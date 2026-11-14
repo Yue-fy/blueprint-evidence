@@ -22,6 +22,7 @@ callout. X1 sl-014: 300 D16 slab 212 m² (gold 214.5), sl-015: 150 D13 slab 60.4
 from __future__ import annotations
 
 import functools
+import os
 import math
 import re
 
@@ -66,9 +67,7 @@ def callouts(pdf_abs: str, page: int = 0) -> tuple:
     with pymupdf.open(pdf_abs) as d:
         if page >= len(d):
             return ()
-        for b in d[page].get_text("blocks"):
-            if b[6] != 0:
-                continue
+        for b in text_blocks(d[page]):
             t = " ".join(str(b[4]).split())
             if not re.search(r"\bSLAB", t, re.I):
                 continue
@@ -78,6 +77,88 @@ def callouts(pdf_abs: str, page: int = 0) -> tuple:
             sp = tuple(int(x) for x in _SPACING.findall(t))
             out.append((t, int(m.group(1)) if m else _imp_mm(mi) if mi else None, bars, sp, tuple(b[:4])))
     return tuple(out)
+
+
+def ocr_layer(pg) -> bool:
+    """The page's text is an INVISIBLE layer only (render mode 3: P1's traced copy of a PNG / an OCR'd scan)."""
+    if os.environ.get("E1_OCR_BLOCKS", "1") == "0":
+        return False
+    try:
+        tt = pg.get_texttrace()
+    except Exception:  # noqa: BLE001
+        return False
+    return bool(tt) and all(s.get("type") == 3 for s in tt)
+
+
+def text_blocks(pg) -> list:
+    """[(x0, y0, x1, y1, text), ...] text blocks of a page. A real PDF: PyMuPDF's blocks. An invisible OCR layer
+    (ocr_layer): PyMuPDF joins its lines into page-wide blocks (S-100F PNG copy: the D13 callout's 3 lines + a pipe
+    trench note 1300 pt away -> the slab was seeded between them, 229.55 m² for 61.69), so the lines are stacked here:
+    a line joins the block whose last row it continues (same row: x-overlap or a gap < 1 text height; next row: top
+    within 0.6 h of the row's bottom and left edges within 1.5 h or x-overlap >= half the narrower line)."""
+    if not ocr_layer(pg):
+        return [tuple(b[:5]) for b in pg.get_text("blocks") if b[6] == 0]
+    lines = []
+    for b in pg.get_text("dict")["blocks"]:
+        for ln in b.get("lines", []):
+            t = " ".join(s["text"] for s in ln["spans"]).strip()
+            if t:
+                lines.append((*ln["bbox"], t))
+    lines.sort(key=lambda r: (r[1], r[0]))
+    blocks = []  # [x0, y0, x1, y1, [rows: [x0, y0, x1, y1, text]]]
+    for x0, y0, x1, y1, t in lines:
+        h = max(1.0, y1 - y0)
+        best = None
+        for bl in blocks:
+            r = bl[4][-1]
+            rh = max(1.0, r[3] - r[1])
+            hh = min(h, rh)
+            ov = min(x1, r[2]) - max(x0, r[0])
+            if abs(y0 - r[1]) <= 0.4 * hh and abs(y1 - r[3]) <= 0.4 * hh and ov > -1.0 * hh:
+                best = (bl, "row")
+                break
+            if 0.4 * hh <= y0 - r[1] and y0 - r[3] <= 0.6 * hh and (
+                    abs(x0 - bl[0]) <= 1.5 * hh or ov >= 0.5 * min(x1 - x0, r[2] - r[0])):
+                best = (bl, "next")
+                break
+        if best is None:
+            blocks.append([x0, y0, x1, y1, [[x0, y0, x1, y1, t]]])
+            continue
+        bl, how = best
+        if how == "row":
+            r = bl[4][-1]
+            r[0], r[1], r[2], r[3], r[4] = min(r[0], x0), min(r[1], y0), max(r[2], x1), max(r[3], y1), \
+                (r[4] + " " + t) if x0 >= r[0] else (t + " " + r[4])
+        else:
+            bl[4].append([x0, y0, x1, y1, t])
+        bl[0], bl[1], bl[2], bl[3] = min(bl[0], x0), min(bl[1], y0), max(bl[2], x1), max(bl[3], y1)
+    return [(b[0], b[1], b[2], b[3], "\n".join(r[4] for r in b[4])) for b in blocks]
+
+
+DASH_GAP_PT = float(os.environ.get("E1_DASH_GAP_PT", 4.0))  # traced copies: close gaps up to 2x this (dashes ~6 pt)
+
+
+# a traced copy's OCR words are inserted as horizontal text fitted into the OCR box: a VERTICAL dimension number
+# ('9950' along the S-100F D13 slab) gets a box shrunk around its centre (19 pt from its line; 11 pt on the PDF)
+NUM_PT_TRACED = float(os.environ.get("E1_NUM_PT_TRACED", 20.0))
+
+
+@functools.lru_cache(maxsize=16)
+def _traced(pdf_abs: str, page: int) -> bool:
+    """A picture traced into lines (stoa.formats.vectorize): an invisible OCR text layer, no images, and every
+    stroke drawn with ONE pen (the traced ink outlines). A CAD PDF that only hides its text (glyphs drawn as paths,
+    invisible text on top) has several pens and is read as a PDF."""
+    try:
+        import pymupdf
+
+        with pymupdf.open(pdf_abs) as d:
+            pg = d[page]
+            if not ocr_layer(pg) or pg.get_images():
+                return False
+            ws = {round(dr.get("width") or 0, 3) for dr in pg.get_drawings()}
+            return len(ws) == 1
+    except Exception:  # noqa: BLE001
+        return False
 
 
 def _pick(cs: tuple, q: str):
@@ -92,6 +173,10 @@ def _pick(cs: tuple, q: str):
     if not hits and qs:  # the spacing may be printed in the callout's next text block ('… W/ D22' / '@ 300 TOP OF …')
         hits = [c for c in cs if (not qt or c[1] in qt) and (not qb or qb <= set(c[2])) and (c[1] is not None or c[2])]
     return hits[0] if len(hits) == 1 else None
+
+
+HATCH_RINGS = bool(int(os.environ.get("E1_HATCH_RINGS", "1")))
+HATCH_RING_PT = float(os.environ.get("E1_HATCH_RING_PT", "2.5"))
 
 
 @functools.lru_cache(maxsize=4)
@@ -109,11 +194,12 @@ def _mask(pdf_abs: str, page: int, n: float):
     if pg is None:
         return None
     ppt = pg["ppt"]
+    strokes = list(pg["strokes"]) + list(pg.get("dashes") or ())  # a traced copy's dashed lines are slab edges
     m_per_pt = n * L.PT_TO_M_AT_1
     with pymupdf.open(pdf_abs) as d:
         p = d[page]
         ws = p.get_text("words")
-        blocks = [b for b in p.get_text("blocks") if b[6] == 0]
+        blocks = text_blocks(p)
         heads = []
         for dr in p.get_drawings():
             r = dr["rect"]
@@ -124,7 +210,7 @@ def _mask(pdf_abs: str, page: int, n: float):
     ntree = STRtree(nums) if nums else None
     htree = STRtree(heads) if heads else None
     segs, segw = [], []
-    for a, w, _dark in pg["strokes"]:
+    for a, w, _dark in strokes:
         P = np.asarray(a, float) / ppt
         for i in range(len(P) - 1):
             segs.append(LineString([P[i], P[i + 1]]))
@@ -160,12 +246,131 @@ def _mask(pdf_abs: str, page: int, n: float):
         q = Point(pt)
         return any(heads[i].distance(q) <= 2.0 for i in htree.query(q.buffer(2.0)))
 
+    traced = _traced(pdf_abs, page)
+    if traced:  # lines traced from a picture: every line is the OUTLINE of its ink, cut into short pieces wherever
+        # another line touches it (S-100F PNG: the 2.16 pt joint across the D13 slab = 14 pieces < 0.4 m, so the
+        # dimension test below, which the PDF's one-stroke line fails, never saw it) -> test the whole ink RUN
+        allm = np.zeros(pg["shape"], np.uint8)
+        for a, w, _dark in strokes:
+            cv2.polylines(allm, [np.asarray(a, np.int32)], False, 1, max(1, int(round(w * ppt))))
+        allm = cv2.dilate(allm, np.ones((3, 3), np.uint8))
+        runs: dict = {}
+
+        def run_of(s):
+            """The straight ink run (pt) through segment s: the line it lies on, sampled px by px, gaps <= 3 px."""
+            (ax, ay), (bx, by) = s.coords
+            L_ = s.length
+            ux, uy = (bx - ax) / L_, (by - ay) / L_
+            if ux < 0 or (ux == 0 and uy < 0):
+                ux, uy = -ux, -uy
+            mx, my = (ax + bx) / 2 * ppt, (ay + by) / 2 * ppt
+            key = (round(math.atan2(uy, ux), 2), round((mx * uy - my * ux) / 2))
+            t0 = mx * ux + my * uy
+            for lo_, hi_, seg in runs.get(key, ()):
+                if lo_ <= t0 <= hi_:
+                    return seg
+            Hh, Ww = allm.shape
+            ts = np.arange(-max(Hh, Ww), max(Hh, Ww), 1.0)
+            xs_, ys_ = np.rint(mx + ts * ux).astype(int), np.rint(my + ts * uy).astype(int)
+            ok = (xs_ >= 0) & (xs_ < Ww) & (ys_ >= 0) & (ys_ < Hh)
+            ink = np.zeros(len(ts), bool)
+            ink[ok] = allm[ys_[ok], xs_[ok]] > 0
+            i0 = int(np.searchsorted(ts, 0.0))
+            if not ink[i0]:
+                return s
+            j0 = j1 = i0
+            gap = 0
+            while j0 > 0 and gap <= 3:
+                j0 -= 1
+                gap = 0 if ink[j0] else gap + 1
+            j0 += gap
+            gap = 0
+            while j1 < len(ts) - 1 and gap <= 3:
+                j1 += 1
+                gap = 0 if ink[j1] else gap + 1
+            j1 -= gap
+            seg = LineString([((mx + ts[j0] * ux) / ppt, (my + ts[j0] * uy) / ppt),
+                              ((mx + ts[j1] * ux) / ppt, (my + ts[j1] * uy) / ppt)])
+            runs.setdefault(key, []).append((t0 + ts[j0], t0 + ts[j1], seg))
+            return seg
+
+        def twin_ink(r) -> bool:
+            """Another line parallel to run r, lo..hi away, along >= 90 % of it (raster test: pieces don't matter)."""
+            (ax, ay), (bx, by) = r.coords
+            L_ = r.length
+            if L_ <= 0:
+                return False
+            ux, uy = (bx - ax) / L_, (by - ay) / L_
+            ts = np.linspace(0, L_, max(2, int(L_ * ppt / 2)))
+            Hh, Ww = allm.shape
+            for sg in (1, -1):
+                for d in np.arange(lo, hi, 1.0 / ppt):
+                    px_ = np.rint((ax + ts * ux - sg * d * uy) * ppt).astype(int)
+                    py_ = np.rint((ay + ts * uy + sg * d * ux) * ppt).astype(int)
+                    ok = (px_ >= 0) & (px_ < Ww) & (py_ >= 0) & (py_ < Hh)
+                    if ok.mean() < 0.9:
+                        continue
+                    if (allm[py_[ok], px_[ok]] > 0).mean() >= 0.9:
+                        return True
+            return False
+
+        dim_cache: dict = {}
+        joint_cache: dict = {}
+        # HATCH (a PDF reader drops hatch fills; a traced picture keeps every hatch stroke as a line): a diagonal
+        # stroke (20-70 deg off the axes) with >= 3 parallel diagonal strokes (same angle +-3 deg) within 1.5 m.
+        # S-100F PNG D16 slab: hatched patches at the slab edge cut 22 m² out of it (187 vs 214.5).
+        diag = []
+        for i_, (a, w, _dark) in enumerate(strokes):
+            P_ = np.asarray(a, float) / ppt
+            d_ = P_[-1] - P_[0]
+            if len(P_) > 1 and not np.hypot(*d_):  # a closed outline (a traced line): its longest axis
+                j_ = int(np.argmax(np.hypot(*(P_ - P_[0]).T)))
+                d_ = P_[j_] - P_[0]
+            L_ = float(np.hypot(*d_))
+            if L_ * m_per_pt < 0.1:
+                continue
+            an = math.degrees(math.atan2(d_[1], d_[0])) % 180
+            if 20 <= an % 90 <= 70:
+                diag.append((i_, an, P_.mean(axis=0)))
+        hatch = set()
+        if len(diag) >= 4:
+            pts_ = np.array([d[2] for d in diag])
+            ans_ = np.array([d[1] for d in diag])
+            r_pt = 1.5 / m_per_pt
+            for k_, (i_, an, c_) in enumerate(diag):
+                near = np.hypot(*(pts_ - c_).T) <= r_pt
+                da = np.abs(ans_ - an)
+                same = near & (np.minimum(da, 180 - da) <= 3)
+                if int(same.sum()) - 1 >= 3:
+                    hatch.add(i_)
+        if HATCH_RINGS:
+            # HATCH RINGS (cycle 10): dense hatch traced from a picture merges into thick diagonal ink; its outline is a
+            # closed ring running >= 85 % diagonal (20-70 deg) with ink >= HATCH_RING_PT thick (2 x area / perimeter).
+            # A traced slab edge is a thin ring along an axis. S-100F PNG D16: these bands cut a triangle off the slab.
+            for i_, (a, w, _dark) in enumerate(strokes):
+                P_ = np.asarray(a, float) / ppt
+                if i_ in hatch or len(P_) < 4 or float(np.hypot(*(P_[-1] - P_[0]))) > 1.0:
+                    continue
+                sg_ = np.diff(P_, axis=0)
+                l_ = np.hypot(*sg_.T)
+                per = float(l_.sum())
+                if per * m_per_pt < 1.0:
+                    continue
+                an_ = np.degrees(np.arctan2(sg_[:, 1], sg_[:, 0])) % 90
+                if float(l_[(an_ >= 20) & (an_ <= 70)].sum()) < 0.85 * per:
+                    continue
+                area_ = 0.5 * abs(float(np.dot(P_[:, 0], np.roll(P_[:, 1], 1)) - np.dot(P_[:, 1], np.roll(P_[:, 0], 1))))
+                if 2 * area_ / per >= HATCH_RING_PT:
+                    hatch.add(i_)
+
     m = np.zeros(pg["shape"], np.uint8)
     widths, joints = [], []
-    for a, w, _dark in pg["strokes"]:
+    for i_s, (a, w, _dark) in enumerate(strokes):
+        if traced and i_s in hatch:
+            continue
         P = np.asarray(a, float) / ppt
         ln = LineString(P)
-        if ln.length * m_per_pt > 2 and any(ln.distance(c) < 20 for c in cj):
+        if not traced and ln.length * m_per_pt > 2 and any(ln.distance(c) < 20 for c in cj):
             joints.append((np.asarray(a, np.int32), w))
             continue  # a control joint divides a slab into panels
         x0, y0, x1, y1 = ln.bounds
@@ -175,6 +380,23 @@ def _mask(pdf_abs: str, page: int, n: float):
         keep = []
         for i in range(len(P) - 1):
             s = segs[0].__class__([P[i], P[i + 1]])
+            if traced and s.length >= 1.0:
+                r = run_of(s)
+                k_ = r.wkb
+                if k_ not in joint_cache:  # a slab edge and the CJ lines that end on it are ONE traced outline
+                    joint_cache[k_] = r.length * m_per_pt > 2 and any(r.distance(c_) < 20 for c_ in cj)
+                if joint_cache[k_]:
+                    joints.append((np.asarray([a[i], a[i + 1]], np.int32), w))
+                    continue
+                if k_ not in dim_cache:
+                    dim_cache[k_] = (r.length * m_per_pt > 0.4 and ntree is not None and
+                                     any(nums[k].distance(r) < NUM_PT_TRACED for k in
+                                         ntree.query(r.buffer(NUM_PT_TRACED))) and
+                                     not twin_ink(r))
+                if dim_cache[k_]:
+                    continue  # a piece of a dimension line / a line the dimension numbers sit on (as on the PDF)
+                keep.append(np.asarray([a[i], a[i + 1]], np.int32))
+                continue
             long_ = s.length * m_per_pt > 0.4
             if long_ and ntree is not None and any(nums[k].distance(s) < 12 for k in ntree.query(s.buffer(12))) \
                     and not has_twin(s, w):
@@ -291,16 +513,26 @@ def _answer(path: str, question: str, page: int) -> Answer | None:
     seed = (int((x0 + x1) / 2 * ppt), int((y0 + y1) / 2 * ppt))
     H, W = m.shape
     area_q = not _PANELS_Q.search(q)
-    if not (0 <= seed[0] < W and 0 <= seed[1] < H) or m[seed[1], seed[0]]:
-        return _leader_dims(path, pdf, page, n, c) if area_q else None
-    ff = m.copy()
+    traced = _traced(pdf, page)
+    g = int(round(DASH_GAP_PT * ppt)) if traced else 0
+    if g:  # a picture traced into lines: a DASHED slab edge is dashes with real gaps (a PDF strokes it whole)
+        k_ = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * g + 1, 2 * g + 1))
+        mf = cv2.dilate(m, k_)
+    else:
+        mf = m
+    tctx = (mf, m, cs) if traced else None
+    if not (0 <= seed[0] < W and 0 <= seed[1] < H) or mf[seed[1], seed[0]]:
+        return _leader_dims(path, pdf, page, n, c, tctx) if area_q else None
+    ff = mf.copy()
     flood = np.zeros((H + 2, W + 2), np.uint8)
     cv2.floodFill(ff, flood, seed, 128)
     reg = (ff == 128).astype(np.uint8)
+    if g:
+        reg = (cv2.dilate(reg, k_) & (m == 0)).astype(np.uint8)
     ys, xs = np.nonzero(reg)
     if not len(xs) or xs.min() <= 1 or ys.min() <= 1 or xs.max() >= W - 2 or ys.max() >= H - 2:
         # ran off the sheet: not a closed slab -- the callout may sit OUTSIDE its slab with a leader into it
-        return _leader_dims(path, pdf, page, n, c) if area_q else None
+        return _leader_dims(path, pdf, page, n, c, tctx) if area_q else None
     cnts, _ = cv2.findContours(reg, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     ct = max(cnts, key=cv2.contourArea)
     full = np.zeros_like(reg)
@@ -308,13 +540,13 @@ def _answer(path: str, question: str, page: int) -> Answer | None:
     per_px = cv2.arcLength(ct, True)
     a_m2 = (float(full.sum()) + per_px * (wmed * ppt / 2 + 0.5)) * m_per_px ** 2
     if not 2.0 <= a_m2 <= 5000:
-        return _leader_dims(path, pdf, page, n, c) if area_q else None
+        return _leader_dims(path, pdf, page, n, c, tctx) if area_q else None
     for o in cs:  # another slab type's callout inside: the region leaked across a slab edge
         if o is c or o[1] is None or (o[1] == c[1] and o[2] == c[2]):
             continue  # notes ('TOP OF SLAB EL.', a rebar note) are not another slab type
         ox, oy = int((o[4][0] + o[4][2]) / 2 * ppt), int((o[4][1] + o[4][3]) / 2 * ppt)
         if 0 <= ox < W and 0 <= oy < H and full[oy, ox]:
-            return _leader_dims(path, pdf, page, n, c) if area_q else None
+            return _leader_dims(path, pdf, page, n, c, tctx) if area_q else None
     if _PANELS_Q.search(q):  # 'into how many panels do the control joints divide the D16 slab'
         if not joints:
             return None
@@ -350,17 +582,24 @@ def _answer(path: str, question: str, page: int) -> Answer | None:
         r = D.rect_spanning(pdf, page, n, (min(xsd), min(ysd), max(xsd), max(ysd)))
     except Exception:  # noqa: BLE001
         r = None
+    if r is None and traced:
+        r = _ocr_sides(pdf, page, n, (min(xsd), min(ysd), max(xsd), max(ysd)), bx, by, a_m2)
     if r is not None and abs(r["area_m2"] - a_m2) <= 0.05 * a_m2:
         # the traced slab IS the rectangle two printed dimensions span (S-100F D13: 9950 x 6200 = 61.69 vs traced
         # 60.77): the printed numbers are the answer
+        how = "the rectangle these dimensions span" if not r.get("ocr") else \
+            "its sides equal these printed numbers (OCR'd from the picture) within 1.5 %"
         return _dims_answer(path, page, n, c, r, f"the slab traced around its callout ({val} m², extent {bx:.2f} x "
-                                                 f"{by:.2f} m) is the rectangle these dimensions span", poly)
+                                                 f"{by:.2f} m) is {how}", poly)
     ev = [Evidence(file=path, page=page, bbox=[min(xsd), min(ysd), max(xsd), max(ysd)], bbox_space="pdf_pt",
                    exact=False, polygon=poly, note=f"{name}: {val} m² traced at 1:{n:g} (approximate)"),
           Evidence(file=path, page=page, bbox=[round(v, 1) for v in c[4]], bbox_space="pdf_pt", exact=True,
                    note=f"slab callout: {name}")]
-    return Answer(value=val, unit="m2", confidence=0.4, evidence=ev, solver=SOLVER,
+    conf, pic = (0.25, ["lines traced from a picture of the sheet: hatching / symbols merged into the lines can cut "
+                        "into the slab"]) if traced else (0.4, [])
+    return Answer(value=val, unit="m2", confidence=conf, evidence=ev, solver=SOLVER,
                   assumptions=[f"scale: 1:{n:g} printed on the sheet; slab traced from the drawn lines (approximate)",
+                               *pic,
                                f"slab type = the printed callout '{name}'",
                                "slab = the region around that callout bounded by slab edges / beams; control joints "
                                f"(CJ), dimension lines and text frames ignored; extent {bx:.2f} x {by:.2f} m"],
@@ -463,16 +702,50 @@ def _total_answer(path: str, pdf: str, page: int, cs: tuple) -> Answer | None:
                          *(f"slab_area: [{c[0][:30]}] {a.trace[-1][:160]}" for c, a in parts)])
 
 
+def _ocr_sides(pdf: str, page: int, n: float, bb: tuple, bx: float, by: float, a_m2: float) -> dict | None:
+    """A traced copy of a picture (no dimension LINES to pair with, only OCR'd numbers): two printed mm numbers near
+    the traced slab (within 30 % of its size around its box) that equal its traced width and height within 1.5 %
+    (S-100F PNG D13: 6.18 x 9.92 m traced, '6200' and '9950' printed -> 61.69 m², the PDF's answer). Same dict as
+    dimrect.rect_spanning; the number boxes are OCR boxes."""
+    import pymupdf
+
+    x0, y0, x1, y1 = bb
+    pad = 0.3 * max(x1 - x0, y1 - y0)
+    with pymupdf.open(pdf) as d:
+        ws = [w for w in d[page].get_text("words") if _NUM.match(w[4])
+              and x0 - pad <= (w[0] + w[2]) / 2 <= x1 + pad and y0 - pad <= (w[1] + w[3]) / 2 <= y1 + pad]
+
+    def best(side_m):
+        hits = [(abs(int(w[4]) / 1000.0 - side_m) / side_m, w) for w in ws]
+        hits = [h for h in hits if h[0] <= 0.015]
+        return min(hits, key=lambda h: h[0])[1] if hits else None
+
+    wh, wv = best(bx), best(by)
+    if wh is None or wv is None or wh is wv:
+        return None
+    hv, vv = int(wh[4]), int(wv[4])
+    area = round(hv * vv / 1e6, 3)
+    if abs(area - a_m2) > 0.06 * a_m2:
+        return None
+    mm = n * 0.3527777778  # mm on the ground per pt at 1:n
+    return {"w_mm": hv, "h_mm": vv, "area_m2": area, "rect": bb, "ink": "traced from the picture",
+            "dims": ((hv, "h", x0, x1, None, tuple(wh[:4]), round(bx * 1000)),
+                     (vv, "v", y0, y1, None, tuple(wv[:4]), round(by * 1000))), "ocr": True, "mm_per_pt": mm}
+
+
 def _dims_answer(path: str, page: int, n: float, c, r: dict, how: str, poly=None) -> Answer:
     (hv, *_h), (vv, *_v) = r["dims"]
     h, v = r["dims"]
     x0, y0, x1, y1 = r["rect"]
     name = c[0][:60]
     val = r["area_m2"]
-    ev = [Evidence(file=path, page=page, bbox=[round(t, 1) for t in h[5]], bbox_space="pdf_pt", exact=True,
-                   note=f"dimension {hv} mm (printed; measures {h[6]} mm at 1:{n:g})"),
-          Evidence(file=path, page=page, bbox=[round(t, 1) for t in v[5]], bbox_space="pdf_pt", exact=True,
-                   note=f"dimension {vv} mm (printed; measures {v[6]} mm at 1:{n:g})"),
+    ocr = bool(r.get("ocr"))
+    ev = [Evidence(file=path, page=page, bbox=[round(t, 1) for t in h[5]], bbox_space="pdf_pt", exact=not ocr,
+                   note=f"dimension {hv} mm (printed; {'the traced slab measures' if ocr else 'measures'} {h[6]} mm "
+                        f"at 1:{n:g})"),
+          Evidence(file=path, page=page, bbox=[round(t, 1) for t in v[5]], bbox_space="pdf_pt", exact=not ocr,
+                   note=f"dimension {vv} mm (printed; {'the traced slab measures' if ocr else 'measures'} {v[6]} mm "
+                        f"at 1:{n:g})"),
           Evidence(file=path, page=page, bbox=[round(x0, 1), round(y0, 1), round(x1, 1), round(y1, 1)],
                    bbox_space="pdf_pt", exact=False, polygon=[[round(x0, 1), round(y0, 1)], [round(x1, 1), round(y0, 1)],
                                                               [round(x1, 1), round(y1, 1)], [round(x0, 1), round(y1, 1)]],
@@ -485,13 +758,173 @@ def _dims_answer(path: str, page: int, n: float, c, r: dict, how: str, poly=None
                                f"the drawing measured at 1:{n:g}",
                                "slab = the plan area to the slab edge; nothing drawn as a void inside it"],
                   missing=[],
-                  trace=[f"slab_area: '{name[:50]}': {how}; dimensions {hv} x {vv} mm (each measures its own line at "
-                         f"1:{n:g}: {h[6]} / {v[6]} mm; edges inked {r['ink']}) = {val} m²"])
+                  trace=[f"slab_area: '{name[:50]}': {how}; dimensions {hv} x {vv} mm " +
+                         (f"(the traced slab's sides measure {h[6]} / {v[6]} mm at 1:{n:g}; numbers OCR'd from the "
+                          f"picture) = {val} m²" if ocr else
+                          f"(each measures its own line at 1:{n:g}: {h[6]} / {v[6]} mm; edges inked {r['ink']}) = "
+                          f"{val} m²")])
 
 
-def _leader_dims(path: str, pdf: str, page: int, n: float, c) -> Answer | None:
+@functools.lru_cache(maxsize=4)
+def _ink(pdf_abs: str, page: int):
+    """(every stroke rasterised and grown 1 px, ppt) on linework's px grid: the INK of a traced copy."""
+    import cv2
+    import numpy as np
+
+    from stoa.evidence import linework as L
+
+    pg = L._page(pdf_abs, page)
+    if pg is None:
+        return None
+    ink = np.zeros(pg["shape"], np.uint8)
+    for a, w, _d in list(pg["strokes"]) + list(pg.get("dashes") or ()):
+        cv2.polylines(ink, [np.asarray(a, np.int32)], False, 1, max(1, int(round(w * pg["ppt"]))))
+    return cv2.dilate(ink, np.ones((3, 3), np.uint8)), pg["ppt"]
+
+
+def _ray(ink, p, ang: float, gap: int = 3) -> float:
+    """Length (px) of the ink run leaving point p in direction ang (rad), gaps <= gap px."""
+    import numpy as np
+
+    H, W = ink.shape
+    ux, uy = math.cos(ang), math.sin(ang)
+    ts = np.arange(1, max(H, W))
+    xs, ys = np.rint(p[0] + ts * ux).astype(int), np.rint(p[1] + ts * uy).astype(int)
+    ok = (xs >= 0) & (xs < W) & (ys >= 0) & (ys < H)
+    hit = np.zeros(len(ts), bool)
+    hit[ok] = ink[ys[ok], xs[ok]] > 0
+    last, miss = 0, 0
+    for i, h in enumerate(hit):
+        if h:
+            last, miss = i + 1, 0
+        else:
+            miss += 1
+            if miss > gap:
+                break
+    return float(last)
+
+
+def _traced_leader(pdf: str, page: int, box_pt) -> tuple | None:
+    """Tip (px, unit direction) of a leader drawn from a callout on a traced copy (no vector leader: the leader is ink
+    outlines merged with every wall it crosses). From the ink nearest the callout's side, follow straight runs (<= 3,
+    each >= 2 text heights, turning >= 20 deg) and return the end of the last one. S-100F PNG D22 callout -> the
+    horizontal tail, then the diagonal into the genset slab."""
+    import numpy as np
+
+    got = _ink(pdf, page)
+    if got is None:
+        return None
+    ink, ppt = got
+    x0, y0, x1, y1 = (v * ppt for v in box_pt)
+    hh = max(4.0, min(y1 - y0, 12 * ppt))  # one text row is at most the block's height
+    H, W = ink.shape
+    best = None
+    for side in ("r", "l"):
+        xa, xb = (int(x1), int(x1 + 3 * hh)) if side == "r" else (int(x0 - 3 * hh), int(x0))
+        ya, yb = int(y0), int(y1)
+        xa, xb, ya, yb = max(0, xa), min(W, xb), max(0, ya), min(H, yb)
+        if xb <= xa or yb <= ya:
+            continue
+        ys, xs = np.nonzero(ink[ya:yb, xa:xb])
+        if not len(xs):
+            continue
+        d = (xs + xa - (x1 if side == "r" else x0)) ** 2
+        i = int(np.argmin(d))
+        p0 = (float(xs[i] + xa), float(ys[i] + ya))
+        a0 = 0.0 if side == "r" else math.pi
+        cand = [(_ray(ink, p0, a0 + math.radians(k)), a0 + math.radians(k)) for k in range(-80, 81, 5)]
+        L0, ang = max(cand)
+        if L0 >= 2 * hh and (best is None or L0 > best[0]):
+            best = (L0, p0, ang)
+    if best is None:
+        return None
+    L0, p, ang = best
+    pts = [p]
+    for _ in range(3):
+        q = (p[0] + L0 * math.cos(ang), p[1] + L0 * math.sin(ang))
+        pts.append(q)
+        nxt = []
+        for k in range(0, 360, 5):
+            a2 = math.radians(k)
+            dd = abs((a2 - ang + math.pi) % (2 * math.pi) - math.pi)
+            if dd < math.radians(20) or dd > math.radians(160):
+                continue  # straight on / back the way it came
+            Ln = _ray(ink, q, a2)
+            if Ln >= 2 * hh:
+                nxt.append((Ln, a2))
+        if len(nxt) != 1 and not (nxt and max(nxt)[0] >= 2.5 * sorted(nxt)[-2][0]):
+            break  # a clean bend continues one way only (a wall crossing would offer two)
+        L0, ang = max(nxt)
+        p = q
+    if len(pts) < 3:
+        return None  # a straight tail ending in open space is not a leader we can trust
+    return pts[-1], (math.cos(ang), math.sin(ang)), ppt
+
+
+def _traced_leader_answer(path: str, pdf: str, page: int, n: float, c, mf, m, cs) -> Answer | None:
+    """Traced copy: the callout is outside its slab -> follow its leader in the ink, flood the slab at its tip, and
+    answer only when two OCR'd printed numbers equal the traced sides (_ocr_sides)."""
+    import cv2
+    import numpy as np
+
+    from stoa.evidence import linework as L
+
+    lt = _traced_leader(pdf, page, c[4])
+    if lt is None:
+        return None
+    (tx, ty), (ux, uy), ppt = lt
+    H, W = mf.shape
+    seed = None
+    for k in range(0, 25):  # off the arrow head's ink, onward
+        x, y = int(round(tx + k * ux)), int(round(ty + k * uy))
+        if 0 <= x < W and 0 <= y < H and not mf[y, x]:
+            seed = (x, y)
+            break
+    if seed is None:
+        return None
+    ff = mf.copy()
+    cv2.floodFill(ff, np.zeros((H + 2, W + 2), np.uint8), seed, 128)
+    reg = (ff == 128).astype(np.uint8)
+    g = int(round(DASH_GAP_PT * ppt))
+    k_ = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * g + 1, 2 * g + 1))
+    reg = (cv2.dilate(reg, k_) & (m == 0)).astype(np.uint8)
+    ys, xs = np.nonzero(reg)
+    if not len(xs) or xs.min() <= 1 or ys.min() <= 1 or xs.max() >= W - 2 or ys.max() >= H - 2:
+        return None
+    cnts, _ = cv2.findContours(reg, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    ct = max(cnts, key=cv2.contourArea)
+    full = np.zeros_like(reg)
+    cv2.drawContours(full, [ct], -1, 1, -1)
+    m_per_px = n * L.PT_TO_M_AT_1 / ppt
+    a_m2 = float(full.sum()) * m_per_px ** 2
+    if not 1.0 <= a_m2 <= 2000:
+        return None
+    for o in cs:
+        if o[1] is None or o is c:
+            continue
+        ox, oy = int((o[4][0] + o[4][2]) / 2 * ppt), int((o[4][1] + o[4][3]) / 2 * ppt)
+        if 0 <= ox < W and 0 <= oy < H and full[oy, ox]:
+            return None
+    poly = [[round(float(x) / ppt, 2), round(float(y) / ppt, 2)] for x, y in cv2.approxPolyDP(ct, 1.5, True)[:, 0, :]]
+    xsd, ysd = [q[0] for q in poly], [q[1] for q in poly]
+    bx, by = (max(xsd) - min(xsd)) * n * L.PT_TO_M_AT_1, (max(ysd) - min(ysd)) * n * L.PT_TO_M_AT_1
+    r = _ocr_sides(pdf, page, n, (min(xsd), min(ysd), max(xsd), max(ysd)), bx, by, a_m2)
+    if r is None:
+        return None
+    return _dims_answer(path, page, n, c, r, f"the callout's leader (followed in the traced ink) ends at "
+                                             f"({tx / ppt:.0f}, {ty / ppt:.0f}) pt; the slab traced there "
+                                             f"({a_m2:.2f} m², extent {bx:.2f} x {by:.2f} m) has sides equal to these "
+                                             f"printed numbers (OCR'd) within 1.5 %", poly)
+
+
+def _leader_dims(path: str, pdf: str, page: int, n: float, c, traced_ctx=None) -> Answer | None:
     """The callout sits OUTSIDE its slab with a leader into it (S-100F '300 SLAB-ON-GRADE W/ D22 @ 300' -> the genset
     foundation): the rectangle two printed dimensions span around the leader's end."""
+    if traced_ctx is not None:
+        try:
+            return _traced_leader_answer(path, pdf, page, n, c, *traced_ctx)
+        except Exception:  # noqa: BLE001
+            return None
     try:
         from stoa.evidence import dimrect as D
 

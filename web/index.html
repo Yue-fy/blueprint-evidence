@@ -11,14 +11,16 @@
       <div class="logo" aria-hidden="true">B</div>
       <div class="tb-name">
         <h1>Blueprint Evidence</h1>
-        <p>Ask a drawing or a building model. Every answer shows where it came from.</p>
+        <p>Ask a drawing or a building model. Answers point to where on the drawing they come from, or say what they could not find.</p>
       </div>
       <div class="brand-right">
         <span id="backend" class="badge" title="Which backend answered the last request">API …</span>
+        <button id="privBtn" class="priv-toggle" type="button" role="switch" aria-checked="false" title="Private mode: drawings never leave our server (no Gemini or NVIDIA steps)"><span class="sw" aria-hidden="true"></span>Private</button>
         <button id="tourBtn" class="tour" title="Step through the demo questions">Guided demo</button>
         <button id="viewToggle" class="view-toggle" type="button" title="Switch between the simple view and the expert view (files, solvers, costs, traces)">Expert view</button>
       </div>
     </header>
+    <div id="privNote" class="priv-note" role="status" hidden></div>
     <div id="landing" class="landing" hidden></div>
     <div id="app">
       <aside id="side">
@@ -54,7 +56,7 @@
             <input id="search" type="search" placeholder="Filter files…" aria-label="Filter files" />
           </div>
           <ul id="files" class="files"></ul>
-          <label class="upload-box" id="uploadBox" title="Your own floor plan, sheet, scan or IFC model: it is saved only on this machine and answered by the same pipeline, with no template and no twin. Select a sheet and its .ifc model together to link them.">
+          <label class="upload-box" id="uploadBox" title="Your own floor plan, sheet, scan or IFC model: it is stored only on this server and answered by the same pipeline, with no template and no twin; with Private off, an unsure answer may send one page image to Gemini or NVIDIA. Select a sheet and its .ifc model together to link them.">
             <input id="uploadInput" type="file" accept=".pdf,.png,.jpg,.jpeg,.heic,.heif,.ifc,.dxf,.dwg,.svg,.webp,.tif,.tiff,.bmp,.gif,image/*,application/pdf" multiple hidden />
             <b>＋ Your own drawing</b><small id="uploadMsg">PDF, image or photo, IFC, DXF · or drop it here · a sheet + its .ifc or .dxf together link up</small>
           </label>
@@ -69,6 +71,8 @@
           <form id="askForm">
             <textarea id="question" rows="3" placeholder="e.g. How many doors are shown on the floor plan?"></textarea>
             <small class="any-lang">Ask in your own words, in any language.</small>
+            <small class="on-page" id="onPage" hidden></small>
+            <small class="takeoff" id="takeoff" hidden></small>
             <button type="button" class="ask-more" id="askMore">Example questions</button>
             <div id="chips" class="chips"></div>
             <div class="row">
@@ -87,6 +91,7 @@
           </section>
         </details>
         <section id="diffs" class="diffs" hidden></section>
+        <section id="glance" class="glance" hidden aria-label="This floor at a glance"></section>
       </aside>
 
       <main id="main">
@@ -107,8 +112,10 @@
         <div id="views" data-mode="2d">
           <div id="xbanner" class="xbanner" hidden></div>
           <section id="bench" class="bench" hidden aria-label="How well it works"></section>
+          <div id="featPanels" class="feat-panels" hidden></div>
           <div id="pane2d" class="pane"><div id="v2d"></div>
             <div id="pageCtl" class="pagectl" role="group" aria-label="Pages of this PDF" hidden></div>
+            <div id="featBar" class="feat-bar" role="toolbar" aria-label="More tools" hidden></div>
             <div class="zoomctl" role="group" aria-label="Zoom the drawing">
               <button type="button" data-zoom="in" title="Zoom in" aria-label="Zoom in">+</button>
               <button type="button" data-zoom="out" title="Zoom out" aria-label="Zoom out">−</button>

@@ -176,4 +176,38 @@ def scale_from_arcs(png: str) -> tuple[float | None, int]:
     if len(dets) < 3:
         return None, len(dets)
     top = sorted(dets, key=lambda d: -d["score"])[: max(3, len(dets) // 2)]
-    return statistics.median(d["r_px"] for d in top) / DOOR_LEAF_M, len(dets)
+    med = statistics.median(d["r_px"] for d in top)
+    if LEAF_GATE and med < LEAF_BELOW * lo and leaf_share(png, top) < LEAF_SHARE:
+        return None, len(dets)  # near the radius floor and mostly no door leaves: not door swings (W6 17:42)
+    return med / DOOR_LEAF_M, len(dets)
+
+
+# W6 17:42 (night-W6 616f21f web/src/mobile/doorscale.py, measured there; ported unchanged): near the detector's 12 px
+# radius floor the radius steps put the median of ANY small quarter strokes at ~15 px, so photos of big sheets read the
+# same ~30 px/m whatever the sheet (USACE S-100F / M-101A photos: truth ~95). A door swing has a LEAF (ink along one
+# bounding radius): DfE 93 %, Fraser 100 %, Pagenstr 80 % vs S-100F 12 %, M-101A 45 %. Applied only below 1.5x the
+# floor (CubiCasa bare-arc swings well above it keep their estimate). STOA_O1_LEAF_GATE=0 = off.
+LEAF_SHARE, LEAF_BELOW, LEAF_INK = 0.65, 1.5, 0.75
+LEAF_GATE = os.environ.get("STOA_O1_LEAF_GATE", "1") != "0"
+
+
+def leaf_share(png: str, dets: list[dict]) -> float:
+    """Share of door-arc detections (image px) with a straight radial line of ink from the hinge along one of the
+    quadrant's bounding radii (0.15-0.9 r, 1 px slack) - a door leaf. Rounded box corners, pipe bends and symbol strokes
+    have none."""
+    from PIL import ImageFilter
+
+    ink = np.asarray(Image.open(png).convert("L").filter(ImageFilter.MinFilter(3))) < INK
+    h, w = ink.shape
+
+    def frac(cx: float, cy: float, th: float, r: float) -> float:
+        n = hit = 0
+        for t in np.linspace(0.15, 0.9, 16):
+            x, y = int(round(cx + math.cos(th) * t * r)), int(round(cy + math.sin(th) * t * r))
+            if 0 <= x < w and 0 <= y < h:
+                n, hit = n + 1, hit + int(ink[y, x])
+        return hit / max(1, n)
+
+    leaves = sum(max(frac(*d["c"], math.radians(d["q"] * 90), d["r_px"]),
+                     frac(*d["c"], math.radians(d["q"] * 90 + 90), d["r_px"])) >= LEAF_INK for d in dets)
+    return leaves / max(1, len(dets))

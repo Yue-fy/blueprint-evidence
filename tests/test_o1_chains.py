@@ -209,3 +209,29 @@ def test_bottom_chain_chosen_over_larger_top_chain():
     # a part named without a dimension line is not the overall dimension: no answer from the chains
     assert CH.overall_answer("x.png", "How wide is the pump room part (left) overall, according to the dimensions?",
                              tl) is None
+
+
+def test_two_lengths_inch_mark_as_two_apostrophes():
+    from stoa.solvers.raster.textqa import two_lengths
+
+    assert two_lengths("60'-0'' x 50'-0''") == (60.0, 50.0, "ft")
+    assert two_lengths("12'-6\" x 14'") == (12.5, 14.0, "ft")
+
+
+def test_tag_count_ids_with_a_note_mention():
+    """D1 17:46: FP-1..3 drawn, the note 'FP-3, (OPTIONAL STANDBY …)' names FP-3 again -> 3 pumps, not 4."""
+    from stoa.solvers.raster.textqa import _tag_count_answer
+
+    tl = T.TextLayer(path="x.png", size=(1000, 800), tiles=1)
+    tl.items = [T.TextItem(text=t, box=[10 + 60 * k, 10, 50 + 60 * k, 25]) for k, t in
+                enumerate(["FP-1", "FP-2", "FP-3", "FP-3,", "CV-1"])]
+    assert _tag_count_answer("x.png", "How many fuel pumps (FP) are shown?", tl, "raster").value == 3
+
+
+def test_finnish_how_big_is_not_a_count():
+    """X1 x1-173: 'Kuinka suuri on keittiön lattiapinta-ala?' (how big is the kitchen floor area) was counted (1 kitchen)."""
+    from stoa.solvers.raster import question_op
+
+    assert question_op("Kuinka suuri on keittiön lattiapinta-ala?") == ("none", [])
+    assert question_op("Kuinka monta keittiötä?") == ("single", ["kitchen"])
+    assert question_op("Kunika monta makuuhuonetta on?") == ("single", ["bedroom"])

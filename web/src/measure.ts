@@ -81,6 +81,9 @@ export function printedScaleOf(p: { ok?: boolean; n?: number; text?: string } | 
   return { unitsPerM: PT_PER_M_AT_1 / n, label: `1:${Math.round(n * 100) / 100}`, source: t && !/^1\s*:\s*[\d.]+$/.test(t) ? `printed on the drawing (${t})` : "printed on the drawing" };
 }
 
+/** source of a scale the visitor set earlier and F7's corrections remembered (it goes when an answer no longer uses it) */
+export const LEARNED = "set by you (remembered for this project)";
+
 export function scaleFromAnswer(a: Answer, space: "pdf_pt" | "image_px"): Scale | null {
   const text = [...(a.trace ?? []), ...(a.assumptions ?? []), ...(a.evidence ?? []).map((e) => e.note ?? "")].join("\n");
   const px = text.match(/([\d.]+)\s*px per m\b/i);
@@ -89,6 +92,15 @@ export function scaleFromAnswer(a: Answer, space: "pdf_pt" | "image_px"): Scale 
     return { unitsPerM: u, label: scaleLabel(u, space), source: /scale bar/i.test(text) ? "from the scale bar on the drawing" : "read from the drawing" };
   }
   if (space !== "pdf_pt") return null;
+  // P1's paper copy (stoa.formats.normalize.paper_copy): '1:200 @ A1' printed on an A3 page = 1:400 on this file. The
+  // readers measured on the page enlarged to A1 (where 1:200 holds); the viewer and this tool show the uploaded page, so
+  // its own 1:400 is the scale here (taking 1:200 made 'Measure yourself' 4x too small and a false door-swing warning).
+  const onFile = text.match(/\bthe drawing is at 1\s*:\s*(\d{1,6}) on this file\b/i);
+  if (onFile && Number(onFile[1]) >= 1) {
+    const n = Number(onFile[1]);
+    const why = text.match(/\('1:(\d{1,6}) @ (A\d)'\) but this PDF page is (A\d)/);
+    return { unitsPerM: PT_PER_M_AT_1 / n, label: `1:${n}`, source: why ? `printed as 1:${why[1]} for ${why[2]} paper; this page is ${why[3]}` : "printed on the drawing (for another paper size)" };
+  }
   // US / UK architectural scales: 1/4" = 1'-0" is 1:48, 1" = 40'-0" is 1:480 (Stoa's M-101A and AFCEC sheets). The 1:N
   // patterns below must not read '1/4"' as 1:4 (that made every measurement on a US sheet 12× too small, 16:55).
   const imp = imperialScale(typeof a.value === "string" && /^\s*[\d\s/.]+\s*(?:"|''|″)\s*=/.test(a.value) ? a.value : text);
@@ -106,7 +118,8 @@ export function scaleFromAnswer(a: Answer, space: "pdf_pt" | "image_px"): Scale 
   if (!k) return null;
   const n = Number(k[1]);
   if (!(n >= 1 && n <= 50000)) return null;
-  const src = est ? "estimated (not printed on the drawing; unsure)" : rs ? "printed on the drawing" : /title block/i.test(text) ? "from the title block"
+  // F7's corrections: 'scale: 1:200 set by you (the drawing prints no scale)' = the visitor's earlier correction
+  const src = !est && /\bset by you\b/i.test(text) ? LEARNED : est ? "estimated (not printed on the drawing; unsure)" : rs ? "printed on the drawing" : /title block/i.test(text) ? "from the title block"
     : /printed (?:scale|on the sheet)|scale[^\n]{0,12}printed/i.test(text) ? "printed on the drawing"
     : v ? `read from the drawing${(a.confidence ?? 0) < 0.5 ? " (unsure)" : ""}` : "read from the drawing";
   return { unitsPerM: PT_PER_M_AT_1 / n, label: `1:${n}`, source: src };
@@ -125,6 +138,9 @@ export class Measure {
   private n = 0;
   /** told when the visitor sets a scale (the hero's scale line follows) */
   onScale: (s: Scale | null) => void = () => {};
+  /** A measurement finished (F7 20:38: 'use it as the answer?'): a traced room (area, outline, its name when the card
+   *  traced a named room) or a two-click length; manual = the visitor clicked (false: the answer card traced it). */
+  onMeasure: (m: { kind: "area" | "length"; value: number; unit: "m²" | "m"; poly?: [number, number][]; line?: [[number, number], [number, number]]; name?: string; manual: boolean; scale: string }) => void = () => {};
 
   constructor(private v2d: Viewer2D, host: HTMLElement, private shapes: Shapes) {
     this.el = document.createElement("div");
@@ -191,6 +207,15 @@ export class Measure {
     this.auto = s;
     this.render();
     if (!same && !this.user) this.onScale(s);
+  }
+
+  /** An answer on this file that uses no scale: a remembered correction's scale is not the one in force any more (F7
+   *  20:31: after Undo the card still said 'Scale 1:200 printed' for an answer measured at no scale). */
+  dropLearned() {
+    if (!this.auto || this.auto.source !== LEARNED) return;
+    this.auto = null;
+    this.render();
+    if (!this.user) this.onScale(null);
   }
 
   get scale(): Scale | null {
@@ -286,6 +311,11 @@ export class Measure {
     this.q(".m-out").innerHTML = html;
   }
 
+  /** As if the visitor clicked at p with the open tool (right-click 'Measure from here': the length's first end). */
+  clickAt(p: [number, number]) {
+    void this.click(p);
+  }
+
   private async click(p: [number, number]) {
     if (!this.tool) return;
     const s = this.scale;
@@ -319,15 +349,20 @@ export class Measure {
       const m = Math.hypot(b[0] - a[0], b[1] - a[1]) / s.unitsPerM;
       this.v2d.measureLine(a, b, `${fmtM(m)} m`);
       this.out(`Length: <b>${fmtM(m)} m</b> <small>at ${esc(s.label)} (${esc(s.source)})</small>`);
+      try {
+        this.onMeasure({ kind: "length", value: Math.round(m * 1000) / 1000, unit: "m", line: [a, b], manual: true, scale: s.label });
+      } catch {
+        /* a listener's problem never breaks measuring */
+      }
       return;
     }
-    await this.roomAt(p);
+    await this.roomAt(p, "", [], true);
   }
 
   /** Trace the room around point p (drawing coordinates) and measure it at the current scale: area (m²) and the
    *  outline's extent along the drawing's axes (length ≥ width, m). Draws the outline; null when there is no scale or
    *  no closed room there. Used by a click in area mode and by the answer card (a room found by its printed label). */
-  async roomAt(p: [number, number], name = "", others: [number, number][] = []): Promise<{ m2: number; length: number; width: number; perimeter: number; poly: [number, number][] } | null> {
+  async roomAt(p: [number, number], name = "", others: [number, number][] = [], manual = false): Promise<{ m2: number; length: number; width: number; perimeter: number; poly: [number, number][] } | null> {
     const s = this.scale;
     if (!s) return null;
     const r = 1; // a point box around the click
@@ -352,6 +387,11 @@ export class Measure {
       const perimeter = poly.reduce((n, q, i) => { const r = poly[(i + 1) % poly.length]; return n + Math.hypot(r[0] - q[0], r[1] - q[1]); }, 0) / s.unitsPerM;
       this.v2d.measurePoly(sh.poly, `${fmtM(m2)} m²`);
       this.out(`${name ? `${esc(name)}: ` : "Room area: "}<b>${fmtM(m2)} m²</b> · perimeter <b>${fmtM(perimeter)} m</b> <small>traced ${sh.method === "wall lines" ? "from the wall lines (door swings closed at the doorway)" : "outline"} at ${esc(s.label)} (${esc(s.source)}); inner faces of the walls${sh.method === "wall lines" ? "" : ", furniture lines may cut it"}; door openings not deducted from the perimeter</small>`);
+      try {
+        this.onMeasure({ kind: "area", value: Math.round(m2 * 1000) / 1000, unit: "m²", poly: sh.poly, ...(name ? { name } : {}), manual, scale: s.label });
+      } catch {
+        /* a listener's problem never breaks measuring */
+      }
       return { m2, length: Math.max(dx, dy), width: Math.min(dx, dy), perimeter, poly: sh.poly };
     } catch (e) {
       this.out(`Could not trace the room: ${esc((e as Error).message)}`);

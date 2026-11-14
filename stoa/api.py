@@ -9,6 +9,7 @@ server on :5173. Answers are cached per (path, question, solver, kwargs) in memo
 from __future__ import annotations
 
 import collections
+import contextlib
 import functools
 import json
 import os
@@ -44,6 +45,12 @@ class AskRequest(BaseModel):
     question: str
     solver: str = "pipeline"
     solver_args: dict = {}
+    # G1 (captain 19:47 / 19:54, KNOWLEDGE 20:27): what the visitor pointed at, in Evidence.bbox space:
+    # {point?: [x, y], region?: [[x, y], ...], view?: str, space: 'pdf_pt' | 'image_px', page?: int} (stoa/agent/click.py)
+    context: dict | None = None
+    point: list | None = None
+    region: list | None = None
+    view: str | None = None
 
 
 _SOLVERS: dict[tuple, object] = {}
@@ -94,7 +101,12 @@ def health() -> dict:
 @app.post("/ask")
 def ask(req: AskRequest) -> dict:
     path = _safe_rel(req.path)
-    key = (path, req.question.strip(), req.solver, json.dumps(req.solver_args, sort_keys=True))
+    ctx = dict(req.context or {})
+    for k in ("point", "region", "view"):  # W5 sends both forms
+        if getattr(req, k, None) is not None and k not in ctx:
+            ctx[k] = getattr(req, k)
+    key = (path, req.question.strip(), req.solver, json.dumps(req.solver_args, sort_keys=True),
+           json.dumps(ctx, sort_keys=True) if ctx else "")
     with _ANS_LOCK:
         if key in _ANSWERS:
             _ANSWERS.move_to_end(key)
@@ -104,7 +116,11 @@ def ask(req: AskRequest) -> dict:
     except KeyError as e:
         raise HTTPException(400, str(e)) from e
     t0 = time.perf_counter()
-    with CostMeter() as meter:
+    try:
+        from stoa.agent.click import use as _use_context
+    except Exception:  # noqa: BLE001
+        _use_context = None
+    with CostMeter() as meter, (_use_context(ctx) if _use_context and ctx else contextlib.nullcontext()):
         ans = solver.solve(path, req.question)
     if not isinstance(ans, Answer):
         ans = Answer.model_validate(ans)
@@ -238,3 +254,9 @@ def intent(q: str = Query(...)) -> dict:
     from stoa.router.intent import parse
 
     return parse(q).to_dict()
+
+
+# Feature routers F1-F8 under /feat/<name> (stoa/features/__init__.py; only those named in STOA_FEATURES; default none)
+from stoa.features import include_feature_routers  # noqa: E402
+
+include_feature_routers(app)

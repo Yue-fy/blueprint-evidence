@@ -65,7 +65,17 @@ def _record(path: str, live: bool = True) -> dict | None:
     try:
         import adapter
         os.environ.setdefault("CC5K_SAVE_MAPS", str(LIVE_MAPS))
-        return adapter.counts_for(str(path))
+        from stoa.extras.room_graph.graph import map_name
+
+        keep = os.environ.get("CC5K_SAVE_NAME")
+        os.environ["CC5K_SAVE_NAME"] = map_name(str(path))  # predict.py names the saved map (T2 21:15)
+        try:
+            return adapter.counts_for(str(path))
+        finally:
+            if keep is None:
+                os.environ.pop("CC5K_SAVE_NAME", None)
+            else:
+                os.environ["CC5K_SAVE_NAME"] = keep
     except Exception:  # noqa: BLE001  (no torch env / weights: no estimate)
         return None
 
@@ -109,9 +119,11 @@ def room_regions(path: str, min_px: int = 200) -> list[dict]:
     import cv2  # in $JUNCTION_VENV
     import numpy as np
 
-    npz = ART / "cc5k_seg" / f"{Path(path).stem}.npz"
+    from stoa.extras.room_graph.graph import map_name  # T2 21:15: an upload's map is named by its content
+
+    npz = ART / "cc5k_seg" / f"{map_name(path)}.npz"
     if not npz.exists():
-        npz = LIVE_MAPS / f"{Path(path).stem}.npz"
+        npz = LIVE_MAPS / f"{map_name(path)}.npz"
     if not npz.exists():
         return []
     rooms = np.load(npz)["rooms"]

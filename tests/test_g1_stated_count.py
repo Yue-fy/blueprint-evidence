@@ -92,7 +92,8 @@ def test_pipe_runs_route_only_text_questions():
     up = ".stoa/neutral/x1sl/acf1f07a2d/acf1f07a2d.pdf"
     if not Path(up).is_file():
         pytest.skip("needs the stoa-like upload copy (RL 17:38: fresh clones do not have it)")
-    assert route(up, parse('What does the 16" line connect to?'))[0] == "pipe_runs"
+    # c7 (captain 19:15): Erin's piping reader leads on uploaded PDFs, pipe_runs right behind it for text questions
+    assert route(up, parse('What does the 16" line connect to?'))[:2] == ["piping", "pipe_runs"]
     assert "pipe_runs" not in route(up, parse("How many fuel pumps (FP) are shown?"))
 
 
@@ -248,3 +249,14 @@ def test_line_rooms_numbered_labels_and_no_deduct_skirting():
     assert lab[0] == "English 9"
     assert _NO_DEDUCT.search("How many linear metres of skirting board does the Plant need, ignoring door openings?")
     assert not _NO_DEDUCT.search("How many linear metres of skirting board does the laundry need (minus the door)?")
+
+
+def test_count_wordings_reach_label_count():
+    """H 19:24: 'Number of X?', 'Total number of X', 'Tell me how many X there are.', 'Can you count X?' read like
+    'How many X?' inside label_count / stated_count; a room NUMBER question stays as asked."""
+    from stoa.solvers.label_count import as_how_many
+
+    for q in ("Number of filter separators?", "Total number of filter separators?", "Can you count the filter separators?",
+              "Tell me how many filter separators there are.", "What is the total number of filter separators?"):
+        assert as_how_many(q) == "How many filter separators?", q
+    assert as_how_many("What is the number of the room with the stair?") == "What is the number of the room with the stair?"

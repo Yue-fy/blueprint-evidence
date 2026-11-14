@@ -82,10 +82,126 @@ def sheet_labels(abs_path: str, virtual: str, out: dict) -> None:
         + (" ✓" if n == m else " (the rest have no printed label found)") + " (boxes on the sheet)")
 
 
+@contextlib.contextmanager
+def page_on_screen(abs_path: str, page) -> "contextlib.AbstractContextManager[str]":
+    """The page the visitor turned to in a multi-page PDF upload (W5 18:55; X1 18:38: the normaliser picks the page from
+    the question alone, so 'What is the area of Science Lab 3?' on a 3-page set was answered from page 1). For this one
+    question the page pick (stoa.formats.pages.pick_page and G1's stair-note pick, both looked up at call time by
+    stoa.formats.normalize.prepare) returns that page; everything else (one-page copy, sheet number, notes, evidence
+    mapped back to the uploaded file's page) is the upload solver's own. Yields a note for the trace ('' = no hint)."""
+    if page is None or not str(abs_path).lower().endswith(".pdf"):
+        yield ""
+        return
+    try:
+        import pymupdf
+
+        import stoa.formats.pages as pages
+
+        with pymupdf.open(abs_path) as d:
+            n = d.page_count
+        k = int(page)
+    except Exception:  # noqa: BLE001 — older trees or an unreadable file: the solver picks the page as before
+        yield ""
+        return
+    if n < 2 or not 0 <= k < n:
+        yield ""
+        return
+    same = lambda p_: Path(str(p_)).resolve() == Path(abs_path).resolve()  # noqa: E731
+    orig_pick = pages.pick_page
+    pages.pick_page = lambda p_, q="": (k, "the page on screen when the question was asked") if same(p_) else orig_pick(p_, q)
+    try:
+        import stoa.pipeline as pl
+    except Exception:  # noqa: BLE001
+        pl = None
+    orig_stair = getattr(pl, "_stair_page", None)
+    if orig_stair:
+        pl._stair_page = lambda p_, q: None if same(p_) else orig_stair(p_, q)
+    try:
+        yield f"page on screen: {k + 1} of {n} (the visitor turned to it)"
+    finally:
+        pages.pick_page = orig_pick
+        if orig_stair:
+            pl._stair_page = orig_stair
+
+
+HOSTED_TEXT = {"gemini", "nvidia", "api", "verda"}  # stoa.llm backends that leave this server ('verda' = EU-hosted)
+
+
+@contextlib.contextmanager
+def privacy(private: bool, eu: bool = False):
+    """Captain 18:53 PRIVATE MODE: the drawing never leaves this server for this one question (no Gemini, no NVIDIA, no
+    hosted text model; eu=True still allows Verda's EU-hosted text model). The pipeline's hosted steps are switched off
+    by its own arguments (answer(): gemini=0, verify=0, api=0); here the process-wide ones: a hosted free-text backend
+    ($STOA_TEXT_BACKEND) falls back to the local server, STOA_MODE=api (no local GPU) is lifted, and STOA_PRIVATE=1 /
+    STOA_EU_ONLY=1 tell any reader that checks them (G1 18:53). Restored after the question (the worker serves others)."""
+    if not private:
+        yield ""
+        return
+    keep = {k: os.environ.get(k) for k in ("STOA_TEXT_BACKEND", "STOA_MODE", "STOA_PRIVATE", "STOA_EU_ONLY")}
+    tb = (os.environ.get("STOA_TEXT_BACKEND") or "").strip().lower()
+    if tb in HOSTED_TEXT and not (eu and tb == "verda"):
+        os.environ["STOA_TEXT_BACKEND"] = "local"
+    if (os.environ.get("STOA_MODE") or "").strip().lower() == "api":
+        os.environ.pop("STOA_MODE", None)
+    os.environ["STOA_PRIVATE"] = "1"
+    if eu:
+        os.environ["STOA_EU_ONLY"] = "1"
+    try:
+        yield ("private mode: no hosted model was called (Gemini, NVIDIA off); the drawing stayed on this server"
+               + ("; EU-hosted text model (Verda) allowed" if eu else ""))
+    finally:
+        for k, v in keep.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+
+@contextlib.contextmanager
+def ask_context(ctx):
+    """What the visitor pointed at (web feature plug-ins, web/src/features/registry.ts askWith): {point: [x, y], region:
+    [[x, y], ...], view, space: 'pdf_pt' | 'image_px', page}. Handed to the readers as $STOA_ASK_CONTEXT (JSON) for this one
+    question (G1 wires 'point' / 'view' / 'region' into the pipeline); restored afterwards (the worker serves others)."""
+    if not isinstance(ctx, dict) or not ctx:
+        yield ""
+        return
+    keep = os.environ.get("STOA_ASK_CONTEXT")
+    os.environ["STOA_ASK_CONTEXT"] = json.dumps(ctx)
+    try:
+        parts = []
+        if ctx.get("point"):
+            parts.append(f"point ({', '.join(f'{float(v):.1f}' for v in ctx['point'][:2])})")
+        if ctx.get("region"):
+            parts.append(f"region of {len(ctx['region'])} points")
+        if ctx.get("view"):
+            parts.append(f"view {ctx['view']}")
+        yield (f"context: {' + '.join(parts)} in {ctx.get('space', 'drawing')} coordinates"
+               + (f" on page {int(ctx['page']) + 1}" if isinstance(ctx.get("page"), int) else ""))
+    finally:
+        if keep is None:
+            os.environ.pop("STOA_ASK_CONTEXT", None)
+        else:
+            os.environ["STOA_ASK_CONTEXT"] = keep
+
+
 def answer(req: dict) -> dict:
+    """F7 'learn from corrections' (stoa/features/corrections.py, night-F7): wraps the answer; it passes through untouched
+    unless STOA_FEATURES has 'corrections' or the request carries solver_args.learn. Without the module: the plain one."""
+    root = str(Path(__file__).resolve().parents[2])
+    if root not in sys.path:
+        sys.path.insert(0, root)
+    try:
+        from stoa.features.corrections import wrap_upload
+    except Exception:  # noqa: BLE001 (not on this tree, or broken: never block the answer)
+        return _answer(req)
+    return wrap_upload(_answer, req)
+
+
+def _answer(req: dict) -> dict:
     """One question about one uploaded file -> the Answer as a JSON-ready dict."""
     abs_path, virtual, question = req["abs"], req["virtual"], str(req.get("question", "")).strip()
     solver_name, solver_args = req.get("solver") or "", dict(req.get("solver_args") or {})
+    private, eu = bool(req.get("private")), bool(req.get("eu"))
     # run from the repo root so stoa/ imports like they do for the API
     root = Path(__file__).resolve().parents[2]
     if str(root) not in sys.path:
@@ -109,19 +225,44 @@ def answer(req: dict) -> dict:
             from stoa.pipeline import Pipeline
 
             known = inspect.signature(Pipeline.__init__).parameters
+            if private:  # every hosted step off, whatever the request or the server's defaults say
+                for k in ("gemini", "verify", "api"):
+                    if k in known:
+                        solver_args[k] = 0
+                if "private" in known:
+                    solver_args["private"] = 1
             for k, env in (("gemini", "STOA_API_GEMINI"), ("verify", "STOA_API_VERIFY")):
                 if k in known and k not in solver_args and os.environ.get(env, "1") != "0":
                     solver_args[k] = 1
+        elif private and (solver_args.get("backend") in HOSTED_TEXT or solver_name in ("gemini_agent",)):
+            raise SystemExit(f"private mode: '{solver_name}' calls a hosted model; switch private mode off to use it")
         solver = get_solver(solver_name, **solver_args)
         t0 = time.perf_counter()
-        with CostMeter() as meter:
-            ans = solver.solve(abs_path, question)
+        with CostMeter() as meter, page_on_screen(abs_path, req.get("page")) as on_page, privacy(private, eu) as priv, \
+                ask_context(req.get("context")) as ctx_line:
+            solve, ctx = solver.solve, req.get("context")
+            # F1 region ask (stoa/features/region.py): a drawn box / lasso (>= 3 points) scopes the question; a 2-point
+            # region is a LINE to measure in G1's context shape (KNOWLEDGE 20:27), so it stays with the pipeline
+            if isinstance(ctx, dict) and isinstance(ctx.get("region"), list) and len(ctx["region"]) >= 3:
+                try:
+                    from stoa.features.region import upload_solve
+
+                    solve = upload_solve(solver.solve, ctx, req.get("page"))
+                except Exception as e:  # noqa: BLE001 (not on this tree / broken: the plain question)
+                    print(f"region hook: {e}", file=sys.stderr)
+            ans = solve(abs_path, question)
         if not isinstance(ans, Answer):
             ans = Answer.model_validate(ans)
         rep, met = ans.cost.model_dump(), meter.cost.model_dump()
         ans.cost = ans.cost.model_validate({k: max(rep.get(k, 0) or 0, met.get(k, 0) or 0) for k in set(rep) | set(met)})
         if not ans.cost.wall_seconds:
             ans.cost.wall_seconds = round(time.perf_counter() - t0, 4)
+        if on_page:
+            ans.trace = [f"upload: {on_page}", *ans.trace]
+        if priv:
+            ans.trace = [f"data: {priv}", *ans.trace]
+        if ctx_line:
+            ans.trace = [ctx_line, *ans.trace]
         out = ans.model_dump()
         name, folder = Path(abs_path).name, Path(abs_path).parent
         vdir = virtual.rsplit("/", 1)[0]

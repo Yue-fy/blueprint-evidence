@@ -62,25 +62,76 @@ def convert(value: float, from_unit: str | None, to_unit: str | None) -> float |
 _NUM_RE = re.compile(r"[-+]?\d{1,3}(?:[ ,  ]\d{3})+(?:\.\d+)?|[-+]?\d+(?:[.,]\d+)?")
 
 
-def parse_number(v) -> float | None:
-    """Best-effort number from a solver value: 12, 12.5, '12,5 m²', '1 234.5', 'about 7'."""
+# Vulgar fractions: NFKC turns '½' into '1⁄2' (U+2044), so '2½' used to read as 21. Spell them out first.
+_VULGAR = {"½": "1/2", "⅓": "1/3", "⅔": "2/3", "¼": "1/4", "¾": "3/4", "⅕": "1/5", "⅖": "2/5", "⅗": "3/5",
+           "⅘": "4/5", "⅙": "1/6", "⅚": "5/6", "⅐": "1/7", "⅛": "1/8", "⅜": "3/8", "⅝": "5/8", "⅞": "7/8",
+           "⅑": "1/9", "⅒": "1/10"}
+# Feet-inch strings anchored at the first number: 9'-0", 2' 10", 13'-1 1/2", 5'-1/2", 2'-10, 9' (feet only).
+_FTIN_RE = re.compile(r"""(?P<ft>\d+(?:\.\d+)?)\s*'(?!')"""
+                      r"""(?:\s*-?\s*(?:(?P<inch>\d+(?:\.\d+)?)(?![\d/])(?:(?:\s+|-)(?P<n1>\d+)/(?P<d1>\d+))?"""
+                      r"""|(?P<n2>\d+)/(?P<d2>\d+))\s*"?)?""")
+# A mixed number '2 1/2' / '2-1/2', or a plain fraction '1/16' (not a date '14/11/2026', not a ratio '1:100').
+_MIXED_RE = re.compile(r"(?P<w>\d+)(?:\s+|-)(?P<n>\d+)/(?P<d>\d+)(?![\d/])")
+_FRAC_RE = re.compile(r"(?P<n>\d+)\s*/\s*(?P<d>\d+)(?![\d/.,])")
+
+
+def _prep(v) -> str:
+    s = str(v)
+    for k, r in _VULGAR.items():
+        s = s.replace(k, " " + r)
+    s = unicodedata.normalize("NFKC", s).replace("\u2044", "/")
+    return s.replace("\u2032", "'").replace("\u2019", "'").replace("\u2033", '"').replace("\u201d", '"').replace("''", '"')
+
+
+def parse_quantity(v) -> tuple[float | None, str | None]:
+    """(number, unit implied by the string's own marks or None). Feet-inch strings ('2\'-10"', '13\'-1 1/2"', '9\'')
+    come back as total INCHES with unit 'in'; a fraction or mixed number ('2 1/2', '2½', '1/16') as its value, with
+    unit 'in' when an inch mark follows it ('3/4"'); everything else as parse_number always read it, unit None."""
     if v is None or isinstance(v, bool):
-        return None
+        return None, None
     if isinstance(v, (int, float)):
-        return None if (isinstance(v, float) and not math.isfinite(v)) else float(v)
-    s = unicodedata.normalize("NFKC", str(v))
-    m = _NUM_RE.search(s)
-    if not m:
-        return None
-    t = m.group(0)
-    if re.fullmatch(r"[-+]?\d{1,3}(?:[ ,  ]\d{3})+(?:\.\d+)?", t):
-        t = re.sub(r"[ ,  ]", "", t)  # thousands separators
+        return (None if (isinstance(v, float) and not math.isfinite(v)) else float(v)), None
+    s = _prep(v)
+    m0 = _NUM_RE.search(s)
+    if not m0:
+        return None, None
+    p = m0.start()
+    sign = -1.0 if s[p] == "-" else 1.0
+    if s[p] in "+-":
+        p += 1
+    if not (p > 0 and s[p - 1] in "/:"):  # '1:100' / '1/100' keep their old reading below
+        m = _FTIN_RE.match(s, p)
+        if m:
+            try:
+                inch = float(m.group("inch")) if m.group("inch") else 0.0
+                for n, d in (("n1", "d1"), ("n2", "d2")):
+                    if m.group(n) and float(m.group(d)) > 0:
+                        inch += float(m.group(n)) / float(m.group(d))
+                return sign * (float(m.group("ft")) * 12.0 + inch), "in"
+            except ValueError:
+                pass
+        for rx, whole in ((_MIXED_RE, True), (_FRAC_RE, False)):
+            m = rx.match(s, p)
+            if m and float(m.group("d")) > 0:
+                x = (float(m.group("w")) if whole else 0.0) + float(m.group("n")) / float(m.group("d"))
+                if not whole and s[m.end():m.end() + 1] == ":":
+                    break
+                return sign * x, ("in" if s[m.end():].lstrip().startswith('"') else None)
+    t = m0.group(0)
+    if re.fullmatch(r"[-+]?\d{1,3}(?:[ ,  ]\d{3})+(?:\.\d+)?", t):
+        t = re.sub(r"[ ,  ]", "", t)  # thousands separators
     else:
         t = t.replace(",", ".")  # decimal comma
     try:
-        return float(t)
+        return float(t), None
     except ValueError:
-        return None
+        return None, None
+
+
+def parse_number(v) -> float | None:
+    """Best-effort number from a solver value: 12, 12.5, '12,5 m²', '1 234.5', 'about 7', '2 1/2', '2½', '1/16';
+    a feet-inch string ('2\'-10"') reads as total inches (see parse_quantity for its unit)."""
+    return parse_quantity(v)[0]
 
 
 def _norm_text(s: str) -> str:
@@ -167,12 +218,22 @@ def score(qtype: str, gold, gold_unit: str | None, pred_value, pred_unit: str | 
     """True/False for scored types; None for text/other and for questions without a known answer (not scored)."""
     if qtype in ("text", "other") or gold is None:
         return None
-    x = parse_number(pred_value)
+    x, x_mark = parse_quantity(pred_value)
     if x is None:
         return False
-    g = parse_number(gold)
+    g, g_mark = parse_quantity(gold)
     if g is None:
         return False
+    if qtype != "count":
+        # a feet-inch string is total inches whatever unit field came with it; a bare '3/4"' only when no unit was given
+        if x_mark == "in" and (pred_unit is None or "'" in _prep(pred_value)):
+            pred_unit = "in"
+        if g_mark == "in" and (gold_unit is None or "'" in _prep(gold)):
+            if gold_unit is not None:
+                gg = convert(g, "in", gold_unit)
+                g = g if gg is None else gg
+            else:
+                gold_unit = "in"
     if qtype == "count":
         if pred_unit is not None and norm_unit(pred_unit) not in (None, "count") and norm_unit(pred_unit) in _UNITS:
             if _UNITS[norm_unit(pred_unit)][0] != "N":

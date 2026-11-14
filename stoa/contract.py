@@ -111,6 +111,16 @@ class Answer(BaseModel):
     # D31 (S0 14:25, additive, optional): what the uploaded file was recognised as (stoa.router.recognize: kind, label,
     # confidence, scale, scale_source, storey, pages, reader); the UI chip + 'Change' menu read it
     recognition: dict | None = None
+    # D47 (S0 19:50, additive, optional; G1 19:24 / W5 19:10): a question back to the user when readings disagree or a
+    # scale is unknown: {ask, why, options: [{label, value, unit, evidence: [indices into evidence], question}],
+    # click: 'room' | 'scale' | None}. `value` stays the best answer; clarify only offers the alternatives.
+    clarify: dict | None = None
+    # D47 (captain 18:53): where this question's data went: 'local' | 'gemini' | 'nvidia' | 'verda'; None = not recorded
+    data_used: list[str] | None = None
+    # D50 (S0 20:35, additive, optional; T1 20:13, audit fix #2): does the located evidence support the value?
+    # {state: 'supported' | 'approximate' | 'unlocated', why: str, shown: int | None, of: int | None}; set by
+    # stoa.trust.support.mark_support() at the end of Pipeline.solve. None = not assessed.
+    support: dict | None = None
 
     @property
     def abstained(self) -> bool:

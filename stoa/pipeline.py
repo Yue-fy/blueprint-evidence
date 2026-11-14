@@ -45,13 +45,15 @@ yes/no question by a bare number, or a how-many question by yes/no is capped at 
 from __future__ import annotations
 
 import json
+import os
 import re
 import threading
 import time
 from pathlib import Path
 
 from stoa.contract import Answer, Cost, Evidence
-from stoa.data import siblings, source_of
+from stoa.data import siblings
+from stoa.data import source_of as _data_source_of
 from stoa.router import budget, gating, prior
 from stoa.router.canonical import canonical
 from stoa.router.compose import combine, decompose
@@ -69,6 +71,45 @@ LINK_IFC_ACCEPT = 0.8  # link question: ifc as asked answers when kg_qa gives no
 LINK_DISAGREE = 0.6  # link question: kg_qa vs ifc as asked, same answer shape, different values
 UNSEEN_STRUCT_CAP = 0.35  # unseen wording WITH extra structure (comparison/exclusion words, numbers): F, held-out: 33%
 
+
+
+
+_RENDER_STEM = re.compile(r"\.r\d{2,3}$")
+
+
+def _cad_render(path: str) -> bool:
+    """A PNG made by the upload solver from a VECTOR PDF page (normalize.render_png: '<stem>.r150.png' next to
+    '<stem>.pdf'). Captain 20:47 (Ziying, dfe-08): such a render of a CAD sheet must never be read as a CubiCasa5K
+    flat plan (out of domain: Finnish flat plans), whatever the style classifier says from its pixels."""
+    p = Path(str(path))
+    if p.suffix.lower() != ".png" or not _RENDER_STEM.search(p.stem):
+        return False
+    return p.with_name(_RENDER_STEM.sub("", p.stem) + ".pdf").exists()
+
+
+def source_of(path: str) -> str:
+    """stoa.data.source_of, except that a render of a vector PDF page is never 'cubicasa5k' (no CubiCasa5K
+    readers / gates / LoRA as the final number on a CAD sheet; G1 c9)."""
+    s = _data_source_of(path)
+    if s == "cubicasa5k" and (_cad_render(path) or (_is_upload(path) and _sheet_sized(path))):
+        return "unknown"
+    return s
+
+
+SHEET_PX = int(os.environ.get("STOA_SHEET_PX", "4500"))  # 0 = off; long side; CubiCasa5K: 27 of 4,787 dataset images are larger (0.6 %), Stoa / EFA sheet PNGs 4961-10200
+
+
+def _sheet_sized(path: str) -> bool:
+    """F1 20:32 (3) / QA 20:00 (1): an UPLOADED image the style classifier calls CubiCasa5K but that is sheet-sized (an
+    A3 at 300 dpi = 4961 px; Stoa's PNGs ~10,000 px) is a CAD sheet export, not a Finnish flat plan: no CubiCasa
+    readers / LoRA as its final number (doors went to vlm_lora on such PNGs)."""
+    try:
+        from PIL import Image
+
+        with Image.open(str(path)) as im:
+            return SHEET_PX > 0 and max(im.size) > SHEET_PX
+    except Exception:  # noqa: BLE001
+        return False
 
 def _excluded_names(question: str) -> list[str]:
     """Quoted names the question leaves out ("all the other rooms on 'A', leaving out 'kleedkamer (20)'")."""
@@ -563,7 +604,7 @@ def _absence_cap(intent: Intent, conf: float, ans: Answer, trace: list[str]) -> 
     return ABSENCE_CAP, ans
 # tier of each solver (cost order); unknown names count as "local"
 TIER = {"dxf": "deterministic", "ifc": "deterministic", "schedule": "deterministic", "pdf_vector": "deterministic",
-        "pdf_text": "deterministic", "plan_rooms": "deterministic", "svg_ifc": "deterministic", "area_tags": "deterministic", "label_count": "deterministic", "stated_count": "deterministic", "pipe_runs": "deterministic", "line_rooms": "deterministic", "pdf_textqa": "local", "raster": "local", "vlm_direct": "local", "agent": "local",
+        "pdf_text": "deterministic", "plan_rooms": "deterministic", "svg_ifc": "deterministic", "area_tags": "deterministic", "label_count": "deterministic", "stated_count": "deterministic", "pipe_runs": "deterministic", "door_detect": "local", "openings": "deterministic", "room_size": "deterministic", "piping": "deterministic", "piping_img": "local", "line_rooms": "deterministic", "pdf_textqa": "local", "raster": "local", "vlm_direct": "local", "agent": "local",
         "vlm_nvidia": "api", "prior": "deterministic", "raster_cc5k": "local", "vlm_lora": "local"}
 
 
@@ -643,6 +684,95 @@ def _pick_pdf_page(path: str, question: str) -> tuple[str, int, int, str] | None
         return one_page_copy(p, k, out_dir=out), k, n, why
     except Exception:  # noqa: BLE001 — unreadable PDF: solve the file as it is
         return None
+
+
+# F4 20:16: 'Mikä on pesulan pinta-ala?' (laundry) was machine-translated as '... of the washbasin?' (pesuallas) -> no
+# room -> the whole sheet measured (9,940 m² @0.05). Room names the rules do not read, by stem (any case ending);
+# the English name goes into the question quoted, which the translator keeps byte-identical.
+_ROOM_GLOSS = [
+    (r"pesul\w*", "laundry"), (r"kodinhoitohuone\w*|khh", "utility room"), (r"siivous\w*", "cleaning room"),
+    (r"varasto\w*|varastoj\w*", "store"), (r"k[äa]yt[äa]v\w*", "corridor"), (r"eteis\w*|eteinen", "hall"),
+    (r"olohuone\w*", "living room"), (r"toimisto\w*", "office"), (r"luokkahuone\w*|luokka|luokan|luokassa", "classroom"),
+    (r"kirjasto\w*", "library"), (r"ruokala\w*|ruokasali\w*", "dining hall"), (r"liikuntasali\w*|sali\b|salin\b",
+                                                                                       "hall"),
+    (r"opettajainhuone\w*", "staff room"), (r"vaatehuone\w*", "walk-in closet"), (r"porrashuone\w*", "stairwell"),
+    (r"tvättstug\w*", "laundry"), (r"förråd\w*", "store"), (r"vardagsrum\w*", "living room"), (r"kontor\w*", "office"),
+    (r"klassrum\w*", "classroom"), (r"matsal\w*", "dining hall"), (r"städ\w*", "cleaning room"),
+    (r"waschküche\w*|waschraum\w*", "laundry"), (r"abstellraum\w*|lager\b|lagerraum\w*", "store"),
+    (r"flur\w*", "corridor"), (r"wohnzimmer\w*", "living room"), (r"büro\w*", "office"),
+    (r"klassenzimmer\w*|klassenraum\w*", "classroom"), (r"bibliothek\w*", "library"), (r"speisesaal\w*|mensa\b",
+                                                                                         "dining hall"),
+    (r"turnhalle\w*|sporthalle\w*", "sports hall"), (r"lehrerzimmer\w*", "staff room"),
+    (r"hauswirtschaftsraum\w*", "utility room"),
+]
+_ROOM_GLOSS_RX = [(re.compile(rf"(?<![\w\"']){p}(?![\w\"'])", re.I), en) for p, en in _ROOM_GLOSS]
+
+
+def _room_gloss(question: str) -> tuple[str, list[tuple[str, str]]]:
+    """(question with each glossary room word replaced by its English name in double quotes, [(word, English)])."""
+    from stoa.llm import lang_guess
+
+    if lang_guess(question) == "en":
+        return question, []
+    out, hits = question, []
+    for rx, en in _ROOM_GLOSS_RX:
+        m = rx.search(out)
+        if m:
+            hits.append((m.group(0), en))
+            out = out[:m.start()] + f'"{en}"' + out[m.end():]
+    return out, hits
+
+
+_OPENING_WORDS = {"door": r"ov(?:i|e)\w*|t[üu]r(?:en)?|d[öo]rr\w*|portes?|porta\w*|puert\w*|deur\w*",
+                  "window": r"ikkun\w*|fenster\w*|f[öo]nster\w*|fen[êe]tres?|finestr\w*|ventan\w*|raam\w*|vindu\w*"}
+_COUNT_FILLER = re.compile(
+    r"\b(?:kuinka|monta|montako|onko|on|ovat|niitä|siinä|tässä|t[äa]ll[äa]|piirustuksessa|piirustuksella|kuvassa|"
+    r"tasossa|pohjassa|pohjapiirroksessa|kerroksessa|yhteens[äa]|kaikkiaan|kpl|wie|viele|gibt|es|im|in|der|dem|den|"
+    r"die|das|plan|grundriss|zeichnung|auf|sind|hat|ist|insgesamt|hur|m[åa]nga|finns|det|p[åa]|ritningen|planen|"
+    r"totalt|combien|de|d|y|a|il|dans|le|la|les|sur|dessin|sont|au|total|quant[ie]|ci|sono|nel|nella|disegno|pianta|"
+    r"in totale|cu[áa]nt[oa]s|hay|en|el|plano|hoeveel|zijn|er|op|tekening|het)\b", re.I)
+
+
+def _opening_count_english(question: str) -> str | None:
+    """F4 20:20 (a): 'Kuinka monta ovea piirustuksessa on?' (DfE PDF) never reached openings / door_detect (their
+    can_handle reads English) and R2's trigger does not translate it (Finnish, class found) -> vlm_lora 70 @0.2 / the
+    prior. A non-English door / window count whose other words are only count cues, filler ('in the drawing') and
+    glossary room names is rewritten deterministically ('How many doors are there?', '... in the laundry?'); no
+    translation model, so none of its slips. Anything else stays as asked."""
+    from stoa.llm import lang_guess
+
+    if lang_guess(question) == "en":
+        return None
+    hinted, gloss = _room_gloss(question)
+    kind = next((k for k, rx in _OPENING_WORDS.items() if re.search(rf"\b(?:{rx})\b", hinted, re.I)), None)
+    if kind is None:
+        return None
+    rest = re.sub(r'"[^"]{2,40}"', " ", hinted)
+    rest = re.sub(rf"\b(?:{_OPENING_WORDS[kind]})\b", " ", rest, flags=re.I)
+    rest = _COUNT_FILLER.sub(" ", rest)
+    if re.search(r"[A-Za-zÀ-ÿ]{2,}|\d", rest) or len(gloss) > 1:
+        return None
+    if not re.search(r"\b(?:kuinka monta|montako|wie viele|hur m[åa]nga|combien|quant[ie]|cu[áa]nt[oa]s|hoeveel|"
+                     r"anzahl|lukum[äa][äa]r[äa])\b", question, re.I):
+        return None
+    return f"How many {kind}s are in the {gloss[0][1]}?" if gloss else f"How many {kind}s are there in the drawing?"
+
+
+def _ask_context(path: str, picked):
+    """The visitor's click / region / view for this question (stoa.agent.click; None = none). Dropped when it was drawn
+    on another page than the one picked, or in another space than the file read (an upload's image / vector re-read)."""
+    try:
+        from stoa.agent.click import current
+    except Exception:  # noqa: BLE001
+        return None
+    ctx = current()
+    if ctx is None:
+        return None
+    if picked and ctx.page is not None and int(picked[1]) != int(ctx.page):
+        return None
+    if (ctx.point or ctx.region) and (ctx.space == "pdf_pt") != str(path).lower().endswith(".pdf"):
+        return None
+    return ctx
 
 
 def _parse_scale(v) -> int | None:
@@ -814,6 +944,11 @@ def route(path: str, intent: Intent | None = None) -> list[str]:
             out.append("dxf")
         if src == "opening_design" or (intent and intent.filters.get("sheet")):
             out.append("schedule")
+        if src == "unknown" and ext == ".pdf":
+            # captain 19:15: Erin's piping reader (PR #14; tag families CV / FP / FSCV / FSI / FSR / PS / PG / MAV,
+            # labelled line sizes, notes, connections, tagged spans at the printed scale) first on uploaded PDFs; its
+            # can_handle needs a piping word / tag in the question, so other questions skip it for free
+            out.append("piping")
         if src == "unknown" and ext == ".pdf" and intent is not None and intent.task == "text":
             # G1 c5 (captain 16:15 piping): 'What does the 16" line connect to?' = the printed run callouts of that size
             # ('16" SS FROM OPERATING TANKS'); a regex check first, so other text questions cost nothing
@@ -830,6 +965,12 @@ def route(path: str, intent: Intent | None = None) -> list[str]:
                 # G1 c5 (E1 16:59, X1 16:41: Stoa's AFCEC dorm sheet): a PRINTED count of the asked kind ('SECOND FLOOR =
                 # 48 DORMS', 'TOTAL = 144 DORMS') beats counting fills (plan_rooms 2); abstains when nothing is printed
                 out.append("stated_count")
+                if intent.target in ("door", "window"):
+                    # G1 c6 (X1 17:24 AFCEE A-101 'doors of module 02' 9: vlm_lora 10 @0.34 on the whole sheet): V1's
+                    # door/window symbol detector at the printed scale, scoped to the named viewport; abstains for free
+                    # (service down, no scale, IfcConvert sheets, door types)
+                    out.append("openings")  # DR 18:56: vector swing arcs / tags per view or room ($0; 9/9 on X1's PDF rows)
+                    out.append("door_detect")
             out.append("area_tags")
             out.append("plan_rooms")
             if intent is not None and intent.task == "count":
@@ -856,6 +997,17 @@ def route(path: str, intent: Intent | None = None) -> list[str]:
             out.append("label_count")
         if ext in IMG_EXT and intent is not None and intent.task == "text" and _is_upload(path):
             out.append("pipe_runs")  # G1 c5: 'where does the 6" pipe go?' from the image's text layer
+        if ext in IMG_EXT and intent is not None and intent.task == "count" and _is_upload(path) and \
+                intent.target in ("door", "window") and src != "cubicasa5k":
+            # DR 19:02 (night-DR c64c664): openings on MULTI-VIEW image sheets (plan views from the text layer, detector
+            # px/m self-calibrated from the door boxes): A-101 PNG module 02 9 ✓ (was 10), module 01 4 ✓ (was 6), sheet
+            # 13 ✓; single-view images abstain BEFORE any detector call (free; skipped until night has night-DR)
+            out.append("openings")
+        if ext in IMG_EXT and intent is not None and intent.task == "count" and _is_upload(path) and \
+                intent.target == "door" and src != "cubicasa5k":
+            # G1 c6: V1's detector on uploaded sheets / our renders of PDFs (CubiCasa-style images keep the LoRA);
+            # windows: after W3's wall-symbol detector (below)
+            out.append("door_detect")
         if src != "cubicasa5k" and ext in IMG_EXT and lone:
             # a raster plan of an unseen style with no vector/IFC twin (the hidden set's "different" drawings): R2's
             # LoRA beats the base VLM on plain counts there (swiss PNG twins, 200 dev Qs: cc-v3 57.5%, cc-v2 46.0%,
@@ -866,6 +1018,8 @@ def route(path: str, intent: Intent | None = None) -> list[str]:
                 # non-render styles (clean-render gate + pre-scan before its text layer, night-W3 9464a6b), and the
                 # LoRA answers as before
                 out.append("raster")
+                if _is_upload(path):
+                    out.append("door_detect")  # G1 c6: V1's window symbols when W3's detector abstains
             out.append("vlm_lora")
         out.append("raster")
         if src == "cubicasa5k":  # R2's counting LoRA (cc-v2): gated per concept on train_gate (it never saw those)
@@ -1070,6 +1224,102 @@ def _is_upload(path: str) -> bool:
     return not rel.startswith("data/")
 
 
+_SKIRT = re.compile(r"\b(?:skirtings?|skirting boards?|baseboards?|base boards?|kick ?boards?|(?:wall|cove|rubber) base|"
+                    r"jalkalist\w*|"
+                    r"sockelleist\w*|fu(?:ß|ss)leist\w*|golvlist\w*|sockel\w*)\b", re.I)
+_SKIRT_FILLER = re.compile(
+    r"\b(?:how|much|many|what|which|length|lengths|long|metres?|meters?|m|lm|linear|lineal|feet|foot|ft|of|do|does|we|i|"
+    r"you|need|needs|needed|should|shall|must|order|ordering|buy|purchase|get|install|fit|fitting|is|are|be|will|would|"
+    r"the|a|an|for|to|required|require|requires|in|on|at|this|that|plan|drawing|sheet|page|please|can|could|there|"
+    r"run|runs|amount|quantity|total|after|excluding|exclude|minus|less|deducting|doorways?|doors?|openings?|"
+    r"including|include|with|without|ignoring|board|boards|skirting|skirtings|baseboard|baseboards|our|my|it|"
+    r"enough|roughly|approximately|about)\b", re.I)
+_SKIRT_ALL = re.compile(r"\b(?:all|every|each|whole|entire|building|floor|storey|story|level|house|flat|apartment|"
+                        r"rooms|school|unit|wing)\b", re.I)
+
+
+def _skirting_which_room(question: str) -> Answer | None:
+    """QA 20:32 (4): 'How much skirting should we order?' (no room named, two-PNG upload) -> '≈ 1,000 m · read off a
+    picture'. Skirting is per room (installed length = the room's inner perimeter - its doorways): with no room and no
+    whole-floor scope in the question, ask which room (W5's clarify, click: room) instead of guessing a sheet-wide
+    figure. A room name, a click on the plan, or 'all rooms / the whole floor' goes on to the readers."""
+    if not _SKIRT.search(question) or _SKIRT_ALL.search(question):
+        return None
+    rest = _SKIRT_FILLER.sub(" ", _SKIRT.sub(" ", question))
+    if re.search(r"[A-Za-zÀ-ÿ]{2,}|\d", rest):
+        return None  # something names the room ('laundry', 'Room 1.04', 'Group Room')
+    ans = Answer(value=None, unit="m", confidence=0.0, solver="pipeline/clarify",
+                 trace=["skirting: the question names no room (skirting is ordered per room: its inner perimeter minus "
+                        "the doorways) -> asking which room"],
+                 assumptions=["no room named: not guessing a whole-sheet length"],
+                 missing=["which room: click it on the plan, or name it ('How much skirting for the Laundry?'); "
+                          "for every room ask 'skirting for all rooms'"])
+    try:
+        from stoa.agent.vision import set_clarify
+
+        ans = set_clarify(ans, {"ask": "Which room is the skirting for?",
+                                "why": "skirting is measured per room (perimeter minus doorways)",
+                                "options": [], "click": "room"})
+    except Exception:  # noqa: BLE001
+        pass
+    return ans
+
+
+_DIM_OF = [("area", re.compile(r"^(?:m2|m²|sq\.? ?m|sqm|sf|s\.f\.|sq\.? ?ft\.?|sqft|ft2|ft²|square (?:feet|foot|metres?|meters?)|"
+                               r"ha|cm2|cm²|mm2|mm²)$", re.I)),
+           ("volume", re.compile(r"^(?:m3|m³|ft3|ft³|cu\.? ?ft|cf|cy|cubic (?:feet|metres?|meters?)|l|litres?|liters?)$", re.I)),
+           ("length", re.compile(r"^(?:m|mm|cm|km|ft|feet|foot|in|inch(?:es)?|lf|lin\.? ?ft|'|\"|metres?|meters?)$", re.I))]
+
+
+def _dimension_guard(question: str, ans: Answer) -> Answer:
+    """X1 21:22 (1): 'What is the perimeter of the Break Room (2.02) …?' (a LENGTH) ended as '153.0 SF' @0.30 - the
+    room's printed area tag (raster, unit 'SF', which _fits did not know). A number in another dimension than the one
+    asked is not an answer: value None, the reading kept in missing + trace, so the card says what was found instead
+    of showing an area as a perimeter."""
+    if ans.value is None or isinstance(ans.value, (str, bool)) or not ans.unit:
+        return ans
+    task = parse(question).task
+    if task not in ("length", "area", "volume"):
+        return ans
+    u = str(ans.unit).strip()
+    kind = next((k for k, rx in _DIM_OF if rx.match(u)), None)
+    if kind is None or kind == task:
+        return ans
+    out = ans.model_copy(deep=True)
+    out.value, out.confidence = None, 0.0
+    out.missing = [f"a {task} was asked; the only reading found was {ans.value} {ans.unit} (an {kind}), so it is not "
+                   f"given as the answer", *out.missing]
+    out.trace = [*out.trace, f"dimension guard: {ans.value} {ans.unit} is an {kind}, the question asks for a {task} -> "
+                             f"withheld ({ans.solver})"]
+    return out
+
+
+def _facade_unresolved(question: str, ans: Answer) -> Answer:
+    """Captain 20:47 addendum (b): when the question names a facade / side ('the west facade of the classroom wing')
+    and the facade reader did not answer, another reader's count is NOT limited to that wall: say so (missing), cap the
+    confidence at 0.3, and drop 'searched area: approximate extent of the plan' claims that suggest a scope."""
+    if ans.value is None or "facade" in str(ans.solver or ""):
+        return ans
+    try:
+        from stoa.agent.facade import parse as facade_parse
+
+        fa = facade_parse(question)
+    except Exception:  # noqa: BLE001
+        fa = None
+    if fa is None:
+        return ans
+    side = re.compile(rf"\b{fa.side}\b[^\n]{{0,40}}\b(?:facade|side|wall)\b|\b(?:facade|side)\b[^\n]{{0,20}}\b{fa.side}\b", re.I)
+    if any(side.search(str(t)) and "not resolved" not in str(t) for t in [*ans.trace, *ans.assumptions]):
+        return ans  # the reader applied the side itself (DR's openings: 'openings: west facade of …', 21:06)
+    where = f"the {fa.side} {'facade' if fa.by_compass else 'side'}" + (f" of the {fa.wing_text}" if fa.wing_text else "")
+    out = ans.model_copy(deep=True)
+    if out.confidence > 0.3:
+        out.confidence = 0.3
+    out.missing = [*out.missing, f"the scope '{where}' was not resolved: this {fa.kind} count is not limited to that wall"]
+    out.trace = [*out.trace, f"facade scope '{where}' not resolved by the facade reader: confidence capped at 0.3"]
+    return out
+
+
 def _dims_guard(question: str, ans: Answer, path: str) -> Answer:
     """G1 c4 (X1 wild ks51): a reader answered an AREA question with a room's printed DIMENSIONS ('3,50 x 3,00',
     '3,07 m x 3,07 m' @0.20, no unit) -> the area of that rectangle (a x b m², stated, <= SHAPE_CAP); a width / length
@@ -1122,6 +1372,23 @@ def _unit_guard(question: str, ans: Answer, path: str, rec: dict | None) -> Answ
     (ISO 129). Uploads only; stated in the assumptions, confidence <= 0.6."""
     if isinstance(ans.value, bool) or not _is_upload(path):
         return ans
+    from stoa.router.intent import _PIPE_SIZE
+
+    pv = _num(ans.value)
+    if _PIPE_SIZE.search(question) and isinstance(ans.value, str) and re.match(r"\s*\d{1,2}\s*['’′](?![\d-])", ans.value):
+        # sl-219 / sl-220 (M-101A PNG): "8' SS" / "16' SS" for an 8" / 16" stainless line (the ' mark is the OCR of ″)
+        out = ans.model_copy(deep=True)
+        out.value = re.sub(r"^(\s*\d{1,2})\s*['’′]", r'\1"', ans.value)
+        out.assumptions = [*out.assumptions, "a pipe size is given in inches: the printed ' mark read as ″"]
+        return out
+    if _PIPE_SIZE.search(question) and pv is not None and 0 < pv <= 48 and str(ans.unit or "").lower() in ("ft", "'"):
+        # G1 c7 (stoa-like sl-045, M-101A PNG): raster read the callout '6"' as "6'" -> 6 ft; a pipe / duct / bar size
+        # is a nominal diameter in inches (or mm), never feet: the ' mark is the OCR of ″
+        out = ans.model_copy(deep=True)
+        out.unit = "in"
+        out.assumptions = [*out.assumptions, f"a pipe size is given in inches: the printed {pv:g}' read as {pv:g}\""]
+        out.trace = [*out.trace, f"unit guard: {pv:g} ft on a pipe-size question -> {pv:g} in"]
+        return out
     if ans.value is not None and float(ans.confidence or 0) > SHAPE_CAP and parse(question).task == "area" and \
             _own_number(question, ans):
         return _shape_capped(ans, f"the answer {ans.value} is the size the question itself names (a thickness / "
@@ -1129,22 +1396,38 @@ def _unit_guard(question: str, ans: Answer, path: str, rec: dict | None) -> Answ
     v = _num(ans.value)
     if v is not None and v >= 1000 and float(v).is_integer() and parse(question).task == "area" and \
             str(ans.unit or "").lower() in ("m2", "m²") and float(ans.confidence or 0) > 0.1 and \
-            re.fullmatch(r"1\s*:\s*\d{1,4}", str((rec or {}).get("scale") or "").strip()) and \
-            str(path).lower().endswith(".pdf"):
+            str(path).lower().endswith((".pdf", *IMG_EXT)):
         try:
             import os
 
-            from stoa.solvers.label_count import text_lines
+            from stoa.solvers.label_count import _image_lines, text_lines
 
-            bare = {re.sub(r"\s", "", t) for t, _ in text_lines(str(path), os.stat(str(path)).st_mtime)}
+            lines = text_lines(str(path), os.stat(str(path)).st_mtime) if str(path).lower().endswith(".pdf") else \
+                (_image_lines(str(path)) or ())  # G1 c6 (D1 16:59 / O1 18:20): the image readers' '7200 m²'
+            bare = {re.sub(r"(?<=\d)[ ,](?=\d{3}\b)", "", t.strip()) for t, _ in lines}
+            metric = re.fullmatch(r"1\s*:\s*\d{1,4}", str((rec or {}).get("scale") or "").strip()) or any(
+                re.search(r"\b1\s*:\s*\d{2,4}\b", t) for t, _ in lines)
         except Exception:  # noqa: BLE001
-            bare = set()
-        if str(int(v)) in bare:
+            bare, metric = set(), False
+        if (metric or int(v) % 100 == 0) and str(int(v)) in bare:
+            # X1 18:32: screenshot crops print no 1:N, only the grid strings '7,200' / '4,800' (mm, multiples of 100)
             # D1 17:22 (EFA school sheets, metric 1:200): 'English 9' = 7200 m² @0.32 = the printed 7200 mm DIMENSION
             out = ans.model_copy(deep=True)
             out.confidence = 0.1
             why = (f"{int(v)} is printed on this metric sheet as a bare number, i.e. a dimension in mm "
                    f"({int(v) / 1000:g} m), not an area")
+            out.trace = [*out.trace, f"size check: {why}"]
+            out.missing = [*out.missing, why]
+            return out
+    if v is not None and v >= 50 and float(ans.confidence or 0) > 0.1 and parse(question).task == "area" and \
+            not _GROSS_Q.search(question) and str(path).lower().endswith((".pdf", *IMG_EXT)):
+        hit = _gross_line(path, v, question)
+        if hit:
+            # X1 18:15 (2) / 18:24: 'total floor area of all the rooms labelled Infants' -> 2190 = the sheet's 'Overall
+            # GIFA' line; 'How big is the Learning Resource Centre?' -> 4834 m² = the title block's area TARGET
+            out = ans.model_copy(deep=True)
+            out.confidence = 0.1
+            why = (f"{v:g} is the sheet's printed '{hit[:60]}' (a gross / target total), not the asked room(s)")
             out.trace = [*out.trace, f"size check: {why}"]
             out.missing = [*out.missing, why]
             return out
@@ -1239,6 +1522,177 @@ def _room_number(ans: Answer, path: str) -> bool:
                for b2 in named):
             return True
     return False
+
+
+def _no_quantity(ans: Answer) -> bool:
+    """An answer with no quantity in it ('SEE A1/S-513', 'A:', 'Not specified'): not an answer to an area / volume
+    question (G1 c5 pdf_text; c6 raster 'A:' @0.75 on D1's line-only PNG, the label's number was removed)."""
+    return _num(ans.value) is None and not _DIMS_PAIR.match(str(ans.value)) and not re.search(
+        r"\d[\d,.]*\s*(?:m²|m2\b|m³|m3\b|sq\.?\s?(?:m|ft)\b|ft²|ft2\b|sf\b|square|qm\b|x\s*\d|"
+        # a size ('16"' for 'What size is the suction header?', read as an area by the size cue)
+        r"\"|”|''|['’]|in\b|inch|mm\b|cm\b|m\b|ft\b)", str(ans.value), re.I)
+
+
+_RANGE = re.compile(r"\b(?P<name>[A-Z][A-Za-z&/]*(?:\s+[A-Z][A-Za-z&/]*){0,3}?)s?\s+(?P<lo>\d{1,2})\s*(?:to|-|–|—|through|"
+                    r"thru|bis|\.\.)\s*(?:(?P=name)s?\s+)?(?P<hi>\d{1,2})\b")
+
+
+def _room_range_parts(question: str):
+    """('Science Lab', 1, 5, 'area') for 'combined area of Science Labs 1 to 5' / 'Maths 1-5' / 'English 1 to English
+    5'; None otherwise (a single room, a storey range, more than 12 rooms, no area / perimeter asked)."""
+    it = parse(question)
+    if it.task not in ("area", "length"):
+        return None
+    kind = "area" if it.task == "area" else ("perimeter" if re.search(r"\bperimeter", question, re.I) else None)
+    if kind is None or re.search(r"(?i)skirting|baseboard|sockel|jalkalist|golvlist|fu(?:ß|ss)leist|(?:wall|cove|rubber) base\b", question):
+        return None  # skirting conventions (doors deducted or not) do not survive a rewrite to 'perimeter'
+
+    m = _RANGE.search(question)
+    if not m:
+        return None
+    name, lo, hi = m.group("name").strip(), int(m.group("lo")), int(m.group("hi"))
+    if not (1 <= hi - lo <= 11) or re.fullmatch(r"(?i)(?:level|floor|storey|story|grid|room|rooms|sheet|page|"
+                                                r"what|the|total|area|how)", name):
+        return None
+    if re.search(r"(?i)\b(?:level|floor|storey|grid|axis|axes)\b", name):
+        return None
+    return name, lo, hi, kind
+
+
+_GROSS_Q = re.compile(r"(?i)\b(?:gross|gifa|gia|nia|net internal|overall|whole|entire|building|storey|level|"
+                      r"floor\b(?!\s*area)|bruttogrundfl|geschoss|kerrosala|bruttoala)")
+_GROSS_LINE = re.compile(r"(?i)\b(?:gifa|gia|nia|gross|overall|target|total|ground\s*:|first\s*:|second\s*:|bgf|brutto)")
+
+
+def _gross_line(path: str, v: float, question: str = "") -> str | None:
+    """The printed line ('Overall GIFA 2190 m²', 'Area target: 4834') whose number equals v, from the text layer we
+    already have (PDF words, or the image's cached / render text layer); None when there is none."""
+    import os
+
+    try:
+        from stoa.data import abspath
+        from stoa.solvers.label_count import _image_lines, text_lines
+
+        p = str(abspath(path))
+        lines = text_lines(p, os.stat(p).st_mtime) if p.lower().endswith(".pdf") else (_image_lines(p) or ())
+    except Exception:  # noqa: BLE001
+        return None
+    generic = {"gifa", "gross", "overall", "target", "total", "area", "areas", "floor", "ground", "first", "second",
+               "internal", "external", "with", "from", "this", "that", "sqm", "square", "metres", "meters"}
+    qw = {w for w in re.findall(r"[a-zäöüå]{4,}", question.lower())} - generic
+    num = re.compile(r"(?<![\d.,])\d{1,3}(?:[ ,]\d{3})+(?:\.\d+)?|(?<![\d.,])\d+(?:\.\d+)?")
+
+    def names_asked(t: str) -> bool:  # 'TOTAL COMMON SPACE = 4,479 SF' answers 'total common space' (Stoa AFCEC A-2)
+        return bool(qw & ({w for w in re.findall(r"[a-zäöüå]{4,}", t.lower())} - generic))
+
+    def has_v(t: str) -> bool:
+        return any(abs(float(re.sub(r"[ ,]", "", m.group(0))) - v) < 0.51 for m in num.finditer(t))
+
+    labels = [(t, bb) for t, bb in lines if _GROSS_LINE.search(t)]
+    for t, _ in labels:
+        if not names_asked(t) and has_v(t):
+            return t.strip()
+    # X1 20:38 (EFA 300-dpi scans): OCR prints 'Overali GIFA' and '1274m2' as two lines (the number one row below, or
+    # beside 'Total:'): a bare number line counts when a gross / total / target label is on its row to the left or
+    # just above it
+    for t, bb in lines:
+        if _GROSS_LINE.search(t) or not has_v(t) or len(re.sub(r"[\d\s.,]|m2|m²|sqm|sf|ft2|ft²", "", t, flags=re.I)) > 2:
+            continue
+        try:
+            x0, y0, x1, y1 = (float(c) for c in bb[:4])
+        except Exception:  # noqa: BLE001
+            continue
+        h = max(1.0, y1 - y0)
+        for lt, lb in labels:
+            if names_asked(lt):
+                continue
+            a0, b0, a1, b1 = (float(c) for c in lb[:4])
+            same_row = min(y1, b1) - max(y0, b0) > 0.3 * h and a1 <= x0 + h and x0 - a1 <= 8 * h
+            above = 0 <= y0 - b1 <= 3.5 * h and min(x1, a1) - max(x0, a0) > -2 * h
+            if same_row or above:
+                return f"{lt.strip()} {t.strip()}"
+    return None
+
+
+_NUMWORD = {"two": 2, "three": 3, "four": 4, "five": 5, "six": 6, "seven": 7, "eight": 8, "nine": 9, "ten": 10,
+            "both": 2}
+_COUNTED = re.compile(r"\b(?:the|all|all the)\s+(?P<n>two|three|four|five|six|seven|eight|nine|ten|both|\d{1,2})\s+"
+                      r"(?P<name>[A-Z][A-Za-z&/]*(?:\s+[A-Z][A-Za-z&/]*){0,2})\s*(?:classrooms?|rooms?|labs?|"
+                      r"laboratories|studios?|offices?|stores?|bays?|units?|wards?|suites?)?\b")
+
+
+def _counted_rooms(path: str, question: str):
+    """('MFL', 1, 3, 'area') for 'How much floor area do the three MFL classrooms have together?' when the sheet prints
+    exactly that many labels 'MFL <n>' with consecutive numbers (X1 sl-121); None otherwise."""
+    it = parse(question)
+    if it.task != "area":
+        return None
+    m = _COUNTED.search(question)
+    if not m:
+        return None
+    w = m.group("n").lower()
+    n = int(w) if w.isdigit() else _NUMWORD[w]
+    name = m.group("name").strip()
+    if not (2 <= n <= 12):
+        return None
+    import os
+
+    try:
+        from stoa.data import abspath
+        from stoa.solvers.label_count import _image_lines, text_lines
+
+        f = str(abspath(path))
+        lines = text_lines(f, os.stat(f).st_mtime) if f.lower().endswith(".pdf") else (_image_lines(f) or ())
+    except Exception:  # noqa: BLE001
+        return None
+    rx = re.compile(r"(?i)^\s*" + re.escape(name) + r"s?\s*(\d{1,2})\s*$")
+    nums = sorted({int(mm.group(1)) for t, _ in lines for mm in [rx.match(t)] if mm})
+    if len(nums) != n or nums != list(range(nums[0], nums[0] + n)):
+        return None
+    return name, nums[0], nums[-1], "area"
+
+
+_TO_SI = {"m2": ("area", 1.0), "m²": ("area", 1.0), "ft2": ("area", 0.09290304), "ft²": ("area", 0.09290304),
+          "sf": ("area", 0.09290304), "sq ft": ("area", 0.09290304), "sqft": ("area", 0.09290304),
+          "m": ("length", 1.0), "mm": ("length", 0.001), "cm": ("length", 0.01), "ft": ("length", 0.3048),
+          "in": ("length", 0.0254)}
+_ASK_UNIT = [
+    ("m2", r"square met(?:re|er)s?|\bm²|\bm2\b|\bsq\.? ?m\b|\bsqm\b|neli[öo]met|quadratmeter|\bqm\b|m[eè]tres? carr[eé]s?|"
+           r"kvadratmeter|vierkante meter|metri quadrati"),
+    ("ft2", r"square f(?:ee|oo)t|\bsq\.? ?ft\b|\bft²|\bft2\b"),
+    ("mm", r"\bin (?:millimet(?:re|er)s?|mm)\b|\bhow many (?:millimet(?:re|er)s?|mm)\b"),
+    ("m", r"\bin met(?:re|er)s?\b|\bhow many (?:linear |running |lineal )?met(?:re|er)s?\b|\bin metern\b|\bmetreinä\b|"
+          r"\bmetriä\b|\bin m\b"),
+    ("ft", r"\bin feet\b|\bhow many (?:linear |lineal )?feet\b|\bin ft\b"),
+]
+
+
+def _to_asked_unit(question: str, ans: Answer) -> Answer:
+    """H 18:54 (Stoa PNG wording probe): 'How many square metres is the west wing in total?' -> 7009.0 SF; 'total length
+    of the foundation in metres?' -> 27000.0 mm. A number in another unit of the SAME kind as the one the question
+    names is converted, the original kept in the assumptions; nothing else changes."""
+    if ans.value is None or isinstance(ans.value, bool):
+        return ans
+    have = str(ans.unit or "").strip().lower()
+    v = _num(ans.value)
+    if v is None:
+        m = re.fullmatch(r"\s*(\d[\d,]*(?:\.\d+)?)\s*(sf|sq\.?\s*ft|ft2|ft²|m2|m²|mm|cm|m|ft)\s*", str(ans.value), re.I)
+        if not m:
+            return ans
+        v, have = float(m.group(1).replace(",", "")), re.sub(r"sq\.?\s*ft", "sq ft", m.group(2).lower())
+    if have not in _TO_SI:
+        return ans
+    kind, k_have = _TO_SI[have]
+    want = next((u for u, rx in _ASK_UNIT if re.search(rx, question, re.I)), None)
+    if want is None or want == have or (want in ("m2", "m²") and have in ("m2", "m²")) or _TO_SI[want][0] != kind:
+        return ans
+    nv = round(v * k_have / _TO_SI[want][1], 3 if want in ("m", "ft") else 2)
+    out = ans.model_copy(deep=True)
+    out.value, out.unit = nv, want
+    why = f"converted to the asked unit: {_fmt_num(v)} {have} = {_fmt_num(nv)} {want}"
+    out.assumptions = [*out.assumptions, why]
+    out.trace = [*out.trace, f"unit: {why}"]
+    return out
 
 
 def _own_number(question: str, ans: Answer) -> bool:
@@ -1380,7 +1834,7 @@ class Pipeline(BaseSolver):
                  translate_cap: float | str = 0.9, both_readings: int | str = 1, links: int | str = 1,
                  pvm: int | str = 1, ev_live: int | str = 1, ev_text: int | str = 1, gemini: int | str | None = None,
                  verify: int | str | None = None, scale: str | int | None = None,
-                 px_per_m: float | str | None = None, **kwargs):
+                 px_per_m: float | str | None = None, private: int | str | None = None, **kwargs):
         super().__init__(**kwargs)
         import os
 
@@ -1419,6 +1873,12 @@ class Pipeline(BaseSolver):
         self.accept = float(accept)
         self.agree = {"1": "cheap", "0": "never", "2": "always"}.get(str(agree), str(agree))  # cheap|never|always
         self.api = bool(int(api))
+        # captain 18:53 PRIVATE MODE (W5 5edd56d sends private: true): no Gemini / Nemotron / hosted VLM for this
+        # answer; stoa.agent.private also refuses hosted calls inside readers while it runs (env STOA_PRIVATE=1 too)
+        self.private = str(os.environ.get("STOA_PRIVATE", "0") if private is None else private).lower() in (
+            "1", "true", "yes")
+        if self.private:
+            self.gemini = self.verify = self.api = False
         self.margin = float(margin)
         self.max_tries = int(max_tries)
         self.use_gate = bool(int(use_gate))
@@ -1464,18 +1924,70 @@ class Pipeline(BaseSolver):
 
     # -- main -------------------------------------------------------------------------------------
     def solve(self, path: str, question: str) -> Answer:
+        """One question + where its data went (captain 18:53): a 'data_used: local[, gemini][, nvidia][, verda]' trace
+        line (and Answer.data_used once the contract has it); private=1 refuses every hosted call while it runs."""
+        from stoa import llm
+        from stoa.agent import private as P
+
+        tok = P._CTX.set(True) if self.private else None
+        try:
+            with llm.cost_meter() as m:
+                ans = self._solve_all(path, question)
+        finally:
+            if tok is not None:
+                P._CTX.reset(tok)
+        used = P.data_used(ans.trace, m.api_calls)
+        for t in ans.trace:  # nested solves (upload pages, room ranges): one merged line, last
+            if str(t).startswith("data_used: "):
+                used += [u for u in str(t)[11:].split(" (")[0].split(", ") if u and u not in used]
+        ans.trace = [t for t in ans.trace if not str(t).startswith("data_used: ")] + [
+            "data_used: " + ", ".join(used) + (" (private mode)" if self.private else "")]
+        try:
+            if "data_used" in type(ans).model_fields:
+                ans.data_used = used
+        except Exception:  # noqa: BLE001
+            pass
+        if ans.value is not None and _is_upload(path) and "clarify" in type(ans).model_fields and \
+                getattr(ans, "clarify", None) is None and parse(question).task in ("count", "area", "length"):
+            # VP 19:42 (captain 18:50 B): 'Which plan do you mean?' with one option per plan view when the question
+            # names none and the sheet has several (no-op for named views / totals / single-view sheets)
+            try:
+                from stoa.sheet import attach_view_choices
+
+                layer = None
+                if Path(path).suffix.lower() in IMG_EXT:
+                    from stoa.solvers.area_tags import _cached_layer
+
+                    layer = _cached_layer(str(path))
+                if layer is not None or str(path).lower().endswith(".pdf"):
+                    page = next((e.page for e in ans.evidence if e.page is not None), 0) or 0
+                    ans = attach_view_choices(ans, path, question, page, layer=layer)
+            except Exception:  # noqa: BLE001 - stoa.sheet not merged yet / the contract has no clarify yet
+                pass
+        return ans
+
+    def _solve_all(self, path: str, question: str) -> Answer:
         """One question, metered as a whole (D20-2): optional LLM steps stop once the question's budget is spent."""
         from stoa.router import budget
 
         orig, picked = path, _pick_pdf_page(path, question)
         if picked:  # G1 (P1 13:10): a multi-page PDF upload -> solve the page the question is about
             path = picked[0]
-        pre = _scale_answer(path, question, _recognition(path, picked)) if _is_upload(path) else None
+        ctx = _ask_context(path, picked)
+        pre = _scale_answer(path, question, _recognition(path, picked)) if _is_upload(path) and ctx is None else None
+        if pre is None and ctx is None:
+            pre = _skirting_which_room(question)
         if pre is not None:
             ans = pre
         else:
             with budget.question(), _pixel_scale(self.px_per_m):
-                ans = self._solve_question(path, question)
+                if ctx is not None:  # G1 (captain 19:47 / 19:54): the point / region / view the visitor marked
+                    from stoa.agent import click as C
+
+                    with C.use(None):  # the rewritten / scoped questions inside run without it
+                        ans = C.answer(self, path, question, ctx, self._solve_question)
+                else:
+                    ans = self._solve_question(path, question)
                 n = budget.note()
                 if n and ans.value is not None:
                     ans.assumptions = [*ans.assumptions, n]
@@ -1490,15 +2002,30 @@ class Pipeline(BaseSolver):
             ans.assumptions = [*ans.assumptions, chip(rec)]
             ans.recognition = dict(rec)  # D31
         ans = _tableqa_guard(_unit_guard(question, ans, path, rec), path)
+        from stoa.trust import support as _support  # T1 (audit 19:51): a cited number must BE the asked quantity
+
+        ans = _support.citation_guard(question, ans)
         ans = _parts_guard(question, _length_guard(question, _shape_guard(question, _dims_guard(question, ans, path))),
                            path)
+        ans = _to_asked_unit(question, ans)
+        ans = _facade_unresolved(question, ans)
+        ans = _dimension_guard(question, ans)
         try:  # E1: plan_rooms on an IfcConvert-style sheet re-read from its IfcSpace outlines; disagreement caps conf
             from stoa.evidence.ifcplan_pdf import check_plan_rooms
 
             ans = check_plan_rooms(ans, path, question)
         except Exception:  # noqa: BLE001
             pass
-        if self.gemini or self.verify:  # G1: after the cascade, with its own budget (opt-in, see __init__)
+        defer = (self.gemini or self.verify) and type(self).__name__ == "Upload" and \
+            str(path).lower().endswith(".pdf") and (ans.value is None or str(ans.solver or "").split("/")[-1] in (
+                "prior", "dummy")) and (rec or {}).get("kind") != "bim_plan"
+        if defer:
+            # G1 c7 (S0/RL d25 replay, S-100 PDF sl-021): no PDF reader answered -> Gemini read 19.8 m on the PDF and
+            # the upload solver never read the page as an image, where raster reads the printed 12000 mm (= gold).
+            # The image pass follows (upload._as_image) and escalates itself if still unsure: local readers first
+            ans.trace = [*ans.trace, "hybrid routing deferred: no PDF reader answered, the page is read as an image "
+                                     "next (local readers first)"]
+        elif self.gemini or self.verify:  # G1: after the cascade, with its own budget (opt-in, see __init__)
             from stoa.agent.escalate import escalate
 
             with budget.question():
@@ -1569,10 +2096,13 @@ class Pipeline(BaseSolver):
             pass
         from stoa.evidence.exactness import mark_exact  # E1 (D25): once, after every solver incl. G1's escalation
 
-        ans = mark_exact(ans)
+        ans = mark_exact(_support.final_guard(question, ans))  # T1: still resting on a rejected citation -> no number
+        from stoa.trust import sanity as _sanity  # T1 (Ziying tab 3): implausible 0 windows/doors; ranges off-domain
+
+        ans = _sanity.sanity_guard(question, ans, path)
         if self.user_scale:
             ans = _apply_user_scale(ans, self.user_scale, rec)
-        return ans
+        return _support.mark_support(question, ans)  # T1: supported / approximate / unlocated
 
     def _solve_question(self, path: str, question: str) -> Answer:
         t0 = time.perf_counter()
@@ -1618,6 +2148,8 @@ class Pipeline(BaseSolver):
                 link.assumptions = [*link.assumptions, tr_note] if tr_note else link.assumptions
                 return link
         ans = self._per_room(path, question, t0)
+        if ans is None and _is_upload(path):
+            ans = self._room_range(path, question, t0)
         if ans is None:
             plan = decompose(source_of(path), question) if self.compose else None
             if plan is None:
@@ -1729,6 +2261,9 @@ class Pipeline(BaseSolver):
         only a non-English question the rule parser could not read (unknown language, no target, or a free-text
         task); keep the English only if ITS parse finds a target (lang4 CS/HU/TR/RO 38 -> 48/48; hard's 175
         non-English questions: fires on 0, while translating all of them loses 7)."""
+        eng = _opening_count_english(question)
+        if eng is not None:
+            return eng, f"read by the rules as \"{eng}\" (a door / window count; no translation model)", None
         try:
             from stoa.llm import COVERED_LANGS, lang_guess, should_translate, to_english
 
@@ -1741,17 +2276,23 @@ class Pipeline(BaseSolver):
                 return question, None, None
         except Exception:  # noqa: BLE001  (no llm module / parser error: answer the original)
             return question, None, None
+        hinted, glossed = _room_gloss(question)
         try:
             from stoa.contract import CostMeter
 
             with CostMeter() as m:
-                tr = to_english(question, force=True)
+                tr = to_english(hinted, force=True)
             cost = m.cost
         except Exception as e:  # noqa: BLE001
             return question, f"translation failed ({type(e).__name__}); answered the original wording", None
         if not (tr.translated and tr.ok):
             return question, (tr.note or None), cost
         it2 = parse(tr.text)
+        g_ok = bool(glossed) and all(en.lower() in tr.text.lower() for _src, en in glossed)
+        if g_ok:  # F4 20:16: the room name came from the glossary, quoted (kept byte-identical by the translator)
+            eng = re.sub(r"\"([^\"]{2,40})\"", r"\1", tr.text)  # (tr is the translator's memo: not mutated)
+            return eng, (tr.note or "") + " (room word" + ("s" if len(glossed) > 1 else "") + " " + ", ".join(
+                f"'{a}' = {b}" for a, b in glossed) + " from the room-name glossary)", cost
         if it2.target in (None, "unknown"):
             return question, None, cost  # the English reads no better than the original
         from stoa.llm import COVERED_LANGS, lang_guess
@@ -1855,6 +2396,50 @@ class Pipeline(BaseSolver):
             out.solver = f"pipeline/{name}"
             return out
         return ans
+
+    def _room_range(self, path: str, question: str, t0: float) -> Answer | None:
+        """G1 c6 (X1 18:15, unseen EFA school sheets 0/8): 'What is the combined area of Science Labs 1 to 5?',
+        'Total floor area of the maths classrooms (Maths 1-5)?', 'English 1 to English 5' = the sum of the numbered
+        rooms, each asked on its own ('What is the area of Science Lab 3?' is answered right) and every term listed.
+        A range answered with ONE room (plan_rooms 82.47 @0.55 for five labs) is what this replaces. None = not a
+        range question, or a part was not answered (the normal path then runs)."""
+        rng = _room_range_parts(question) or _counted_rooms(path, question)
+        if rng is None:
+            return None
+        name, lo, hi, kind = rng
+        trace = [f"numbered room range: {name} {lo} to {hi} → {hi - lo + 1} rooms, each measured on its own, summed"]
+        total, vals, confs, ev, units, assumptions = Cost(), [], [], [], set(), []
+        names = [name] + ([name[:-1]] if name.endswith("s") and not name.endswith("ss") and len(name) > 4 else [])
+        for k in range(lo, hi + 1):
+            for nm in names:  # 'Science Labs 1 to 5' -> 'Science Lab 1' when the plural is not printed ('Maths 1' is)
+                sub = f"What is the {kind} of {nm} {k}?"
+                a = self._solve_atomic(path, sub)
+                total = total.add(_cost_of(a))
+                if _num(a.value) is not None and _fits(parse(sub).task, a):
+                    names = [nm]
+                    break
+            v = _num(a.value)
+            if v is None or not _fits(parse(sub).task, a) or float(a.confidence or 0) < (
+                    0.35 if str(path).lower().endswith(IMG_EXT) else 0.25):  # X1 18:50: crop sl-136 parts @0.30-0.32
+                # stoa-like sl-127 (phone photo): five guesses @0.05 summed to 3552 m²: a sum of guesses is no reading
+                trace.append(f"'{name} {k}': no {kind} read ({a.value!r} @{float(a.confidence or 0):.2f}); the range is "
+                             "not summed")
+                return None
+            vals.append(v)
+            units.add(str(a.unit or "").lower())
+            confs.append(float(a.confidence or 0))
+            trace.append(f"'{names[0]} {k}': {_fmt_num(round(v, 2))} {a.unit or ''} (conf {a.confidence:.2f}, {a.solver})")
+            ev += [e.model_copy(update={"note": f"{names[0]} {k}: {e.note}".strip(": ")}) for e in a.evidence[:20]]
+            assumptions += [x for x in a.assumptions if x not in assumptions][:2]
+        if len(units) != 1:
+            return None
+        terms = " + ".join(_fmt_num(round(v, 2)) for v in vals)
+        tot = round(sum(vals), 2)
+        trace.append(f"total = {terms} = {_fmt_num(tot)} {next(iter(units))}")
+        total.wall_seconds = round(time.perf_counter() - t0, 4)
+        return Answer(value=tot, unit=next(iter(units)) or None, confidence=round(min(confs) * 0.95, 3), evidence=ev,
+                      trace=trace, solver="pipeline/room_range",
+                      assumptions=[f"{names[0]} {lo}-{hi}: {terms}", *assumptions], missing=[], cost=total)
 
     def _multi_part(self, path: str, question: str, t0: float) -> Answer | None:
         """G1 (red team multi32): a question with parts asking DIFFERENT quantities or referring back ('… and what is
@@ -1977,6 +2562,10 @@ class Pipeline(BaseSolver):
         free when the text layer is cached) caps any path's answer and says why."""
         if Path(path).suffix.lower() not in IMG_EXT or source_of(path) in ("cubicasa5k", "swiss_dwellings"):
             return
+        if str(ans.solver or "").endswith("room_size"):
+            # G1 c7 (X1 sc-217..219, HABS sheet = plan + elevation): the asked room's label and size are printed on
+            # this sheet, so it does show that room (the veto read 'Front (North) Elevation' as the whole sheet)
+            return
         try:
             from stoa.solvers.raster.sheet import veto
         except Exception:  # noqa: BLE001  (W3's module not merged yet)
@@ -2006,7 +2595,13 @@ class Pipeline(BaseSolver):
         if not self.raster_first or "raster" not in cands or any(
                 TIER.get(c) == "deterministic" and c not in ("label_count", "stated_count", "pipe_runs") for c in cands):
             return None, None
-        if Path(path).suffix.lower() not in IMG_EXT or source_of(path) == "cubicasa5k":
+        if Path(path).suffix.lower() not in IMG_EXT:
+            return None, None
+        if source_of(path) == "cubicasa5k" and not (_is_upload(path) and intent.task in ("area", "length", "volume")):
+            # O1 18:20 / 15:53: on an UPLOAD 'cubicasa5k' is only R2's style guess, and line-only CAD sheets (D1's EFA
+            # school PNGs p 0.88-0.92, X1's 1951 ks51 scan, the esino photo) read so. Areas / lengths there are read
+            # from printed labels, chains and the printed scale by raster (abstains cheaply without them); dataset
+            # CubiCasa rows (data/cubicasa5k/…, counts only) keep their measured path.
             return None, None
         if intent.task == "count" and intent.target != "unknown":
             return None, None  # symbol counts of known classes: the LoRA's measured order stays (route())
@@ -2022,6 +2617,10 @@ class Pipeline(BaseSolver):
             return None, None
         if a.value is None:
             trace.append(f"raster (question as asked): abstained ({(a.missing or ['?'])[0][:80]})")
+            return None, None
+        if intent.task in ("area", "volume") and _is_upload(path) and _no_quantity(a):
+            trace.append(f"raster (question as asked): '{str(a.value)[:40]}' is not a quantity for an {intent.task} "
+                         "question: next reader")
             return None, None
         if a.confidence >= self.raw_accept and _fits(intent.task, a):
             trace.append(f"raster (question as asked): {a.value} {a.unit or ''} (conf {a.confidence:.2f}; read from "
@@ -2252,6 +2851,49 @@ class Pipeline(BaseSolver):
         trace.append(f"room graph: {a.value} {a.unit or ''} at conf {a.confidence:.2f}, unsure")
         return None, ("room_graph", a)
 
+    def _facade_first(self, path: str, question: str, intent, trace: list[str], t0: float) -> Answer | None:
+        """G1 c9 (captain 20:47, Ziying dfe-08 'How many windows are on the west facade of the classroom wing?' = 18,
+        ours 0 from CubiCasa5K): a window / door count scoped to a facade / side of a wing on a VECTOR PDF -> the
+        facade reader (stoa.agent.facade: north arrow or top = north, the wing's outer wall run on the footprint, its
+        strip re-read at >= 400 dpi, glazed runs between piers). $0, 1-3 s. None -> the other readers (their sheet-wide
+        count is then capped in _facade_unresolved)."""
+        if intent.task != "count" or Path(path).suffix.lower() != ".pdf":
+            return None
+        try:
+            from stoa.agent import facade as FA
+
+            if FA.parse(question) is None:
+                return None
+            fa = FA.answer(path, question, 0)
+        except Exception as e:  # noqa: BLE001 — the other readers go on
+            trace.append(f"facade: failed ({type(e).__name__}: {_clip(e, 80)})")
+            return None
+        if fa is None or fa.value is None:
+            trace.append("facade: the side / wing named by the question was not found on this sheet")
+            return None
+        op = self._get("openings")
+        try:  # DR 21:06: openings reads facade questions from the vector glazing too -> an independent cross-check
+            oa = op.solve(path, question) if op is not None and op.can_handle(path, question) else None
+        except Exception:  # noqa: BLE001
+            oa = None
+        if oa is not None and oa.value is not None and any(re.search(r"\bfacade of\b", str(t)) for t in oa.trace):
+            if _agree(fa.value, oa.value, "count"):
+                fa.confidence = round(max(fa.confidence, 0.85), 3)
+                fa.assumptions = [*fa.assumptions, f"two independent methods agree (facade wall strip: {fa.value}; "
+                                                   f"openings vector window units: {oa.value})"]
+                fa.trace = [*fa.trace, f"cross-check: openings (vector window units on the same facade) {oa.value} = "
+                                       f"{fa.value} ✓ → confidence {fa.confidence:.2f}"]
+            else:
+                fa.confidence = round(min(fa.confidence, 0.5), 3)
+                fa.missing = [*fa.missing, f"openings counted {oa.value} on the same facade (its vector window units)"]
+                fa.trace = [*fa.trace, f"cross-check: openings {oa.value} ≠ {fa.value} → confidence "
+                                       f"{fa.confidence:.2f}"]
+            fa.cost = fa.cost.add(_cost_of(oa)) if fa.cost else _cost_of(oa)
+        fa.trace = trace + fa.trace
+        fa.solver = "pipeline/facade"
+        fa.cost.wall_seconds = round(time.perf_counter() - t0, 4)
+        return fa
+
     def _lengths_first(self, path: str, question: str, cands: list[str], trace: list[str], t0: float) -> Answer | None:
         """G1 (W5 13:13, Stoa: lengths are the 2nd most asked kind): room length / width / perimeter and the building's
         outer dimensions on a Swiss-style floor (DXF or its PDF alone), read from the outlines with the measured line
@@ -2321,6 +2963,51 @@ class Pipeline(BaseSolver):
         pre = self._lengths_first(path, question, cands, trace, t0)
         if pre is not None:
             return pre
+        fa = self._facade_first(path, question, intent, trace, t0)
+        if fa is not None:
+            return fa
+        if _is_upload(path) and Path(path).suffix.lower() in IMG_EXT:
+            # G1 c7: Erin's piping reader on an image of a piping sheet (its tag families / sizes / notes from the
+            # already-read text layer; abstains for free on non-piping questions or an unread layer)
+            pi = self._get("piping_img")
+            try:
+                pa = pi.solve(path, question) if pi is not None and pi.can_handle(path, question) else None
+            except Exception:  # noqa: BLE001
+                pa = None
+            if pa is not None and pa.value is not None and pa.confidence >= 0.6 and _fits(intent.task, pa):
+                pa.trace = trace + pa.trace
+                pa.solver = "pipeline/piping_img"
+                pa.cost.wall_seconds = round(time.perf_counter() - t0, 4)
+                return pa
+        if intent.task == "area" and _is_upload(path):
+            # G1 c7 (X1 19:33, real HABS scans): a room's size printed under its name ('LIVING ROOM' / 13'-5" x
+            # 13'-6") IS its area (181.13 sq ft; d24 answered 14.44 m² from a picture reading @0.05); $0, text layer
+            try:
+                from stoa.solvers.room_size import answer as room_size
+
+                rs = room_size(path, question)
+            except Exception:  # noqa: BLE001
+                rs = None
+            if rs is not None and rs.confidence >= 0.6:
+                rs.trace = trace + rs.trace
+                rs.solver = "pipeline/room_size"
+                rs.cost.wall_seconds = round(time.perf_counter() - t0, 4)
+                return rs
+            if rs is not None:
+                trace.append(f"room_size: {rs.value} {rs.unit} @{rs.confidence:.2f} (several labels match): next reader")
+            if Path(path).suffix.lower() in IMG_EXT:
+                # G1 c7 (VP 19:27): the printed room area tags of the asked plan view on an image sheet (VP's
+                # stoa.sheet scope on the already-read text layer; abstains for free otherwise) before raster / agent
+                at = self._get("area_tags")
+                try:
+                    ta = at.solve(path, question) if at is not None else None
+                except Exception:  # noqa: BLE001
+                    ta = None
+                if ta is not None and ta.value is not None and ta.confidence >= 0.6 and _fits(intent.task, ta):
+                    ta.trace = trace + ta.trace
+                    ta.solver = "pipeline/area_tags"
+                    ta.cost.wall_seconds = round(time.perf_counter() - t0, 4)
+                    return ta
         why = self._agent_reason(path, question, intent, cands) if allow_agent else None
         unsure = None  # a deterministic solver's own answer to the raw question that it was not sure of
         raw_abstained: set[str] = set()  # deterministic solvers that did not understand the question as asked
@@ -2357,7 +3044,7 @@ class Pipeline(BaseSolver):
             ans = self._run_agent(path, question, why, t0)
             if ans is not None:
                 ans.trace = trace + ans.trace  # intent, "dxf as asked: unsure", then the agent's steps
-                return self._vs_unsure(ans, unsure, intent)
+                return self._vs_unsure(ans, unsure, intent, question)
             trace.append(f"general agent gave no answer ({why}); falling back to the template path")
         if self.api:
             cands.append("vlm_nvidia")
@@ -2404,6 +3091,11 @@ class Pipeline(BaseSolver):
                 if sk:  # D20-2: a reading exists and the question's LLM budget is spent
                     trace.append(sk)
                     break
+            if name in ("door_detect", "openings") and (answers or (unsure is not None and _fits(intent.task, unsure[1]))):
+                # S0 18:47 (gate d24 up_lone 4 L): pdf_vector's vector window counts 21 / 6 / 13 / 9 (= gold) were
+                # replaced by the detector's 20 / 5 / 5 / 8: a symbol detector only answers when no reader has
+                trace.append(f"{name}: skipped ({(answers[0][0] if answers else unsure[0])} already counted them)")
+                continue
             if name in raw_abstained and not (canon and canon != question):
                 trace.append(f"{name}: already asked this exact question (not understood): skipped")
                 continue
@@ -2438,10 +3130,11 @@ class Pipeline(BaseSolver):
                 trace.append(f"{name}: abstained ({(ans.missing or ['?'])[0][:80]})")
                 if any("not understood" in str(x) for x in [*ans.missing, *ans.trace[-2:]]):
                     not_understood.add(name)
-                if name == "stated_count":
+                if name in ("stated_count", "pipe_runs", "door_detect", "openings", "piping"):
                     # S0 gate d21: stated_count (new in d21, before plan_rooms / label_count) abstains for free on a
                     # text layer already read; it must not use up one of max_tries, or plan_rooms never runs on lone
-                    # BIM-plan PDFs ('Wie viele Räume … EG' 30 -> prior 60: up_lone 8 L at d21)
+                    # BIM-plan PDFs ('Wie viele Räume … EG' 30 -> prior 60: up_lone 8 L at d21). G1: pipe_runs (routed
+                    # first for text questions on uploads) is the same kind of free text-layer reader.
                     tries -= 1
                 continue
             if not _fits(intent.task, ans):
@@ -2726,11 +3419,7 @@ class Pipeline(BaseSolver):
                 if any("not understood" in str(x) for x in [*a.missing, *a.trace[-2:]]):
                     abstained.add(name)
                 continue
-            if intent.task in ("area", "volume") and _is_upload(path) and _num(a.value) is None and \
-                    not _DIMS_PAIR.match(str(a.value)) and not re.search(
-                        r"\d[\d,.]*\s*(?:m²|m2\b|m³|m3\b|sq\.?\s?(?:m|ft)\b|ft²|ft2\b|sf\b|square|qm\b|x\s*\d|"
-                        # a size ('16"' for 'What size is the suction header?', read as an area by the size cue)
-                        r"\"|”|''|['’]|in\b|inch|mm\b|cm\b|m\b|ft\b)", str(a.value), re.I):
+            if intent.task in ("area", "volume") and _is_upload(path) and _no_quantity(a):
                 # G1 c5 (X1 16:33, stoa-like sl-016): 'How big is the genset foundation in plan?' -> pdf_text 'SEE
                 # A1/S-513' @0.65 (a reference to another sheet, not an area): not an answer; the next reader measures
                 trace.append(f"{name} (question as asked): '{str(a.value)[:40]}' is not a quantity for an {intent.task} "
@@ -2868,7 +3557,7 @@ class Pipeline(BaseSolver):
             return best, None
         return None, None
 
-    def _vs_unsure(self, ans: Answer, unsure, intent: Intent) -> Answer:
+    def _vs_unsure(self, ans: Answer, unsure, intent: Intent, question: str = "") -> Answer:
         """Agent answer vs a deterministic solver's unsure answer to the same question: keep the surer, log both."""
         if unsure is None:
             return ans
@@ -2893,6 +3582,33 @@ class Pipeline(BaseSolver):
                              f"the agent answers in {ans.unit})" + (" — the agent's calculation uses it ✓" if used else ""))
             return ans
         x, y = _num(ans.value), _num(a_u.value)
+        pm = re.fullmatch(r"\s*(\d[\d,]*(?:\.\d+)?)\s*(sf|sq\.?\s*ft|ft2|ft²|square feet|m2|m²|sqm|m)\s*",
+                          str(a_u.value), re.I)
+        if pm and x is not None and y is None and abs(float(pm.group(1).replace(",", "")) - x) < 1e-6 and \
+                intent.task in ("area", "length"):
+            # G1 c6 (stoa-like sl-100, AFCEE A-101 PNG): raster read the printed '702 SF'; the agent's look() gave
+            # '702 m2' (same number, unit invented): the PRINTED reading and its unit win
+            out = a_u.model_copy(deep=True)
+            out.trace = [*ans.trace, f"cross-check: the agent's {_fmt_num(x)} {ans.unit or ''} is the number {n_u} read "
+                                     f"printed as '{a_u.value}': the printed unit is kept"]
+            out.confidence = round(min(0.6, max(float(a_u.confidence or 0), float(ans.confidence or 0))), 3)
+            out.cost = ans.cost
+            out.solver = f"pipeline/{n_u}"
+            return out
+        if intent.task == "area" and x is not None and y is not None and x >= 1000 and float(x).is_integer() and \
+                int(x) % 100 == 0 and u_a in ("m2", "m²") and 0 < y < x / 10 and question and not re.search(
+                    r"\b(?:total|gross|whole|entire|overall|all|combined|sum|floor area of (?:the|this) (?:building|"
+                    r"floor|storey|level)|building|storey|level)\b", question, re.I) and n_u == "raster":
+            # O1 19:32 (X1 CAD crops sl-134/135): the agent's look() returned the grid dimension string '7200' as
+            # 7200 m² for ONE room ('English 3') while raster measured 54.22 m² @0.3: a round 4-digit number for a
+            # single room's area is a printed mm dimension, the measured reading stays
+            out = a_u.model_copy(deep=True)
+            out.trace = [*ans.trace, f"cross-check: the agent's {_fmt_num(x)} m² for one room is a round printed "
+                                     f"dimension (mm), not an area: {n_u}'s measured {a_u.value} {a_u.unit or ''} kept"]
+            out.confidence = round(min(float(a_u.confidence or 0), 0.3), 3)
+            out.cost = ans.cost
+            out.solver = f"pipeline/{n_u}"
+            return out
         # the 2% tolerance is for measured sizes; a price/rate/text answer must match exactly (1620 EUR is not 1610)
         same = _agree(ans.value, a_u.value, intent.task) if intent.task in ("count", "area", "length", "volume") else (
             abs(x - y) <= 1e-6 * max(1.0, abs(y)) if x is not None and y is not None else _agree(ans.value, a_u.value, "text"))

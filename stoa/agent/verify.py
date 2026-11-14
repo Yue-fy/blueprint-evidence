@@ -13,6 +13,7 @@ value (router rule 3: a new reader checks, it does not overrule); the shifts are
 from __future__ import annotations
 
 import json
+import re
 import os
 import time
 
@@ -111,6 +112,11 @@ def verify(path: str, question: str, ans: Answer, model: str = MODEL) -> dict:
         return {"verdict": "unsure", "reason": f"no image ({type(e).__name__})", "value_seen": "", "cost": Cost()}
     if not imgs:
         return {"verdict": "unsure", "reason": "no drawing image to check", "value_seen": "", "cost": Cost()}
+    from stoa.agent.private import hosted_allowed
+
+    if not hosted_allowed("nvidia"):
+        return {"verdict": "unsure", "reason": "private mode: no Nemotron check (the drawing stays on this server)",
+                "value_seen": "", "cost": Cost()}
     how = " | ".join(str(t)[:160] for t in ans.trace[:4])
     prompt = PROMPT.format(
         question=question, answer=f"{ans.value} {ans.unit or ''}".strip(), how=how[:700],
@@ -121,8 +127,11 @@ def verify(path: str, question: str, ans: Answer, model: str = MODEL) -> dict:
         r = llm.chat(prompt, images=imgs, backend="nvidia", model=model, max_tokens=900, temperature=0.0,
                      thinking=False, cache=True, max_pixels=PAGE_PIXELS, max_side=4096)
     except Exception as e:  # noqa: BLE001
-        return {"verdict": "unsure", "reason": f"{LABEL} unavailable ({type(e).__name__})", "value_seen": "",
-                "cost": Cost()}
+        if "STOA_LLM_REPLAY" in str(e):  # E1 20:58: gate runs replay the disk cache; a miss is not an outage
+            return {"verdict": "unsure", "reason": f"{LABEL} not called (replay run: no cached response, no new "
+                                                   f"hosted call)", "value_seen": "", "cost": Cost()}
+        return {"verdict": "unsure", "reason": f"{LABEL} unavailable ({type(e).__name__}: {str(e)[:80]})",
+                "value_seen": "", "cost": Cost()}
     tin, tout = r.prompt_tokens or 0, r.completion_tokens or 0
     cost = Cost(llm_calls=1, api_calls=1, llm_tokens_in=tin, llm_tokens_out=tout, api_tokens_in=tin,
                 api_tokens_out=tout, wall_seconds=round(time.perf_counter() - t0, 3))
@@ -138,6 +147,10 @@ def verify(path: str, question: str, ans: Answer, model: str = MODEL) -> dict:
             "cost": cost, "images": len(imgs), "boxes": nbox}
 
 
+_NOT_THE_QUANTITY = re.compile(r"\b(?:is an? (?:dimension|grid|level|elevation|height|label|tag|room number|sheet number|"
+                               r"scale)|(?:dimension|grid|elevation|level) (?:label|line|string|value|tag)|not an? "
+                               r"(?:area|length|count|room area|perimeter))\b", re.I)
+
 def apply_verdict(ans: Answer, v: dict) -> Answer:
     """Move the confidence by the verdict (never the value); add the verdict to the trace (and missing if it disagrees)."""
     c0 = ans.confidence
@@ -149,10 +162,20 @@ def apply_verdict(ans: Answer, v: dict) -> Answer:
         c = c0
     seen = f" (it reads {v['value_seen']})" if v.get("value_seen") and v["verdict"] == "disagree" else ""
     word = {"agree": "agrees", "disagree": "disagrees", "unsure": "is unsure"}[v["verdict"]]
-    ans.trace = [*ans.trace, f"Second opinion (NVIDIA {LABEL}): {word}{seen} because {v['reason']} → confidence "
+    reason = " ".join(str(v.get("reason") or "").split()) or "it gave no reason"  # QA 20:00 (2): 'because  →'
+    ans.trace = [*ans.trace, f"Second opinion (NVIDIA {LABEL}): {word}{seen} because {reason} → confidence "
                              f"{c0:.2f} → {c:.2f}"]
     if v["verdict"] == "disagree":
-        ans.missing = [*ans.missing, f"{LABEL} looked at the evidence and disagrees{seen}: {v['reason']}"]
+        ans.missing = [*ans.missing, f"{LABEL} looked at the evidence and disagrees{seen}: {reason}"]
+        if c0 < 0.5 and isinstance(ans.value, (int, float)) and not isinstance(ans.value, bool) and \
+                _NOT_THE_QUANTITY.search(reason):
+            # QA 20:00 (1): '≈ 7200 m²' stayed on the card although Nemotron said '7200 is a dimension label, not an
+            # area': a weak reading the checker identifies as another kind of number is withheld, not displayed
+            ans.missing = [f"withheld: {ans.value} {ans.unit or ''} is, per {LABEL}, not the asked quantity "
+                           f"({reason})".replace("  ", " "), *ans.missing]
+            ans.trace = [*ans.trace, f"{ans.value} {ans.unit or ''} withheld (a weak reading the checker identifies "
+                                     f"as a dimension / level / label)"]
+            ans.value = None
     ans.confidence = round(c, 3)
     ans.cost = (ans.cost or Cost()).add(v.get("cost") or Cost())
     return ans

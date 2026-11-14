@@ -144,7 +144,9 @@ class GeminiAgent(Agent):
     # -- Gemini calls ----------------------------------------------------------------------------------
     def _call(self, msgs, schema, images, purpose: str, cost_box: list):
         from stoa import llm
+        from stoa.agent.private import check
 
+        check("gemini")  # private mode: behaves like an unreachable API
         r = llm.chat(msgs, images=images or None, backend="gemini", model=self.model, max_tokens=6000,
                      temperature=0.0, json_schema=schema, purpose=purpose, cache=True, max_pixels=THUMB_PIXELS,
                      max_side=4096)

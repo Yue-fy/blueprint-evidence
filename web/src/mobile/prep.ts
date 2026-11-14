@@ -1,11 +1,14 @@
 /**
- * Phone photos before upload: upright (EXIF orientation applied by the browser's decoder) and no bigger than the
- * readers need. A 12 MP photo (4032 px) goes as it is (the server turns it upright from its EXIF tag); a 48 MP photo,
- * a huge PNG or anything over 8 MB is re-encoded to JPEG at <= 4096 px on the long side, which keeps printed text
- * readable for OCR and cuts the upload on a slow booth network to ~1-2 MB. HEIC (or anything the browser cannot
- * decode) is sent untouched: the server converts it.
+ * Phone photos before upload: no bigger IN BYTES than a slow booth network carries. A JPEG or PNG up to 8 MB goes as it
+ * is, not even decoded (the server turns it upright from its EXIF tag and makes its own reading copy): Stoa's example
+ * PNGs are 10,000-14,000 px but 1-4 MB, and the 4,096 px limit this had until 14 Nov 21:20 turned the DfE sheet's
+ * Multi-Purpose Hall from 247.73 m² (traced at the printed 1:200; gold 246.37) into '≈ 298 Rough guess'; decoding a
+ * 139 MP image only to measure it can also run an iPhone tab out of memory. Over 8 MB (a 48 MP photo, a huge PNG,
+ * WebP / BMP / GIF): re-encoded to JPEG at <= 4096 px (photos) or <= 8192 px (PNG: drawings and scans) on the long
+ * side. HEIC (or anything the browser cannot decode) is sent untouched: the server converts it.
  */
 const MAX_SIDE = 4096;
+const MAX_SIDE_PNG = 8192;
 const MAX_BYTES = 8e6;
 
 export interface Prepared {
@@ -19,6 +22,7 @@ export interface Prepared {
 export async function prepImage(f: File): Promise<Prepared> {
   const isImage = /^image\//.test(f.type) || /\.(jpe?g|png|webp|bmp|gif|heic|heif|tiff?)$/i.test(f.name);
   if (!isImage) return { file: f, note: "" };
+  if (f.size <= MAX_BYTES && /jpe?g|png/i.test(f.type || f.name)) return { file: f, note: "" };
   let bmp: ImageBitmap;
   try {
     bmp = await createImageBitmap(f, { imageOrientation: "from-image" });
@@ -26,12 +30,7 @@ export async function prepImage(f: File): Promise<Prepared> {
     return { file: f, note: "" };
   }
   const long = Math.max(bmp.width, bmp.height);
-  if (long <= MAX_SIDE && f.size <= MAX_BYTES && /jpe?g|png/i.test(f.type || f.name)) {
-    const r = { file: f, note: "", width: bmp.width, height: bmp.height };
-    bmp.close();
-    return r;
-  }
-  const k = Math.min(1, MAX_SIDE / long);
+  const k = Math.min(1, (/png/i.test(f.type || f.name) ? MAX_SIDE_PNG : MAX_SIDE) / long);
   const w = Math.round(bmp.width * k), h = Math.round(bmp.height * k);
   const canvas = document.createElement("canvas");
   canvas.width = w;

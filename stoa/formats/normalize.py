@@ -27,9 +27,12 @@ or under $STOA_CACHE/formats when that folder is read-only.
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
+import json
 import os
 import re
+import threading
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -113,6 +116,14 @@ def svg_text_fix(path: str | Path) -> bytes:
     return _GLYPH_XY.sub(lambda m: f'{m.group(1)}{m.group(2)}"', raw.decode("utf-8", "replace")).encode("utf-8")
 
 
+def tmp_path(dst: Path) -> Path:
+    """A private temp name next to dst for an atomic write (write it, then os.replace(tmp, dst)): readers never see a
+    half-written cache file. Per process AND thread (eval workers and the UI's warm + first question are threads of
+    one process); keeps dst's suffix so PIL / PyMuPDF pick the same format."""
+    dst = Path(dst)
+    return dst.with_name(f".{dst.stem}.{os.getpid()}-{threading.get_ident()}.tmp{dst.suffix}")
+
+
 def svg_to_pdf(path: str | Path, out_dir: str | Path | None = None) -> tuple[str, tuple[float, float, float]]:
     """(PDF path, (x0, y0, SVG user units per PDF pt)). Vector content and text survive (MuPDF's SVG reader)."""
     import pymupdf
@@ -123,7 +134,9 @@ def svg_to_pdf(path: str | Path, out_dir: str | Path | None = None) -> tuple[str
         width_pt = doc[0].rect.width
         if not dst.exists() or dst.stat().st_mtime < src.stat().st_mtime:
             pdf = pymupdf.open("pdf", doc.convert_to_pdf())
-            pdf.save(dst, garbage=3, deflate=True)
+            tmp = tmp_path(dst)
+            pdf.save(tmp, garbage=3, deflate=True)
+            os.replace(tmp, dst)
     x0, y0, w = svg_user_box(src) or (0.0, 0.0, width_pt)
     return str(dst), (x0, y0, w / width_pt if width_pt else 1.0)
 
@@ -265,9 +278,11 @@ def shrink_image(src: str | Path, dst: str | Path, max_side: int = 6000) -> dict
     except (TypeError, ValueError, IndexError):
         keep = {}
     Path(dst).parent.mkdir(parents=True, exist_ok=True)
-    tmp = Path(dst).with_name(f".{Path(dst).name}.{os.getpid()}.tmp")  # S0 17:42: a reader saw a half-written copy
+    tmp = tmp_path(Path(dst))  # S0 17:42: a reader saw a half-written copy
     if Path(dst).suffix.lower() in (".jpg", ".jpeg"):
-        out.convert("RGB").save(tmp, format="JPEG", quality=94, **keep)
+        from stoa.formats.paper import SRC_SIZE_KEY
+
+        out.convert("RGB").save(tmp, format="JPEG", quality=94, comment=f"{SRC_SIZE_KEY}={W}x{H}", **keep)
     else:
         from PIL import PngImagePlugin
 
@@ -301,14 +316,27 @@ def paper_copy(pdf: str) -> tuple[str, float, str] | None:
             if hit is None:
                 return None
             f, named, page, n = hit
-            out = _cache_dir(Path(pdf)) / f"{Path(pdf).stem}.paper{named}.pdf"
+            rot = pg.rotation % 360
+            # X1/E1 18:45-18:52: show_pdf_page draws a /Rotate page AS DISPLAYED, so the copy of a rotated sheet had
+            # sideways text in its own frame and every vector reader failed (3/3 rows lost). The copy keeps the source's
+            # unrotated frame (x f) and the same /Rotate: readers and pdf_pt evidence (x 1/f) see what the original has
+            out = _cache_dir(Path(pdf)) / f"{Path(pdf).stem}.paper{named}{f'.rot{rot}' if rot else ''}.pdf"
             if not out.exists() or out.stat().st_mtime < Path(pdf).stat().st_mtime:
+                srcd = d
+                if rot:
+                    srcd = pymupdf.open(pdf)
+                    srcd[0].set_rotation(0)
+                sp = srcd[0]
                 nd = pymupdf.open()
-                np_ = nd.new_page(width=pg.rect.width * f, height=pg.rect.height * f)
-                np_.show_pdf_page(np_.rect, d, 0)
-                tmp = out.with_name(out.name + ".tmp")
+                np_ = nd.new_page(width=sp.rect.width * f, height=sp.rect.height * f)
+                np_.show_pdf_page(np_.rect, srcd, 0)
+                if rot:
+                    np_.set_rotation(rot)
+                tmp = tmp_path(out)
                 nd.save(tmp, garbage=3, deflate=True)
                 nd.close()
+                if srcd is not d:
+                    srcd.close()
                 os.replace(tmp, out)
     except Exception:  # noqa: BLE001 — the page as it is
         return None
@@ -317,6 +345,8 @@ def paper_copy(pdf: str) -> tuple[str, float, str] | None:
                          f"where 1:{n} holds")
 
 
+SHRINK_VERSION = 2  # bump when shrink_image's output changes: older cached copies are rebuilt (H / X1 18:41-18:47:
+# copies made before the PNG size tag were reused by every gate). 1 = cb0fc1d (no tag), 2 = 33016c6+ (size tag)
 IMAGE_MAX_SIDE = 6000  # = the web upload's cap (web/server/normalize_upload.py), so CLI / API / evals read what the UI reads
 
 
@@ -343,7 +373,7 @@ def shrunk_copy(src: Path, side: int) -> tuple[str, float, str] | None:
         try:
             if dst.exists() and meta.exists() and dst.stat().st_mtime >= src.stat().st_mtime:
                 m = json.loads(meta.read_text())
-                if m.get("src_size") == [W, H]:
+                if m.get("src_size") == [W, H] and m.get("v", 1) == SHRINK_VERSION:
                     return str(dst), float(m["factor"]), m["note"]
         except (OSError, ValueError, KeyError):
             pass
@@ -368,9 +398,9 @@ def shrunk_copy(src: Path, side: int) -> tuple[str, float, str] | None:
             except Exception:  # noqa: BLE001 — the copy is then read like any new image
                 pass
             try:
-                tmpm = meta.with_name(f".{meta.name}.tmp")
-                tmpm.write_text(json.dumps({"src_size": [W, H], "factor": r["factor"], "note": r["note"],
-                                            "clean": r["clean"], "flat": r.get("flat")}))
+                tmpm = tmp_path(meta)
+                tmpm.write_text(json.dumps({"v": SHRINK_VERSION, "src_size": [W, H], "factor": r["factor"],
+                                            "note": r["note"], "clean": r["clean"], "flat": r.get("flat")}))
                 os.replace(tmpm, meta)
             except OSError:
                 pass
@@ -397,7 +427,7 @@ def carry_text_layers(src: Path, dst: Path, factor: float) -> list[str]:
             for it in d.get("items", []):
                 it["box"] = [round(v * factor, 1) for v in it["box"]]
             d["notes"] = [*d.get("notes", []), f"carried over from the full-size image's reading (boxes x{factor:.4f})"]
-            tmp = fd.with_name(f".{fd.name}.tmp")
+            tmp = tmp_path(fd)
             tmp.write_text(json.dumps(d))
             os.replace(tmp, fd)
             done.append(f"vlm:{backend}")
@@ -410,7 +440,7 @@ def carry_text_layers(src: Path, dst: Path, factor: float) -> list[str]:
             d["size"] = [round(v * factor) for v in d.get("size", [0, 0])]
             for it in d.get("items", []):
                 it["box"] = [round(v * factor, 1) for v in it["box"]]
-            tmp = od.with_name(f".{od.name}.tmp")
+            tmp = tmp_path(od)
             tmp.write_text(json.dumps(d))
             os.replace(tmp, od)
             done.append("ocr")
@@ -442,7 +472,11 @@ def _render(pg, zoom: float, dst: Path, pdf: str, tag: bool = True) -> None:
     pix = pg.get_pixmap(matrix=pymupdf.Matrix(zoom, zoom), alpha=False)
     if tag:
         pix.set_dpi(dpi, dpi)
-    pix.save(dst)
+    # X1 19:24 (gate d25 sc-110): pix.save wrote dst in place, so a second question on the same upload opened a
+    # half-written 22 MB scan.png ('cannot identify image file' in raster AND vlm_direct -> the dataset prior)
+    tmp = tmp_path(dst)
+    pix.save(tmp)
+    os.replace(tmp, dst)
 
 
 def has_text(pdf: str, min_chars: int = 20) -> bool:
@@ -450,6 +484,46 @@ def has_text(pdf: str, min_chars: int = 20) -> bool:
 
     with pymupdf.open(pdf) as d:
         return len((d[0].get_text() or "").strip()) >= min_chars
+
+
+_TRACED_NAME = re.compile(r"\.vec\d+\.pdf$", re.I)
+NATIVE_MIN_STREAM = 20_000  # bytes of page content: a CAD export draws its lines there (stoa-like: 111 kB - 3.3 MB)
+_NATIVE: dict = {}
+_NATIVE_LOCK = threading.Lock()
+
+
+def native_vector_pdf(path: str | Path, page: int = 0) -> bool:
+    """True when this PDF page is a NATIVE vector drawing (a CAD / Revit export: lines in the page content, a real text
+    layer), False for a scan (an image over half the page, with or without an OCR text layer), for one of our traced
+    copies of a picture (<stem>.vecN.pdf, producer stoa.formats.vectorize) and on any read error. Cheap (<= 0.1 s on
+    Stoa's sheets), memoised by path + mtime. For callers deciding whether a hosted cross-check is worth paying for:
+    a located reading from a native vector page is its own evidence (P1 21:40, KNOWLEDGE)."""
+    p = str(path)
+    if not p.lower().endswith(".pdf") or _TRACED_NAME.search(p):
+        return False
+    try:
+        key = (p, int(page), os.stat(p).st_mtime_ns)
+    except OSError:
+        return False
+    with _NATIVE_LOCK:
+        if key in _NATIVE:
+            return _NATIVE[key]
+    ok = False
+    try:
+        import pymupdf
+
+        with pymupdf.open(p) as d:
+            if "stoa.formats.vectorize" not in str((d.metadata or {}).get("producer") or "") and 0 <= page < len(d):
+                pg = d[page]
+                area = abs(pg.rect) or 1.0
+                cover = max([abs(pymupdf.Rect(i["bbox"]) & pg.rect) / area for i in pg.get_image_info()] or [0.0])
+                stream = sum(len(d.xref_stream(x) or b"") for x in pg.get_contents())
+                ok = cover < 0.5 and stream >= NATIVE_MIN_STREAM and len((pg.get_text() or "").strip()) >= 20
+    except Exception:  # noqa: BLE001 — unreadable: not known to be native
+        ok = False
+    with _NATIVE_LOCK:
+        _NATIVE[key] = ok
+    return ok
 
 
 def heic_to_jpg(path: str | Path, out_dir: str | Path | None = None) -> str:
@@ -470,7 +544,9 @@ def heic_to_jpg(path: str | Path, out_dir: str | Path | None = None) -> str:
     dst = Path(out_dir or _cache_dir(src)) / f"{src.stem}.jpg"
     if not dst.exists() or dst.stat().st_mtime < src.stat().st_mtime:
         with Image.open(src) as im:
-            ImageOps.exif_transpose(im).convert("RGB").save(dst, "JPEG", quality=92)
+            tmp = tmp_path(dst)
+            ImageOps.exif_transpose(im).convert("RGB").save(tmp, "JPEG", quality=92)
+            os.replace(tmp, dst)
     return str(dst)
 
 
@@ -547,7 +623,13 @@ def prepare(path: str, question: str = "") -> Prepared:
             prep.notes.append("HEIC photo converted to JPEG (turned upright) before reading")
         elif ext in (".png", ".jpg", ".jpeg"):
             side = int(os.environ.get("STOA_IMAGE_MAX_SIDE", str(IMAGE_MAX_SIDE)) or 0)
-            got = shrunk_copy(Path(src), side) if side > 0 else None
+            try:  # O1 c7: a phone photo of a printed sheet -> the sheet, deskewed to its paper corners + evened light
+                from stoa.solvers.raster.photo import prepare_hook
+
+                photo = prepare_hook(prep, src, _cache_dir(Path(src)))
+            except ImportError:
+                photo = False
+            got = shrunk_copy(Path(src), side) if side > 0 and not photo else None
             if got:
                 prep.path, prep.img_scale, note = got
                 prep.kind = "shrink"
@@ -611,6 +693,103 @@ def prepare(path: str, question: str = "") -> Prepared:
     return prep
 
 
+def to_solved(prep: Prepared, pts, space: str):
+    """Points on the UPLOADED file, in the space the browser shows ('image_px' on a picture, 'pdf_pt' on a PDF page, 'svg'
+    on an SVG) -> (points, space) on prep.path, the file the readers solve: the inverse of restore() for inputs (a
+    right-click point / region from W5's feature registry, F7 / F1 15:5x). None when no map is known (a deskewed phone
+    photo) or the space does not fit the conversion: then the caller must not pass the points on."""
+    try:
+        pts = [[float(p[0]), float(p[1])] for p in pts]
+    except (TypeError, ValueError, IndexError):
+        return None
+    if prep.kind == "as_is" or not pts:
+        return pts, space
+    if prep.scan_zoom:  # scanned / rendered PDF page read as a PNG: page points -> PNG pixels
+        if space != "pdf_pt":
+            return None
+        z = prep.scan_zoom
+        return [[x * z, y * z] for x, y in pts], "image_px"
+    if prep.paper_f:  # the page enlarged to the paper its scale was written for
+        if space != "pdf_pt":
+            return None
+        return [[x * prep.paper_f, y * prep.paper_f] for x, y in pts], "pdf_pt"
+    if getattr(prep, "photo_h", None):
+        return None  # deskewed photo: no forward map here (stoa.solvers.raster.photo maps evidence back only)
+    if prep.img_scale:  # the uploaded picture's smaller copy
+        if space != "image_px":
+            return None
+        return [[x * prep.img_scale, y * prep.img_scale] for x, y in pts], "image_px"
+    if prep.kind.startswith("svg_pdf") and space == "svg":
+        ox, oy, k = prep.svg_frame
+        return [[(x - ox) / k, (y - oy) / k] for x, y in pts], "pdf_pt"
+    return pts, space  # page / dxf_roles / dwg / heic: same coordinates
+
+
+@contextlib.contextmanager
+def ask_context_on(prep: Prepared):
+    """While the readers solve prep.path: $STOA_ASK_CONTEXT's point / region (W5's ask_context, on the uploaded file) in
+    the solved file's coordinates and page. A point that cannot be mapped is dropped (with 'dropped' saying why), never
+    passed on in the wrong space. Restored afterwards."""
+    raw = os.environ.get("STOA_ASK_CONTEXT")
+    click, cv = None, None
+    try:  # G1 20:47: the API's /ask serves threads and hands the context as a context var (stoa.agent.click.use)
+        from stoa.agent import click
+
+        cv = click._CTX.get()
+        cv = cv if isinstance(cv, click.Ask) else None
+    except Exception:  # noqa: BLE001 — G1's module not on this branch
+        click = None
+    if prep.kind == "as_is" or (not raw and cv is None):
+        yield
+        return
+    ctx = None
+    if cv is not None:  # the context var wins over the env (stoa.agent.click.current does the same)
+        ctx = {"point": list(cv.point) if cv.point else None, "region": [list(q) for q in cv.region],
+               "view": cv.view, "space": cv.space, "page": cv.page}
+    else:
+        try:
+            ctx = json.loads(raw)
+        except ValueError:
+            ctx = None
+    if not isinstance(ctx, dict):
+        yield
+        return
+    reg = ctx.get("region")
+    if isinstance(reg, (list, tuple)) and len(reg) == 4 and all(isinstance(v, (int, float)) for v in reg):
+        x0, y0, x1, y1 = (float(v) for v in reg)  # a box [x0, y0, x1, y1] -> its corners
+        ctx = {**ctx, "region": [[x0, y0], [x1, y0], [x1, y1], [x0, y1]]}
+    new = dict(ctx)
+    space = str(ctx.get("space") or ("pdf_pt" if prep.original.lower().endswith(".pdf") else "image_px"))
+    page = ctx.get("page")
+    off_page = page is not None and prep.pages > 1 and int(page) != int(prep.page)
+    out_space = space
+    for key in ("point", "region"):
+        v = ctx.get(key)
+        if not v:
+            continue
+        m = None if off_page else to_solved(prep, [v] if key == "point" else v, space)
+        if m is None:
+            new.pop(key, None)
+            new["dropped"] = [*new.get("dropped", []), f"{key}: " + (
+                f"on page {int(page) + 1}, the question was read on page {prep.page + 1}" if off_page
+                else f"no map from the uploaded file's {space} to its {prep.kind} copy")]
+            continue
+        new[key] = m[0][0] if key == "point" else m[0]
+        out_space = m[1]
+    new["space"] = out_space
+    if prep.pages > 1 or prep.kind.startswith("page"):
+        new["page"] = 0  # the solved file is the picked page alone
+    new["solved_file"] = prep.path
+    if raw:
+        os.environ["STOA_ASK_CONTEXT"] = json.dumps(new)
+    try:
+        with (click.use(new) if click is not None else contextlib.nullcontext()):
+            yield
+    finally:
+        if raw:
+            os.environ["STOA_ASK_CONTEXT"] = raw
+
+
 def restore(ans, prep: Prepared):
     """Evidence back on the uploaded file + the conversion notes. Mutates and returns `ans`."""
     if prep.kind == "as_is" and not prep.error:
@@ -640,6 +819,11 @@ def restore(ans, prep: Prepared):
                 pts = getattr(ev, attr, None)
                 if pts:
                     setattr(ev, attr, [[x * z, y * z] for x, y in pts])
+            continue
+        if getattr(prep, "photo_h", None) and ev.bbox_space == "image_px":  # deskewed sheet -> the uploaded photo
+            from stoa.solvers.raster.photo import restore_ev
+
+            restore_ev(ev, prep, orig)
             continue
         if prep.img_scale and ev.bbox_space == "image_px":  # smaller copy's pixels -> the uploaded image's pixels
             z = 1 / prep.img_scale

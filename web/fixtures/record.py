@@ -33,7 +33,10 @@ EXTRA = [
 # The customer view (default since the captain's redesign): its tour and every project's example chips.
 TOUR_CUSTOMER = json.loads((HERE / "tour-customer.json").read_text())
 PROJECTS = json.loads((HERE / "projects.json").read_text())
-PROJECT_CHIPS = [(p["sheets"][0]["path"], q) for p in PROJECTS for q in p["chips"]] + [
+# dataset sheets only: the catalogue's example sheets ('examples/<file>', Stoa's sheets) are uploads on the web server
+# (POST /api/case), which the API cannot read by path; warm them through the web server instead (W6's
+# experiments/w6/warm_cases.py, or ask each chip once in the UI)
+PROJECT_CHIPS = [(p["sheets"][0]["path"], q) for p in PROJECTS for q in p["chips"] if p["sheets"][0]["path"].startswith("data/")] + [
     (s["path"], q) for p in PROJECTS for s in p["sheets"] if s["path"].endswith(".ifc") for q in p.get("modelChips", [])]
 QUESTIONS = list(dict.fromkeys([(t["file"], t["q"]) for t in TOUR + TOUR_CUSTOMER if t.get("file") and t.get("q")] + EXTRA + PROJECT_CHIPS))
 

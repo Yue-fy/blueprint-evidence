@@ -23,6 +23,7 @@ Evidence on the PDF (pdf_pt) maps back to the image linearly: px = pt * dpi / 72
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 PAPERS_MM = {
@@ -90,6 +91,89 @@ def _quarter(c, r: float, q: int, k: float):
     c1 = (p0[0] - kk * math.sin(a0), p0[1] + kk * math.cos(a0))
     c2 = (p3[0] + kk * math.sin(a1), p3[1] - kk * math.cos(a1))
     return [(x * k, y * k) for x, y in (p0, c1, c2, p3)]
+
+
+def _traced_at(pdf: Path, png: Path, dpi: float, tol: float = 0.01) -> bool:
+    """The cached copy was traced at `dpi` (its page is the image's pixels x 72 / dpi): P1 19:45, a copy cached at one
+    paper source's dpi is not reused when another source gives a different one (the scale-bar dpi vs the sheet's)."""
+    import pymupdf
+    from PIL import Image
+
+    Image.MAX_IMAGE_PIXELS = None
+    try:
+        with Image.open(png) as im:
+            w = im.size[0]
+        with pymupdf.open(str(pdf)) as d:
+            pw = d[0].rect.width
+        return abs(w * 72.0 / pw - dpi) <= tol * dpi
+    except Exception:  # noqa: BLE001 — cannot tell: keep it (the mtime rule, as before)
+        return True
+
+
+def text_sig(items) -> str:
+    """Signature of the text layer a copy is traced with (its words become the copy's invisible text AND mask glyph ink
+    out of the linework). X1 20:43: copies traced from the 19:22 garbled PP-OCR layer ('Faress Roons') were reused
+    after O1's OCR gate replaced that layer, and gate d27 lost 5 of 9 DfE scan rows a fresh copy gets right."""
+    import hashlib
+
+    h = hashlib.sha1()
+    for it in items or []:
+        h.update(f"{it.text}|{','.join(str(round(float(v))) for v in it.box)}\n".encode())
+    return h.hexdigest()[:16]
+
+
+def _current_sig(png: str) -> str:
+    try:
+        from stoa.solvers.raster.textlayer import text_layer
+
+        return text_sig(text_layer(png).items)  # cached by the readers that ran first (never a cold read in practice)
+    except Exception:  # noqa: BLE001
+        return text_sig([])
+
+
+def _sig_of(pdf: Path) -> str | None:
+    import pymupdf
+
+    try:
+        with pymupdf.open(str(pdf)) as d:
+            kw = (d.metadata or {}).get("keywords") or ""
+    except Exception:  # noqa: BLE001
+        return None
+    m = re.search(r"stoa-textsig:([0-9a-f]{16})", kw)
+    return m.group(1) if m else None
+
+
+def traced_copy(png: str, dpi: float) -> str:
+    """The cached vector copy of `png` (<stem>.vec<VERSION>.pdf next to it), traced once: questions asked at the same
+    time about one new sheet and the upload's warm pre-read all wait for ONE trace (P1 18:2x: 3 eval workers traced
+    Stoa's DfE copy at once, ~62 s each, 3x the CPU) under a cross-process lock; the PDF itself is written atomically."""
+    import fcntl
+
+    from stoa.formats.normalize import _cache_dir
+
+    src = Path(png)
+    out = _cache_dir(src) / f"{src.stem}.vec{VERSION}.pdf"
+    sig = _current_sig(str(src))
+
+    def fresh() -> bool:
+        try:
+            if not (out.exists() and out.stat().st_mtime >= src.stat().st_mtime):
+                return False
+        except OSError:
+            return False
+        # traced with the text layer the readers see NOW (a copy without a signature predates 20:50 Sat: re-traced once)
+        return _sig_of(out) == sig and _traced_at(out, src, dpi)
+
+    if fresh():
+        return str(out)
+    with open(out.with_name(f".{out.name}.lock"), "w") as lockf:
+        fcntl.flock(lockf, fcntl.LOCK_EX)
+        try:
+            if not fresh():
+                to_vector_pdf(str(src), str(out), dpi=dpi)
+        finally:
+            fcntl.flock(lockf, fcntl.LOCK_UN)
+    return str(out)
 
 
 def to_vector_pdf(png: str, out: str | None = None, dpi: float | None = None, text: bool = True) -> dict:
@@ -223,6 +307,7 @@ def to_vector_pdf(png: str, out: str | None = None, dpi: float | None = None, te
     fd, tmp = tempfile.mkstemp(suffix=".pdf", dir=str(Path(out).parent))  # atomic: parallel workers / a failed save
     os.close(fd)                                                           # never leave a half-written cache file
     try:
+        doc.set_metadata({"producer": "stoa.formats.vectorize", "keywords": f"stoa-textsig:{text_sig(items)}"})
         doc.save(tmp, garbage=3, deflate=True)
         os.replace(tmp, out)
     finally:

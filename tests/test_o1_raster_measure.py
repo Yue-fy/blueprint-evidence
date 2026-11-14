@@ -288,3 +288,47 @@ def test_doorarcs_threads_identical(tmp_path, monkeypatch):
     seq = D.detect(str(p), 60.0)
     monkeypatch.setattr(D, "ARC_THREADS", 4)
     assert D.detect(str(p), 60.0) == seq
+
+
+def test_leaf_share_door_swings_vs_bare_arcs(tmp_path):
+    """W6 17:42 leaf check (ported to doorarcs): swings with a leaf count, bare quarter arcs do not."""
+    import cv2
+    from stoa.solvers.raster import doorarcs as D
+
+    img = np.full((400, 400), 255, np.uint8)
+    cv2.line(img, (100, 100), (150, 100), 0, 2)  # leaf along +x from the hinge
+    cv2.ellipse(img, (100, 100), (50, 50), 0, 0, 90, 0, 2)
+    cv2.ellipse(img, (300, 300), (50, 50), 0, 0, 90, 0, 2)  # bare arc (a rounded corner), no leaf
+    p = tmp_path / "arcs.png"
+    Image.fromarray(img).save(p)
+    dets = [{"c": [100.0, 100.0], "r_px": 50.0, "q": 0}, {"c": [300.0, 300.0], "r_px": 50.0, "q": 0}]
+    assert D.leaf_share(str(p), dets) == 0.5
+
+
+def test_drop_grid_lines_keeps_walls_removes_dashes():
+    """Captain 18:21 fix list (2): a dashed grid line crossing the sheet goes, a continuous wall line stays."""
+    ppm = 20.0
+    ink = np.zeros((200, 600), np.uint8)
+    ink[50, 20:580] = 1  # wall: continuous 28 m
+    for x in range(20, 580, 16):  # grid line: 12 px dashes, 4 px gaps, 28 m long
+        ink[120, x:x + 12] = 1
+    out = M.drop_grid_lines(ink, ppm)
+    assert out[50].sum() == ink[50].sum()
+    assert out[120].sum() <= 0.05 * ink[120].sum()  # (an end pixel may survive the line opening)
+
+
+def test_blank_holding_most_rooms_is_a_leak_not_a_room(tmp_path, monkeypatch):
+    # O1 c9 (QA 20:18 DfE phone photo): a framed sheet whose open blank holds >= LEAK_LABELS other room labels -> None
+    from stoa.solvers.raster import measure as _M
+
+    img = Image.new("L", (1200, 800), 255)
+    d = ImageDraw.Draw(img)
+    d.rectangle([10, 10, 1189, 789], outline=0, width=4)  # the sheet frame: the blank never reaches the image border
+    p = tmp_path / "framed.png"
+    img.save(p)
+    others = [[100.0 + 90 * k, 400, 140 + 90 * k, 412] for k in range(11)]
+    monkeypatch.setattr(_M, "LEAK_LABELS", 10)
+    assert _M.room_area(str(p), [600.0, 200, 640, 212], 50.0, others=others, hull=True) is None
+    monkeypatch.setattr(_M, "LEAK_LABELS", 0)
+    r = _M.room_area(str(p), [600.0, 200, 640, 212], 50.0, others=others, hull=True)
+    assert r is not None and any("split from 11" in n for n in r["notes"])

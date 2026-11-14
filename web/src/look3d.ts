@@ -14,30 +14,119 @@ import { RenderPass } from "three/examples/jsm/postprocessing/RenderPass.js";
 import { GTAOPass } from "three/examples/jsm/postprocessing/GTAOPass.js";
 import { OutputPass } from "three/examples/jsm/postprocessing/OutputPass.js";
 import { OutlinePass } from "three/examples/jsm/postprocessing/OutlinePass.js";
+import "./look3d.css";
 
 /** `?ao=0` in the URL turns the AO frame off (a fallback for a weak GPU during a demo). */
 const AO_ON = !/[?&]ao=0\b/.test(location.search);
 const IDLE_MS = 150;
+/** exploded floors (W7): up to this many per-floor cut bands in the AO's G-buffer */
+const MAX_BANDS = 16;
+const BANDS = { n: { value: 0 }, base: { value: new Array<number>(MAX_BANDS).fill(1e9) }, cut: { value: new Array<number>(MAX_BANDS).fill(1e9) } };
+/** Pixel ratio cap for both 3D panes (W7: 2 → 1.5; a retina laptop draws 44 % fewer pixels, the AO frame too). */
+export const MAX_DPR = 1.5;
 
 /** Mix a material's colours toward clay white (0 = the model's own colours, 1 = all clay); shared by all materials. */
 export const CLAY = { value: 0 };
 /** Clay for glass (transparent buckets): a little of their own tint stays. */
 export const CLAY_GLASS = { value: 0 };
+/** The 'Rooms' look (W7): 1 = each element in its role colour (walls warm white, doors wood, glass light blue), 0 = off. */
+export const ROLE = { value: 0 };
 
-/** Clay-white diffuse (the model's colours mixed toward a warm white; the luminance keeps a hint of contrast). */
-export function clayify(mat: THREE.Material, glass = false, furniture = false) {
+/** Clay-white diffuse (the model's colours mixed toward a warm white; the luminance keeps a hint of contrast). A mesh
+ * whose geometry has a `role` attribute (viewer3d: one colour per element kind) takes that colour while ROLE is 1. */
+export function clayify(mat: THREE.Material, glass = false, furniture = false, role = false) {
   // furniture and fixtures: the same clay, a step darker than the walls (captain 16:00)
   const tint = furniture ? "vec3(0.80, 0.795, 0.78)" : "vec3(0.93, 0.925, 0.91)";
   mat.onBeforeCompile = (sh) => {
     sh.uniforms.uClay = glass ? CLAY_GLASS : CLAY;
+    if (role) {
+      sh.uniforms.uRole = ROLE;
+      sh.vertexShader = sh.vertexShader
+        .replace("void main() {", "attribute vec3 role;\nvarying vec3 vRole;\nvoid main() {\n  vRole = role;");
+    }
     sh.fragmentShader = sh.fragmentShader
-      .replace("void main() {", "uniform float uClay;\nvoid main() {")
+      .replace("void main() {", `uniform float uClay;\n${role ? "uniform float uRole;\nvarying vec3 vRole;\n" : ""}void main() {`)
       .replace("#include <color_fragment>", `#include <color_fragment>
       float clayL = dot(diffuseColor.rgb, vec3(0.299, 0.587, 0.114));
+      ${role ? "diffuseColor.rgb = mix(diffuseColor.rgb, vRole, uRole);" : ""}
       diffuseColor.rgb = mix(diffuseColor.rgb, ${tint} * (0.86 + 0.14 * clayL), uClay);`);
   };
-  mat.customProgramCacheKey = () => `clay${glass ? "-glass" : ""}${furniture ? "-furn" : ""}`;
+  mat.customProgramCacheKey = () => `clay${glass ? "-glass" : ""}${furniture ? "-furn" : ""}${role ? "-role" : ""}`;
 }
+
+// ---------------------------------------------------------------------------------------------------------------
+// Room types (W7, captain 21:10): floors tinted by what the room is for, with a small legend. The type comes from the
+// room's NAME only (IFC LongName / Name, the plan's printed label), in English, German, French, Italian, Estonian
+// (Maleva is in Tallinn), Finnish and Swedish. A name we do not know is 'other' — never a guessed type.
+
+export type RoomType = "living" | "bedroom" | "kitchen" | "wet" | "circulation" | "storage" | "other";
+
+/** Muted, low-saturation floor tints (light and dark canvas use the same tints: the model itself stays light). */
+export const ROOM_TYPES: { key: RoomType; label: string; hex: string }[] = [
+  { key: "living", label: "Living", hex: "#e3d3b6" },
+  { key: "bedroom", label: "Bedroom", hex: "#d6d0e4" },
+  { key: "kitchen", label: "Kitchen", hex: "#ecc9b0" },
+  { key: "wet", label: "Bath · WC · sauna · laundry", hex: "#bfdcdc" },
+  { key: "circulation", label: "Hall · corridor · stair", hex: "#d9e2cf" },
+  { key: "storage", label: "Storage · technical", hex: "#cfcdc8" },
+  { key: "other", label: "Other", hex: "#ebe9e5" },
+];
+export const ROOM_HEX = Object.fromEntries(ROOM_TYPES.map((t) => [t.key, t.hex])) as Record<RoomType, string>;
+
+// Words on a normalised name (lower case, accents removed: köök → kook, küche → kuche, õ → o). Each word must start a
+// word of the name (no match inside a longer word, except where a trailing * allows a longer ending).
+const ROOM_WORDS: [RoomType, string[]][] = [
+  ["wet", ["wc", "w.c", "inva-wc", "bad", "bader", "badezimmer", "du", "dusche*", "dusch*", "bath*", "shower*", "toilet*", "toilette*",
+    "lavatory", "washroom*", "restroom*", "sauna*", "saun", "leiliruum", "laundry", "waschkuche", "waschraum", "pesukoda", "pesuruum",
+    "pesuh*", "tualett*", "vannituba", "vannitoba", "kph", "kh", "ph", "khh", "kylpyhuone*", "pesuhuone*", "kodinhoitohuone*",
+    "sanitar*", "bagno", "doccia", "bain", "salle de bain*", "salle d'eau", "douche", "badrum", "tvattstuga", "lazienka"]],
+  ["circulation", ["korridor*", "koridor*", "corridor*", "hallway*", "flur", "gang", "diele", "vorplatz", "eingang*",
+    "entree", "entrance*", "entrance hall", "stair hall", "lift hall", "foyer", "fuajee*", "esik", "eeskoda", "lobby", "stair*", "trepp*", "trepikoda", "treppenhaus", "lift*",
+    "elevator*", "aufzug", "porras*", "porrashuone*", "kaytava*", "eteinen", "tuulikaappi", "landing", "vestibule", "vestibul",
+    "disimpegno", "ingresso", "corridoio", "scala", "degagement", "palier", "escalier", "passage", "hallen", "trapphus", "farstu"]],
+  ["storage", ["abiruum", "abstell*", "storage", "store", "stores", "storeroom*", "closet", "cupboard", "ripostiglio", "reduit", "keller*",
+    "cellar", "cave", "cantina", "estrich", "varasto*", "vaatehuone*", "panipaik*", "sahver", "pantry", "server*", "tehno*",
+    "tehniline*", "technik*", "technical", "mechanical", "mech", "plant room", "boiler*", "heizung*", "soojussolm", "veem.solm",
+    "veemootja*", "el.kilp", "elektri*", "elec*", "ventilatsioon*", "ventilation", "iv-kamber", "shaft", "schacht", "gaine",
+    "koristus*", "janitor", "cleaning", "liikumisvahendid", "utility", "ict", "tekn*", "lvi*", "garage", "garaaz*", "autotalli",
+    "forrad", "kallare"]],
+  ["kitchen", ["kook", "teekook", "kitchen*", "kuche", "kueche", "kochen", "cuisine", "cucina", "keittio*", "kok", "kuchnia"]],
+  ["living", ["elutuba", "living*", "wohnen", "wohnzimmer", "wohn", "salon", "sejour", "soggiorno", "olohuone*", "family room",
+    "lounge", "dining", "essen", "sook*", "ruokailu*", "pranzo", "oleskelu*", "vardagsrum", "matsal", "wohnkuche", "wohnen/essen"]],
+  ["bedroom", ["magamistuba", "magamis*", "bedroom*", "schlafzimmer", "schlafen", "zimmer", "kinderzimmer", "chambre", "camera",
+    "makuuhuone*", "mh", "sovrum", "sypialnia", "dormitorio", "guest room", "master bedroom"]],
+];
+const ROOM_RE: [RoomType, RegExp][] = ROOM_WORDS.map(([k, ws]) => [k, new RegExp(`(^|[^a-z0-9])(${ws.map((w) =>
+  w.endsWith("*") ? `${esc(w.slice(0, -1))}[a-z]*` : esc(w)).join("|")})(?![a-z])`)]);
+function esc(s: string) { return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"); }
+
+/** What a room is for, from its name ('ELUTUBA+KÖÖK' → living: the first part of a combined name that we know). */
+export function roomType(...names: (string | null | undefined)[]): RoomType {
+  for (const raw of names) {
+    const n = String(raw ?? "").normalize("NFD").replace(/[̀-ͯ]/g, "").toLowerCase().trim();
+    if (!n) continue;
+    if (n === "hall" || n === "halli") return "circulation"; // a lone 'Hall' at home; 'Sports hall' / 'Main hall' stay other
+    for (const part of n.split(/[+&]|\s\/\s|,/)) {
+      for (const [k, re] of ROOM_RE) if (re.test(part)) return k;
+    }
+  }
+  return "other";
+}
+
+// The look the visitor picked: 'rooms' (floors by room type, coloured doors and glass) or 'clay' (all white, for
+// elegant still frames). Kept in localStorage; both panes follow it.
+export type LookMode = "rooms" | "clay";
+const LOOK_KEY = "be.look3d";
+let lookMode: LookMode = (() => { try { return localStorage.getItem(LOOK_KEY) === "clay" ? "clay" : "rooms"; } catch { return "rooms"; } })();
+const lookListeners = new Set<(m: LookMode) => void>();
+export function getLook(): LookMode { return lookMode; }
+export function setLook(m: LookMode) {
+  if (m === lookMode) return;
+  lookMode = m;
+  try { localStorage.setItem(LOOK_KEY, m); } catch { /* private window */ }
+  for (const f of lookListeners) f(m);
+}
+export function onLook(f: (m: LookMode) => void) { lookListeners.add(f); }
 
 /** A soft fresnel rim on a highlight material: its silhouette glows a lighter accent, cheap on every frame. */
 export function rimGlow(mat: THREE.MeshLambertMaterial, strength = 0.9) {
@@ -89,6 +178,28 @@ export class Look3D {
         }
       });
     };
+    // exploded floors (W7): the AO's normal/depth pass draws every mesh with ONE material, so the per-floor cuts are
+    // done here by world height: a fragment belongs to the highest band whose base is at or below it, and is dropped
+    // above that band's cut (bands are ≥ 6 m apart, so they never overlap)
+    const nm = this.gtao.normalMaterial;
+    nm.onBeforeCompile = (sh) => {
+      sh.uniforms.uBandN = BANDS.n;
+      sh.uniforms.uBandBase = BANDS.base;
+      sh.uniforms.uBandCut = BANDS.cut;
+      sh.vertexShader = sh.vertexShader.replace("void main() {", "varying float vW7Y;\nvoid main() {")
+        .replace("#include <project_vertex>", "#include <project_vertex>\n  vW7Y = (modelMatrix * vec4(transformed, 1.0)).y;");
+      sh.fragmentShader = sh.fragmentShader.replace("void main() {", `uniform int uBandN;
+uniform float uBandBase[${MAX_BANDS}];
+uniform float uBandCut[${MAX_BANDS}];
+varying float vW7Y;
+void main() {
+  if (uBandN > 0) {
+    float cutY = 1e9;
+    for (int i = 0; i < ${MAX_BANDS}; i++) { if (i < uBandN && vW7Y >= uBandBase[i]) cutY = uBandCut[i]; }
+    if (vW7Y > cutY) discard;
+  }`);
+    };
+    nm.customProgramCacheKey = () => "w7-bands";
     this.composer.addPass(this.gtao);
     // a soft accent halo around the answer's elements (still frames only, like the AO)
     this.glow = new OutlinePass(new THREE.Vector2(Math.max(1, size.x), Math.max(1, size.y)), scene, camera);
@@ -315,9 +426,119 @@ export class Look3D {
     this.refined = false;
   }
 
+  /** The AO frame on or off (a fallback; exploded floors keep their AO through setBands). */
+  setAO(on: boolean) {
+    this.gtao.enabled = on;
+    this.refined = false;
+  }
+
+  /** Exploded floors' cuts for the AO (W7): bands sorted by base (world y, lifted); null = none. */
+  setBands(bands: { base: number; cut: number }[] | null) {
+    const b = (bands ?? []).slice().sort((x, y) => x.base - y.base).slice(0, MAX_BANDS);
+    BANDS.n.value = b.length;
+    for (let i = 0; i < MAX_BANDS; i++) {
+      BANDS.base.value[i] = i < b.length ? b[i].base : 1e9;
+      BANDS.cut.value[i] = i < b.length ? b[i].cut : 1e9;
+    }
+    this.refined = false;
+  }
+
   /** Show or hide the ground (e.g. a storey filter shows one floor floating: the shadow still marks the footprint). */
   setGroundVisible(on: boolean) {
     this.ground.visible = on;
     this.refined = false;
   }
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// The pane's small legend + switches (W7): bottom left of a 3D pane, Apple-like glass card. Rooms legend (only the
+// types this model / floor really has, with counts), or the area ramp of an area answer; 'Rooms | Clay'; and, on a
+// model with several floors, 'Explode floors'.
+
+export interface LegendRow { key: string; label: string; hex: string; n: number }
+export interface AreaRamp { min: number; max: number; title: string }
+
+/** light → deep blue (RANK_HEX's ends): an area ramp for 'biggest room' / 'rooms by size' answers */
+export const AREA_LO = new THREE.Color("#dbe9fb");
+export const AREA_HI = new THREE.Color("#0040a8");
+export function areaColor(a: number, min: number, max: number): THREE.Color {
+  const k = max > min ? Math.max(0, Math.min(1, (a - min) / (max - min))) : 1;
+  return AREA_LO.clone().lerp(AREA_HI, Math.pow(k, 0.8));
+}
+
+export class LookPanel {
+  readonly el = document.createElement("div");
+  private legend = document.createElement("div");
+  private explodeBtn: HTMLButtonElement;
+  private segBtns: HTMLButtonElement[] = [];
+  onExplode: (on: boolean) => void = () => {};
+  private exploded = false;
+
+  constructor(host: HTMLElement) {
+    this.el.className = "look3d";
+    this.legend.className = "look3d-legend";
+    const row = document.createElement("div");
+    row.className = "look3d-row";
+    const seg = document.createElement("div");
+    seg.className = "look3d-seg";
+    seg.setAttribute("role", "group");
+    seg.setAttribute("aria-label", "3D look");
+    for (const [m, label, tip] of [["rooms", "Rooms", "Floors coloured by room type"], ["clay", "Clay", "All white, for still frames"]] as const) {
+      const b = document.createElement("button");
+      b.type = "button";
+      b.textContent = label;
+      b.title = tip;
+      b.dataset.look = m;
+      b.addEventListener("click", () => setLook(m));
+      b.addEventListener("pointerdown", (e) => e.stopPropagation());
+      seg.append(b);
+      this.segBtns.push(b);
+    }
+    this.explodeBtn = document.createElement("button");
+    this.explodeBtn.type = "button";
+    this.explodeBtn.className = "look3d-explode";
+    this.explodeBtn.textContent = "Explode floors";
+    this.explodeBtn.title = "Lift the floors apart and cut the walls, to see every floor at once";
+    this.explodeBtn.hidden = true;
+    this.explodeBtn.addEventListener("click", () => this.setExploded(!this.exploded, true));
+    row.append(seg, this.explodeBtn);
+    this.el.append(this.legend, row);
+    host.append(this.el);
+    const sync = () => this.segBtns.forEach((b) => b.setAttribute("aria-pressed", String(b.dataset.look === getLook())));
+    onLook(sync);
+    sync();
+  }
+
+  setExplodeAvailable(on: boolean) { this.explodeBtn.hidden = !on; }
+
+  setExploded(on: boolean, fire = false) {
+    this.exploded = on;
+    this.explodeBtn.setAttribute("aria-pressed", String(on));
+    this.explodeBtn.textContent = on ? "Stack floors" : "Explode floors";
+    if (fire) this.onExplode(on);
+  }
+
+  /** Room-type rows (null = none), or an area ramp (wins when given); `note` = a muted line under the rows. */
+  setLegend(rows: LegendRow[] | null, ramp: AreaRamp | null = null, note = "") {
+    const fmt = (v: number) => (v >= 100 ? Math.round(v).toLocaleString("en-US") : v.toFixed(1));
+    if (ramp) {
+      this.legend.innerHTML = `<div class="look3d-title">${escHtml(ramp.title)}</div>
+        <div class="look3d-ramp" style="background: linear-gradient(90deg, #${AREA_LO.getHexString()}, #${AREA_HI.getHexString()})"></div>
+        <div class="look3d-ends"><span>${fmt(ramp.min)} m²</span><span>${fmt(ramp.max)} m²</span></div>`;
+      this.legend.hidden = false;
+      return;
+    }
+    if (!rows?.length) {
+      this.legend.innerHTML = "";
+      this.legend.hidden = true;
+      return;
+    }
+    this.legend.innerHTML = rows.map((r) => `<div class="look3d-item"><i style="background:${r.hex}"></i><span>${escHtml(r.label)}</span><b>${r.n}</b></div>`).join("")
+      + (note ? `<div class="look3d-note">${escHtml(note)}</div>` : "");
+    this.legend.hidden = false;
+  }
+}
+
+function escHtml(s: string) {
+  return s.replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" })[c]!);
 }

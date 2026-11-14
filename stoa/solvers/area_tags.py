@@ -22,7 +22,9 @@ FT2_M2 = 0.09290304
 _ROOMNO = re.compile(r"^(?:\d{1,2}\.\d{2}|[A-Z]{0,2}\d{2,4}[A-Z]?)$")
 _APT_LABEL = re.compile(r"^(?:Whg\.?|Wohnung|App\.?|Appartement|Apt\.?|Unit)\s*[A-Z0-9]{1,3}$", re.I)
 _APT_Q = re.compile(r"\b(?:apartment|wohnung|whg\.?|appartement|appartamento|flat|logement)\s+([A-Z0-9]{1,2})\b", re.I)
-_TAG = re.compile(r"^(?:(?P<no>[A-Z]{0,3}\d{1,4}(?:\.[A-Z0-9]{1,3})?)\s*[-–:]\s*)?(?P<v>\d{1,3}(?:[,']\d{3})+|\d+(?:[.,]\d+)?)"
+# F5 20:22: DfE baseline sheets print 'A: 62 m2' / 'NIA: 62 m2' / 'Area = 62 m2' under the room name -> a short letter
+# prefix with ':' / '=' is the tag's own label, not a room number
+_TAG = re.compile(r"^(?:(?:[A-Za-z]{1,4}|area)\s*[:=]\s*)?(?:(?P<no>[A-Z]{0,3}\d{1,4}(?:\.[A-Z0-9]{1,3})?)\s*[-–:]\s*)?(?P<v>\d{1,3}(?:[,']\d{3})+|\d+(?:[.,]\d+)?)"
                   r"\s*(?P<u>SF|S\.F\.|SQ\.?\s*FT\.?|FT²|FT2|m²|m2|qm|sqm)$", re.I)
 _SYN = {"gym": ["fitness", "gym", "weight", "exercise"], "toilet": ["rest", "toilet", "wc", "restroom", "lavatory"],
         "restroom": ["rest", "toilet", "restroom"], "kitchen": ["kitchen", "kitchenette", "pantry", "break"],
@@ -34,6 +36,36 @@ _STOP = {"what", "is", "the", "of", "area", "areas", "how", "big", "large", "in"
          "meters", "m²", "m2", "sf", "ft²", "ft2", "sq", "ft", "room", "rooms", "this", "on", "floor", "plan", "sheet",
          "drawing", "a", "an", "which", "one", "are", "there", "size", "total", "net", "gross", "all", "and", "to",
          "for", "at", "shown", "level", "first", "1st", "ground", "do", "does", "have", "has", "space", "spaces", "s"}
+
+
+_SCOPE_WORDS = {"module", "modules", "wing", "wings", "building", "buildings", "storey", "storeys", "story", "level",
+                "levels", "second", "third", "fourth", "upper", "lower", "basement", "north", "south", "east", "west",
+                "administration", "admin", "area", "zone", "block", "part", "section", "together", "combined", "sum",
+                "altogether", "overall", "gesamt", "whole", "entire", "together"}
+_FILLER = {"floor", "private", "public", "across", "including", "included", "excluding", "inside", "within", "under",
+           "over", "between", "from", "through", "drawn", "plan", "sheet", "here", "listed", "printed", "labelled",
+           "labeled", "named", "called", "marked", "tagged", "together", "rooms", "room", "spaces", "space", "net",
+           "usable", "useful", "internal", "interior", "type", "types", "each", "both", "every", "what", "much"}
+_NUMBER_WORDS = {"two": 2, "three": 3, "four": 4, "five": 5, "six": 6, "seven": 7, "eight": 8, "nine": 9, "ten": 10,
+                 "eleven": 11, "twelve": 12}
+
+
+def _cached_layer(img_abs: str):
+    """The image's text layer when some reader already read it (raster / label_count / W5's warm pre-read), else None
+    (same test as label_count._image_lines: never a fresh OCR from here)."""
+    try:
+        from stoa.solvers.raster import textlayer as T
+
+        tag = T.file_tag(img_abs)
+        cached = any(k.startswith(f"{img_abs}{tag}|") for k in list(T._mem)) or \
+            T._disk_key(img_abs, 1100, "local").exists()
+        if not cached:
+            from stoa import ocr
+
+            cached = ocr.cached(img_abs)
+        return T.text_layer(img_abs) if cached else None
+    except Exception:  # noqa: BLE001
+        return None
 
 
 @functools.lru_cache(maxsize=64)
@@ -93,13 +125,35 @@ class AreaTags(BaseSolver):
     sources = ()
 
     def can_handle(self, path: str, question: str) -> bool:
-        return str(path).lower().endswith(".pdf")
+        return str(path).lower().endswith((".pdf", ".png", ".jpg", ".jpeg", ".tif", ".tiff", ".webp"))
 
     def solve(self, path: str, question: str) -> Answer:
         from stoa.data import abspath
 
+        img = not str(path).lower().endswith(".pdf")
+        layer = None
+        if img:
+            # VP 19:27: stoa.sheet reads the same views / room tags on Stoa's PNGs as on their PDF twins (AFCEE A-101
+            # PNG sl-100 702 / sl-101 362 / sl-102 1388 with a sum rule; d24 sl-101 raster 484). Images: only VP's
+            # scoped, NAMED tags on an already-read text layer (no fresh OCR here)
+            layer = _cached_layer(str(abspath(path)))
+            if layer is None:
+                return self.abstain("image without a text layer read yet (area tags need the printed tags)")
+        scoped = ()
+        try:  # VP 18:43: the room tags of the view(s) the question means, rotation-aware, one per room (night-VP
+            # stoa/sheet/labels.py; measured 2 W / 0 L on X1 stoa-like dev + D1's probes); () -> every tag as before
+            from stoa.sheet.labels import as_area_tags
+
+            scoped = (as_area_tags(str(abspath(path)), question, layer=layer) if img else
+                      as_area_tags(str(abspath(path)), question)) or ()
+            if scoped and not any(t.get("name") or t.get("number") for t in scoped):
+                scoped = ()  # S0 d25: a scope of only unnamed totals (CTR A101: 5 x '21996 SF') names no room
+        except Exception:  # noqa: BLE001 - module not merged yet, or it failed on this sheet
+            scoped = ()
+        if img and not scoped:
+            return self.abstain("no named room area tags in the image's plan views")
         try:
-            tags = list(read_tags(str(abspath(path))))
+            tags = list(scoped or read_tags(str(abspath(path))))
         except Exception as e:  # noqa: BLE001
             return self.abstain(f"could not read the PDF text ({type(e).__name__})")
         if len(tags) < 3:
@@ -109,7 +163,7 @@ class AreaTags(BaseSolver):
 
             from stoa.router.recognize import _pdf
 
-            if _pdf(str(abspath(path)), os.stat(abspath(path)).st_mtime)["bim_fill"] >= 2:
+            if not img and _pdf(str(abspath(path)), os.stat(abspath(path)).st_mtime)["bim_fill"] >= 2:
                 return self.abstain("IfcConvert-style sheet: plan_rooms measures its room fills")
         except Exception:  # noqa: BLE001
             pass
@@ -136,7 +190,7 @@ class AreaTags(BaseSolver):
             [f"converted from the sheet's {('ft²' if tags[0]['unit'] == 'ft2' else 'm²')} (1 ft² = 0.09290304 m²)"]
 
         def ev(ts, note=None):
-            return [Evidence(file=path, page=0, bbox=t["bbox"], bbox_space="pdf_pt", exact=True,
+            return [Evidence(file=path, page=0, bbox=t["bbox"], bbox_space="image_px" if img else "pdf_pt", exact=not img,
                              note=note or f"{_label(t)}: {t['text']}") for t in ts[:80]]
 
         def ans(v, ts, conf, assumptions, missing=None, extra_trace=None):
@@ -146,7 +200,9 @@ class AreaTags(BaseSolver):
 
         sup = re.search(r"\b(largest|biggest|smallest)\b", q)
         total = re.search(r"\b(total|sum|all|combined|altogether|overall|gesamt)\b", q)
-        count = re.search(r"\bhow many\b|\bnumber of\b", q)
+        # H 19:06: 'How many square metres is the west wing in total?' answered '4 count' (the number of tags)
+        count = re.search(r"\bhow many\b(?!\s+(?:square|sq\b|sq\.|m²|m2|ft²|ft2|sf|cubic|linear|metres|meters|feet))|"
+                          r"\bnumber of\b", q)
         units_scope = re.search(r"\b(units?|apartments?|dwellings?|flats?)\b", q)
         scope = named
         if units_scope:
@@ -246,6 +302,33 @@ class AreaTags(BaseSolver):
             s = sum(conv(t["value"], t["unit"]) for t in picked)
             return ans(s, picked, 0.8, [f"sum of the named rooms' area tags: " + " + ".join(
                 f"{_label(t)} {t['text'].split(' - ')[-1]}" for t in picked)])
+        if total and len(loose) > len(named) and not scoped:
+            # H 19:06 (AFCEC A-2 PDF, 4 named + 12 unlabelled figures = the SQUARE FOOTAGE table): 'the west wing's
+            # total area in m²' summed the 4 named tags (1580.19 m² @0.6; gold 7,009 SF printed in the table)
+            return self.abstain(f"{len(loose)} of {len(tags)} area figures carry no room name (a printed area table, "
+                                "not room tags): a total is read from the table, not summed from tags", trace)
+        if total and not units_scope:
+            # VP 19:06 / E1 19:07 (AFCEE A-101, X1 sl-096): 'combined area of the four private offices in the
+            # administration module' summed every scoped tag (1887 SF, gold 362); 'total floor area of all Manager
+            # Offices' -> 3275 (E1: 281). Room words that pick a PROPER subset of >= 2 tags -> the sum of that subset.
+            # Scope words (module / wing / storey names) are VP's scope_for's job, not a room name.
+            room_words = name_words - _SCOPE_WORDS - _FILLER - set(_NUMBER_WORDS)
+            every = re.search(r"\ball (?:the )?(?:rooms|spaces)\b|\bevery (?:room|space)\b", q)  # scope words name the view
+            sub = matches(room_words, scope) if room_words and not every else []
+            if room_words and not every and not sub:
+                # X1 sl-127 / sc-083 (EFA scans): 'total floor area of English 1 to English 5' summed every tag (2388 m²)
+                # when no tag is named 'English': rooms the question names that no tag carries -> not this reader
+                return self.abstain(f"no area tag is named like {sorted(room_words)[:4]} (the rooms the question "
+                                    "sums)", trace)
+            if 2 <= len(sub) < len(scope):
+                s = sum(conv(t["value"], t["unit"]) for t in sub)
+                said = next((n for w, n in _NUMBER_WORDS.items() if re.search(rf"\b{w}\b", q)), None)
+                conf = 0.8 if said == len(sub) else (0.45 if said else 0.65)
+                return ans(s, sub, conf, [f"sum of the {len(sub)} area tags named like {sorted(room_words)[:4]}: " + " + ".join(
+                    f"{_label(t)} {t['text'].split(' - ')[-1]}" for t in sub[:12]) + (" …" if len(sub) > 12 else "")],
+                    [f"the question says {said} rooms, {len(sub)} tags match"] if said and said != len(sub) else
+                    ["rooms named like that without an area tag are not in the sum"],
+                    [f"total of a named subset: {len(sub)} of {len(scope)} tags"])
         if total:
             s = sum(conv(t["value"], t["unit"]) for t in scope)
             printed = [t for t in loose if conv(t["value"], t["unit"]) >= 0.8 * s]

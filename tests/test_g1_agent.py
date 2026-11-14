@@ -534,3 +534,23 @@ def test_hybrid_counts_only_on_uploads():
     assert vision.wanted(lora, "How many doors?", "/tmp/upload/plan.png")
     prior = Answer(value=1, unit="count", confidence=0.2, solver="pipeline/prior")
     assert vision.wanted(prior, "How many doors?", "data/cubicasa5k/colorful-4539.png")  # nothing usable: still looks
+
+
+def test_area_tags_total_of_named_subset(monkeypatch):
+    """VP 19:06 / E1 19:07 (AFCEE A-101 sl-096): 'combined area of the four private offices' summed every scoped tag
+    (1887 SF, gold 362); room words picking a proper subset of >= 2 tags -> that subset's sum; 'all rooms in X' -> all."""
+    import stoa.solvers.area_tags as A
+
+    def tag(name, no, v):
+        return {"name": name, "number": no, "value": v, "unit": "ft2", "text": f"{v} SF", "bbox": [0, 0, 1, 1]}
+
+    tags = (tag("Fitness and Sports Manager Office", "2.04", 120), tag("NCOIC Office", "2.05", 81),
+            tag("Operations Manager Office", "2.06", 80), tag("Sports Program Manager Office", "2.07", 81),
+            tag("Staff Workstations", "2.00", 702), tag("Corridor", "2.01", 300), tag("Break Room", "2.03", 523))
+    monkeypatch.setattr(A, "read_tags", lambda *a, **k: tags)
+    t = A.AreaTags()
+    a = t.solve("/tmp/upload/a101.pdf", "What is the combined area of the four private offices in the administration module?")
+    assert a.value == 362.0 and a.confidence == 0.8
+    assert t.solve("/tmp/upload/a101.pdf", "What is the total floor area of all Manager Offices?").value == 281.0
+    assert t.solve("/tmp/upload/a101.pdf", "What is the total floor area of all rooms in the administration module?"
+                   ).value == 1887.0

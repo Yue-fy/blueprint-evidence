@@ -801,12 +801,18 @@ def test_printed_area_table_answers_totals_types_and_wings(tmp_path):
     assert b is not None and b.value == 6095 + 6285 and len(b.evidence) == 2
     assert answer(f, "How many square feet of circulation does the north wing have?").value == 1403
     assert answer(f, "What is the total area of the west wing?").value == 7009
+    # H 19:23: 'm²' in the question and possessives ('the west wing's') used to find no row
+    w = answer(f, "What is the total area of the west wing in m²?")
+    assert w is not None and w.unit == "m2" and abs(w.value - 7009 * 0.09290304) < 0.01
+    assert answer(f, "What is the west wing's total area in m²?") is not None
+    assert answer(f, "How big is the north wing's dormitory?").value == 6285
     assert answer(f, "How many rooms are on this floor?") is None
     from stoa.contract import Answer
 
     kept = prefer_printed_table(f, "What is the total area of the west wing?", Answer(value=7009, unit="ft2",
                                                                                       confidence=0.6, solver="x"))
-    assert kept.solver == "x" and "printed area table" in kept.trace[-1]
+    assert kept.solver == "x" and any("printed area table" in t for t in kept.trace) and kept.confidence == 0.85
+    assert kept.evidence and kept.evidence[0].exact
     rep = prefer_printed_table(f, "What is the total area of the west wing?", Answer(value=1580.2, unit="m2",
                                                                                      confidence=0.6, solver="x"))
     assert rep.value == 7009 and rep.solver == "area_table" and rep.confidence == 0.85
@@ -853,6 +859,43 @@ def test_slab_area_by_type_ignores_joints_and_dimension_lines(tmp_path):
     assert answer(f, "How many different slab types are called out on the plan?").value == 2
     pn = answer(f, "Into how many panels do the control joints (CJ) divide the 150 mm D13 slab?")
     assert pn is not None and (pn.value, pn.unit) == (2, "count") and len(pn.evidence) == 2
+
+
+def test_slab_area_on_a_picture_traced_into_lines(tmp_path):
+    """E1 cycle 9 (H 18:54, QA 18:56: Stoa's S-100F as PNG lost every slab answer): on P1's traced copy of a picture
+    (one pen for every line, invisible OCR text) the callout's OCR lines are stacked into one block, a DASHED slab
+    edge (real gaps; a PDF strokes it whole) still bounds the slab, and two OCR'd numbers that equal the traced sides
+    become the answer (their product, conf 0.6)."""
+    import pymupdf
+
+    from stoa.evidence import slabs
+
+    f = str(tmp_path / "plan.s6000.vec6.pdf")
+    doc = pymupdf.open()
+    pg = doc.new_page(width=842, height=595)
+    sh = pg.new_shape()
+    # slab A: x 100..400, y 100..300 pt (1:50 -> 5.29 x 3.53 m); slab B to its right up to x 700; A's right edge dashed
+    for a, b in [((100, 100), (700, 100)), ((100, 300), (700, 300)), ((100, 100), (100, 300)), ((700, 100), (700, 300))]:
+        sh.draw_line(a, b)
+    y = 100.0
+    while y < 300:
+        sh.draw_line((400, y), (400, min(300.0, y + 12)))
+        y += 17  # 5 pt gaps
+    sh.finish(color=(0, 0, 0), width=0.4)
+    sh.commit()
+    for (x, yy), t in [((150, 150), "150 SLAB-ON-GRADE W/"), ((150, 158), "D13 @ 300"), ((150, 166), "TOP OF SLAB"),
+                       ((550, 250), "300 SLAB-ON-GRADE W/ D16 @ 300"), ((240, 75), "5290"), ((440, 200), "3530"),
+                       ((600, 560), "SCALE 1:50")]:
+        pg.insert_text((x, yy), t, fontsize=6, render_mode=3)
+    doc.save(f)
+    with pymupdf.open(f) as d:
+        assert slabs.ocr_layer(d[0])
+        texts = [b[4] for b in slabs.text_blocks(d[0])]
+    assert any("150 SLAB-ON-GRADE W/" in t and "D13 @ 300" in t for t in texts), texts
+    assert slabs._traced(f, 0)
+    a = slabs.answer(f, "What is the area of the 150 SLAB-ON-GRADE W/ D13 @ 300?")
+    assert a is not None and a.value == round(5290 * 3530 / 1e6, 3) and a.confidence == 0.6, (a and a.value, a)
+    assert [e.exact for e in a.evidence[:2]] == [False, False]  # OCR'd number boxes are approximate
 
 
 def test_door_arcs_exploded_into_segments_count_and_grid_bubbles_do_not(tmp_path):
@@ -963,3 +1006,355 @@ def test_area_answered_with_a_printed_extent_string_becomes_its_product():
     assert _imp_mm(_IMP_THK.search('1’-9" SLAB-ON-GRADE W/#5 @ 8" E.W.')) == 533
     assert _imp_mm(_IMP_THK.search('12" SLAB-ON-GRADE U.N.O.')) == 305
     assert _BAR.findall('W/#5 @ 12"') == ["#5"]
+
+
+def test_exploded_dash_line_across_a_room_does_not_split_it(tmp_path):
+    """D1 17:23 (EFA school sheets): a grid / centre line drawn as dozens of short one-segment pieces with small gaps
+    was closed into a wall by the gap closing and sliced the Main Hall (59.6 of 180 m²)."""
+    import pymupdf
+
+    from stoa.evidence.linework import measure_room
+
+    f = str(tmp_path / "dashed.pdf")
+    _room_sheet(f)
+    doc = pymupdf.open(f)
+    pg = doc[0]
+    x = 60.0
+    while x < 440:  # a dash line at y = 140 through both rooms: 3 pt pieces, 1.5 pt gaps, each its own path
+        sh = pg.new_shape()
+        sh.draw_line((x, 140), (x + 3, 140))
+        sh.finish(color=(0, 0, 0), width=0.25, closePath=False)
+        sh.commit()
+        x += 4.5
+    out = str(tmp_path / "dashed2.pdf")
+    doc.save(out)
+    r = measure_room(out, 0, (200, 173), 100)
+    assert r is not None and abs(r["area_m2"] / 37.34 - 1) <= 0.03, r
+
+
+def test_area_table_on_an_image_text_layer_and_its_table_box():
+    """H 17:26 / 18:36: Stoa's AFCEC A-2 as PNG. Rows pair from image text (px units: wide label-value gaps, one-line
+    'LABEL = N SF' reads split); a tile-cut layer (',095 SF') still locates the table's box for a crop re-read."""
+    from types import SimpleNamespace as NS
+
+    from stoa.evidence.areatable import _item_lines, _pair, _table_box
+
+    items = [("WEST WING DORMITORY =", [100, 100, 500, 140]), ("6,095 SF", [1300, 100, 1460, 140]),
+             ("WEST WING CIRCULATION =", [100, 160, 520, 200]), ("914 SF", [1340, 160, 1460, 200]),
+             ("TOTAL WEST WING = 7,009 SF", [100, 220, 1460, 260]), ("UTILITY=", [100, 280, 260, 320]),
+             ("328 SF", [1340, 280, 1460, 320])]
+    rs = _pair(_item_lines(items))
+    got = {r[0]: r[1] for r in rs}
+    assert got == {"WEST WING DORMITORY": 6095, "WEST WING CIRCULATION": 914, "TOTAL WEST WING": 7009,
+                   "UTILITY": 328}
+    cut = [("WEST WING D", [100, 100, 300, 140]), (",095 SF", [1320, 100, 1460, 140]), ("914 SF", [1340, 160, 1460, 200]),
+           (",009 SF", [1320, 220, 1460, 260]), ("TOTAL WEST", [100, 220, 300, 260]), ("Bedroom", [3000, 900, 3200, 940])]
+    tl = NS(size=(6000, 4000), items=[NS(text=t, box=b) for t, b in cut])
+    assert _pair(_item_lines(cut)) == ()
+    x0, y0, x1, y1 = _table_box(tl)
+    assert x0 < 100 and x1 > 1460 and y0 < 100 and y1 > 260 and x1 < 3000
+
+
+def test_measure_room_anchored_ignores_free_standing_court_lines(tmp_path):
+    """X1 18:15 / captain 18:21 (2): on a solid-wall sheet the label of a sports hall sits inside court markings that
+    touch no wall; the room is the hall (20 x 15 m at 1:200), not the court cell around the label. A thin partition
+    that touches a wall still splits rooms."""
+    import pymupdf
+
+    from stoa.evidence import linework as L
+
+    f = str(tmp_path / "hall.pdf")
+    doc = pymupdf.open()
+    pg = doc.new_page(width=842, height=595)
+    u = 1 / (200 * L.PT_TO_M_AT_1)  # pt per metre at 1:200
+    x0, y0, x1, y1 = 100, 100, 100 + 20 * u, 100 + 15 * u
+    t = 0.3 * u
+    sh = pg.new_shape()
+    for r in [(x0 - t, y0 - t, x1 + t, y0), (x0 - t, y1, x1 + 30 * u, y1 + t), (x0 - t, y0, x0, y1),
+              (x1, y0 - t, x1 + t, y1), (x1 + 30 * u, y0 - t, x1 + 30 * u + t, y1 + t),
+              (x1, y0 - t, x1 + 30 * u, y0)]:
+        sh.draw_rect(pymupdf.Rect(*r))
+    sh.finish(color=None, fill=(0, 0, 0))
+    cx, cy = (x0 + x1) / 2, (y0 + y1) / 2
+    sh.draw_rect(pymupdf.Rect(cx - 4 * u, cy - 3 * u, cx + 4 * u, cy + 3 * u))  # court: touches no wall
+    sh.draw_line((cx, cy - 3 * u), (cx, cy + 3 * u))
+    sh.draw_line((x1 + 15 * u, y0), (x1 + 15 * u, y1))  # partition in the next block: touches both walls
+    sh.finish(color=(0, 0, 0), width=0.28)
+    sh.commit()
+    doc.save(f)
+    m = L.measure_room(f, 0, (cx - 2 * u, cy), 200)
+    assert m is not None and abs(m["area_m2"] - 300) < 0.03 * 300 and m["variant"].startswith("anch")
+    right = L.measure_room(f, 0, (x1 + 7 * u, cy), 200)
+    assert right is not None and abs(right["area_m2"] - 15 * 15) < 0.03 * 225
+
+
+def test_lineplan_follows_a_leader_arrow_from_a_label_outside_its_room(tmp_path):
+    """W5 18:26 (Stoa AFCEC A-101 'Break Room'): the room name is printed outside the room with a straight arrow (filled
+    head) pointing into it; the room is measured at the arrow's tip, not around the label."""
+    import pymupdf
+
+    from stoa.evidence import linework as L
+    from stoa.evidence.lineplan import _arrow_tip, _measure
+
+    f = str(tmp_path / "arrow.pdf")
+    doc = pymupdf.open()
+    pg = doc.new_page(width=842, height=595)
+    u = 1 / (100 * L.PT_TO_M_AT_1)  # 1:100
+    x0, y0, x1, y1 = 200, 100, 200 + 5 * u, 100 + 4 * u
+    sh = pg.new_shape()
+    sh.draw_rect(pymupdf.Rect(x0, y0, x1, y1))
+    sh.draw_rect(pymupdf.Rect(100, 50, 700, 560))  # the view frame: the label's own region is closed but huge
+    cx = (x0 + x1) / 2
+    sh.draw_line((cx, y1 + 30), (cx, y1 - 40))  # leader: tail under-ish the label, tip inside the room
+    sh.finish(color=(0, 0, 0), width=0.5)
+    sh.draw_polyline([(cx - 3, y1 - 34), (cx + 3, y1 - 34), (cx, y1 - 42), (cx - 3, y1 - 34)])
+    sh.finish(color=(0, 0, 0), fill=(0, 0, 0), width=0.1)
+    sh.commit()
+    pg.insert_text((cx - 20, y1 + 42), "Break Room", fontsize=7)
+    doc.save(f)
+    box = next(b for t, b in L.text_lines(f, 0) if "Break" in t)
+    tip = _arrow_tip(f, 0, tuple(box))
+    assert tip is not None and x0 < tip[0] < x1 and y0 < tip[1] < y1
+    m = _measure(f, 0, ((box[0] + box[2]) / 2, (box[1] + box[3]) / 2), 100, tuple(box))
+    assert m is not None and abs(m["area_m2"] - 20) < 0.06 * 20 and "leader arrow" in m.get("seed_note", "")
+
+
+def test_measure_room_bridges_a_wide_opening_between_collinear_wall_stubs(tmp_path):
+    """E1 c8 fallback (EFA 'Food bay', Nursery): a room opens into a labelled neighbour through a 2 m gap between two
+    stubs of one solid wall, wider than any door gap; every normal reading swallows the neighbour's label, so the wall
+    line is closed across the gap. Without the fallback: no outline."""
+    import pymupdf
+
+    from stoa.evidence import linework as L
+
+    f = str(tmp_path / "bridge.pdf")
+    doc = pymupdf.open()
+    pg = doc.new_page(width=842, height=595)
+    u = 1 / (100 * L.PT_TO_M_AT_1)  # 1:100
+    x0, y0, x1, y1, x2 = 100, 100, 100 + 6 * u, 100 + 5 * u, 100 + 10 * u
+    t = 0.25 * u
+    sh = pg.new_shape()
+    for r in [(x0 - t, y0 - t, x2 + t, y0), (x0 - t, y1, x2 + t, y1 + t), (x0 - t, y0, x0, y1), (x2, y0, x2 + t, y1),
+              (x1, y0, x1 + t, y0 + 1.5 * u), (x1, y1 - 1.5 * u, x1 + t, y1)]:  # middle wall: 2 m gap
+        sh.draw_rect(pymupdf.Rect(*r))
+        sh.finish(color=None, fill=(0, 0, 0))  # one fill path per wall piece, as the EFA sheets draw them
+    sh.commit()
+    pg.insert_text((x1 + 1.5 * u, (y0 + y1) / 2), "Lobby", fontsize=7)
+    doc.save(f)
+    L._page.cache_clear()
+    m = L.measure_room(f, 0, (x0 + 2 * u, (y0 + y1) / 2), 100)
+    assert m is not None and m["variant"].startswith("bridge@") and abs(m["area_m2"] - 30) < 0.04 * 30
+
+
+def test_numbered_room_ranges_are_expanded():
+    """X1 scan sc-077 'total floor area of English 1 to English 5' found no label (277.1 vs gold 275 once listed)."""
+    from stoa.evidence.lineplan import expand_ranges as e
+
+    assert e("What is the total floor area of English 1 to English 5?") == \
+        "What is the total floor area of English 1, English 2, English 3, English 4 and English 5?"
+    assert e("Group Room 1 to Group Room 3 combined area?") == "Group Room 1, Group Room 2 and Group Room 3 combined area?"
+    assert e("How big are Classroom 3-6 together?").count("Classroom") == 4
+    for q in ("What is the area between 3 to 5 m?", "levels 1 to 3", "grid lines A-1 to A-4", "How big is the English 1?"):
+        assert e(q) == q
+
+
+def test_traced_copy_gets_wall_fills_and_loses_its_dash_outlines(tmp_path, monkeypatch):
+    """E1 cycle 9 (X1 19:20): a picture of a solid-wall sheet traced into ink OUTLINES has no fills (no solid-wall
+    reading ran: Studio 47.79 vs 55.6 on the PDF) and its dashed grid lines are rows of small closed outlines that
+    _drop_dashed never saw (they closed the Studio at 5.86 m instead of 6.76)."""
+    import pymupdf
+
+    from stoa.evidence import linework as L
+
+    f = str(tmp_path / "pic.vec6.pdf")
+    doc = pymupdf.open()
+    pg = doc.new_page(width=600, height=400)
+    sh = pg.new_shape()
+    for x0, y0, x1, y1 in [(100, 100, 400, 103), (100, 297, 400, 300), (100, 100, 103, 300), (397, 100, 400, 300)]:
+        sh.draw_polyline([(x0, y0), (x1, y0), (x1, y1), (x0, y1), (x0, y0)])  # a 3 pt wall strip, outlined
+    x = 105.0
+    while x < 390:  # a dashed grid line across the room: 5 pt dashes, 2 pt gaps, each a closed outline
+        sh.draw_polyline([(x, 199.6), (x + 5, 199.6), (x + 5, 200.4), (x, 200.4), (x, 199.6)])
+        x += 7
+    sh.finish(color=(0, 0, 0), width=0.24, closePath=False)
+    sh.commit()
+    pg.insert_text((200, 150), "Studio", fontsize=6, render_mode=3)
+    doc.save(f)
+    p = L._page(f, 0)  # default: dashes kept apart (rooms ignore them), no rebuilt fills (E1_TRACED_FILLS=0)
+    assert len(p["strokes"]) == 4 and len(p["dashes"]) == 41 and not p["fills"]
+    monkeypatch.setattr(L, "TRACED_FILLS", True)
+    if hasattr(L._page, "cache_clear"):
+        L._page.cache_clear()
+    if hasattr(L._solid_walls, "cache_clear"):
+        L._solid_walls.cache_clear()
+    p = L._page(f, 0)
+    assert len(p["fills"]) >= 1 and L._solid_walls(f, 0)
+    if hasattr(L._page, "cache_clear"):
+        L._page.cache_clear()
+    if hasattr(L._solid_walls, "cache_clear"):
+        L._solid_walls.cache_clear()
+
+
+def test_area_table_on_a_damaged_image_layer_abstains_or_reads_the_crop(monkeypatch):
+    """H 20:00 / QA 20:10 (Stoa's AFCEC PNG, a fresh VLM read): labels cut at the cell edge ('RMITORY', 'E CIRCULATION'),
+    a neighbour tile's 'DORMITORY =' without its wing, title-block text to the RIGHT of a value whose own label was lost.
+    Such a layer never answers on its own (it gave 'north wing dormitory' = the west wing's 6,095 @0.7 and 'total
+    circulation' = one row 1,240 @0.7): the table crop is OCR'd; with no crop read the reader abstains. A question naming a
+    wing never takes a row that names no wing on a table that names wings."""
+    from types import SimpleNamespace as NS
+
+    from stoa.evidence import areatable as A
+
+    def it(t, b):
+        return NS(text=t, box=b)
+
+    dmg = [it("DORMITORY =", [4880, 1013, 5070, 1058]), it("6,095 SF", [5300, 1013, 5458, 1058]),
+           it("TOTAL WEST WING =", [4576, 1181, 4900, 1227]), it("7,009 SF", [5300, 1181, 5457, 1227]),
+           it("RMITORY =", [4880, 1564, 5040, 1609]), it("6,285 SF", [5300, 1564, 5457, 1609]),
+           it("E CIRCULATION =", [4880, 1894, 5100, 1939]), it("1,240 SF", [5300, 1894, 5457, 1939]),
+           it("6,092 SF", [5300, 1285, 5458, 1343]), it("FEBRUARY 2024", [5480, 1280, 5711, 1340])]
+    tl = NS(size=(6000, 3882), items=dmg)
+    monkeypatch.setattr(A, "_cached_layer", lambda p: tl)
+    monkeypatch.setattr(A, "_crop_rows", lambda p, t, b: ())
+    rs = A._pair(A._item_lines((x.text, x.box) for x in dmg), left_only=True)
+    assert all(r[0] != "FEBRUARY 2024" for r in rs)  # title-block text right of a value is never its label
+    assert A._suspect(rs, tl, A._table_box(tl))
+    assert A.image_rows("plan.png") == ()
+    assert A.answer("plan.png", "What is the dormitory area of the north wing in square feet?") is None
+    good = [("WEST WING DORMITORY", 6095.0, "ft2", (0, 0, 9, 9)), ("WEST WING CIRCULATION", 914.0, "ft2", (0, 10, 9, 19)),
+            ("TOTAL WEST WING", 7009.0, "ft2", (0, 20, 9, 29)), ("NORTH WING CIRCULATION", 1403.0, "ft2", (0, 30, 9, 39)),
+            ("DORMITORY", 6285.0, "ft2", (0, 40, 9, 49))]
+    monkeypatch.setattr(A, "_crop_rows", lambda p, t, b: tuple(good))
+    assert A.image_rows("plan.png") == tuple(good)  # the crop's rows (no word test on the crop read)
+    assert A.answer("plan.png", "What is the dormitory area of the north wing in square feet?") is None
+    assert A.answer("plan.png", "What is the dormitory area of the west wing?").value == 6095
+    nowing = [("DORMITORY", 6285.0, "ft2", (0, 0, 9, 9)), ("CIRCULATION", 1403.0, "ft2", (0, 10, 9, 19)),
+              ("TOTAL", 7688.0, "ft2", (0, 20, 9, 29))]
+    monkeypatch.setattr(A, "_crop_rows", lambda p, t, b: tuple(nowing))
+    a = A.answer("plan.png", "What is the dormitory area of the north wing?")
+    assert a is not None and a.value == 6285 and a.confidence <= 0.3 and "names no north" in a.assumptions[-1]
+    from stoa.contract import Answer
+
+    kept = A.prefer_printed_table("plan.png", "What is the dormitory area of the north wing?",
+                                  Answer(value=6000, unit="ft2", confidence=0.4, solver="x"))
+    assert kept.solver == "x" and "not used" in kept.trace[-1]
+
+
+def test_dashed_room_separation_line_still_bounds_a_room(tmp_path, monkeypatch):
+    """QA 20:00 (EFA 'PE Store', 50.19 ✓ at d23 -> abstained): a dashed line drawn wall to wall between two rooms is a
+    ROOM SEPARATION, not a grid line: it is kept (both ends on wall ink, its middle on none). A dashed grid line that
+    crosses the walls and ends outside the building is still dropped."""
+    import pymupdf
+
+    from stoa.evidence import linework as L
+
+    f = str(tmp_path / "sep.pdf")
+    _room_sheet(f)
+    doc = pymupdf.open(f)
+    pg = doc[0]
+
+    def dashes(x0, x1, y):
+        x = x0
+        while x < x1:
+            sh = pg.new_shape()
+            sh.draw_line((x, y), (min(x + 3, x1), y))
+            sh.finish(color=(0.5, 0.5, 0.5), width=0.25, closePath=False)
+            sh.commit()
+            x += 4.5
+
+    dashes(60, 440, 140)  # grid line through both rooms, out past the walls
+    dashes(100, 300, 190)  # separation inside Room A, wall to wall
+    out = str(tmp_path / "sep2.pdf")
+    doc.save(out)
+    r = L.measure_room(out, 0, (200, 160), 100)
+    k = 0.0352778  # m per pt at 1:100
+    assert r is not None and abs(r["area_m2"] / (200 * 90 * k * k) - 1) <= 0.03, r
+    monkeypatch.setattr(L, "KEEP_SEPARATIONS", False)
+    L._page.cache_clear()
+    L._dist.cache_clear() if hasattr(L._dist, "cache_clear") else None
+    r2 = L.measure_room(out, 0, (200, 160), 100)
+    assert r2 is not None and r2["area_m2"] > 30, r2
+
+
+def test_straight_door_leaf_without_an_arc_closes_its_opening(tmp_path, monkeypatch):
+    """QA 20:00 (EFA Food Room's bi-fold cupboard): a door drawn as a straight LEAF opened ~30° with no swing arc. Its
+    closed position (the leaf turned onto the wall line at its hinge) closes the opening, as an arc's spokes do; without
+    it the room runs on through the 1.06 m opening into the next room."""
+    import pymupdf
+
+    from stoa.evidence import linework as L
+
+    f = str(tmp_path / "leaf.pdf")
+    doc = pymupdf.open()
+    pg = doc.new_page(width=600, height=400)
+    sh = pg.new_shape()
+    for a, b in [((100, 100), (400, 100)), ((100, 250), (400, 250)), ((100, 100), (100, 250)), ((400, 100), (400, 250)),
+                 ((300, 100), (300, 150)), ((300, 180), (300, 250))]:
+        sh.draw_line(a, b)
+    sh.finish(color=(0, 0, 0), width=1.0)
+    sh.draw_line((300, 150), (285, 150 + 30 * 0.8660254))  # the leaf: 30 pt (1.06 m at 1:100), 30° off the wall line
+    sh.finish(color=(0, 0, 0), width=0.25)
+    sh.commit()
+    doc.save(f)
+    k = 0.0352778  # m per pt at 1:100
+    r = L.measure_room(f, 0, (200, 175), 100)
+    assert r is not None and abs(r["area_m2"] / (200 * 150 * k * k) - 1) <= 0.04, r
+    monkeypatch.setattr(L, "DOOR_LEAVES", False)
+    L._dist.cache_clear()
+    r2 = L.measure_room(f, 0, (200, 175), 100)
+    assert r2 is None or r2["area_m2"] > 45, r2
+
+
+def test_area_table_sum_from_an_image_whose_totals_do_not_add_up_stays_low(monkeypatch):
+    """X1 20:38 (AFCEC 300-dpi scan): the read lost the EAST wing's dormitory row, so 'total dormitory across all three
+    wings' summed two rows (12,380 of 18,472) at 0.6 and replaced a right answer. With a TOTAL row that does not add up
+    the sum stays <= 0.3 (a right 0.4 answer is kept); a one-row lookup <= 0.5."""
+    from stoa.contract import Answer
+    from stoa.evidence import areatable as A
+
+    rows = (("WEST WING DORMITORY", 6095.0, "ft2", (0, 0, 9, 9)), ("WEST WING CIRCULATION", 914.0, "ft2", (0, 10, 9, 19)),
+            ("TOTAL WEST WING", 7009.0, "ft2", (0, 20, 9, 29)), ("EAST WING CIRCULATION", 913.0, "ft2", (0, 30, 9, 39)),
+            ("TOTAL EAST WING", 7005.0, "ft2", (0, 40, 9, 49)), ("NORTH WING DORMITORY", 6285.0, "ft2", (0, 50, 9, 59)),
+            ("NORTH WING CIRCULATION", 1403.0, "ft2", (0, 60, 9, 69)), ("TOTAL NORTH WING", 7688.0, "ft2", (0, 70, 9, 79)))
+    monkeypatch.setattr(A, "image_rows", lambda p: rows)
+    q = "What is the total dormitory area on this floor across all three wings?"
+    a = A.answer("scan.png", q)
+    assert a is not None and a.value == 12380 and a.confidence <= 0.3
+    kept = A.prefer_printed_table("scan.png", q, Answer(value=18472, unit="ft2", confidence=0.4, solver="raster"))
+    assert kept.value == 18472 and kept.solver == "raster"
+    one = A.answer("scan.png", "How many square feet of dormitory does the north wing have?")
+    assert one.value == 6285 and 0.3 < one.confidence <= 0.5
+
+
+def test_semicircle_door_swing_with_its_leaf_closes_the_doorway(tmp_path, monkeypatch):
+    """H 20:37 (Stoa's DfE Multi-Purpose Hall, Ziying's skirting 50.4 m vs ours 53.83): a door drawn as a 180° swing
+    (arc + the leaf back to the hinge, one path) was not taken for a door (30-100° only): the outline followed the arc and
+    the opening was not deducted. With the leaf to the centre it is a door: the doorway is closed on the wall line."""
+    import math
+
+    import pymupdf
+
+    from stoa.evidence import linework as L
+
+    f = str(tmp_path / "semi.pdf")
+    doc = pymupdf.open()
+    pg = doc.new_page(width=600, height=400)
+    sh = pg.new_shape()
+    for a, b in [((100, 100), (400, 100)), ((100, 250), (400, 250)), ((100, 100), (100, 250)), ((400, 100), (400, 250)),
+                 ((300, 100), (300, 150)), ((300, 180), (300, 250))]:
+        sh.draw_line(a, b)
+    sh.finish(color=(0, 0, 0), width=1.0)
+    pts = [pymupdf.Point(300 + 30 * math.sin(math.radians(t)) * -1, 180 - 30 * math.cos(math.radians(t)))
+           for t in range(0, 181, 12)]  # from the doorway tip (300, 150) round into Room A to (300, 210)
+    sh.draw_polyline(pts + [pymupdf.Point(300, 180)])  # + the leaf back to the hinge
+    sh.finish(color=(0, 0, 0), width=0.25, closePath=False)
+    sh.commit()
+    doc.save(f)
+    k = 0.0352778
+    full = 200 * 150 * k * k
+    r = L.measure_room(f, 0, (180, 175), 100)
+    assert r is not None and abs(r["area_m2"] / full - 1) <= 0.025, (r and r["area_m2"], full)
+    monkeypatch.setattr(L, "DOOR_SEMI", False)
+    L._dist.cache_clear()
+    r2 = L.measure_room(f, 0, (180, 175), 100)
+    assert r2 is None or r2["area_m2"] < 0.975 * full or r2["area_m2"] > 1.2 * full, (r2 and r2["area_m2"], full)

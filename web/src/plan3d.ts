@@ -13,17 +13,26 @@
  */
 import * as THREE from "three";
 import { OrbitControls } from "three/examples/jsm/controls/OrbitControls.js";
+import { mergeGeometries } from "three/examples/jsm/utils/BufferGeometryUtils.js";
 import type { Evidence } from "./types";
-import { matchEvidence, planGeo, type BBox, type PlanGeo, type Pt } from "./plangeo";
-import { Look3D } from "./look3d";
+import { matchEvidence, planGeo, type BBox, type PlanGeo, type PlanRoom, type Pt } from "./plangeo";
+import { Look3D, LookPanel, MAX_DPR, ROOM_HEX, ROOM_TYPES, getLook, onLook, roomType, type RoomType } from "./look3d";
 
 type Plan3DGeo = PlanGeo;
 
 const HL = new THREE.Color("#0071e3");
-const FLOOR: Record<string, string> = {
-  bedroom: "#e6edf9", living: "#e7f3e6", kitchen: "#fbf0dc", bath: "#dff0f5", corridor: "#eeeff2",
-  storage: "#ece6f4", outdoor: "#e3efd9", other: "#f1f2f4",
-};
+/** the server's room kinds (stoa/geometry/plan3d.py room_kind) in the shared room types; 'outdoor' is not a type */
+const SERVER_KIND: Record<string, RoomType> = { bedroom: "bedroom", living: "living", kitchen: "kitchen", bath: "wet",
+  corridor: "circulation", storage: "storage" };
+/** a plan room's type: its printed name (look3d.roomType), else the server's kind from the same name ('Zimmer' etc.) */
+function planRoomType(r: PlanRoom): RoomType {
+  const t = roomType(r.name);
+  if (t !== "other" || !r.name || /^\s*room\s*$/i.test(r.name)) return t;
+  return SERVER_KIND[r.kind] ?? "other";
+}
+/** the Clay look's colours (the old calm look) */
+const CLAY_FLOOR = "#f1f0ed", CLAY_DOOR = "#e2dfd9", CLAY_GLASS = "#d9e3ea";
+const WOOD = "#b48d66", GLASS = "#9cc4e2";
 
 interface Target { kind: "room" | "unit" | "door" | "window"; i: number; bbox: BBox; top: THREE.Vector3; meshes: THREE.Mesh[] }
 
@@ -48,12 +57,24 @@ export class Plan3D {
   private lastFramed: BBox | null = null;
   private loadToken = 0;
   private look: Look3D;
+  /** W7: the look's materials (Rooms ↔ Clay swaps their colours), the legend card, the room-type counts */
+  private mats = { floor: new THREE.MeshLambertMaterial({ vertexColors: true }), door: new THREE.MeshLambertMaterial({ color: WOOD }),
+    glass: new THREE.MeshLambertMaterial({ color: GLASS, transparent: true, opacity: 0.5 }) };
+  private floorTypeCol: Float32Array | null = null;
+  private floorGeom: THREE.BufferGeometry | null = null;
+  private roomTypes: RoomType[] = [];
+  private panel: LookPanel;
+  private lit = false;
+  /** hover (W7): the merged floor + wall meshes and each room's vertex range in the floor mesh */
+  private floorMesh: THREE.Mesh | null = null;
+  private wallMesh: THREE.Object3D | null = null;
+  private floorRanges: { i: number; v0: number; v1: number }[] = [];
 
   constructor(el: HTMLElement) {
     this.el = el;
     el.classList.add("v3d");
-    this.renderer = new THREE.WebGLRenderer({ antialias: true, preserveDrawingBuffer: true });
-    this.renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+    this.renderer = new THREE.WebGLRenderer({ antialias: true });
+    this.renderer.setPixelRatio(Math.min(window.devicePixelRatio, MAX_DPR));
     // the canvas colour follows the page theme (--canvas-3d: light grey, or dark grey in dark mode)
     el.append(this.renderer.domElement);
     this.labelLayer.className = "v3d-labels";
@@ -81,6 +102,10 @@ export class Plan3D {
     this.root.add(this.furn);
     this.scene.add(sun, this.root, this.hl);
     new ResizeObserver(() => this.resize()).observe(el);
+    this.panel = new LookPanel(el);
+    onLook(() => this.applyLook());
+    this.installHover();
+    (window as unknown as { __p3d: Plan3D }).__p3d = this; // dev hook (like __v3d): __p3d.stats() for the perf note
     const loop = () => {
       requestAnimationFrame(loop);
       this.controls.update();
@@ -130,9 +155,17 @@ export class Plan3D {
     for (const l of [...this.labels, ...this.pins]) l.el.remove();
     this.labels = [];
     this.pins = [];
+    for (const t of this.targets) for (const m of t.meshes) m.geometry.dispose(); // door / window targets (not in the scene)
     this.targets = [];
     this.geo = null;
     this.file = "";
+    this.floorGeom = null;
+    this.floorMesh = null;
+    this.wallMesh = null;
+    this.floorRanges = [];
+    this.floorTypeCol = null;
+    this.roomTypes = [];
+    this.lit = false;
   }
 
   private shape(pts: Pt[]) {
@@ -142,11 +175,89 @@ export class Plan3D {
     return s;
   }
 
-  /** A prism over a DXF polygon from height z0 to z1, in three.js axes. */
-  private prism(pts: Pt[], z0: number, z1: number, mat: THREE.Material, edges?: THREE.LineBasicMaterial) {
+  /** A prism's geometry over a DXF polygon from height z0 to z1, in three.js axes (no uv: merged geometries must match). */
+  private prismGeom(pts: Pt[], z0: number, z1: number) {
     const g = new THREE.ExtrudeGeometry(this.shape(pts), { depth: z1 - z0, bevelEnabled: false });
     g.rotateX(-Math.PI / 2); // shape (x, y) → (x, −z); extrusion → +y (up)
     g.translate(0, z0, 0);
+    g.deleteAttribute("uv");
+    return g;
+  }
+
+  /** Hovering a room's floor shows its name, type and printed / traced area (W7; same tip as the IFC viewer). */
+  private installHover() {
+    const ray = new THREE.Raycaster();
+    const tip = document.createElement("div");
+    tip.className = "v3d-tip";
+    tip.hidden = true;
+    let last = 0, shown = -1;
+    const hide = () => { tip.hidden = true; shown = -1; };
+    const cv = this.renderer.domElement;
+    cv.addEventListener("pointerleave", hide);
+    cv.addEventListener("pointermove", (e) => {
+      const now = performance.now();
+      if (now - last < 66) return;
+      last = now;
+      if (e.buttons || !this.geo || !this.floorMesh || getLook() !== "rooms" || document.body.dataset.view === "expert") return hide();
+      const r = cv.getBoundingClientRect();
+      ray.setFromCamera(new THREE.Vector2(((e.clientX - r.left) / r.width) * 2 - 1, -((e.clientY - r.top) / r.height) * 2 + 1), this.camera);
+      const hit = ray.intersectObject(this.floorMesh, false)[0];
+      if (!hit || hit.faceIndex == null) return hide();
+      ray.far = hit.distance - 0.05;
+      const front = this.wallMesh ? ray.intersectObject(this.wallMesh, false).length > 0 : false;
+      ray.far = Infinity;
+      if (front) return hide();
+      const v = hit.faceIndex * 3;
+      const fr = this.floorRanges.find((x) => v >= x.v0 && v < x.v1);
+      const room = fr ? this.geo.rooms[fr.i] : null;
+      if (!room) return hide();
+      if (!tip.isConnected) this.labelLayer.append(tip);
+      if (shown !== fr!.i) {
+        const type = planRoomType(room);
+        const kind = ROOM_TYPES.find((t) => t.key === type)?.label ?? "";
+        const name = [room.name, room.number].filter(Boolean).join(" ") || "Room";
+        // DXF metres; `unit` is the apartment the room belongs to ('A')
+        const area = room.area > 0 ? ` · ${room.area >= 100 ? Math.round(room.area) : room.area.toFixed(1)} m²` : "";
+        tip.innerHTML = "<b></b><span></span>";
+        tip.querySelector("b")!.textContent = name;
+        tip.querySelector("span")!.textContent = `${kind}${area}${room.unit ? ` · apartment ${room.unit}` : ""}`;
+        shown = fr!.i;
+      }
+      tip.hidden = false;
+      tip.style.transform = `translate(${e.clientX - r.left + 14}px, ${e.clientY - r.top + 14}px)`;
+    });
+  }
+
+  /** The Rooms / Clay look (W7): floors by room type + wood doors + blue glass, or all clay; an answer fades the
+   * room colours toward white so the accent blue stands out; the legend lists the types this floor has. */
+  private applyLook() {
+    const rooms = getLook() === "rooms";
+    this.mats.door.color.set(rooms ? WOOD : CLAY_DOOR);
+    this.mats.glass.color.set(rooms ? GLASS : CLAY_GLASS);
+    if (this.floorGeom && this.floorTypeCol) {
+      const attr = this.floorGeom.attributes.color as THREE.BufferAttribute;
+      const arr = attr.array as Float32Array;
+      const clay = new THREE.Color(CLAY_FLOOR), white = new THREE.Color("#f3f2ef");
+      for (let i = 0; i < arr.length; i += 3) {
+        const c = rooms ? new THREE.Color(this.floorTypeCol[i], this.floorTypeCol[i + 1], this.floorTypeCol[i + 2]) : clay.clone();
+        if (rooms && this.lit) c.lerp(white, 0.7);
+        arr[i] = c.r; arr[i + 1] = c.g; arr[i + 2] = c.b;
+      }
+      attr.needsUpdate = true;
+    }
+    this.panel.el.classList.toggle("faded", rooms && this.lit);
+    if (!rooms || !this.roomTypes.length) this.panel.setLegend(null);
+    else {
+      const n = new Map<RoomType, number>();
+      for (const t of this.roomTypes) n.set(t, (n.get(t) ?? 0) + 1);
+      this.panel.setLegend(ROOM_TYPES.filter((t) => n.get(t.key)).map((t) => ({ key: t.key, label: t.label, hex: t.hex, n: n.get(t.key)! })));
+    }
+    this.needsRender = true;
+  }
+
+  /** A prism over a DXF polygon from height z0 to z1, in three.js axes. */
+  private prism(pts: Pt[], z0: number, z1: number, mat: THREE.Material, edges?: THREE.LineBasicMaterial) {
+    const g = this.prismGeom(pts, z0, z1);
     const m = new THREE.Mesh(g, mat);
     if (edges) m.add(new THREE.LineSegments(new THREE.EdgesGeometry(g, 30), edges));
     return m;
@@ -154,18 +265,35 @@ export class Plan3D {
 
   private build(geo: Plan3DGeo) {
     const H = geo.heights;
-    // clay-white walls with light edges (the calm look); doors wood, windows glass
-    const wallMat = new THREE.MeshLambertMaterial({ color: "#ecebe7" });
-    const edgeMat = new THREE.LineBasicMaterial({ color: "#a7aeb8" });
-    const doorMat = new THREE.MeshLambertMaterial({ color: "#b98a5e" });
-    const glassMat = new THREE.MeshLambertMaterial({ color: "#8fc6e6", transparent: true, opacity: 0.55 });
-    for (const w of geo.walls) if (w.length >= 3) this.root.add(this.prism(w, 0, H.wall, wallMat, edgeMat));
+    // W7: static geometry merged per material (walls + sills + lintels; wall edges; room floors with vertex colours;
+    // door leaves; glass; fixtures + their edges): ~10 draw calls instead of ~550 on a Swiss floor. Doors and windows
+    // keep their own (unrendered) meshes as highlight targets.
+    // warm off-white walls with thin edges; doors wood, windows light-blue glass (Rooms) or clay (Clay)
+    const wallMat = new THREE.MeshLambertMaterial({ color: "#eeebe5" });
+    const edgeMat = new THREE.LineBasicMaterial({ color: "#a7aeb8", transparent: true, opacity: 0.75 });
+    const walls: THREE.BufferGeometry[] = [], edges: THREE.BufferGeometry[] = [], floors: THREE.BufferGeometry[] = [];
+    const leaves: THREE.BufferGeometry[] = [], panes: THREE.BufferGeometry[] = [];
+    const wall = (pts: Pt[], z0: number, z1: number) => {
+      const g = this.prismGeom(pts, z0, z1);
+      walls.push(g);
+      edges.push(new THREE.EdgesGeometry(g, 30));
+    };
+    for (const w of geo.walls) if (w.length >= 3) wall(w, 0, H.wall);
+    this.roomTypes = [];
+    this.floorRanges = [];
+    const fcol: number[] = [];
+    let nv = 0;
     geo.rooms.forEach((r, i) => {
       if (r.poly.length < 3) return;
-      const mat = new THREE.MeshLambertMaterial({ color: FLOOR[r.kind] ?? FLOOR.other });
-      const m = this.prism(r.poly, 0, 0.02, mat);
-      this.root.add(m);
-      this.targets.push({ kind: "room", i, bbox: r.bbox, top: new THREE.Vector3(r.anchor[0], 0.6, -r.anchor[1]), meshes: [m] });
+      const type = planRoomType(r);
+      this.roomTypes.push(type);
+      const g = this.prismGeom(r.poly, 0, 0.02); // ExtrudeGeometry is non-indexed: vertex ranges = faces
+      this.floorRanges.push({ i, v0: nv, v1: nv + g.attributes.position.count });
+      nv += g.attributes.position.count;
+      const c = new THREE.Color(ROOM_HEX[type]);
+      for (let k = 0; k < g.attributes.position.count; k++) fcol.push(c.r, c.g, c.b);
+      floors.push(g);
+      this.targets.push({ kind: "room", i, bbox: r.bbox, top: new THREE.Vector3(r.anchor[0], 0.6, -r.anchor[1]), meshes: [] });
       if (r.name || r.number) {
         const el = document.createElement("div");
         el.className = "p3d-label";
@@ -176,30 +304,67 @@ export class Plan3D {
     });
     geo.doors.forEach((d, i) => {
       const leaf = d.leaf && d.leaf.length >= 3 ? d.leaf : null;
-      const m = leaf ? this.prism(leaf, 0, H.door, doorMat.clone(), edgeMat) : null;
-      if (m) this.root.add(m);
+      let m: THREE.Mesh | null = null;
+      if (leaf) {
+        const g = this.prismGeom(leaf, 0, H.door);
+        leaves.push(g);
+        edges.push(new THREE.EdgesGeometry(g, 30));
+        m = new THREE.Mesh(g, this.mats.door); // highlight target only (the merged leaves are drawn)
+      }
       // the wall over the opening (door head to the top of the wall), so a door reads as a door, not a slot
-      if (d.gap && d.gap.length >= 3) this.root.add(this.prism(d.gap, H.door, H.wall, wallMat, edgeMat));
+      if (d.gap && d.gap.length >= 3) wall(d.gap, H.door, H.wall);
       const c = center(d.bbox);
       this.targets.push({ kind: "door", i, bbox: d.bbox, top: new THREE.Vector3(c[0], H.door + 0.4, -c[1]), meshes: m ? [m] : [] });
     });
     geo.windows.forEach((w, i) => {
       if (w.foot.length < 3) return;
-      const sill = this.prism(w.foot, 0, H.sill, wallMat, edgeMat);
-      const glass = this.prism(w.foot, H.sill, H.head, glassMat.clone());
-      const lintel = this.prism(w.foot, H.head, H.wall, wallMat, edgeMat);
-      this.root.add(sill, glass, lintel);
+      wall(w.foot, 0, H.sill);
+      const g = this.prismGeom(w.foot, H.sill, H.head);
+      panes.push(g);
+      wall(w.foot, H.head, H.wall);
       const c = center(w.bbox);
-      this.targets.push({ kind: "window", i, bbox: w.bbox, top: new THREE.Vector3(c[0], H.head + 0.4, -c[1]), meshes: [glass] });
+      this.targets.push({ kind: "window", i, bbox: w.bbox, top: new THREE.Vector3(c[0], H.head + 0.4, -c[1]), meshes: [new THREE.Mesh(g, this.mats.glass)] });
     });
+    const add = (gs: THREE.BufferGeometry[], mat: THREE.Material, to: THREE.Object3D = this.root, lines = false) => {
+      if (!gs.length) return null;
+      const g = mergeGeometries(gs, false);
+      if (!g) return null;
+      const o = lines ? new THREE.LineSegments(g, mat as THREE.LineBasicMaterial) : new THREE.Mesh(g, mat);
+      if (!lines) o.userData.shared = false;
+      to.add(o);
+      return o;
+    };
+    this.wallMesh = add(walls, wallMat);
+    add(edges, edgeMat, this.root, true);
+    if (floors.length) {
+      const fg = mergeGeometries(floors, false);
+      if (fg) {
+        this.floorTypeCol = new Float32Array(fcol);
+        fg.setAttribute("color", new THREE.BufferAttribute(new Float32Array(fcol), 3));
+        this.floorGeom = fg;
+        this.floorMesh = new THREE.Mesh(fg, this.mats.floor);
+        this.root.add(this.floorMesh);
+      }
+      floors.forEach((g) => g.dispose());
+    }
+    add(leaves, this.mats.door);
+    add(panes, this.mats.glass);
     // fixtures the drawing contains (kitchen counters, basins, WCs): clay a step darker than the walls
     const fixMat = new THREE.MeshLambertMaterial({ color: "#d6d3cc" });
     const fixEdge = new THREE.LineBasicMaterial({ color: "#b3b8c0" });
+    const fix: THREE.BufferGeometry[] = [], fixE: THREE.BufferGeometry[] = [];
     for (const f of geo.fixtures ?? []) {
       if (f.poly.length < 3) continue;
-      this.furn.add(this.prism(f.poly, 0.02, Math.max(0.1, f.h), fixMat, fixEdge));
+      const g = this.prismGeom(f.poly, 0.02, Math.max(0.1, f.h));
+      fix.push(g);
+      fixE.push(new THREE.EdgesGeometry(g, 30));
       this.fixtureCount++;
     }
+    add(fix, fixMat, this.furn);
+    add(fixE, fixEdge, this.furn, true);
+    // the merged copies are drawn: the pieces can go (door / window targets keep theirs)
+    for (const g of [...walls, ...edges, ...fix, ...fixE]) g.dispose();
+    this.applyLook();
     geo.units.forEach((u, i) => {
       const c = center(u.bbox);
       this.targets.push({ kind: "unit", i, bbox: u.bbox, top: new THREE.Vector3(c[0], H.wall + 0.6, -c[1]), meshes: [] });
@@ -272,6 +437,11 @@ export class Plan3D {
       this.labelLayer.append(el);
       this.pins.push({ el, p: t.top.clone() });
     });
+    // W7: an answer fades the room colours (the accent blue stands out); no answer = full room colours again
+    if (this.lit !== hit.size > 0) {
+      this.lit = hit.size > 0;
+      this.applyLook();
+    }
     const boxes = [...hit.keys()].map((t) => t.bbox);
     if (boxes.length) {
       const u: BBox = [Math.min(...boxes.map((b) => b[0])), Math.min(...boxes.map((b) => b[1])), Math.max(...boxes.map((b) => b[2])), Math.max(...boxes.map((b) => b[3]))];
@@ -283,6 +453,22 @@ export class Plan3D {
 
   frameAll() {
     if (this.geo) this.frame(this.geo.bbox, 1.08);
+  }
+
+  /** Perf note (dev): draw calls, triangles and GPU ms of one plain frame and of one AO frame. */
+  stats() {
+    const gl = this.renderer.getContext();
+    this.renderer.render(this.scene, this.camera);
+    const { calls, triangles } = this.renderer.info.render;
+    let t = performance.now();
+    for (let i = 0; i < 20; i++) this.renderer.render(this.scene, this.camera);
+    gl.finish();
+    const frameMs = (performance.now() - t) / 20;
+    t = performance.now();
+    for (let i = 0; i < 5; i++) this.look.refine();
+    gl.finish();
+    return { calls, triangles, frameMs: Math.round(frameMs * 100) / 100, aoMs: Math.round(((performance.now() - t) / 5) * 100) / 100,
+      pixelRatio: this.renderer.getPixelRatio() };
   }
 
   /** Fit a DXF box (with the wall height) into the view from a fixed oblique direction. */

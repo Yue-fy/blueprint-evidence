@@ -13,17 +13,25 @@
   <header class="m-top">
     <div class="m-logo" aria-hidden="true">S</div>
     <div class="m-brand"><b>Ask a plan</b><small>photo → question → answer on the drawing</small></div>
+    <button id="privBtn" class="priv-toggle m-priv" type="button" role="switch" aria-checked="false" title="Private mode: your photo never leaves our server (no Gemini or NVIDIA steps)"><span class="sw" aria-hidden="true"></span>Private</button>
     <a class="m-desk" href="./">Full view</a>
   </header>
+  <div id="privNote" class="priv-note" role="status" hidden></div>
 
   <main class="m-main">
-    <section id="pick" class="m-card m-pick">
-      <h1>Take a photo of a floor plan</h1>
-      <p>Then ask how big a room is, the total floor area, or how many doors. The answer is drawn on your photo.</p>
-      <label class="m-btn primary huge"><input id="cam" type="file" accept="image/*" capture="environment" />
-        <span class="m-ico" aria-hidden="true">📷</span> Take a photo</label>
-      <label class="m-btn"><input id="pickf" type="file" accept="image/*,.pdf,application/pdf" /> Choose a photo or PDF</label>
-      <button type="button" class="m-link" id="sample">No plan at hand? Try a sample</button>
+    <section id="pick" class="m-pickwrap">
+      <div id="casesCard" class="m-card m-cases">
+        <h1>Try a case</h1>
+        <p>Real drawings, each its own case. Tap one, then a question: the answer is worked out live and marked on the sheet.</p>
+        <div id="cases" class="m-caselist"></div>
+      </div>
+      <div class="m-card m-pick">
+        <h2>Take a photo of a drawing</h2>
+        <p>Then ask how big a room is, how long a wall is, or the total floor area. The answer is drawn on your photo.</p>
+        <label class="m-btn primary huge"><input id="cam" type="file" accept="image/*" capture="environment" />
+          <span class="m-ico" aria-hidden="true">📷</span> Take a photo</label>
+        <label class="m-btn"><input id="pickf" type="file" accept="image/*,.pdf,application/pdf" /> Choose a photo or PDF</label>
+      </div>
     </section>
 
     <section id="stage" class="m-stage">
@@ -53,6 +61,7 @@
     </section>
 
     <section id="askCard" class="m-card m-ask">
+      <div id="caseSheets" class="m-sheets" hidden></div>
       <div id="chips" class="m-chips"></div>
       <form id="askForm" class="m-askrow">
         <input id="q" type="text" enterkeyhint="send" autocomplete="off" placeholder="Ask about this drawing…" aria-label="your question" />
@@ -60,6 +69,7 @@
         <button type="submit" class="m-btn primary small" id="send">Ask</button>
       </form>
       <button type="button" class="m-btn ghost small" id="cancel" hidden>Cancel</button>
+      <div id="caseNote" class="m-casenote" hidden></div>
     </section>
 
     <section id="result" class="m-card m-result" hidden aria-live="polite"></section>

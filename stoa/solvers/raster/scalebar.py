@@ -150,6 +150,8 @@ class PrintedBar(Bar):
     def _dpi_text(self) -> str:
         if self.dpi_from == "pixels":
             return f"{self.dpi:.0f} dpi from the image's pixel size on the {self.paper} sheet it names"
+        if self.dpi_from == "note":
+            return f"{self.dpi:.0f} dpi: the image is the whole {self.paper} sheet its note bases the scales on"
         return f"{self.dpi:.0f} dpi image"
 
     def describe(self) -> str:
@@ -183,15 +185,36 @@ def paper_of(size_px: tuple[int, int], dpi: float | None, tol: float = 0.02) -> 
     return None
 
 
-def printed_bar(img_path: str, tl) -> PrintedBar | None:
+def printed_bar(img_path: str, tl, photo_guess: bool = False) -> PrintedBar | None:
     """PrintedBar from the image DPI + the sheet's printed ratio, or None (no DPI tag, not a paper size, no ratio, or
-    several different ratios printed: a plan at 1:100 with 1:20 details does not say which one a room is drawn at)."""
+    several different ratios printed: a plan at 1:100 with 1:20 details does not say which one a room is drawn at).
+    A deskewed phone photo (raster/photo.py) has no true DPI: its pixels are spread over the paper size the SHEET
+    names ('1:200 @ A1', a lone 'A1'); when it names none, None unless photo_guess (then its A3 tag, stated)."""
     try:
         with Image.open(T._abspath(img_path)) as im:
             size, dpi = im.size, (im.info.get("dpi") or (None,))[0]
+            photo = im.info.get("stoa_photo")
     except Exception:  # noqa: BLE001
         return None
     paper, dpi_from = paper_of(size, dpi), "tag"
+    if photo is not None:
+        named = _photo_paper(size, tl)
+        if named is not None:
+            paper, dpi, dpi_from = named[1], named[0], "photo"
+        elif photo_guess:
+            from stoa.solvers.raster.photo import a3_prior
+
+            prior = a3_prior(T._abspath(img_path))
+            if prior is None:
+                return None
+            dpi, paper = prior
+            dpi_from = "photo-guess"
+        else:
+            return None
+    if paper is None:  # 'SCALE(S) AS NOTED ON THIS SHEET ARE BASED ON A FULL 22X34 SHEET' (VP 19:38, G1 18:45)
+        hit = _sheet_note_paper(size, tl)
+        if hit is not None:
+            (dpi, paper), dpi_from = hit, "note"
     if paper is None:  # Stoa's exports: no DPI tag (or 96), but an exact sheet at an export dpi that the sheet names
         hit = _paper_from_pixels(size, tl)
         if hit is None:
@@ -219,6 +242,46 @@ def printed_bar(img_path: str, tl) -> PrintedBar | None:
                       dpi_from=dpi_from)
 
 
+_SHEET_NOTE = re.compile(r"\b(?:based\s+on|for|on)\s+(?:an?\s+)?(?:full[\s-]*(?:size\s+)?|full-size\s+)?(\d{1,2})\s*(?:\"|”|in\.?)?"
+                         r"\s*[x×X]\s*(\d{1,2})\s*(?:\"|”|in\.?)?\s*(?:inch(?:es)?\s+)?(?:sheet|paper|drawing)", re.I)
+
+
+def _sheet_note_paper(size: tuple[int, int], tl) -> tuple[float, str] | None:
+    """(dpi, sheet) from a note that names the sheet the scales hold on ('… BASED ON A FULL 22X34 SHEET', inches),
+    when the image has that sheet's aspect (2 %): the image is the whole sheet, dpi = long side px / long side in.
+    AFCEE A-101 PNG 10200 x 6600: 300 dpi -> 1/8" = 1'-0" = 123.03 px/m (VP: truth 123.03). STOA_O1_SHEET_NOTE=0: off."""
+    if os.environ.get("STOA_O1_SHEET_NOTE", "1") == "0":
+        return None
+    a, b = sorted(size)
+    hits = set()
+    for i in tl.items:
+        for m in _SHEET_NOTE.finditer(i.text):
+            w, l = sorted((int(m.group(1)), int(m.group(2))))
+            if 8 <= w and l <= 60 and abs((b / a) / (l / w) - 1) <= 0.02:
+                hits.add((w, l))
+    if len(hits) != 1:
+        return None
+    w, l = hits.pop()
+    name = next((n for n, (sw, sl) in PAPER_MM.items() if abs(sw / 25.4 - w) <= 0.3 and abs(sl / 25.4 - l) <= 0.3),
+                f'{w}" x {l}"')
+    return b / l, name
+
+
+def _photo_paper(size: tuple[int, int], tl) -> tuple[float, str] | None:
+    """(dpi, sheet) for a deskewed photo: the one standard sheet of the image's aspect (2 %) that the sheet's text
+    names ('@ A1' in a scale note, 'A1', 'ISO A1', 'ANSI D'; P1's paper._named), its long side over the image's."""
+    try:
+        from stoa.formats.paper import PAPER_MM as PM, _named
+    except ImportError:
+        return None
+    a, b = sorted(size)
+    texts = [_AT_WORD.sub(r"@ \1", i.text) for i in tl.items]
+    hits = [n for n, (sw, sl) in PM.items() if abs((b / a) / (sl / sw) - 1) <= 0.02 and _named(n, texts)]
+    if len(hits) != 1:
+        return None
+    return b / (PM[hits[0]][1] / 25.4), hits[0]
+
+
 def _paper_from_pixels(size: tuple[int, int], tl) -> tuple[float, str] | None:
     """P1's stoa.formats.paper.paper_from_pixels (pixel size at a usual export dpi, confirmed by the sheet size the
     sheet's text names: 'A2', 'ISO A1', 'ANSI D'); None while that module is absent or on any error.
@@ -243,10 +306,22 @@ def scale_source(bar) -> str:
     if src == "user":
         return "the scale set by the user"
     if src == "printed":
+        if getattr(bar, "dpi_from", "tag") == "photo":
+            return (f"the printed scale {bar.unit_text} on the {bar.paper} sheet it names (photo deskewed to the "
+                    f"paper's corners, {bar.dpi:.0f} px per inch of that sheet)")
+        if getattr(bar, "dpi_from", "tag") == "photo-guess":
+            return (f"the printed scale {bar.unit_text}, ASSUMING the photographed print is {bar.paper} (the sheet "
+                    "names no paper size; a different print size scales every length)")
         if getattr(bar, "dpi_from", "tag") == "pixels":
             return (f"the printed scale {bar.unit_text} at {bar.dpi:.0f} dpi (the image's pixel size on the "
                     f"{bar.paper} sheet it names)")
+        if getattr(bar, "dpi_from", "tag") == "note":
+            return (f"the printed scale {bar.unit_text} at {bar.dpi:.0f} dpi (the sheet's note: scales are based on a "
+                    f"full {bar.paper} sheet, and the image is that whole sheet)")
         return f"the printed scale {bar.unit_text} at the image's {bar.dpi:.0f} dpi ({bar.paper} sheet)"
+    if src == "chains" and getattr(bar, "run", None):
+        return (f"the spacing of one printed dimension chain ({len(bar.run)} strings such as '{bar.run[0]}', no printed "
+                "total to check it against)")
     if src == "chains":
         return f"the printed dimension chains' spacing ({len(getattr(bar, 'pairs', []))} chain(s) agreeing)"
     return "the scale bar"

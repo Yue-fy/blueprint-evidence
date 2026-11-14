@@ -163,6 +163,28 @@ def recognize(path: str) -> dict:
             style, pr = guess_style(str(p))
             k = {"cubicasa5k": "cubicasa_plan", "swiss_dwellings": "plan_render", "ifc_models": "plan_render",
                  "scan": "scan"}.get(style, "other")
+            if k == "cubicasa_plan":
+                try:
+                    from stoa.pipeline import SHEET_PX, _is_upload, _sheet_sized
+
+                    if _is_upload(str(p)) and _sheet_sized(str(p)):
+                        return _out("plan_render", 0.7, f"sheet-sized image (long side > {SHEET_PX} px): a CAD sheet "
+                                                        f"export, not a CubiCasa-style flat plan (style classifier "
+                                                        f"said cubicasa5k p={pr:.2f})")
+                except Exception:  # noqa: BLE001
+                    pass
+            if k == "scan" and pr < 0.85:
+                # W5 19:17 / O1 19:59 / QA 18:56: Stoa's clean CAD PNG exports (M-101A, S-100F) read 'scan' 0.65-0.78
+                # here, so the chip said 'scanned / historical drawing'. Pure-white paper / a clean render (raster's
+                # own scan test: 1 of 160 real scans passes it) = a digital export, not a scan.
+                try:
+                    from stoa.solvers.raster.textqa import _clean
+
+                    if _clean(str(p)):
+                        return _out("plan_render", 0.8, f"clean digital image (CAD / PDF export: pure white paper); "
+                                                        f"the style classifier's 'scan' p={pr:.2f} overruled")
+                except Exception:  # noqa: BLE001 — keep the classifier's verdict
+                    pass
             return _out(k, float(pr), f"image style classifier (stoa.style): {style} p={pr:.2f}")
     except Exception as e:  # noqa: BLE001 — recognition is optional
         return _out("other", 0.0, f"could not read the file ({type(e).__name__})")

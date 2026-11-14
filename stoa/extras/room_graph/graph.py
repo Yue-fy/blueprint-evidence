@@ -60,11 +60,38 @@ def _rel(path: str) -> str:
     return p[i:] if i >= 0 else p
 
 
+_NAMES: dict = {}
+
+
+def map_name(path: str) -> str:
+    """Name of a plan's CC5K map: the file stem for a dataset file (its name is unique; existing maps stay valid), the
+    stem + '.' + 10 hex of its content sha1 for anything else (T2 21:15: uploads share names - plan.png, scan.png,
+    image.jpg; 5 different uploads were named plan.png - and a stem-only key served the first visitor's room map, its
+    rooms, counts and evidence boxes, for every later drawing of that name)."""
+    import hashlib
+
+    p = Path(path)
+    if not p.is_absolute():
+        return p.stem  # dataset-relative path
+    data = os.environ.get("STOA_DATA", "junction-dataset")
+    try:
+        st_ = p.stat()
+        if p.resolve().is_relative_to(Path(data).resolve()):
+            return p.stem
+    except (OSError, ValueError):
+        return p.stem
+    k = (str(p), st_.st_size, st_.st_mtime_ns)
+    if k not in _NAMES:
+        _NAMES[k] = f"{p.stem}.{hashlib.sha1(p.read_bytes()).hexdigest()[:10]}"
+    return _NAMES[k]
+
+
 def _npz(path: str, live: bool = False) -> Path | None:
     """Cached map with rooms + icons; live=True runs the CC5K model once on an uncached image (torch env, ~3-10 s
     CPU) and saves its maps to artifacts/R1/cc5k_seg_live/ (new drawings, e.g. a hidden test plan)."""
+    name = map_name(path)
     for d in (ART / "cc5k_seg", ART / "cc5k_seg_live"):
-        f = d / f"{Path(path).stem}.npz"
+        f = d / f"{name}.npz"
         if f.exists():
             with np.load(f) as z:
                 if "icons" in z.files:
@@ -79,7 +106,7 @@ def _npz(path: str, live: bool = False) -> Path | None:
     full = Path(path) if Path(path).is_absolute() else data / path
     if not (Path(py).exists() and full.exists()):
         return None
-    env = dict(os.environ, CC5K_SAVE_MAPS=str(ART / "cc5k_seg_live"))
+    env = dict(os.environ, CC5K_SAVE_MAPS=str(ART / "cc5k_seg_live"), CC5K_SAVE_NAME=name)
     try:
         subprocess.run([py, "-I", str(here / "predict.py"), str(full)], env=env, capture_output=True, timeout=300,
                        check=True)

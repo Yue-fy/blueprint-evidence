@@ -311,10 +311,16 @@ def test_upload_never_raises_on_broken_files(tmp_path):
         assert ans is not None and (ans.value is None or ans.confidence <= 0.5)
 
 
-def test_pick_page_scanned_set_takes_the_page_with_most_ink(tmp_path):
+def test_pick_page_scanned_set_takes_the_page_with_most_ink(tmp_path, monkeypatch):
     from PIL import Image, ImageDraw
 
     from stoa.formats.pages import pick_page
+    from stoa.solvers.raster import textlayer as T
+
+    # the pages' images are read for their text first (P1 19:40): stubbed, no model server in tests
+    monkeypatch.setattr(T, "text_layer", lambda path, *a, **k: T.TextLayer(path=str(path), size=(900, 600), items=[
+        T.TextItem({".p1.": "COVER SHEET", ".p3.": "NOTES SHEET"}.get(next((m for m in (".p1.", ".p3.") if m in
+                                                                            str(path)), ""), "1"), [0, 0, 1, 1])]))
 
     doc = pymupdf.open()
     for kind in ("cover", "plan", "notes"):
@@ -669,6 +675,16 @@ def test_whole_house_count_sums_every_floor_plan_sheet(tmp_path, monkeypatch):
     assert not whole_house_count("How many risers does the stair in the house have?")
     assert not whole_house_count("How many doors are shown on this drawing?")
     assert whole_house_count("How many bedrooms does the house have?")
+    # W5 19:33: each sheet's reading is the SAME printed building total ('TOTAL = 144 DORMS' on every sheet): once
+
+    def fake_total(self, p, q):
+        return Answer(value=144, unit="count", confidence=0.85, solver="pipeline/stated_count",
+                      trace=["stated_count: the printed total row 'TOTAL =': 'TOTAL = 144 DORMS' = 144"])
+
+    monkeypatch.setattr(Pipeline, "solve", fake_total)
+    b = Upload().solve(str(path), "How many dorm rooms are there in the whole building?")
+    assert b.value == 144 and b.confidence == 0.85
+    assert "144 on the 1ST plan (page 2) + 144 on the 2ND plan (page 3)" in b.trace[0] and "not their sum" in b.trace[0]
 
 
 def test_stair_question_on_a_set_asks_g1s_stair_page_first(tmp_path, monkeypatch):
@@ -848,7 +864,7 @@ def test_warm_reads_an_image_upload_before_the_first_question(tmp_path, monkeypa
     Image.new("L", (7000, 3000), 255).save(big)
     out = W.warm(str(big))
     assert out["error"] == "" and out["kind"] == "shrink" and seen == [out["solved_file"]]
-    assert seen[0].endswith("sheet.s6000.png") and "text layer (0 texts)" in out["done"]
+    assert seen[0].endswith("sheet.s6000.png") and any(d.startswith("text layer (0 texts") for d in out["done"])
     bad = W.warm(str(tmp_path / "missing.png"))
     assert isinstance(bad, dict) and "seconds" in bad
 
@@ -933,6 +949,165 @@ def test_paper_of_a_shrunk_sheet_export_and_sheet_reference_removal(tmp_path):
     assert without_sheet("How many valves on sheet M-101B?", "M-101A") == "How many valves on sheet M-101B?"
 
 
+def test_paper_of_a_shrunk_copy_without_its_png_tag(tmp_path):
+    """Gate d22: every cached 6000-px copy made before the PNG tag existed (Stoa's DfE copy, 17:35) lost its original
+    size, so its paper was never found and the sheet was never traced. The shrunk_copy sidecar still has it; JPEG copies
+    carry it as their comment. A sidecar whose factor does not map onto the file is ignored."""
+    import json
+    from pathlib import Path
+
+    from PIL import Image
+
+    from stoa.formats.normalize import shrink_image
+    from stoa.formats.paper import paper_of_image
+
+    want = 6000 / (594 / 25.4)
+    old = tmp_path / "old.s6000.png"
+    Image.new("L", (6000, 4244), 255).save(old)  # no tag: a copy cached by older code
+    assert paper_of_image(str(old), ["ISO A2"]) is None
+    Path(f"{old}.json").write_text(json.dumps({"src_size": [14000, 9902], "factor": 6000 / 14000, "note": ""}))
+    dpi, sheet = paper_of_image(str(old), ["ISO A2"])
+    assert sheet == "A2" and dpi == pytest.approx(want, rel=0.005)
+    Path(f"{old}.json").write_text(json.dumps({"src_size": [10200, 6600], "factor": 6000 / 10200, "note": ""}))
+    assert paper_of_image(str(old), ["ISO A2"]) is None  # 10200 x 6600 at 0.588 is not this file's 6000 x 4244
+    src = tmp_path / "a2.jpg"
+    Image.new("RGB", (14000, 9902), "white").save(src, quality=90)
+    r = shrink_image(src, tmp_path / "a2.s6000.jpg", 6000)
+    dpi, sheet = paper_of_image(r["path"], ["ISO A2"])
+    assert sheet == "A2" and dpi == pytest.approx(want, rel=0.005)
+
+
+def test_traced_copy_is_traced_once_for_concurrent_questions(tmp_path, monkeypatch):
+    """P1 18:2x: 3 eval workers asking about one new sheet each traced it (~62 s each). One trace, the rest wait."""
+    import concurrent.futures as cf
+    import time
+    from pathlib import Path
+
+    from stoa.formats import vectorize as V
+
+    png = tmp_path / "sheet.png"
+    png.write_bytes(b"x")
+    calls = []
+
+    def fake(src, out, dpi=None, text=True):
+        calls.append(src)
+        time.sleep(0.3)
+        d = pymupdf.open()
+        d.new_page()
+        d.set_metadata({"keywords": f"stoa-textsig:{V._current_sig(src)}"})
+        d.save(out)
+        return {}
+
+    monkeypatch.setattr(V, "to_vector_pdf", fake)
+    with cf.ThreadPoolExecutor(6) as ex:
+        got = list(ex.map(lambda _: V.traced_copy(str(png), 200.0), range(6)))
+    assert len(calls) == 1 and len(set(got)) == 1 and got[0].endswith(f"sheet.vec{V.VERSION}.pdf")
+
+
+def test_traced_copy_made_at_another_dpi_is_traced_again(tmp_path, monkeypatch):
+    """P1 19:45: the cached copy is keyed by name only; one traced at the pixel-size dpi must not be reused when the
+    scale-bar source gives another (its page = pixels x 72 / dpi tells which dpi it was traced at)."""
+    from pathlib import Path
+
+    from PIL import Image
+
+    from stoa.formats import vectorize as V
+
+    png = tmp_path / "sheet.png"
+    Image.new("L", (2000, 1000), 255).save(png)
+    calls = []
+
+    def fake(src, out, dpi=None, text=True):
+        calls.append(dpi)
+        d = pymupdf.open()
+        d.new_page(width=2000 * 72 / dpi, height=1000 * 72 / dpi)
+        d.set_metadata({"keywords": f"stoa-textsig:{V._current_sig(src)}"})
+        d.save(out)
+        return {}
+
+    monkeypatch.setattr(V, "to_vector_pdf", fake)
+    V.traced_copy(str(png), 200.0)
+    V.traced_copy(str(png), 201.0)  # within 1 %: the same copy
+    V.traced_copy(str(png), 150.0)
+    assert calls == [200.0, 150.0]
+    assert Path(V.traced_copy(str(png), 150.0)).exists() and calls == [200.0, 150.0]
+
+
+def test_question_waits_for_the_uploads_running_warm(tmp_path, monkeypatch):
+    """P1 18:3x: a question asked while the upload's warm pre-read runs used to read the sheet a second time in
+    parallel; it now waits for warm (bounded) and then reads warm's caches. No warm running: no wait."""
+    import threading
+    import time
+
+    from stoa.formats import warm as W
+
+    monkeypatch.setenv("STOA_CACHE", str(tmp_path / "cache"))
+    png = tmp_path / "plan.png"
+    png.write_bytes(b"x")
+    assert W.wait_for_warm(png) == 0.0  # never warmed: no lock file, nothing waits
+    started = threading.Event()
+
+    def slow(path):
+        started.set()
+        time.sleep(1.0)
+        return {"path": str(path)}
+
+    monkeypatch.setattr(W, "_warm", slow)
+    th = threading.Thread(target=W.warm, args=(str(png),))
+    th.start()
+    started.wait(5)
+    waited = W.wait_for_warm(str(png))
+    th.join()
+    assert 0.5 <= waited <= 3.0
+    assert W.wait_for_warm(png) < 0.5  # finished: the lock file stays, unlocked
+    monkeypatch.setattr(W, "_warm", lambda p: time.sleep(2.0) or {})
+    th = threading.Thread(target=W.warm, args=(str(png),))
+    th.start()
+    time.sleep(0.2)
+    assert W.wait_for_warm(png, timeout=0.5) < 1.5  # bounded: a hung warm never blocks a question for long
+    th.join()
+    # QA 20:19: the UI warms upload/<id>/<name> but asks about a style-tagged COPY of the same bytes in another folder
+    copy = tmp_path / "data" / "scan" / "plan.png"
+    copy.parent.mkdir(parents=True)
+    copy.write_bytes(png.read_bytes())
+    other = tmp_path / "other.png"
+    other.write_bytes(b"y")
+    monkeypatch.setattr(W, "_warm", lambda p: time.sleep(1.0) or {})
+    th = threading.Thread(target=W.warm, args=(str(png),))
+    th.start()
+    time.sleep(0.2)
+    assert W.wait_for_warm(copy) >= 0.5 and W.wait_for_warm(other) == 0.0
+    th.join()
+
+
+def test_warm_reads_an_outlined_text_pdf_page_before_the_first_question(tmp_path, monkeypatch):
+    """Captain 18:21 (7): a one-page sheet whose text is outlines made the first question render + OCR it (1,148 s).
+    warm does the same render and its text layer at upload; a sheet with real text is left alone (read in ms)."""
+    from pathlib import Path
+
+    from stoa.formats import warm as W
+    from stoa.solvers.raster import textlayer as T
+
+    seen = []
+    monkeypatch.setattr(T, "text_layer", lambda p, *a, **k: seen.append(p) or T.TextLayer(path=p, size=(1, 1), items=[]))
+    monkeypatch.setattr(T, "is_clean", lambda p: True)
+    outl = tmp_path / "outlined.pdf"
+    d = pymupdf.open()
+    pg = d.new_page(width=420 * 72 / 25.4, height=297 * 72 / 25.4)
+    pg.draw_rect(pymupdf.Rect(50, 50, 500, 400), color=(0, 0, 0), width=1)
+    d.save(outl)
+    out = W.warm(str(outl))
+    assert out["error"] == "" and any(x.startswith("page render + text layer") for x in out["done"])
+    assert seen and seen[0].endswith(".png") and Path(seen[0]).exists()
+    text = tmp_path / "text.pdf"
+    d = pymupdf.open()
+    d.new_page().insert_text((72, 72), "GROUND FLOOR PLAN 1:100 KITCHEN 12.5 m2 LIVING ROOM 24.0 m2")
+    d.save(text)
+    seen.clear()
+    out = W.warm(str(text))
+    assert not seen and not any(x.startswith("page render") for x in out["done"])
+
+
 def test_shrunk_copy_is_made_once_under_concurrency_and_keeps_the_read_text(tmp_path, monkeypatch):
     """S0 17:42 (gate d21): 4 eval workers asked about one big sheet at once; one read the .s6000.png while another was
     still writing it ('cannot identify image file') and a right answer became the prior. The copy is made under a
@@ -983,3 +1158,521 @@ def test_big_set_note_lists_the_sheets_with_the_questions_rare_words(tmp_path):
     assert related(f, "What size is the suction header?", exclude=9) == [(6, "M-106")]
     prep = normalize.prepare(str(f), "What size is the suction header?")
     assert "other sheets with the question's words: M-106 (p. 7)" in prep.notes[0] or prep.page == 6
+
+
+def test_traced_copy_follows_the_text_layer(tmp_path, monkeypatch):
+    """X1 20:43: a copy traced from an older (garbled OCR) text layer was reused after the layer changed; d27 lost 5 of
+    9 DfE scan rows. The copy carries its text layer's signature; another layer (or none recorded: an older copy) =
+    traced again."""
+    from PIL import Image
+
+    from stoa.formats import vectorize as V
+
+    png = tmp_path / "sheet.png"
+    Image.new("L", (2000, 1000), 255).save(png)
+    layer = {"sig": "a" * 16}
+    calls = []
+    monkeypatch.setattr(V, "_current_sig", lambda p: layer["sig"])
+
+    def fake(src, out, dpi=None, text=True):
+        calls.append(layer["sig"])
+        d = pymupdf.open()
+        d.new_page(width=2000 * 72 / dpi, height=1000 * 72 / dpi)
+        d.set_metadata({"keywords": f"stoa-textsig:{layer['sig']}"})
+        d.save(out)
+        return {}
+
+    monkeypatch.setattr(V, "to_vector_pdf", fake)
+    V.traced_copy(str(png), 200.0)
+    V.traced_copy(str(png), 200.0)
+    layer["sig"] = "b" * 16  # O1's gate / a newer OCR replaced the layer
+    V.traced_copy(str(png), 200.0)
+    assert calls == ["a" * 16, "b" * 16]
+    old = tmp_path / "old.png"
+    Image.new("L", (2000, 1000), 255).save(old)
+    d = pymupdf.open()
+    d.new_page(width=2000 * 72 / 200, height=1000 * 72 / 200)
+    d.save(tmp_path / f"old.vec{V.VERSION}.pdf")  # traced before signatures existed
+    V.traced_copy(str(old), 200.0)
+    assert len(calls) == 3
+    from stoa.formats.vectorize import text_sig
+    from stoa.solvers.raster.textlayer import TextItem
+
+    assert text_sig([TextItem(text="Hall", box=[1, 2, 3, 4], tile=0)]) != text_sig([TextItem(text="Ha11", box=[1, 2, 3, 4],
+                                                                                              tile=0)])
+
+
+def test_vector_pass_is_time_boxed_and_remembers_no_reading():
+    """S0 18:42 (gate d24): slab questions on Stoa's S-100F PNG spent 60-167 s each on the traced copy's readers for no
+    reading. The pass is time-boxed (STOA_VECTOR_BUDGET) and a (copy, intent) that gave nothing is skipped next time."""
+    import time
+
+    from stoa.solvers import upload as U
+
+    ans, took = U._solve_within(lambda: 42, 1.0)
+    assert ans == 42 and took < 1.0
+    t0 = time.perf_counter()
+    ans, took = U._solve_within(lambda: time.sleep(2.0) or 1, 0.2)
+    assert ans is None and time.perf_counter() - t0 < 1.0
+    # S0 19:18 (gate d25): running over is NOT remembered; the late answer is handed to late() in the thread, which
+    # memos only 'no measured reading'
+    got = []
+    ans, _ = U._solve_within(lambda: time.sleep(0.4) or "late", 0.1, got.append)
+    assert ans is None
+    for _ in range(50):
+        if got:
+            break
+        time.sleep(0.05)
+    assert got == ["late"]
+    a = Answer(value=1.0, unit="m2", confidence=0.3, trace=["recognised: {}", "intent: area slab [drawing] (lang en)"])
+    assert U._intent_key(a) == "area slab"
+    assert U._measured(Answer(value=151.79, solver="upload/plan_rooms")) and not U._measured(a)
+    # E1 19:36: a dimension-confirmed slab area (>= 0.5) counts, a traced-only one (0.25) does not; DR 19:59: openings
+    assert U._measured(Answer(value=61.69, unit="m2", confidence=0.5, solver="pipeline/slab_area"))
+    assert not U._measured(Answer(value=194.0, unit="m2", confidence=0.25, solver="pipeline/slab_area"))
+    assert U._measured(Answer(value=91, unit="count", confidence=0.4, solver="pipeline/openings"))
+    assert U._intent_key(Answer(value=1.0, trace=["x"])) == ""
+    # X1 20:38: the 'no reading' memo is per QUESTION (one 'area unknown' miss blocked other area questions on the sheet)
+    assert U._question_key("How big is the Sports Hall?") == U._question_key("how big is the sports hall")
+    assert U._question_key("How big is the Sports Hall?") != U._question_key("What is the area of the kitchen?")
+
+
+def test_paper_copy_of_a_rotated_page_keeps_its_frame(tmp_path):
+    """X1/E1 18:45-18:52: a '1:200 @ A1' A3 sheet with /Rotate 90 lost every vector reader on its paper copy (the copy
+    was drawn as displayed: sideways text in its own frame). The copy keeps the unrotated frame x f and the /Rotate."""
+    src = tmp_path / "rot.pdf"
+    d = pymupdf.open()
+    pg = d.new_page(width=420 * 72 / 25.4, height=297 * 72 / 25.4)  # A3 landscape
+    pg.insert_text((100, 100), "CLASSROOM 1")
+    pg.insert_text((900, 800), "GROUND FLOOR PLAN 1:200 @ A1")
+    pg.draw_line((50, 50), (300, 50))
+    pg.set_rotation(90)
+    d.save(src)
+    path, f, note = normalize.paper_copy(str(src))
+    assert f == pytest.approx(2.0, rel=0.01) and path.endswith(".paperA1.rot90.pdf") and "1:400" in note
+    with pymupdf.open(str(src)) as a, pymupdf.open(path) as b:
+        assert b[0].rotation == 90
+        wa = [w for w in a[0].get_text("words") if w[4] == "CLASSROOM"][0]
+        wb = [w for w in b[0].get_text("words") if w[4] == "CLASSROOM"][0]
+        assert all(abs(x * f - y) < 1.0 for x, y in zip(wa[:4], wb[:4]))
+
+
+def test_shrunk_copy_from_older_shrink_code_is_rebuilt(tmp_path):
+    """H / X1 18:41-18:47: a cached 6000-px copy made by older shrink code (no version in its sidecar) was reused by
+    every gate; it is now rebuilt once, and the rebuilt copy carries the original size."""
+    import json
+    from pathlib import Path
+
+    from PIL import Image
+
+    big = tmp_path / "sheet.png"
+    Image.new("L", (9000, 6000), 255).save(big)
+    path, f, _ = normalize.shrunk_copy(big, 6000)
+    meta = Path(f"{path}.json")
+    m = json.loads(meta.read_text())
+    assert m["v"] == normalize.SHRINK_VERSION
+    m.pop("v")
+    meta.write_text(json.dumps(m))
+    Image.new("L", (6000, 4000), 255).save(path)  # an old copy: no size tag
+    path2, _, _ = normalize.shrunk_copy(big, 6000)
+    assert path2 == path and json.loads(meta.read_text())["v"] == normalize.SHRINK_VERSION
+    with Image.open(path2) as im:
+        assert im.info.get("stoa_src_size") == "9000x6000"
+
+
+def test_pick_page_finds_a_room_name_printed_on_one_page_of_a_set(tmp_path):
+    """X1 / G1 18:35-18:56: 'What is the area of Science Lab 3?' on a GF / 1F / 2F set went to page 1 ('the most
+    drawing') although only page 3 prints 'Science Lab 3'; 'Lab 30' is not 'Lab 3'."""
+    from stoa.formats.pages import pick_page
+
+    src = tmp_path / "set.pdf"
+    d = pymupdf.open()
+    for k, labels in enumerate((["Science Lab 30", "PE Store", "Hall"], ["Science Lab 31", "Library"],
+                                ["Science Lab 3", "Science Lab 4", "Prep Room"])):
+        pg = d.new_page(width=842, height=595)
+        for i in range(60 if k == 0 else 10):  # page 1 carries the most drawing
+            pg.draw_line((20 + i * 5, 20), (20 + i * 5, 500))
+        for i, t in enumerate(labels):
+            pg.insert_text((100, 100 + 40 * i), t)
+    d.save(src)
+    assert pick_page(src, "What is the area of Science Lab 3?")[0] == 2
+    assert pick_page(src, "What's the net floor area of the PE Store?")[0] == 0
+
+
+def test_paper_from_the_scale_bar_and_printed_ratio(tmp_path, monkeypatch):
+    """X1 19:20: a scanned PDF's page image (no DPI tag, pixel size no standard paper) never got the vector readers and
+    the trace said nothing. The scale bar's px per m x the printed 1:N gives the paper dpi; snapped to a standard sheet
+    when the image is one."""
+    from PIL import Image
+    from stoa.formats import paper as _P
+    if not hasattr(_P, "paper_of_bar"):  # S0 d26: P1 14e6c9e committed this test before paper.paper_of_bar (still WIP)
+        pytest.skip("stoa.formats.paper.paper_of_bar not committed yet (P1 WIP)")
+
+    from stoa.formats import paper as P
+    from stoa.solvers.raster import scalebar as SB
+    from stoa.solvers.raster import textlayer as T
+
+    bar = SB.Bar(unit="m", px_per_unit=39.08, labels=[(0, 0, []), (20, 782, [])], box=[0, 0, 782, 30], residual=4.2,
+                 source="layer")
+    monkeypatch.setattr(SB, "bars", lambda path, layer=None, **k: [bar])
+    a2 = tmp_path / "a2.png"
+    Image.new("L", (4677, 3307), 255).save(a2)  # A2 at 200 dpi, untagged
+    layer = T.TextLayer(path=str(a2), size=(4677, 3307), items=[T.TextItem("GROUND FLOOR PLAN 1:200", [0, 0, 10, 10])])
+    dpi, sheet, how = P.paper_of_bar(str(a2), layer)
+    assert sheet == "A2" and dpi == pytest.approx(200.0, rel=0.002) and "39.08 px per m" in how and "1:200" in how
+    crop = tmp_path / "crop.png"
+    Image.new("L", (3000, 2000), 255).save(crop)  # a crop: no paper -> the bar's own dpi
+    dpi, sheet, _ = P.paper_of_bar(str(crop), layer)
+    assert sheet == "custom" and dpi == pytest.approx(39.08 * 200 * 0.0254, rel=1e-6)
+    layer.items = [T.TextItem("KITCHEN", [0, 0, 10, 10])]
+    assert P.paper_of_bar(str(crop), layer) is None  # no printed 1:N
+
+
+def test_cache_writes_are_atomic_per_thread(tmp_path):
+    """X1 19:24 (gate d25 sc-110): _render wrote the scan PNG in place and a parallel question opened it half-written.
+    Writes go to a per-process-and-thread temp name with the same suffix, then os.replace."""
+    import threading
+
+    names = []
+    th = threading.Thread(target=lambda: names.append(normalize.tmp_path(tmp_path / "a.scan.png")))
+    th.start()
+    th.join()
+    names.append(normalize.tmp_path(tmp_path / "a.scan.png"))
+    assert names[0] != names[1] and all(n.suffix == ".png" and n.name.startswith(".a.scan.") for n in names)
+    src = tmp_path / "p.pdf"
+    d = pymupdf.open()
+    d.new_page(width=200, height=100).insert_text((20, 50), "PLAN")
+    d.save(src)
+    dst = tmp_path / "p.scan.png"
+    with pymupdf.open(src) as doc:
+        normalize._render(doc[0], 2.0, dst, str(src))
+    from PIL import Image
+
+    with Image.open(dst) as im:
+        assert im.size == (400, 200)
+    assert [p.name for p in tmp_path.iterdir() if ".tmp" in p.name] == []
+
+
+def test_private_mode_blocks_every_hosted_model(monkeypatch):
+    """Captain 18:53 / RL 19:21: private mode = no external call on ANY path (warm-up, scans, sets, the verifier).
+    STOA_PRIVATE=1 makes stoa.llm refuse a hosted backend before any request or cached reply; our own servers
+    (loopback, private network, Tailscale) stay allowed; STOA_EU_ONLY=1 keeps Verda (W5's EU option)."""
+    from stoa import llm
+
+    monkeypatch.setenv("STOA_PRIVATE", "1")
+    monkeypatch.delenv("STOA_EU_ONLY", raising=False)
+    llm.check_private("local")
+    for b in ("gemini", "nvidia", "verda"):
+        with pytest.raises(llm.ExternalCallBlocked):
+            llm.check_private(b)
+    with pytest.raises(llm.ExternalCallBlocked):
+        llm.chat("hello", backend="gemini")
+    monkeypatch.setenv("STOA_MODE", "api")  # api mode reroutes local steps to Gemini: blocked too
+    with pytest.raises(llm.LocalModelUnavailable):
+        llm.chat("hello", backend="local")
+    monkeypatch.setenv("STOA_EU_ONLY", "1")
+    llm.check_private("verda")
+    assert llm._private_host("http://100.101.2.3:8001/v1") and not llm._private_host("https://example.com/v1")
+    monkeypatch.setenv("STOA_PRIVATE", "0")
+    llm.check_private("gemini")
+
+
+def test_private_mode_request_flag_and_service_urls(monkeypatch):
+    """Audit 19:51 risk 3 / T2: one request-level private state must block every hosted call. G1's Pipeline(private=1)
+    sets a context var (stoa.agent.private) instead of the env: stoa.llm's guard honours it too. Non-LLM services (OCR,
+    door detector) are reached by URL: check_private_url refuses a non-private host in private mode."""
+    import contextvars
+    import sys
+    import types
+
+    from stoa import llm
+
+    monkeypatch.delenv("STOA_PRIVATE", raising=False)
+    monkeypatch.delenv("STOA_EU_ONLY", raising=False)
+    fake = types.ModuleType("stoa.agent.private")
+    fake._CTX = contextvars.ContextVar("stoa_private_test", default=False)
+    monkeypatch.setitem(sys.modules, "stoa.agent.private", fake)
+    import stoa.agent as agent_pkg
+
+    monkeypatch.setattr(agent_pkg, "private", fake, raising=False)
+    llm.check_private("gemini")  # neither signal: allowed
+    tok = fake._CTX.set(True)
+    try:
+        assert llm.private_mode()
+        with pytest.raises(llm.ExternalCallBlocked):
+            llm.check_private("nvidia")
+        llm.check_private("local")
+        llm.check_private_url("http://127.0.0.1:8110", "OCR server")
+        with pytest.raises(llm.ExternalCallBlocked):
+            llm.check_private_url("https://ocr.example.com", "OCR server")
+    finally:
+        fake._CTX.reset(tok)
+    assert not llm.private_mode()
+    llm.check_private_url("https://ocr.example.com")  # not private: allowed
+
+
+def test_warm_command_is_private(monkeypatch, tmp_path):
+    """RL 19:21: the upload warm-up ran with the server's env and, with STOA_MODE=api, sent tiles to Gemini even with
+    the visitor's Private switch on. `python -m stoa.formats.warm` now sets STOA_PRIVATE=1 for itself."""
+    import os
+
+    from stoa.formats import warm
+
+    monkeypatch.setenv("STOA_PRIVATE", "0")  # recorded, so the '1' main() sets is undone after the test
+    monkeypatch.delenv("STOA_WARM_HOSTED", raising=False)
+    monkeypatch.setattr(warm, "warm", lambda p: {"path": p, "private": os.environ.get("STOA_PRIVATE")})
+    warm.main([str(tmp_path / "x.png")])
+    assert os.environ.get("STOA_PRIVATE") == "1"
+
+
+def test_scanned_set_pages_are_picked_by_their_read_text(tmp_path, monkeypatch):
+    """Captain 18:50: a SCANNED set (every page a picture) was picked by 'the most ink' only (P1's 3-page scanned EFA
+    set: 9/24 on the right page). Each page's image text is read once, cached beside the set, and used for picking."""
+    import io
+
+    from PIL import Image, ImageDraw
+
+    from stoa.formats import pages as PG
+    from stoa.solvers.raster import textlayer as T
+
+    d = pymupdf.open()
+    for ink in (0.4, 0.1):  # page 1 has more ink: the old rule picks it for everything
+        img = Image.new("L", (1200, 850), 255)
+        ImageDraw.Draw(img).rectangle([50, 50, 50 + int(1100 * ink), 800], fill=0)
+        buf = io.BytesIO()
+        img.save(buf, format="PNG")
+        pg = d.new_page(width=842, height=595)
+        pg.insert_image(pg.rect, stream=buf.getvalue())
+    f = tmp_path / "set.pdf"
+    d.save(f)
+    said = {"p1": ["GROUND FLOOR PLAN", "SPORTS HALL"], "p2": ["FIRST FLOOR PLAN", "LIBRARY", "ENGLISH 1"]}
+
+    def fake_layer(path, *a, **k):
+        name = Path(path).name
+        key = "p1" if ".p1." in name else "p2"
+        return T.TextLayer(path=str(path), size=(1200, 850), items=[T.TextItem(t, [0, 0, 1, 1]) for t in said[key]])
+
+    from pathlib import Path
+
+    monkeypatch.setattr(T, "text_layer", fake_layer)
+    assert PG.scanned_set(PG.page_scores(f))
+    k, why = PG.pick_page(f, "How big is the Library?")
+    assert k == 1 and "scanned pages: text read from their images" in why
+    assert PG.cached_scan_texts(f) == {0: "GROUND FLOOR PLAN\nSPORTS HALL", 1: "FIRST FLOOR PLAN\nLIBRARY\nENGLISH 1"}
+    assert PG.pick_page(f, "How big is the sports hall?")[0] == 0
+    monkeypatch.setattr(T, "text_layer", lambda *a, **k: (_ for _ in ()).throw(AssertionError("read twice")))
+    assert PG.pick_page(f, "How many doors does English 1 have?")[0] == 1  # from the cache
+
+
+def test_sheet_storey_from_a_title_that_ends_with_the_floor():
+    """P1 20:15: the EFA sheets' titles say 'Secondary Type 3 600 Ground Floor' (no 'plan'): the storey of a scanned
+    set's page, so 'on the ground floor' finds it. A table listing every floor names none."""
+    from stoa.formats.pages import sheet_storey
+
+    assert sheet_storey("Plant Room\nSecondary Type 3 600 Ground Floor") == "Ground Floor"
+    assert sheet_storey("x\nLevel 2") == "Level 2"
+    assert sheet_storey("GROUND FLOOR PLAN\nFIRST FLOOR") == "GROUND"  # the plan title wins
+    assert sheet_storey("FIRST FLOOR = 48 DORMS\nSECOND FLOOR\nTHIRD FLOOR") is None
+    assert sheet_storey("the ground floor slab is cast in place before the first floor walls go up, see note") is None
+
+
+def test_ask_context_points_follow_the_solved_copy(monkeypatch):
+    """F7 20:24 / W5's feature registry: a right-click point / region arrives in the UPLOADED file's coordinates, but an
+    upload > 6000 px is read through its smaller copy, a scanned PDF page through its PNG, an SVG through its PDF copy.
+    ask_context_on(prep) hands the readers the point in the solved file's space, drops what it cannot map, restores."""
+    import json
+    import os
+
+    from stoa.formats import normalize as N
+
+    shrink = N.Prepared(original="/u/big.png", path="/u/big.s6000.png", kind="shrink", img_scale=0.5)
+    assert N.to_solved(shrink, [[100, 40]], "image_px") == ([[50.0, 20.0]], "image_px")
+    assert N.to_solved(shrink, [[100, 40]], "pdf_pt") is None
+    scan = N.Prepared(original="/u/s.pdf", path="/u/s.scan.png", kind="scan", scan_zoom=4.0)
+    assert N.to_solved(scan, [[10, 20]], "pdf_pt") == ([[40.0, 80.0]], "image_px")
+    svg = N.Prepared(original="/u/a.svg", path="/u/a.svg-v2.pdf", kind="svg_pdf", svg_frame=(100.0, 50.0, 2.0))
+    assert N.to_solved(svg, [[110, 70]], "svg") == ([[5.0, 10.0]], "pdf_pt")
+    assert N.to_solved(N.Prepared(original="/u/x.pdf", path="/u/x.pdf"), [[1, 2]], "pdf_pt") == ([[1.0, 2.0]], "pdf_pt")
+
+    ctx = {"point": [100, 40], "region": [[0, 0], [200, 0], [200, 80]], "space": "image_px", "view": "plan"}
+    monkeypatch.setenv("STOA_ASK_CONTEXT", json.dumps(ctx))
+    with N.ask_context_on(shrink):
+        got = json.loads(os.environ["STOA_ASK_CONTEXT"])
+        assert got["point"] == [50.0, 20.0] and got["region"][1] == [100.0, 0.0] and got["view"] == "plan"
+        assert got["solved_file"] == "/u/big.s6000.png"
+    assert json.loads(os.environ["STOA_ASK_CONTEXT"]) == ctx  # restored
+
+    pages = N.Prepared(original="/u/set.pdf", path="/u/set.p2.pdf", kind="page", page=2, pages=3)
+    monkeypatch.setenv("STOA_ASK_CONTEXT", json.dumps({"point": [5, 5], "space": "pdf_pt", "page": 0}))
+    with N.ask_context_on(pages):  # the visitor clicked page 1, the question was read on page 3: not passed on
+        got = json.loads(os.environ["STOA_ASK_CONTEXT"])
+        assert "point" not in got and "page 3" in got["dropped"][0]
+    monkeypatch.setenv("STOA_ASK_CONTEXT", json.dumps({"point": [5, 5], "space": "pdf_pt", "page": 2}))
+    with N.ask_context_on(pages):
+        got = json.loads(os.environ["STOA_ASK_CONTEXT"])
+        assert got["point"] == [5.0, 5.0] and got["page"] == 0
+
+
+def test_scanned_set_pages_classified_from_the_warm_reading(tmp_path):
+    """T3's project loop: stoa.sheet.sets.classify reads a PDF page's own text, so every page of a SCANNED set came out
+    'unknown, level not read' (P1's 3-page EFA scan: 3 of 3). pages.classify_scan_page uses what the warm already read
+    (page texts cached in <stem>.pagetext.json; the page's scan PNG layer when cached) and never reads anything itself."""
+    import json
+
+    import fitz
+    from PIL import Image
+
+    from stoa.formats import pages as P
+
+    img = tmp_path / "pic.png"
+    Image.new("L", (400, 300), 255).save(img)
+    pdf = tmp_path / "set.pdf"
+    d = fitz.open()
+    for _ in range(2):
+        pg = d.new_page(width=842, height=595)
+        pg.insert_image(pg.rect, filename=str(img))
+    d.save(pdf)
+    assert P.classify_scan_page(pdf, 0) is None  # nothing read yet: no cold read here
+    texts = {"0": "SCHOOL\nSecondary Type 3 600 Ground Floor\nScale 1:200 @ A1", "1": "Second Floor Plan\nHall"}
+    P._scan_text_file(pdf).write_text(json.dumps({"key": P._scan_key(pdf), "texts": texts}))
+    a, b = P.classify_scan_page(pdf, 0), P.classify_scan_page(pdf, 1)
+    assert (a.storey, a.page, str(a.file)) == ("0", 0, str(pdf)) and "Ground" in a.storey_name
+    assert b.storey == "2" and b.kind == "floor_plan"
+
+
+def test_private_hosts_are_an_explicit_list():
+    """T2 20:43: ipaddress.is_private also admits documentation / reserved ranges (TEST-NET 192.0.2/24, 240/4): those
+    are not our servers."""
+    from stoa import llm
+
+    for ok in ("http://127.0.0.1:8001/v1", "http://10.1.2.3:8110", "http://192.168.1.5", "http://100.101.2.3:8001",
+               "http://[::1]:8001", "http://localhost:8001"):
+        assert llm._private_host(ok), ok
+    for bad in ("http://192.0.2.10/v1", "http://198.51.100.7", "http://203.0.113.9", "http://240.0.0.1",
+                "https://generativelanguage.googleapis.com/v1beta/openai/", "http://8.8.8.8"):
+        assert not llm._private_host(bad), bad
+
+    class PrivateNetworkBlocked(ConnectionRefusedError):
+        pass
+
+    try:
+        try:
+            raise PrivateNetworkBlocked("no")
+        except PrivateNetworkBlocked as inner:
+            raise RuntimeError("connection error") from inner
+    except RuntimeError as outer:
+        assert llm._netguard_blocked(outer)
+    assert not llm._netguard_blocked(RuntimeError("x"))
+
+
+def test_cover_page_words_do_not_beat_the_plan_page(tmp_path):
+    """S0 21:16 (d27 up_fmt2 pdf3_last / pdfmulti: 3 L): a cover sheet 'APARTMENT BUILDING - TENDER DRAWINGS / 1 Cover
+    2 Legend 3 Floor plan' won 'net floor area of apartment C' with 2 weak word matches over the plan page (French
+    labels, 48 area labels). Weak matches on a page with no drawing do not beat a page that carries one."""
+    import fitz
+
+    pdf = tmp_path / "set.pdf"
+    d = fitz.open()
+    cover = d.new_page(width=842, height=595)
+    cover.insert_text((60, 80), "APARTMENT BUILDING - TENDER DRAWINGS", fontsize=20)
+    cover.insert_text((60, 120), "1  Cover    2  Legend and notes    3  Floor plan", fontsize=11)
+    legend = d.new_page(width=842, height=595)
+    legend.insert_text((60, 80), "LEGEND", fontsize=14)
+    legend.insert_text((60, 110), "Wall, load-bearing: solid fill. All dimensions in metres unless noted.", fontsize=9)
+    plan = d.new_page(width=842, height=595)
+    for i in range(12):
+        x, y = 60 + (i % 4) * 180, 60 + (i // 4) * 160
+        plan.draw_rect(fitz.Rect(x, y, x + 170, y + 150), width=2)
+        for k in range(40):  # hatching: vector content like a real plan
+            plan.draw_line((x + 4 * k % 170, y), (x + 4 * k % 170, y + 6))
+        plan.insert_text((x + 10, y + 30), ["Cuisine", "Chambre", "Bain", "Séjour"][i % 4], fontsize=8)
+        plan.insert_text((x + 10, y + 45), f"{10 + i}.{i:02d} m²", fontsize=8)
+    d.save(pdf)
+    from stoa.formats import pages as P
+
+    k, why = P.pick_page(pdf, "What is the net floor area of apartment C in m², summing all its rooms except balconies?")
+    assert k == 2, why
+    # a question that names the cover's own words strongly still goes there (no quantity asked)
+    k2, _ = P.pick_page(pdf, "What does the cover sheet say about the tender drawings?")
+    assert k2 == 0
+
+
+def _cad_pdf(path, lines=1500):
+    import pymupdf
+
+    d = pymupdf.open()
+    pg = d.new_page(width=842, height=595)
+    sh = pg.new_shape()
+    for i in range(lines):
+        sh.draw_line((20 + i % 800, 20 + (i * 7) % 550), (40 + i % 780, 30 + (i * 11) % 540))
+    sh.finish(width=0.3)
+    sh.commit()
+    pg.insert_text((60, 60), "LAUNDRY 7.03 m2   KITCHEN 35.61 m2   SCALE 1:200 @ A1")
+    d.save(str(path))
+    return str(path)
+
+
+def test_native_vector_pdf_tells_cad_exports_from_scans_and_traced_copies(tmp_path):
+    import pymupdf
+    from PIL import Image
+
+    cad = _cad_pdf(tmp_path / "plan.pdf")
+    assert normalize.native_vector_pdf(cad)
+    # the same drawing as one of our traced copies (by name, or by producer after a rename) is not native
+    traced = tmp_path / "plan.vec6.pdf"
+    traced.write_bytes(open(cad, "rb").read())
+    assert not normalize.native_vector_pdf(traced)
+    d = pymupdf.open(cad)
+    d.set_metadata({"producer": "stoa.formats.vectorize"})
+    d.save(str(tmp_path / "renamed.pdf"))
+    assert not normalize.native_vector_pdf(tmp_path / "renamed.pdf")
+    # a scan: one page-sized image, even with an OCR text layer on top
+    Image.new("L", (1200, 850), 255).save(tmp_path / "scan.png")
+    s = pymupdf.open()
+    pg = s.new_page(width=842, height=595)
+    pg.insert_image(pg.rect, filename=str(tmp_path / "scan.png"))
+    pg.insert_text((60, 60), "LAUNDRY 7.03 m2   KITCHEN 35.61 m2   SCALE 1:200 @ A1", render_mode=3)
+    s.save(str(tmp_path / "scan.pdf"))
+    assert not normalize.native_vector_pdf(tmp_path / "scan.pdf")
+    # a text-only page (a cover / schedule without linework), images, missing files: False, never an error
+    t = pymupdf.open()
+    t.new_page().insert_text((60, 60), "APARTMENT BUILDING - TENDER DRAWINGS, SHEET INDEX")
+    t.save(str(tmp_path / "cover.pdf"))
+    assert not normalize.native_vector_pdf(tmp_path / "cover.pdf")
+    assert not normalize.native_vector_pdf(tmp_path / "scan.png")
+    assert not normalize.native_vector_pdf(tmp_path / "missing.pdf")
+    assert not normalize.native_vector_pdf(cad, page=3)
+
+
+def test_a_question_naming_a_schedule_goes_to_the_schedule_page(tmp_path):
+    # X1 21:22 (night-X1 sl-249/254/255): 'according to the door schedule …' was answered from the plan page, which
+    # prints the module names more often than the A-602 DOOR SCHEDULE page
+    import pymupdf
+
+    from stoa.formats import pages
+
+    d = pymupdf.open()
+    plan = d.new_page(width=842, height=595)
+    sh = plan.new_shape()
+    for i in range(1500):
+        sh.draw_line((20 + i % 800, 20 + (i * 7) % 550), (40 + i % 780, 30 + (i * 11) % 540))
+    sh.finish(width=0.3)
+    sh.commit()
+    y = 40
+    for ln in ("MODULE 07 - SUPPORT - FLOOR PLAN", "MODULE 05 - RESTROOMS - FLOOR PLAN", "SUPPORT 7.01", "SUPPORT 7.02",
+               "RESTROOMS 5.01", "SEE DOOR SCHEDULE A-602", "A-103"):
+        plan.insert_text((60, y), ln)
+        y += 14
+    sched = d.new_page(width=842, height=595)
+    y = 40
+    for ln in ("A-602 DOOR SCHEDULE", "DOOR NUMBER  TYPE  REMARKS", "7.00A  A  SUPPORT", "7.01A  B", "5.01A  A  RESTROOMS"):
+        sched.insert_text((60, y), ln)
+        y += 14
+    f = str(tmp_path / "set.pdf")
+    d.save(f)
+    k, why = pages.pick_page(f, "According to the door schedule, how many doors does the support module (module 07) have?")
+    assert k == 1 and "DOOR SCHEDULE" in why, why
+    assert pages.pick_page(f, "How many doors are listed in the door schedule?")[0] == 1
+    # the plan's own questions stay on the plan; a schedule the set does not print changes nothing
+    assert pages.pick_page(f, "How many doors are there in module 07?")[0] == 0
+    assert pages.pick_page(f, "According to the window schedule, how many windows are in module 07?")[0] == 0

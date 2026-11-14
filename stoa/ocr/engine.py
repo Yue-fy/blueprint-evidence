@@ -10,7 +10,7 @@ agent and the captain's demo, so it lives in a separate env and the main code ta
     python stoa/ocr/engine.py --serve 8110                      # HTTP: POST {"path": IMG} -> JSON
 
 Output per image: {"size": [W, H], "items": [{"text", "box": [x0, y0, x1, y1], "score", "rot"}], "seconds",
-"engine"}. Boxes are ORIGINAL image pixels. `rot` is 0 for normal lines and 90/270 for vertical lines (title
+"cpu_s", "engine"}. Boxes are ORIGINAL image pixels. `rot` is 0 for normal lines and 90/270 for vertical lines (title
 blocks on HABS sheets run up the right margin) that were re-read on a rotated crop.
 """
 
@@ -198,7 +198,7 @@ def _vertical(img: Image.Image, items: list[dict]) -> list[dict]:
 
 
 def read(path: str) -> dict:
-    t0 = time.perf_counter()
+    t0, c0 = time.perf_counter(), time.process_time()
     img = Image.open(path)
     if img.mode in ("RGBA", "LA", "P"):  # transparent pixels -> white paper, not black (convert drops alpha)
         img = img.convert("RGBA")
@@ -218,7 +218,33 @@ def read(path: str) -> dict:
         t = fix_text(it["text"])
         if t != it["text"]:
             it["raw"], it["text"] = it["text"], t
-    return {"size": [W, H], "items": items, "seconds": round(time.perf_counter() - t0, 2), "engine": ENGINE}
+    # cpu_s (P1 20:41): this process's CPU time for the read, all threads (reads are serialised by _lock), for the meter
+    return {"size": [W, H], "items": items, "seconds": round(time.perf_counter() - t0, 2),
+            "cpu_s": round(time.process_time() - c0, 2), "engine": ENGINE}
+
+
+def _out_dir() -> str:
+    """stoa.ocr's disk cache (the only place the server writes a client's `out`)."""
+    shared = os.environ.get("JUNCTION_SHARED", ".stoa")
+    return os.path.realpath(os.path.join(shared, "artifacts", "O1", "ocr"))
+
+
+def _write_out(out, d: dict) -> bool:
+    """Write the reading to the client's cache file `out` (atomic) when it is a .json file directly in the OCR cache
+    folder; anything else is ignored (the server never writes elsewhere)."""
+    if not out or not isinstance(out, str) or not out.endswith(".json") or "error" in d:
+        return False
+    p = os.path.realpath(out)
+    if os.path.dirname(p) != _out_dir() or not os.path.isdir(os.path.dirname(p)):
+        return False
+    tmp = os.path.join(os.path.dirname(p), f".{os.path.basename(p)}.srv{os.getpid()}.tmp")
+    try:
+        with open(tmp, "w") as f:
+            json.dump(d, f)
+        os.replace(tmp, p)
+    except OSError:
+        return False
+    return True
 
 
 def serve(port: int) -> None:
@@ -244,9 +270,14 @@ def serve(port: int) -> None:
         def do_POST(self):
             try:
                 req = json.loads(self.rfile.read(int(self.headers.get("Content-Length", 0))) or b"{}")
-                self._send(200, read(req["path"]))
+                d = read(req["path"])
+                _write_out(req.get("out"), d)  # O1 c10: the reading lands even if the client gave up / exited
+                self._send(200, d)
             except Exception as e:  # noqa: BLE001 - report to the client, keep serving
-                self._send(500, {"error": f"{type(e).__name__}: {e}"})
+                try:
+                    self._send(500, {"error": f"{type(e).__name__}: {e}"})
+                except OSError:  # the client is gone
+                    pass
 
     ThreadingHTTPServer(("127.0.0.1", port), H).serve_forever()
 
@@ -254,6 +285,15 @@ def serve(port: int) -> None:
 def main(argv: list[str]) -> None:
     if argv[:1] == ["--serve"]:
         serve(int(argv[1]) if len(argv) > 1 else 8110)
+        return
+    if "--out" in argv:  # one image -> one JSON file, written atomically (stoa.ocr's detached reads; errors not cached)
+        i = argv.index("--out")
+        out, argv = argv[i + 1], argv[:i] + argv[i + 2:]
+        d = read(argv[0])
+        tmp = f"{out}.{os.getpid()}.tmp"
+        with open(tmp, "w") as f:
+            json.dump(d, f)
+        os.replace(tmp, out)
         return
     out_dir = None
     if "--out-dir" in argv:

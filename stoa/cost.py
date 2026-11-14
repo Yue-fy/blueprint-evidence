@@ -5,7 +5,15 @@ Stoa scores cost (lower is better), so every answer carries `Answer.cost` and th
     usd = gpu_usd + api_usd + cpu_usd
     gpu_usd = billed GPU seconds x $STOA_GPU_USD_PER_HOUR / 3600   (default $2.00/h = one 96 GB GPU, cloud rental)
     api_usd = hosted tokens x the model's list price               (per-model table below; set at call time)
-    cpu_usd = wall seconds x $STOA_CPU_USD_PER_HOUR / 3600          (default $0.05/h, one busy core)
+    cpu_usd = core seconds x $STOA_CPU_USD_PER_HOUR / 3600          (default $0.05 per core-hour)
+    core seconds = wall seconds (this process, one core) + cpu_seconds x $STOA_SERVICE_CORES (default 4.7)
+
+`cpu_seconds` is the wall time a multi-threaded CPU service worked for the question: the PP-OCRv6 engine records its
+wall time at STOA_OCR_THREADS = 8 threads (stoa.ocr.text_layer, E1's area-table crops); the door detector's clients can
+call record_service(seconds, threads). Until 20:25 Sat it was recorded but NOT priced (audit 19:51: '$1.49/1k' with
+scans far above). Measured 20:25 (P1, /usr/bin/time, load 54-95): one cold OCR of a 6000x3979 px scan = 339 s wall,
+1,594 CPU-s (470 %), 5.4 GB RAM -> 4.7 busy cores per recorded second = ~$0.022 per scanned sheet, more than the GPU
+work of the same question. Wall time stretches with machine load, so treat CPU $ as +-2x.
 
 Local GPU time is an amortised estimate from tokens (stoa.llm.gpu_seconds_estimate: prefill 25k tok/s,
 decode 1k tok/s on the shared vLLM), not HTTP latency, because latency includes queueing behind other users.
@@ -31,7 +39,9 @@ def _f(name: str, default: float) -> float:
 
 
 GPU_USD_PER_HOUR = _f("STOA_GPU_USD_PER_HOUR", 2.00)  # one 96 GB GPU equivalent (captain, P1 prompt)
-CPU_USD_PER_HOUR = _f("STOA_CPU_USD_PER_HOUR", 0.05)
+CPU_USD_PER_HOUR = _f("STOA_CPU_USD_PER_HOUR", 0.05)  # per core-hour (cloud vCPU + its RAM, on demand)
+SERVICE_THREADS = _f("STOA_OCR_THREADS", 8)  # nominal threads behind one recorded cpu_second (the OCR engine's)
+SERVICE_CORES = _f("STOA_SERVICE_CORES", 4.7)  # cores actually busy per recorded cpu_second (measured 20:25, above)
 
 # $ per 1M tokens (input, output), paid-tier list prices for prompts <= 200k tokens. Gemini figures checked on
 # 14 Nov 2026 against public price aggregators (Google's own page did not render for us): Gemini output prices include
@@ -109,8 +119,46 @@ def breakdown(c: dict) -> dict:
         local_in = max(0, _g(c, "llm_tokens_in") - _g(c, "api_tokens_in"))
         local_out = max(0, _g(c, "llm_tokens_out") - _g(c, "api_tokens_out"))
         gpu += (local_in * LOCAL_USD_PER_MTOK[0] + local_out * LOCAL_USD_PER_MTOK[1]) / 1e6
-    cpu = _g(c, "wall_seconds") * CPU_USD_PER_HOUR / 3600
+    cpu = core_seconds(c) * CPU_USD_PER_HOUR / 3600
     return {"gpu_usd": gpu, "api_usd": api, "cpu_usd": cpu, "usd": gpu + api + cpu}
+
+
+def service_core_seconds(c: dict) -> float:
+    """Core seconds of the CPU services (OCR engine, detector) this question used."""
+    return _g(c, "cpu_seconds") * SERVICE_CORES
+
+
+def core_seconds(c: dict) -> float:
+    """All CPU work we charge: this process at one core for the wall time + the services' cores."""
+    return _g(c, "wall_seconds") + service_core_seconds(c)
+
+
+def record_cpu(cpu_s: float) -> None:
+    """Charge CPU time a service MEASURED (O1 20:58: stoa.ocr.engine.read returns 'cpu_s' = time.process_time() over all
+    its threads): recorded in the cpu_seconds unit so the price is exactly cpu_s core-seconds, whatever the load.
+    Use it instead of record_cost(cpu_seconds=<wall seconds>) when the reply has cpu_s."""
+    try:
+        sec = float(cpu_s or 0) / SERVICE_CORES
+    except (TypeError, ValueError):
+        return
+    if sec > 0:
+        from stoa.contract import record_cost
+
+        record_cost(cpu_seconds=round(sec, 3))
+
+
+def record_service(seconds: float, threads: float = SERVICE_THREADS) -> None:
+    """Charge a CPU service's busy time to the current question, e.g. the door detector's reply
+    `record_service(res.get('infer_seconds') or 0, threads=16)` (DET_THREADS 16; 0 on a cache hit). No-op outside a meter.
+    Recorded in the OCR engine's unit (seconds at SERVICE_THREADS threads)."""
+    try:
+        sec = float(seconds or 0) * float(threads) / SERVICE_THREADS
+    except (TypeError, ValueError):
+        return
+    if sec > 0:
+        from stoa.contract import record_cost
+
+        record_cost(cpu_seconds=round(sec, 3))
 
 
 def cost_usd(c: dict) -> float:
@@ -119,7 +167,7 @@ def cost_usd(c: dict) -> float:
 
 def rates() -> dict:
     """The prices in force, written into every eval summary so runs stay comparable."""
-    return {"gpu_usd_per_hour": GPU_USD_PER_HOUR, "cpu_usd_per_hour": CPU_USD_PER_HOUR,
+    return {"gpu_usd_per_hour": GPU_USD_PER_HOUR, "cpu_usd_per_hour": CPU_USD_PER_HOUR, "service_cores": SERVICE_CORES,
             "api_default_usd_per_mtok": list(DEFAULT_API_PRICE),
             "api_usd_per_mtok": {k: list(v) for k, v in API_PRICES.items()},
             "gpu_seconds_from_tokens": {"prefill_tps": PREFILL_TPS, "decode_tps": DECODE_TPS}}
@@ -129,7 +177,8 @@ def describe(c: dict) -> str:
     """One line for a person: '$0.00012 = GPU $0.00010 (0.18 s) + API $0.00000 (0 calls) + CPU $0.00002'."""
     b = breakdown(c)
     return (f"${b['usd']:.5f} = GPU ${b['gpu_usd']:.5f} ({gpu_seconds_billed(c):.2f} s at ${GPU_USD_PER_HOUR:.2f}/h)"
-            f" + API ${b['api_usd']:.5f} ({int(_g(c, 'api_calls'))} calls) + CPU ${b['cpu_usd']:.5f}")
+            f" + API ${b['api_usd']:.5f} ({int(_g(c, 'api_calls'))} calls) + CPU ${b['cpu_usd']:.5f}"
+            f" ({core_seconds(c):.0f} core-s)")
 
 
 # ------------------------------------------------------------------------------------------- cost tier (badge)
@@ -141,7 +190,12 @@ def describe(c: dict) -> str:
 TIER_TOKENS = int(_f("STOA_TIER_TOKENS", 30_000))
 TIER_CALLS = int(_f("STOA_TIER_CALLS", 6))
 TIER_API_USD = _f("STOA_TIER_API_USD", 0.003)  # one Gemini 3.1 Pro count = $0.0074; one Flash count = $0.0008
+# CPU services (OCR of a scan, the door detector): cheap up to 10 core-minutes (~$0.008, e.g. OCR of a table crop or a
+# small sheet), in-between above (one cold OCR of a 6000 px scan = 27 core-minutes), expensive above 80 core-minutes.
+TIER_CPU_CORE_S = _f("STOA_TIER_CPU_CORE_S", 600)
+TIER_CPU_CORE_S_HIGH = _f("STOA_TIER_CPU_CORE_S_HIGH", 4800)
 TIER_LABELS = {"cheap": "Cheap", "in-between": "In-between", "expensive": "Expensive"}
+_ORDER = ("cheap", "in-between", "expensive")
 
 
 def tier(c: dict) -> dict:
@@ -163,4 +217,12 @@ def tier(c: dict) -> dict:
     else:
         who = f"{hosted} hosted" if hosted else "our own GPU"
         t, why = "in-between", f"{calls} small-model call{'s' if calls != 1 else ''} ({who}), {tokens:,} tokens"
+    svc = service_core_seconds(c)
+    ct = "expensive" if svc > TIER_CPU_CORE_S_HIGH else "in-between" if svc > TIER_CPU_CORE_S else "cheap"
+    if svc > TIER_CPU_CORE_S:
+        cpu_why = f"text recognition / detection on our CPU ({svc / 60:.0f} core-minutes)"
+        if _ORDER.index(ct) > _ORDER.index(t):
+            t, why = ct, cpu_why
+        else:
+            why = f"{why}; {cpu_why}"
     return {"tier": t, "label": TIER_LABELS[t], "why": why}

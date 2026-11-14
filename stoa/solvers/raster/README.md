@@ -173,3 +173,32 @@ raster vs LoRA on all dev floors: `upload_set.py --what door|window` + `upload_c
 - Known gaps: courts / furniture drawn thicker than hollow walls bound the fill (Sports Hall 20 of 504 m²); open bays
   delimited by dashed lines (Food bay 15.75 vs 17); the style guesser calls line-only CAD PNGs 'cubicasa5k' (routing,
   G1's pipeline) so the agent answers first.
+- NEGATIVE: removing dashed grid lines (>= 12 m, `measure.drop_grid_lines`, `STOA_O1_GRID=1`) before the fill: 300-dpi
+  bench, 150 rooms, within 2% hollow 103 -> 93, solid 117 -> 114 (a grid line's dashes in a doorway closed it). Off.
+- Tag counts: codes are TYPES only when tags >= 1.5 x distinct codes (a note naming FP-3 again is not a 4th pump).
+- `stoa.ocr`: a read over STOA_OCR_TIMEOUT keeps running detached and lands in the cache; a `.timeout` marker skips
+  OCR for STOA_OCR_NEG_TTL seconds on that file.
+
+### O1 cycle 7 (18:35-): phone photos, screenshot crops, numbered rooms
+- `photo.py`: a phone photo of a printed sheet (one bright sheet fully inside the frame on a darker surround) ->
+  corners (Otsu blob -> convex quad -> sub-pixel edge lines), perspective undone to the nearest standard sheet aspect
+  (ISO A first, ANSI / ARCH; Zhang & He aspect recovery when a physical focal length explains the quad, else mean side
+  lengths), light divided out, `<stem>.photo.png` with a `stoa_photo` text chunk + an A3 DPI tag (a prior only),
+  `<stem>.photo.json` sidecar (also caches 'not a photo'), inverse homography for evidence. Hooked into
+  `stoa.formats.normalize.prepare/restore` by P1 (patch `experiments/o1/c7/normalize_photo.patch`). Fires on 5/5 X1
+  phone photos + 3 Europeana sheet photos, on none of 183 other dataset / Stoa / CubiCasa / scan images
+  (`experiments/o1/c7/photo_fp_check.py`). Kill switch `STOA_O1_PHOTO=0` (writes no cache).
+- `scalebar.printed_bar` on a deskewed photo: the pixels span the paper the SHEET names ('1:200 @ A1', 'A1', 'ANSI D'
+  of the image's aspect) -> exact px/m whatever the print size; none named -> None, and textqa uses the A3 guess only
+  after drawn bars and chains, capped at `PHOTO_GUESS_CONF` 0.3 with the assumption stated. On a photo a drawn bar that
+  agrees within 3% gives way to the named-paper scale (whole sheet vs a ~200 px bar: 21.70 vs 21.50, true 21.53).
+- `chains.loose_chain_bar`: one dimension chain WITHOUT a printed total (grid bays on a screenshot crop) gives the
+  scale when >= 4 consecutive metric strings fit their running sums within 2% (longest fitting run, so one OCR misread
+  only shortens it; identical values need >= 6 bays of >= 3 m; signed level marks excluded; a second loose chain must
+  agree within 3%). After drawn bar / printed scale / verified chains. Where another scale exists it agrees within
+  0.2% (3 sheets). Kill switch `STOA_O1_LOOSE_CHAINS=0`.
+- `measure.find_label(loose)`: numbered names ('English 3', 'Bedroom 2', 'MFL 1') match as a whole (`_NAME_NUM`);
+  they and dotted abbreviations ('Lib.', 'Eng. St.') split other rooms' fills.
+- `textqa._range_sum_answer`: 'English 1 to English 5' / 'Bedroom 2 and Bedroom 3' -> each label once, printed area
+  or outline, summed (before the floor / unit sums).
+- X1 probe (photo sl-125..128/133 + crop sl-134..137, Gemini off): 0/9 -> 7-8/9.

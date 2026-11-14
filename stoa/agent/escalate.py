@@ -86,6 +86,9 @@ TEAM_DAY_CAP = int(os.environ.get("STOA_GEMINI_TEAM_CAP", 800))
 def _team_calls_today() -> int:
     from stoa.llm import GEMINI_LOG
 
+    if os.environ.get("STOA_LLM_REPLAY") == "1":
+        return 0  # S0 arbitration replay: answers only from the disk cache, no new calls -> the day cap does not apply
+
     day, n = time.strftime("%Y-%m-%d"), 0
     try:
         with open(GEMINI_LOG, encoding="utf-8") as f:

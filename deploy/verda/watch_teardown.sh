@@ -4,6 +4,7 @@
 # $JUNCTION_SHARED/artifacts/V1/runs/<tag>/; then DELETE the instance and note it in $JUNCTION_SHARED/verda-watch.log.
 # Spot-safe: shard prediction files are rsynced to runs/<tag>/partial/ every 2 min.
 #   ID=<instance id> IP=<ip> TAGS="lone:upload same:pipeline" DEADLINE=HH:MM setsid nohup bash watch_teardown.sh > log 2>&1 &
+#   NO_DELETE=1: pull + report only, keep the instance (V1 cycle 6)
 set -u
 ID=${ID:?}; IP=${IP:?}; TAGS=${TAGS:-${TAG:-all}:${SOLVER:-pipeline}}; STALL_MIN=${STALL_MIN:-20}; PRICE=${PRICE:-2.6174}
 SH=.stoa; BASE=$SH/artifacts/V1/runs
@@ -18,11 +19,13 @@ while :; do
   for ts in $TAGS; do
     t=${ts%%:*}; s=${ts##*:}; mkdir -p $BASE/$t/partial
     $SSH "test -f /root/work/runs/$t/t0" 2>/dev/null || continue
+    started=1
     p=$($SSH "SOLVER=$s bash /root/ship/progress.sh $t" 2>/dev/null); log "$t: $p"; cur=$p
     rsync -a -e "ssh $K" "root@$IP:/root/shared/artifacts/eval/*-$s-s*.jsonl" $BASE/$t/partial/ 2>/dev/null
   done
   n=$(echo "${cur:-}" | sed -n 's/^rows=\([0-9]*\).*/\1/p'); n=${n:-$last}
   if [[ $n == "$last" ]]; then same=$((same+1)); else same=0; last=$n; fi
+  (( ${started:-0} )) || same=0   # a queued chain (e.g. waiting for another job) is not a stall
   if (( same * 2 >= STALL_MIN )); then why="stalled (rows=$n unchanged ${STALL_MIN} min)"; break; fi
   if (( $(date +%s) > dl )); then why="deadline ${DEADLINE:-23:00} (rows=$n)"; break; fi
   sleep 120
@@ -39,6 +42,10 @@ for ts in $TAGS; do
     && log "pulled $t to $OUT ($(du -sh $OUT | cut -f1))" || log "PULL FAILED $t"
 done
 $SSH "cp /root/work/vllm.log $BASE/ 2>/dev/null; true"
+if [ "${NO_DELETE:-0}" = 1 ]; then  # captain 19:23: a kept instance (global teardown deletes it at 02:10)
+  echo "- [$(date +%H:%M)] watcher: runs '$TAGS' $why; results in $BASE/<tag>; instance $ID KEPT (NO_DELETE)" >> $SH/verda-watch.log
+  exit 0
+fi
 log "balance before delete: $(python3 -I $HERE/verda.py balance)"
 python3 -I $HERE/verda.py delete $ID && log "deleted instance $ID"
 sleep 20; log "instances now: $(python3 -I $HERE/verda.py instances)"; log "balance after: $(python3 -I $HERE/verda.py balance)"

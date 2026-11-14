@@ -83,7 +83,8 @@ def predict(path):
         size = Image.open(path).size
         r = rooms if sc == 1.0 else cv2.resize(rooms, size, interpolation=cv2.INTER_NEAREST)
         i = icons if sc == 1.0 else cv2.resize(icons, size, interpolation=cv2.INTER_NEAREST)  # room_graph needs both
-        np.savez_compressed(os.path.join(save, os.path.splitext(os.path.basename(path))[0] + ".npz"), rooms=r, icons=i)
+        name = os.environ.get("CC5K_SAVE_NAME") or os.path.splitext(os.path.basename(path))[0]  # T2: content-named
+        np.savez_compressed(os.path.join(save, os.path.basename(name) + ".npz"), rooms=r, icons=i)
     return {"path": path, "cpu_seconds": round(time.process_time() - t0, 2),
             "model": "CubiCasa5K multi-task (Kalervo et al. 2019), CC BY-NC 4.0 weights",
             "work_scale": round(sc, 4), "counts": out, "rooms": room_counts}

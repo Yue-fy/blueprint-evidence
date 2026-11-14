@@ -44,10 +44,20 @@ LOCAL_BACKEND_LOGIC = {
 }
 
 
+# Tests of the hosted-step logic with a stubbed client: they assume the Gemini step is allowed, so a shell that turns
+# it off (STOA_GEMINI_ESCALATE=0, as the team's own test runs did) must not leak into them.
+HOSTED_STEP_LOGIC = {
+    "tests/test_piping.py::test_connection_uses_validated_gemini_evidence_ids_when_key_exists",
+}
+
+
 @pytest.fixture(autouse=True)
 def _local_backend_logic(request, monkeypatch):
     if request.node.nodeid in LOCAL_BACKEND_LOGIC:
         monkeypatch.delenv("STOA_MODE", raising=False)
+    if request.node.nodeid in HOSTED_STEP_LOGIC:
+        monkeypatch.delenv("STOA_GEMINI_ESCALATE", raising=False)
+        monkeypatch.delenv("STOA_PRIVATE", raising=False)
 
 
 def _has_dataset() -> bool:

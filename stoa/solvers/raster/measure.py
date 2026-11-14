@@ -50,12 +50,13 @@ def find_label(layer: T.TextLayer, question: str, loose: bool = False) -> T.Text
             return hits[0]
         # O1 c6: names joined by '/' ('Food bay/practical resources', 'Head/Mtg' on D1's school sheets) fail _NAME;
         # compare word keys on both sides, and of nested hits ('Hall' inside 'Main Hall') keep the longest
-        wide = [i for i in layer.items if _NAME_WIDE.fullmatch(_lkey(i.text)) and _lkey(i.text) not in _GENERIC
-                and f" {_lkey(i.text)} " in qk]
-        keys = {_lkey(i.text) for i in wide}
+        wide = [i for i in layer.items if (_NAME_WIDE.fullmatch(_wkey(i.text)) or _NAME_NUM.fullmatch(_wkey(i.text))
+                                           or LABEL_ABBR and _NAME_LET.fullmatch(_wkey(i.text)))
+                and _wkey(i.text) not in _GENERIC and f" {_wkey(i.text)} " in qk]
+        keys = {_wkey(i.text) for i in wide}
         top = [k for k in keys if not any(k != o and f" {k} " in f" {o} " for o in keys)]
         if len(top) == 1:
-            got = [i for i in wide if _lkey(i.text) == top[0]]
+            got = [i for i in wide if _wkey(i.text) == top[0]]
             if len(got) == 1:
                 return got[0]
         if hits:
@@ -129,11 +130,29 @@ def concept_labels(layer: T.TextLayer, question: str, concept: str | None = None
 
 _NAME = re.compile(r"[^\W\d_]{3,}(?: [^\W\d_]{2,}){0,2}")
 _NAME_WIDE = re.compile(r"[^\W\d_]{2,}(?: [^\W\d_]{2,}){0,4}")
+# O1 c7: numbered names ('English 3', 'Bedroom 2', 'MFL 1', 'Classroom 12a'): one of a series, matched as a whole
+_NAME_NUM = re.compile(r"[^\W\d_]{2,}(?: [^\W\d_]{2,}){0,3} \d{1,3}[a-z]?")
 
 
 def _lkey(text: str) -> str:
     """A label's word key: normalised, every non-word run (/, -, .) a single space ('Head/Mtg' -> 'head mtg')."""
     return re.sub(r"[^\w]+", " ", T.norm(text)).strip()
+
+
+# O1 c9 (D1's HABS probe): 'Room D' (letter-coded rooms), 'DRAWING RM. 18'-8" × 26'-10".' (a data-table line: name + size,
+# 'RM.' = room). STOA_O1_LABEL_ABBR=0 = off.
+LABEL_ABBR = os.environ.get("STOA_O1_LABEL_ABBR", "1") != "0"
+_NAME_LET = re.compile(r"[^\W\d_]{3,} [^\W\d_]")
+_ABBR = {"rm": "room", "rms": "rooms", "bdrm": "bedroom", "bedrm": "bedroom"}
+_SIZE_TAIL = re.compile(r"\s+\d[\d'’\"”\s./½¼¾-]*\s*[x×X]\s*\d.*$")
+
+
+def _wkey(text: str) -> str:
+    """_lkey of a label without a printed size after it, abbreviations spelled out ('drawing rm' -> 'drawing room')."""
+    if not LABEL_ABBR:
+        return _lkey(text)
+    k = _lkey(_SIZE_TAIL.sub("", text))
+    return " ".join(_ABBR.get(w, w) for w in k.split())
 
 _GENERIC = {"floor", "plan", "plans", "area", "areas", "room", "rooms", "total", "scale", "north", "level", "sheet",
             "drawing", "site", "the", "and", "with", "from", "planner", "page", "date", "title", "project", "unit",
@@ -157,6 +176,10 @@ def _ink(path: str) -> np.ndarray:
 # door-swing sectors kept inside a room's hull (0 = off). Swiss PNG bench (room_fill_eval.py --textqa, 242 rooms):
 # within 2% 90 -> 91, 5% 135 = 135; LEVEL_11 render comms room 16.32 -> 16.51 m² (gold 16.83)
 SEED_SKIP_LABELLED = os.environ.get("STOA_O1_SEED_SKIP", "1") != "0"
+# O1 c9 (QA 20:18, W6's DfE phone photo, 31 px/m, no door bridging): the kitchen's blank ran out through a doorway and
+# held 109 other room labels (the framed sheet's paper) -> the nearest-label split gave a wedge of exterior, 65.52 m².
+# A blank with this many other labels is no room: None (the walls-only refill with door gaps closed is tried next).
+LEAK_LABELS = int(os.environ.get("STOA_O1_LEAK_LABELS", "10") or 0)
 DOOR_SECTOR_M2 = float(os.environ.get("STOA_O1_SECTOR", "1.2") or 0)
 GROW_PER_PX_M = float(os.environ.get("STOA_O1_GROW", "60") or 0)  # border px given back = px_per_m / this (min 1)
 OTHER_LABEL_CUT = os.environ.get("STOA_O1_LABEL_CUT", "1") != "0"  # blanks holding another room's label leave the hull
@@ -171,6 +194,56 @@ FILL = {"door_m": 0.0, "hull": True, "clip": True, "clip_m2": 3.0, "fixture_retr
         "bridge_m": BRIDGE_M}
 WITHIN = {"2%": 6 / 23, "5%": 11 / 23, "10%": 15 / 23, "20%": 19 / 23}
 CONF = 0.3  # P(within 2%): held-out 6/23 rooms; end-to-end held-out 5/17 at the old 0.35
+
+
+# NEGATIVE (O1 c6, lineonly_bench.py --dpi 300 --bridge 2 --limit 10, 150 rooms): within 2% hollow 103 -> 93, solid
+# 117 -> 114 with it -- the dashes of a grid line in a doorway closed that doorway; kept OFF (STOA_O1_GRID=1 = on)
+GRID_DROP = os.environ.get("STOA_O1_GRID", "0") != "0"
+GRID_MIN_M = 12.0  # dashed straight lines at least this long are grid / axis lines (they cross rooms), not zone lines
+GRID_DENSITY = 0.9  # ink share along a closed long line below this = dashed
+DASH_MAX_M = 1.2  # inside a dashed line, ink runs shorter than this are dashes (removed); longer runs are walls (kept)
+
+
+def drop_grid_lines(ink: np.ndarray, px_per_m: float, min_len_m: float = GRID_MIN_M, gap_m: float = 0.25) -> np.ndarray:
+    """Remove DASHED horizontal / vertical lines longer than min_len_m (structural grid lines, captain 18:21 fix list
+    item 2): they cross whole buildings, and the fill's 3-px closing turns their dashes into walls that cut rooms. A
+    candidate = ink closed along the line over gaps <= gap_m, then opened with a min_len_m line kernel; it is dashed when
+    the original ink covers < GRID_DENSITY of it (wall lines are continuous; a door gap is longer than gap_m)."""
+    L = max(10, int(round(min_len_m * px_per_m)))
+    g = max(3, int(round(gap_m * px_per_m)))
+    out = ink.copy()
+    for horiz in (True, False):
+        kc = (g, 1) if horiz else (1, g)
+        ko = (L, 1) if horiz else (1, L)
+        closed = cv2.morphologyEx(ink, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_RECT, kc))
+        long_ = cv2.morphologyEx(closed, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_RECT, ko))
+        n, lab, st, _ = cv2.connectedComponentsWithStats(long_, connectivity=8)
+        for c in range(1, n):
+            x, y, w, h, a = st[c]
+            if (h if horiz else w) > max(4, 0.08 * px_per_m):  # thick: a wall band / poché, never a grid line
+                continue
+            sub = lab[y:y + h, x:x + w] == c
+            dens = float(ink[y:y + h, x:x + w][sub].mean()) if a else 1.0
+            if dens >= GRID_DENSITY:
+                continue
+            # only the DASHES go: ink runs along the line shorter than DASH_MAX_M (a wall drawn on the grid axis is a
+            # longer continuous run and stays)
+            prof = (ink[y:y + h, x:x + w] & sub).any(axis=0 if horiz else 1)
+            kill = np.zeros_like(prof)
+            i, n_ = 0, len(prof)
+            while i < n_:
+                if prof[i]:
+                    j = i
+                    while j < n_ and prof[j]:
+                        j += 1
+                    if j - i < DASH_MAX_M * px_per_m:
+                        kill[i:j] = True
+                    i = j
+                else:
+                    i += 1
+            m = sub & (kill[None, :] if horiz else kill[:, None])
+            out[y:y + h, x:x + w][m] = 0
+    return out
 
 
 def bridge(ink: np.ndarray, px_per_m: float, bridge_m: float, run_m: float = 0.4) -> np.ndarray:
@@ -224,6 +297,8 @@ def _fill(ink: np.ndarray, label_box, px_per_m: float, door_m: float, hull: bool
               or lab[min(H - 1, int((b[1] + b[3]) / 2)), min(W - 1, int((b[0] + b[2]) / 2))] == 0
               and xs.min() <= (b[0] + b[2]) / 2 <= xs.max() and ys.min() <= (b[1] + b[3]) / 2 <= ys.max()
               and comp[max(0, int(b[1]) - pad):int(b[3]) + pad, max(0, int(b[0]) - pad):int(b[2]) + pad].any()]
+    if LEAK_LABELS and len(inside) >= LEAK_LABELS:
+        return None  # the blank holds most of the sheet's rooms: a leak through doorways, not one open-plan room
     if inside:
         d0 = (xs - cx) ** 2 + (ys - cy) ** 2
         keep = np.ones(len(xs), bool)
@@ -338,7 +413,10 @@ def room_area(path: str, label_box: list[float], px_per_m: float, door_m: float 
     # clean render) -> door gaps are bridged at any resolution (textqa._large; O1 c6: D1's line-only school sheets as
     # 300-dpi PNGs = 59 / 29.5 px/m, below BRIDGE_MIN_PX_M)
     if bridge_m > 0 and (px_per_m >= BRIDGE_MIN_PX_M or large):
-        ink = bridge(_ink(path) if ink is None else ink, px_per_m, bridge_m)
+        base = _ink(path) if ink is None else ink
+        if GRID_DROP:  # large-format CAD: dashed grid lines cross rooms (drop_grid_lines)
+            base = drop_grid_lines(base, px_per_m)
+        ink = bridge(base, px_per_m, bridge_m)
     r = _room_area(path, label_box, px_per_m, door_m, ink, wall_m, hull, clip, clip_m2, others, fixture_retry, grow)
     if not solid:
         return r

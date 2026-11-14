@@ -1,5 +1,128 @@
 [
   {
+    "id": "dfe-school",
+    "name": "Special school, ground floor",
+    "place": "Department for Education, UK (fictitious site)",
+    "facts": [
+      "Stoa's example sheet",
+      "1:200 with scale bar",
+      "line CAD, room labels"
+    ],
+    "contents": "Level 00 floor plan (Stoa's sheet) + Level 01",
+    "sheets": [
+      {
+        "label": "Level 00",
+        "path": "examples/dfe-special-school-plan-level00.png"
+      },
+      {
+        "label": "Level 01",
+        "path": "examples/SEN-DFE-XX-01-D-X-0202-Special_School_Plan_Level_01-A-C01.pdf"
+      }
+    ],
+    "chips": [
+      "What is the floor area of the Multi-Purpose Hall?",
+      "How many metres of skirting does the Laundry need, door openings excluded?",
+      "How many doors does the Kitchen have?",
+      "What is the total area of all Secondary Classrooms?"
+    ],
+    "credit": "Drawing: Department for Education (UK), Open Government Licence v3.0",
+    "kind": "floor"
+  },
+  {
+    "id": "dfe-scan",
+    "name": "Special school, scanned print",
+    "place": "The same sheet, printed and scanned",
+    "badge": "scan",
+    "facts": [
+      "scanned print (200 dpi)",
+      "no text layer"
+    ],
+    "contents": "1 scanned floor plan",
+    "sheets": [
+      {
+        "label": "Level 00 (scan)",
+        "path": "examples/dfe-school-scan.png"
+      }
+    ],
+    "chips": [
+      "What is the area of the Laundry?",
+      "How many metres of skirting does the Laundry need?"
+    ],
+    "credit": "Drawing: Department for Education (UK), Open Government Licence v3.0; print and scan simulated by us",
+    "kind": "scan"
+  },
+  {
+    "id": "usace-s100f",
+    "name": "Filter building, foundation and slab plan",
+    "place": "US Army Corps of Engineers · sheet S-100F",
+    "facts": [
+      "Stoa's example sheet",
+      "1:50 · mm dimensions",
+      "slab types by thickness and bars"
+    ],
+    "contents": "1 structural sheet (the original vector PDF)",
+    "sheets": [
+      {
+        "label": "S-100F",
+        "path": "examples/usace-S-100F-foundation-slab-plan.pdf"
+      }
+    ],
+    "chips": [
+      "What is the area of the 150 mm slab (D13 @ 300)?",
+      "What is the slab area of each type?",
+      "What is the overall length of the foundation?"
+    ],
+    "credit": "Drawing: US Army Corps of Engineers, AW 078-24-33, public domain",
+    "kind": "structural"
+  },
+  {
+    "id": "usace-m101a",
+    "name": "Hydrant fueling system, piping plan",
+    "place": "US Army Corps of Engineers · sheet M-101A",
+    "facts": [
+      "Stoa's example sheet",
+      "1/4\" = 1'-0\"",
+      "pipes, valves, pumps"
+    ],
+    "contents": "1 piping sheet",
+    "sheets": [
+      {
+        "label": "M-101A",
+        "path": "examples/usace-M-101A-piping-plan.png"
+      }
+    ],
+    "chips": [
+      "How many check valves (CV) are shown?",
+      "What size is the suction header?",
+      "How many pumps are there?"
+    ],
+    "credit": "Drawing: US Army Corps of Engineers, AW 078-24-28, public domain",
+    "kind": "piping"
+  },
+  {
+    "id": "afcec-dorm",
+    "name": "Enlisted dormitory, second floor",
+    "place": "US Air Force Civil Engineer Center · sheet A-2",
+    "facts": [
+      "Stoa's example sheet",
+      "1\" = 40'-0\" · feet and inches",
+      "colour legend + area tables"
+    ],
+    "contents": "1 floor plan",
+    "sheets": [
+      {
+        "label": "A-2 Second floor",
+        "path": "examples/afcec-dormitory-A-2-second-floor.png"
+      }
+    ],
+    "chips": [
+      "How many dorm rooms are on this floor?",
+      "What is the total circulation area?"
+    ],
+    "credit": "Drawing: Air Force Civil Engineer Center (DAF dormitory SD drawings, 2026), US federal work, public",
+    "kind": "floor"
+  },
+  {
     "id": "esplanades",
     "name": "Maleva 18 apartment building",
     "place": "Tallinn, Estonia",
@@ -37,17 +160,11 @@
     ],
     "chips": [
       "How big is room 119?",
-      "Which is the biggest room on this floor?",
       "How many doors are on this floor?",
-      "Do the plan and the 3D model agree on the windows on this floor?"
+      "How many rooms are on each floor?"
     ],
     "credit": "Drawings and model: Esplan (esplan.ee), CC BY 4.0",
-    "kind": "building",
-    "modelChips": [
-      "How many doors are in the whole building?",
-      "How many rooms are on each floor?",
-      "How many windows in the whole building?"
-    ]
+    "kind": "building"
   },
   {
     "id": "swiss",
@@ -75,31 +192,6 @@
     "kind": "floor"
   },
   {
-    "id": "duplex",
-    "name": "Duplex apartment",
-    "place": "Sample building, US",
-    "facts": [
-      "2 floors",
-      "21 rooms",
-      "14 doors"
-    ],
-    "contents": "3D model",
-    "sheets": [
-      {
-        "label": "3D model",
-        "path": "data/ifc_models/bsc-duplex_duplex-a-20110907.ifc"
-      }
-    ],
-    "chips": [
-      "How tall is the building?",
-      "How many doors are in this model?",
-      "How many rooms are on each floor?",
-      "Which storey has the most doors?"
-    ],
-    "credit": "Model: buildingSMART Duplex Apartment sample, CC BY-ND 3.0",
-    "kind": "model"
-  },
-  {
     "id": "sports",
     "name": "Xcel Sports Complex",
     "place": "Wisconsin, US",
@@ -119,52 +211,5 @@
     ],
     "credit": "Drawings: OpeningDesign and the project team in the title block, CC BY-SA 4.0",
     "kind": "schedule"
-  },
-  {
-    "id": "flat",
-    "name": "Apartment floor plan",
-    "place": "Finland",
-    "facts": [
-      "scanned plan",
-      "Finnish room codes"
-    ],
-    "contents": "1 plan image",
-    "sheets": [
-      {
-        "label": "Plan",
-        "path": "data/cubicasa5k/colorful-4539.png"
-      }
-    ],
-    "chips": [
-      "How many bedrooms are there?",
-      "Is there a sauna?",
-      "Kuinka monta makuuhuonetta (MH) pohjapiirustuksessa on?"
-    ],
-    "credit": "Plan: CubiCasa5K, CC BY-NC-SA 4.0, non-commercial use only",
-    "kind": "plan",
-    "licence": "CC BY-NC-SA 4.0: non-commercial use only"
-  },
-  {
-    "id": "habs",
-    "name": "Creque Marine Railway, head house",
-    "place": "Charlotte Amalie, St. Thomas (US Virgin Islands)",
-    "facts": [
-      "historic measured drawing",
-      "scanned sheet"
-    ],
-    "contents": "1 scanned sheet",
-    "sheets": [
-      {
-        "label": "North elevation",
-        "path": "data/habs/vi0026_sheet_00003.jpg"
-      }
-    ],
-    "chips": [
-      "What kind of drawing is this?",
-      "What is the scale of this drawing?",
-      "When was this drawing made?"
-    ],
-    "credit": "Drawing: HAER, National Park Service; Library of Congress, public domain",
-    "kind": "historic"
   }
 ]

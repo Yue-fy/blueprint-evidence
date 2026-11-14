@@ -35,6 +35,7 @@ PART_OFF_CONF = 0.4  # the side-named chain lies outside the part the question n
 FOOTPRINT_CONF = 0.4  # 'footprint' = width x depth assumes a rectangular outline
 
 _FTIN = re.compile(r"^(\d{1,3})\s*['’′]\s*-?\s*(?:(\d{1,2})(?:[\s·•\-]+(\d)/(\d{1,2}))?\s*[\"”″]?)?$")
+_FTIN_STACK = re.compile(r"^(\d{1,3})\s*['’′]\s*-?\s*(\d{2,3}/\d{1,2})\s*[\"”″]?$")  # 13'-11/2" = 13'-1 1/2" (D1 20:12)
 _LOOKALIKE = str.maketrans({"I": "1", "l": "1", "|": "1", "O": "0", "o": "0"})  # 'II'-9"' (HABS OCR) = 11'-9"
 _THOU = re.compile(r"^\d{1,3}(?: \d{3})+$")  # '13 500' (mm with a thin-space thousands separator)
 _DEC = re.compile(r"^\d{1,2}[.,]\d{2,3}$")  # '3,50' / '12.515' (metres)
@@ -66,6 +67,13 @@ def parse(text: str) -> tuple[float, str] | None:
         if m.group(3):
             ft += int(m.group(3)) / int(m.group(4)) / 12
         return (round(ft, 4), "ftin") if 0 < ft <= 999 else None
+    m = _FTIN_STACK.match(t)
+    if m:
+        from stoa.solvers.raster.textlayer import inch_value
+
+        inch = inch_value(m.group(2))
+        ft = int(m.group(1)) + inch / 12
+        return (round(ft, 4), "ftin") if inch < 12 and 0 < ft <= 999 else None
     if _THOU.match(t):
         return float(t.replace(" ", "")), "thou"
     if _DEC.match(t):
@@ -256,6 +264,101 @@ def chain_bar(tl) -> ChainBar | None:
     box = list(agree[0][1].total.item.box)
     return ChainBar(unit="m", px_per_unit=v, labels=[(0.0, 0.0, box), (1.0, v, box)], box=box, residual=dev,
                     source="chains", unit_text="dimension chains", pairs=[p for _, p in agree])
+
+
+LOOSE_MIN_SEGS = 4  # an unverified chain (no printed total, e.g. a screenshot crop of a plan's grid bays) needs this
+LOOSE_SPREAD = 0.02  # many segments whose string centres fit their running sums within this share of the span
+LOOSE_SAME_MIN_SEGS = 6  # a run of IDENTICAL values (a ceiling height printed in every room of a row) needs more
+LOOSE_SAME_MIN_M = 3.0  # ... and grid-bay sized values
+
+
+def _dedupe(L: list[Dim], axis: str) -> list[Dim]:
+    """One read per string: OCR tiles read '7,200' and '7.200' over the same box (keep the first)."""
+    out: list[Dim] = []
+    for d in L:
+        if out:
+            e = out[-1]
+            a0, a1 = (d.item.box[0], d.item.box[2]) if axis == "row" else (d.item.box[1], d.item.box[3])
+            b0, b1 = (e.item.box[0], e.item.box[2]) if axis == "row" else (e.item.box[1], e.item.box[3])
+            if min(a1, b1) - max(a0, b0) > 0.5 * min(a1 - a0, b1 - b0) and abs(d.value - e.value) < 1e-9:
+                continue
+        out.append(d)
+    return out
+
+
+def loose_chain_bar(tl) -> ChainBar | None:
+    """The scale from ONE unverified dimension chain: >= LOOSE_MIN_SEGS consecutive metric strings on one line (no
+    printed total needed) whose centres fit their running sums within LOOSE_SPREAD. For screenshots / crops of a plan
+    with grid bays ('7,200 7,200 4,800 7,200') and no title block, scale note or bar (X1 18:32: 0/9). The longest
+    tightly fitting run wins; px per m is cross-checked against any second loose chain (other axis or line) when there
+    is one (they must agree within 3 %). Kill switch: STOA_O1_LOOSE_CHAINS=0."""
+    if os.environ.get("STOA_O1_LOOSE_CHAINS", "1") == "0" or os.environ.get("STOA_O1_CHAINS", "1") == "0":
+        return None
+    # signed strings are levels ('-120', '+52'), not segments of a chain
+    ds = [d for d in dims_of(tl.items) if d.family != "ft" and not re.match(r"^\s*[-+−–±]", d.item.text)]
+    if len(ds) < LOOSE_MIN_SEGS:
+        return None
+    size = statistics.median(_size(d) for d in ds)
+    tol = max(4.0, 0.6 * size)
+    fits = []
+    for axis in ("row", "col"):
+        for line in _lines(ds, axis, tol):
+            line = _dedupe(line, axis)
+            if len(line) < LOOSE_MIN_SEGS:
+                continue
+            iu = _int_unit(line)
+            best_fit = None
+            # the longest consecutive run that fits (an OCR misread, '1,200' for '7,200', breaks the chain there)
+            for i in range(len(line)):
+                for j in range(len(line), i + LOOSE_MIN_SEGS - 1, -1):
+                    if best_fit is not None and j - i <= best_fit[0]:
+                        break
+                    L = line[i:j]
+                    vals = [_metres(d, iu) for d in L]
+                    if not all(0.3 <= v <= 30 for v in vals):
+                        continue
+                    if len({round(v, 3) for v in vals}) == 1 and (len(L) < LOOSE_SAME_MIN_SEGS
+                                                                  or vals[0] < LOOSE_SAME_MIN_M):
+                        continue
+                    k, spread = _spacing(L, vals, axis)
+                    if k is None or spread is None or spread > LOOSE_SPREAD:
+                        continue
+                    # the strings must not overlap: a chain's strings sit on their own segments
+                    pos = [(d.item.cx if axis == "row" else d.item.cy) for d in L]
+                    if min(b - a for a, b in zip(pos, pos[1:])) < 1.5 * size:
+                        continue
+                    best_fit = (len(L), -spread, k, axis, L, vals, spread)
+            if best_fit is not None:
+                fits.append(best_fit)
+    if not fits:
+        return None
+    fits.sort(reverse=True)
+    n, _, k, axis, L, vals, spread = fits[0]
+    others = [f for f in fits[1:] if f[4] is not L]
+    if others and not any(abs(f[2] / k - 1) <= 0.03 for f in others):
+        return None  # two chains, two scales: a sheet with details at another scale, or not dimension chains at all
+    box = [min(d.item.box[0] for d in L), min(d.item.box[1] for d in L), max(d.item.box[2] for d in L),
+           max(d.item.box[3] for d in L)]
+    return LooseChainBar(unit="m", px_per_unit=k, labels=[(0.0, 0.0, box), (1.0, k, box)], box=box, residual=spread,
+                         source="chains", unit_text="dimension chain (unverified)", pairs=[],
+                         run=[d.item.text.strip() for d in L], values=vals, axis=axis)
+
+
+@dataclass
+class LooseChainBar(ChainBar):
+    run: list = field(default_factory=list)
+    values: list = field(default_factory=list)
+    axis: str = "row"
+
+    def describe(self) -> str:
+        segs = " | ".join(self.run[:8]) + (" | …" if len(self.run) > 8 else "")
+        return (f"scale from one printed dimension chain with no total ({len(self.run)} strings: {segs}): their "
+                f"positions fit their values within {100 * self.residual:.1f}% -> 1 m = {self.px_per_unit:.2f} px")
+
+    def evidence(self, path: str) -> list[Evidence]:
+        return [Evidence(file=path, page=0, bbox=[round(c, 1) for c in self.box], bbox_space="image_px",
+                         note=f"dimension chain {' | '.join(self.run[:8])} ({sum(self.values):g} m): the strings' "
+                              f"spacing gives 1 m = {self.px_per_unit:.2f} px")]
 
 
 # ---------------------------------------------------------------------------------------------------------- questions

@@ -68,6 +68,10 @@ def load(abs_path: str, page: int):
 
         with pymupdf.open(abs_path) as doc:
             pg = doc[min(max(page, 0), len(doc) - 1)]
+            # W6 18:14: render the UNROTATED page (pdf_pt, CONTRACT): on a /Rotate 90 sheet (5 of Stoa's 9 PDFs) the
+            # render was turned while clicks and outlines are unrotated, so every click read the wrong spot. In memory only.
+            if pg.rotation:
+                pg.set_rotation(0)
             r = pg.rect
             clip = r
             try:  # the inked part, from a coarse render (text, title block and frame count too: never cuts the plan)
@@ -315,7 +319,9 @@ def main() -> None:
         poly, area_px, rr, fit = r[:4]
         out.append({"i": it.get("i"), "poly": [[round(float(x) / f + ox, 2), round(float(y) / f + oy, 2)] for x, y in poly],
                     "area": round(area_px / (f * f), 2), "closing_px": rr, "fit": None if fit is None else round(fit, 2)})
-    print(json.dumps({"shapes": out, "space": req.get("space") or "pdf_pt", "method": "flood fill (CPU)"}))
+    # derotated (W6 18:45): PDF pages are rendered unrotated (load()), so flood-fill outlines on /Rotate sheets are in pdf_pt
+    # too; the phone page trusts flood fill on rotated pages only when this flag is set.
+    print(json.dumps({"shapes": out, "space": req.get("space") or "pdf_pt", "method": "flood fill (CPU)", "derotated": True}))
 
 
 if __name__ == "__main__":

@@ -32,9 +32,13 @@ from stoa.contract import Answer, Cost, Evidence
 VISION_MODEL = os.environ.get("STOA_GEMINI_VISION", "gemini-3.1-pro-preview")
 VISION_CAP = float(os.environ.get("STOA_VISION_CAP", 0.45))
 AGREE_CONF, SAMPLES_CONF, DISAGREE_CONF = 0.8, 0.65, 0.3
+MAX_BOXES = 200  # T1 (audit 19:51): was 12, so a 20-door answer showed 12 boxes and blamed Gemini for the other 8
 WEAK = 0.3
 STRUCTURED = ("ifc", "dxf", "svg_ifc", "schedule", "plan_rooms", "label_count", "stated_count", "area_tags", "pdf_vector", "line_rooms",
-              "lengths")
+              "lengths",
+              # G1 c7 (S0/RL d25 replay: A-101F doors openings 6 @0.70 ✓ -> Gemini 5 @0.30): DR's vector swing / tag
+              # counter and the other printed-text readers are deterministic evidence too
+              "openings", "room_size", "slab_area", "area_table", "pipe_runs", "piping")
 SECOND = os.environ.get("STOA_VISION_SECOND", "1") != "0"
 # areas (captain 15:43): our outline x our scale gives the value; Gemini says WHERE the room is and its own estimate is
 # only a cross-check. Our area answers below this confidence get the cross-check (uploads only, gemini=1).
@@ -149,6 +153,20 @@ def _page_image(path: str, tiles: bool = False):
     return img, ("pdf_pt" if a.suffix.lower() == ".pdf" else "image_px"), k, quads
 
 
+def _derotation(path: str):
+    """PyMuPDF derotation matrix of a /Rotate'd PDF page 0 (display points -> unrotated pdf_pt), None when unrotated.
+    5 of Stoa's 9 example PDFs are rotated 90°: S-100F 'S-100F' box landed at its rotation_matrix image (W6 18:16)."""
+    try:
+        import pymupdf
+
+        from stoa.data import abspath
+
+        with pymupdf.open(str(abspath(path))) as doc:
+            return doc[0].derotation_matrix if len(doc) and doc[0].rotation else None
+    except Exception:  # noqa: BLE001
+        return None
+
+
 def _words_only(v) -> bool:
     """A text answer to a numeric question: no number at all ('Not determinable'), a label that merely contains one
     ('BRH 87.50' = a sill height) or a dimension pair ('3,50 x 3,00'). Multi-part answers ('3 ; 43.82') stay."""
@@ -156,6 +174,9 @@ def _words_only(v) -> bool:
         return False
     t = v.strip()
     return not re.fullmatch(r"[~≈]?\s*-?\d+(?:[.,]\d+)?\s*(?:m²|m2|m³|m3|m|ft²|ft2|sq ?ft|ft)?", t)
+
+
+_NUMERIC_ANSWER = re.compile(r"\s*(?:~|ca\.?|approx\.?|about)?\s*[-−]?\d[\d\s.,]*\s*[A-Za-z²³°%'\"’”/. ]{0,8}\s*")
 
 
 def _num(s) -> float | None:
@@ -185,11 +206,34 @@ def _pair_only(path: str, raw: str, how: str) -> bool:
         not re.search(r"\d\s*/\s*$", text[max(0, m.start() - 4):m.start()]) for m in alone.finditer(text))
 
 
+def _log_failure(why: str, seconds: float) -> None:
+    """Captain 20:56: failed / timed-out Gemini vision calls were in no log (gemini_calls.jsonl has the SENT requests,
+    and counts toward the cap, so failures go to their own file): logs/gemini_failures.jsonl {time, agent, purpose,
+    seconds, reason}."""
+    try:
+        from stoa.llm import GEMINI_LOG, _agent_id
+
+        f = GEMINI_LOG.parent / "gemini_failures.jsonl"
+        f.parent.mkdir(parents=True, exist_ok=True)
+        with open(f, "a", encoding="utf-8") as fh:
+            fh.write(json.dumps({"time": time.strftime("%Y-%m-%dT%H:%M:%S"), "agent": _agent_id(),
+                                 "purpose": "G1 vision reading (hybrid upload routing)", "seconds": round(seconds, 1),
+                                 "reason": why}) + "\n")
+    except Exception:  # noqa: BLE001 — logging never breaks an answer
+        pass
+
+
 def read(path: str, question: str, base: Answer | None = None, temperature: float = 0.0) -> Answer | None:
     """One Gemini vision call on the drawing; an Answer (capped) or None (no image / call failed / no answer)."""
     from stoa import llm
     from stoa.agent.gemini import LABEL, PRICE
 
+    from stoa.agent.private import hosted_allowed
+
+    if not hosted_allowed("gemini"):
+        if base is not None:
+            base.trace = [*base.trace, "private mode: no Gemini vision reading (the drawing stays on this server)"]
+        return None
     t0 = time.perf_counter()
     is_count = task_of(question, base) == "count"
     try:
@@ -206,15 +250,28 @@ def read(path: str, question: str, base: Answer | None = None, temperature: floa
             msg += (f"\nImage 1 is the whole sheet; images 2-5 are its top-left, top-right, bottom-left and "
                     f"bottom-right quarters at higher resolution (overlapping slightly). Count on the whole sheet "
                     f"once (no double counts in the overlaps) and give every box in image 1's coordinates.")
+    # QA 20:37 (demo latency): a failing call waited 150-200 s in llm.chat's retries (300 s client timeout, 4 tries)
+    # while the local answer was ready in seconds -> one retry and a deadline; the local answer stands on a miss
+    import concurrent.futures as cf
+    import contextvars
+
+    wait = float(os.environ.get("STOA_VISION_WAIT", 25))  # captain 20:56: <= 25 s on the demo path
+    ex = cf.ThreadPoolExecutor(max_workers=1)
     try:
-        r = llm.chat([{"role": "user", "content": msg}], images=[img, *quads], system=SYS, backend="gemini",
-                     model=VISION_MODEL, max_tokens=6000, temperature=temperature, json_schema=SCHEMA,
-                     purpose="G1 vision reading (hybrid upload routing)", cache=True, max_pixels=MAX_PIXELS,
-                     max_side=MAX_SIDE)
+        fut = ex.submit(contextvars.copy_context().run, llm.chat, [{"role": "user", "content": msg}],
+                        images=[img, *quads], system=SYS, backend="gemini", model=VISION_MODEL, max_tokens=6000,
+                        temperature=temperature, json_schema=SCHEMA, purpose="G1 vision reading (hybrid upload routing)",
+                        cache=True, max_pixels=MAX_PIXELS, max_side=MAX_SIDE, retries=1)
+        r = fut.result(timeout=wait)
     except Exception as e:  # noqa: BLE001
+        why = f"no reply within {wait:.0f} s" if isinstance(e, cf.TimeoutError) else \
+            f"{type(e).__name__}: {' '.join(str(e).split())[:160]}"
+        _log_failure(why, time.perf_counter() - t0)
         if base is not None:
-            base.trace = [*base.trace, f"{label} vision reading failed ({type(e).__name__})"]
+            base.trace = [*base.trace, f"{label} vision reading failed ({why}); the local answer stands"]
         return None
+    finally:
+        ex.shutdown(wait=False)
     try:
         d = json.loads(r.text)
     except Exception:  # noqa: BLE001
@@ -226,15 +283,22 @@ def read(path: str, question: str, base: Answer | None = None, temperature: floa
     cost.gemini_usd = round((tin * pin + tout * pout) / 1e6, 6)
     if not isinstance(d, dict) or not str(d.get("answer", "")).strip():
         return None
+    derot = _derotation(path) if space == "pdf_pt" else None
     pt = d.get("point_2d") or []
     if len(pt) == 2:  # where the asked room is (measure_at_point traces it), kept even if the value is dropped below
-        _POINTS[(str(path), question)] = (float(pt[1]) * img.width / 1000 / k, float(pt[0]) * img.height / 1000 / k,
-                                          space)
+        px, py = float(pt[1]) * img.width / 1000 / k, float(pt[0]) * img.height / 1000 / k
+        if derot is not None:  # W6 18:16: the render is the DISPLAYED page; pdf_pt is the unrotated page space
+            q = __import__("pymupdf").Point(px, py) * derot
+            px, py = q.x, q.y
+        _POINTS[(str(path), question)] = (px, py, space)
     raw, unit_raw = str(d["answer"]).strip(), str(d.get("unit") or "").strip().lower()
     unit = _UNIT.get(unit_raw, unit_raw or None)
     v = _num(raw)
     value: object = raw
-    if v is not None and len(re.sub(r"[\d.,\s\-]", "", raw)) <= 3 and not re.search(r"\d\s*:\s*\d", raw):
+    if v is not None and len(re.sub(r"[\d.,\s\-]", "", raw)) <= 3 and not re.search(r"\d\s*:\s*\d", raw) and \
+            _NUMERIC_ANSWER.fullmatch(raw):
+        # W6 18:16: 'S-100F' (a sheet number) was the value -100; 'B-104' / grid refs alike: numeric only when the whole
+        # answer is a number with at most a short unit
         # W6 17:51: a scale ratio (1:200) is not the number 1
         value = v / 100 if unit_raw == "cm" else (v / 1000 if unit_raw == "mm" else v)
         if unit == "count":
@@ -249,26 +313,59 @@ def read(path: str, question: str, base: Answer | None = None, temperature: floa
         return None
     ev = []
     W, H = img.width, img.height
-    for e in (d.get("evidence") or [])[:12]:
+    boxes = d.get("evidence") or []
+    for e in boxes[:MAX_BOXES]:
         b = e.get("box_2d") or []
         if len(b) != 4:
             continue
         y0, x0, y1, x1 = (float(t) for t in b)
         px = [min(x0, x1) * W / 1000, min(y0, y1) * H / 1000, max(x0, x1) * W / 1000, max(y0, y1) * H / 1000]
         bb = [round(c / k, 2) for c in px]
+        if derot is not None:
+            import pymupdf
+
+            r = pymupdf.Rect(*bb) * derot
+            r.normalize()
+            bb = [round(r.x0, 2), round(r.y0, 2), round(r.x1, 2), round(r.y1, 2)]
         ev.append(Evidence(file=path, page=0, bbox=bb, bbox_space=space, exact=False,
                            note=f"{label} read: {str(e.get('label', ''))[:80]}"))
     if is_count and isinstance(value, int) and ev and len(ev) != value:
         assumptions_n = [f"{label} said {value} but drew {len(ev)} boxes"]
     else:
         assumptions_n = []
+    if len(boxes) > MAX_BOXES:
+        assumptions_n.append(f"showing the first {MAX_BOXES} of {len(boxes)} boxes {label} drew")
     conf = VISION_CAP if not assumptions_n else round(VISION_CAP * 0.7, 3)  # never Gemini's self-report
     how = str(d.get("how") or "").strip()
     trace = [f"{label} vision reading: {raw} {unit_raw} — {how[:300]}"]
     assumptions = [f"read by {label} from the drawing image"] + assumptions_n + \
         [str(a)[:160] for a in (d.get("assumptions") or [])[:3]]
+    missing = [str(m)[:160] for m in (d.get("missing") or [])[:3]]
+    if is_count and isinstance(value, int) and len(ev) < value:  # T1: partial evidence says it is partial
+        missing.append(_partial(len(ev), value))
     return Answer(value=value, unit=unit, confidence=conf, evidence=ev, solver="pipeline/gemini_vision", trace=trace,
-                  assumptions=assumptions, missing=[str(m)[:160] for m in (d.get("missing") or [])[:3]], cost=cost)
+                  assumptions=assumptions, missing=missing, cost=cost)
+
+
+def _partial(shown: int, of: int) -> str:
+    return f"showing {shown} of {of} counted items: {of - shown} are not marked on the drawing"
+
+
+def _count_marks(a: Answer) -> int:
+    return sum(1 for e in a.evidence or [] if e.bbox or e.ifc_guid or e.polygon)
+
+
+def _coverage_ok(a: Answer, task: str, question: str = "") -> bool:
+    """A count may only gain confidence when every counted item is marked, or a marked printed total says the number
+    (T1, audit 19:51 risk #1: 20 doors, 12 boxes, promoted to 0.8 with the mismatch warning dropped)."""
+    if task != "count" or not isinstance(a.value, (int, float)) or isinstance(a.value, bool):
+        return True
+    if _count_marks(a) >= int(a.value):
+        return True
+    from stoa.trust.support import support_state
+
+    st = support_state(question or "How many?", a)
+    return bool(st) and st["state"] == "supported"
 
 
 _POINTS: dict = {}  # (path, question) -> (x, y, space) of the room Gemini pointed at (in-process only)
@@ -468,6 +565,153 @@ def _inside(pt, ev: list) -> bool | None:
     return None
 
 
+BACKED_CONF = float(os.environ.get("STOA_BACKED_CONF", 0.6))
+_FACTOR = re.compile(r"^\s*(\d{1,3}(?:[ ,]\d{3})+|\d+(?:\.\d+)?)\s*(mm|cm|m|dimension|dim\.?)?\s*$", re.I)
+
+
+def _digits(s: str) -> str:
+    return re.sub(r"[^\d]", "", str(s))
+
+
+def _sheet_tokens(path: str, space: str) -> list[tuple[str, tuple]]:
+    """(text, box) of the printed tokens in the space Gemini's boxes were mapped to: PDF words (unrotated pdf_pt, the
+    space read() derotates into) or the image's text layer (label_count._image_lines: cached / PDF-render lines)."""
+    from stoa.data import abspath
+
+    p = str(abspath(path))
+    if space == "pdf_pt" and p.lower().endswith(".pdf"):
+        try:
+            import pymupdf
+
+            with pymupdf.open(p) as doc:
+                return [(w[4], tuple(w[:4])) for w in doc[0].get_text("words")]
+        except Exception:  # noqa: BLE001
+            return []
+    try:
+        from stoa.solvers.label_count import _image_lines
+
+        out = []
+        for t, bb in _image_lines(p) or ():
+            out += [(w, bb) for w in str(t).split()] if len(str(t).split()) > 1 else [(t, bb)]
+        return out
+    except Exception:  # noqa: BLE001
+        return []
+
+
+def printed_backing(path: str, g: Answer) -> dict | None:
+    """Captain 18:56 arbitration, areas: Gemini's area is BACKED when it is the product of two dimension numbers it
+    marked (its evidence labels) AND our own text layer finds both numbers printed at the spots it marked. Fitted on the
+    97 cached Gemini area readings (QA r2-r4 + X1 runs): the 12 two-factor products are S-100F slab 6200 x 9950 = 61.69 ✓
+    (5x), genset 6200 x 4272 = 26.49 ✓ (3x), A-101F toilet 1900 x 2054 = 3.90 ✓ and two plain cm rooms; Gemini's
+    estimates by eye ('approximately 3.8 m by 3.8 m'), wall-subtracted extents (19800-1200 x 12000-1200 = 200.88, gold
+    214.5) and trapezoids are never a product of two marked numbers. A sheet-wide 'two printed numbers multiply to it'
+    test is useless (180/200 random values matched): the check is LOCAL (each number inside Gemini's own box).
+    -> {'a', 'b', 'unit', 'boxes': [(text, box), (text, box)], 'space'} or None."""
+    if not isinstance(g.value, (int, float)) or isinstance(g.value, bool) or g.unit not in ("m2", "ft2") or g.value <= 0:
+        return None
+    marked = []
+    for e in g.evidence or []:
+        lab = str(e.note or "").split(" read: ", 1)[-1]
+        m = _FACTOR.match(lab)
+        if m and e.bbox:
+            marked.append((float(m.group(1).replace(",", "").replace(" ", "")), m.group(1), e))
+    if len(marked) < 2:
+        return None
+    scales = {"m2": ((1e-6, "mm"), (1e-4, "cm"), (1.0, "m")), "ft2": ((1.0, "ft"),)}[g.unit]
+    pair = None
+    for i in range(len(marked)):
+        for j in range(i + 1, len(marked)):
+            for s, u in scales:
+                p = marked[i][0] * marked[j][0] * s
+                if abs(p - g.value) <= 0.005 * g.value + 0.005:
+                    pair = (marked[i], marked[j], u)
+                    break
+            if pair:
+                break
+        if pair:
+            break
+    if pair is None:
+        return None
+    space = pair[0][2].bbox_space
+    toks = _sheet_tokens(path, space)
+    if not toks:
+        return None
+    xs = [c for _, b in toks for c in (b[0], b[2])]
+    ys = [c for _, b in toks for c in (b[1], b[3])]
+    diag = ((max(xs) - min(xs)) ** 2 + (max(ys) - min(ys)) ** 2) ** 0.5 or 1.0
+    found = []
+    for val, raw, e in pair[:2]:
+        x0, y0, x1, y1 = e.bbox
+        pad = max(0.5 * ((x1 - x0) ** 2 + (y1 - y0) ** 2) ** 0.5, 0.01 * diag)
+        best = None
+        for t, b in toks:
+            if _digits(t) != _digits(raw):
+                continue
+            cx, cy = (b[0] + b[2]) / 2, (b[1] + b[3]) / 2
+            if x0 - pad <= cx <= x1 + pad and y0 - pad <= cy <= y1 + pad:
+                d = abs(cx - (x0 + x1) / 2) + abs(cy - (y0 + y1) / 2)
+                if best is None or d < best[0]:
+                    best = (d, t, b)
+        if best is None:
+            return None
+        found.append((best[1], best[2]))
+    return {"a": pair[0][1], "b": pair[1][1], "unit": pair[2], "boxes": found, "space": space}
+
+
+def set_clarify(ans: Answer, payload: dict) -> Answer:
+    """W5 19:10 shape (Answer.clarify = {ask, why, options: [{label, value, unit, evidence: [i], question}], click}).
+    The field is set only once the contract has it (proposed to S0 19:2x); the trace always says it in one line."""
+    try:
+        if "clarify" in type(ans).model_fields:
+            ans.clarify = payload
+    except Exception:  # noqa: BLE001
+        pass
+    # W5 20:10: each option's evidence indices in the line too ('[evidence 0,1]'), until the contract field lands
+    opts = " | ".join((f"{o.get('label')}: {o.get('value')} {o.get('unit') or ''}".strip()
+                       + (f" [evidence {','.join(str(i) for i in o['evidence'])}]" if o.get("evidence") else ""))
+                      for o in payload["options"])
+    ans.trace = [*ans.trace, f"clarify: {payload['ask']} ({opts})"]
+    return ans
+
+
+def _backed_area(path: str, question: str, ans: Answer, g: Answer, back: dict, head: str, ours: bool) -> Answer:
+    """Gemini's two-factor area whose factors our text layer found where it marked them becomes the answer (ours was
+    weak or missing); our reading stays visible as the alternative / clarify option."""
+    label = label_of(g)
+    a, b, u = back["a"], back["b"], back["unit"]
+    ev = [Evidence(file=path, page=0, bbox=[round(float(c), 2) for c in bb], bbox_space=back["space"], exact=True,
+                   note=f"printed dimension {t} ({label} multiplied it; our text layer found it here)")
+          for t, bb in back["boxes"]]
+    ev += [e for e in g.evidence if not _FACTOR.match(str(e.note or "").split(" read: ", 1)[-1])]
+    out = g.model_copy(deep=True)
+    out.evidence = ev
+    out.confidence = BACKED_CONF
+    out.solver = "pipeline/gemini_vision"
+    out.assumptions = [f"area = {a} x {b} {u}, both dimension strings printed on the drawing at the marked spots "
+                       f"({label} chose the pair; our text layer confirmed both numbers)", *g.assumptions[1:]]
+    c0 = float(ans.confidence or 0)
+    steps = [f"{label} multiplied the printed dimensions {a} x {b} {u} = {g.value:g} {g.unit}; both numbers found by our "
+             f"text layer inside the boxes it marked ✓ → confidence {BACKED_CONF}"]
+    if ours:
+        steps.append(f"our {str(ans.solver or '').split('/')[-1]} reading {str(ans.value)[:30]} {ans.unit or ''} "
+                     f"@{c0:.2f} had no such backing → kept as the alternative")
+        out.missing = [*out.missing, f"our first reader answered {str(ans.value)[:40]} {ans.unit or ''} @{c0:.2f} "
+                                     f"({ans.solver})"]
+    out.trace = [*ans.trace[:3], head.rstrip(": ") + ":", *g.trace, *steps]
+    out.cost = g.cost
+    if ours and isinstance(ans.value, (int, float)):
+        n = len(out.evidence)
+        out.evidence = [*out.evidence, *(ans.evidence or [])[:6]]
+        set_clarify(out, {"ask": "Two readings disagree: which area do you mean?", "why": "two readings disagree",
+                          "options": [
+                              {"label": f"{a} x {b} {u} (printed dimensions)", "value": g.value, "unit": g.unit,
+                               "evidence": list(range(len(back["boxes"]))), "question": question},
+                              {"label": f"our {str(ans.solver or '').split('/')[-1]} reading", "value": ans.value,
+                               "unit": ans.unit, "evidence": list(range(n, len(out.evidence))), "question": question}],
+                          "click": "room"})
+    return out
+
+
 def _area_crosscheck(path: str, question: str, ans: Answer, g: Answer, head: str) -> Answer:
     """Our area stays the value (captain 15:43); Gemini checks WHICH room we measured (its point inside our outline)
     and roughly HOW BIG (its own estimate). Same room + estimate within 10 % -> 'two independent methods agree'
@@ -528,7 +772,9 @@ def vision_step(path: str, question: str, ans: Answer, why: str = "") -> Answer:
         import concurrent.futures as cf
 
         pool = cf.ThreadPoolExecutor(max_workers=1)
-        g2_future = pool.submit(read, path, question, None, 0.8)
+        import contextvars  # T2 21:14: private mode / cost meter context must reach the second sample's thread
+
+        g2_future = pool.submit(contextvars.copy_context().run, read, path, question, None, 0.8)
         pool.shutdown(wait=False)
     g = read(path, question, base=ans)
     if g is None:
@@ -548,6 +794,26 @@ def vision_step(path: str, question: str, ans: Answer, why: str = "") -> Answer:
     if task == "area":
         # captain 15:43: the VALUE of an area is our outline x our scale; Gemini locates the room and cross-checks
         ours_num = ours and isinstance(ans.value, (int, float)) and not isinstance(ans.value, bool)
+        base = str(ans.solver or "").split("/")[-1]
+        same = ours_num and isinstance(g.value, (int, float)) and g.unit == ans.unit and \
+            abs(float(g.value) - float(ans.value)) <= 0.1 * abs(float(ans.value))
+        back = None if same else printed_backing(path, g)
+        if back is not None:
+            # captain 18:56: a weak local reading yields to Gemini only when a second source backs it; here our own
+            # text layer finds both dimension numbers Gemini multiplied, at the spots it marked (QA r2-r4: S-100F slab
+            # 61.69 / genset 26.49 vs our raster @0.30). A confident structured reading of ours stays (clarify).
+            c0 = float(ans.confidence or 0)
+            if not ours_num or c0 <= WEAK + 1e-9 or (base not in STRUCTURED and c0 < 0.5):
+                return _backed_area(path, question, ans, g, back, head, ours)
+            kept = _area_crosscheck(path, question, ans, g, head)
+            kept.confidence = round(min(kept.confidence, 0.5), 3)
+            return set_clarify(kept, {
+                "ask": "Two readings disagree: which area do you mean?", "why": "two backed readings disagree",
+                "options": [{"label": f"our {base} reading", "value": ans.value, "unit": ans.unit,
+                             "evidence": list(range(len(kept.evidence))), "question": question},
+                            {"label": f"{back['a']} x {back['b']} {back['unit']} (printed dimensions)",
+                             "value": g.value, "unit": g.unit, "evidence": [], "question": question}],
+                "click": "room"})
         if ours_num and (why.startswith("area cross-check") or _located(ans)):
             return _area_crosscheck(path, question, ans, g, head)
         m = measure_at_point(path, question, g) or measure_raster_at_point(path, question, g)
@@ -558,19 +824,47 @@ def vision_step(path: str, question: str, ans: Answer, why: str = "") -> Answer:
                                  f"({ans.solver})")
             return m
         if ours_num:
-            return _area_crosscheck(path, question, ans, g, head)
+            c0 = float(ans.confidence or 0)
+            out = _area_crosscheck(path, question, ans, g, head)
+            if out.trace and str(out.trace[-1]).endswith("; our measurement is kept"):
+                # QA 20:39 (EFA GF scan 'sports hall': agent look() 1,274 @0.32 vs Gemini 594, gold 504): an UNLOCATED
+                # reading is not a measurement -> 'two readings disagree', capped, and the visitor picks
+                out.trace[-1] = out.trace[-1][:-len("; our measurement is kept")] + (
+                    f"; NEITHER reading is measured (ours, {base}, has no located outline): two readings disagree → "
+                    f"ours shown at confidence {c0:.2f} → {min(c0, 0.3):.2f}, pick one")
+                out.confidence = round(min(c0, 0.3), 3)
+                if isinstance(g.value, (int, float)):
+                    label = g.trace[0].split(" vision")[0] if g.trace else "Gemini"
+                    out = set_clarify(out, {
+                        "ask": "Two unmeasured readings disagree: which area is right?",
+                        "why": "neither reading has a located outline",
+                        "options": [{"label": f"our {base} reading (not located)", "value": ans.value, "unit": ans.unit,
+                                     "evidence": list(range(len(out.evidence))), "question": question},
+                                    {"label": f"{label}'s visual estimate", "value": g.value, "unit": g.unit,
+                                     "evidence": [], "question": question}],
+                        "click": "room"})
+            return out
         return _unmeasured(ans, g, head)
     if ours and _same(ans.value, g.value, unit):
         c = round(max(ans.confidence, AGREE_CONF), 3)
-        ans.trace = [*ans.trace, head + g.trace[0] + f" — two independent readings agree (ours {ans.value}, Gemini "
-                     f"{g.value}) ✓ confidence {ans.confidence:.2f} → {c:.2f}"]
-        ans.assumptions = [*ans.assumptions, f"two independent methods agree ({ans.solver}: {ans.value}; "
-                                             f"{g.trace[0].split(' vision')[0]}: {g.value})"]
-        ans.confidence = c
         from stoa.pipeline import _located
 
         if not _located(ans):  # Gemini's boxes (one per counted object) become the evidence a human checks
             ans.evidence = [*(ans.evidence or []), *g.evidence]
+        partial = not _coverage_ok(ans, task, question)
+        if partial:
+            # T1 (audit 19:51): 20 = 20 but only 12 of them marked -> the agreement does not prove the marks; no
+            # promotion, and Gemini's own 'said 20 but drew 12 boxes' warning stays on the answer
+            c = round(float(ans.confidence or 0), 3)
+            ans.assumptions = [*ans.assumptions, *(a for a in g.assumptions if " but drew " in a or "showing the first" in a)]
+            if not any("counted items" in str(m) for m in ans.missing):
+                ans.missing = [*ans.missing, _partial(_count_marks(ans), int(ans.value))]
+        ans.trace = [*ans.trace, head + g.trace[0] + f" — two independent readings agree (ours {ans.value}, Gemini "
+                     f"{g.value}) ✓ confidence {ans.confidence:.2f} → {c:.2f}"
+                     + (" (not raised: not every counted item is marked)" if partial else "")]
+        ans.assumptions = [*ans.assumptions, f"two independent methods agree ({ans.solver}: {ans.value}; "
+                                             f"{g.trace[0].split(' vision')[0]}: {g.value})"]
+        ans.confidence = c
         ans.cost = g.cost
         return ans
     g2 = None
@@ -584,20 +878,47 @@ def vision_step(path: str, question: str, ans: Answer, why: str = "") -> Answer:
     if g2 is not None:
         g.cost = g.cost.add(g2.cost)
     if g2 is not None and _same(g.value, g2.value, unit):
-        g.confidence = SAMPLES_CONF
+        full = _coverage_ok(g, task, question)  # T1: same-model agreement + partial marks is no reason to raise confidence
+        g.confidence = SAMPLES_CONF if full else g.confidence
         g.trace = [*g.trace, f"second {VISION_MODEL} sample at temperature 0.8: {g2.value} — samples agree "
-                   f"→ confidence {SAMPLES_CONF}"]
+                   + (f"→ confidence {SAMPLES_CONF}" if full else "(confidence not raised: not every counted item is "
+                                                                   "marked)")]
         g.assumptions.append("two Gemini samples agree")
     elif g2 is not None:
         g.confidence = DISAGREE_CONF
         g.trace = [*g.trace, f"second {VISION_MODEL} sample at temperature 0.8: {g2.value} — samples disagree "
                    f"→ confidence {DISAGREE_CONF}"]
         g.missing.append(f"a second Gemini reading gave {g2.value}")
+    base = str(ans.solver or "").split("/")[-1]
+    if ours and g2 is not None and not _same(g.value, g2.value, unit) and _same(ans.value, g2.value, unit):
+        # QA arbiter r2-r4 (A-101F doors): label_count 6 ✓, Gemini 5 then 6 -> one Gemini sample backs ours
+        return _kept(ans, g, head, f"{label_of(g)}'s two samples disagree ({g.value}, {g2.value}) and the second agrees "
+                     f"with ours", max(float(ans.confidence or 0), SAMPLES_CONF if _coverage_ok(ans, task, question) else 0))
+    if ours and _located(ans) and (base in STRUCTURED or task == "length") and not (
+            g2 is not None and _same(g.value, g2.value, unit)):
+        # QA arbiter r2-r4 (DfE laundry skirting raster 10.01 m ✓ -> Gemini 14.5): an evidence-backed reading (tags,
+        # printed text, a measured outline) is never replaced by one unconfirmed vision reading; Gemini's figure is
+        # kept as the alternative to check
+        return _kept(ans, g, head, f"our {base} reading is backed by drawn / printed evidence; {label_of(g)}'s single "
+                     f"visual reading {g.value} {g.unit or ''} is shown as the alternative", float(ans.confidence or 0))
     if ours:
         g.confidence = round(min(g.confidence, DISAGREE_CONF if g2 is None else g.confidence), 3)
         g.missing.append(f"our reader answered {ans.value} {ans.unit or ''} @{ans.confidence:.2f} ({ans.solver})")
     g.trace = [*ans.trace[:3], head.rstrip(": ") + ":", *g.trace]
     return g
+
+
+def label_of(g: Answer) -> str:
+    return g.trace[0].split(" vision")[0] if g.trace else "Gemini"
+
+
+def _kept(ans: Answer, g: Answer, head: str, why: str, conf: float) -> Answer:
+    """Our reading stays the answer; Gemini's reading is the stated alternative (captain 18:56 arbitration)."""
+    ans.trace = [*ans.trace, head + (g.trace[0] if g.trace else "") + f" — {why} → ours kept"]
+    ans.missing = [*ans.missing, f"{label_of(g)} read {g.value} {g.unit or ''} (alternative; check the marked spots)"]
+    ans.confidence = round(min(max(conf, 0.0), 0.8), 3)
+    ans.cost = g.cost
+    return ans
 
 
 __all__ = ["read", "vision_step", "wanted", "VISION_CAP"]

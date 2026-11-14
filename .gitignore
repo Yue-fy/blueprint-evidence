@@ -41,3 +41,9 @@ __pycache__/
 !samples/**/*.dxf
 # page renders the format normaliser caches next to a writable input (stoa/formats/normalize.py)
 samples/**/*.r[0-9]*.png
+# sidecars the raster readers cache next to an input image (photo deskew: stoa/solvers/raster/photo.py; traced
+# vector copies and 6000-px copies of scans)
+samples/**/*.photo.json
+samples/**/*.photo.png
+samples/**/*.vec[0-9]*.pdf
+samples/**/*.s6000.*

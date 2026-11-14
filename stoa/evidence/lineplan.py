@@ -358,12 +358,100 @@ def _door_check(pdf: str, page: int, n: float) -> tuple[float | None, int]:
     return (radii[len(radii) // 2] if len(radii) >= 3 else None), len(radii)
 
 
+def _measure(pdf: str, page: int, pt, n: float, tag_box: tuple):
+    """measure_room at the label; when that fails, at the tip of a LEADER ARROW that starts at the label (W5 18:26,
+    Stoa's AFCEC A-101: 'Break Room / 2.02 / 153 SF' is printed in the open space below the room with a straight arrow
+    pointing into it -> the label's own region is the whole view (3,576 m², holds 'Retail', 'Lobby' ...))."""
+    from stoa.evidence import linework as L
+
+    m = L.measure_room(pdf, page, pt, n, tag_box=tag_box)
+    if not ARROW_SEED:
+        return m
+    tip = _arrow_tip(pdf, page, tag_box)
+    if tip is None:
+        return m
+    m2 = L.measure_room(pdf, page, tip, n, tag_box=tag_box, own_radius_pt=0.0)
+    if m2 is None:
+        return m
+    if m is not None:  # the arrow ends in the label's own room (a note / fall arrow): keep it. Containment is not
+        try:           # enough: the label's region has its holes filled, so a room inside it 'contains' the tip
+            from shapely.geometry import Polygon
+
+            a, b = Polygon(m["polygon"]).buffer(0), Polygon(m2["polygon"]).buffer(0)
+            if a.intersection(b).area >= 0.9 * a.union(b).area:
+                return m
+        except Exception:  # noqa: BLE001
+            return m
+    return {**m2, "seed_note": f"label outside the room: followed its leader arrow to ({tip[0]:.0f}, {tip[1]:.0f}) pt"}
+
+
+ARROW_SEED = bool(int(__import__("os").environ.get("E1_ARROW_SEED", "1")))
+
+
+def _arrow_tip(pdf: str, page: int, box: tuple) -> tuple | None:
+    """A straight leader from a label: a one-segment stroke whose tail is within ~2 text heights of the label box and
+    whose far end carries a small filled head (arrowhead) -> a point just past the head, inside what it points at."""
+    import math
+
+    import numpy as np
+
+    from stoa.evidence import linework as L
+
+    pg = L._page(pdf, page)
+    if pg is None or not box:
+        return None
+    ppt = pg["ppt"]
+    th = max(2.0, min(box[2] - box[0], box[3] - box[1]))
+    reach = 2.0 * th + 2.0
+
+    def dbox(p):
+        dx = max(box[0] - p[0], 0.0, p[0] - box[2])
+        dy = max(box[1] - p[1], 0.0, p[1] - box[3])
+        return math.hypot(dx, dy)
+
+    heads = []
+    for f in pg["fills"]:
+        xs, ys = f[:, 0] / ppt, f[:, 1] / ppt
+        bw, bh = xs.max() - xs.min(), ys.max() - ys.min()
+        tri = abs(float((xs * np.roll(ys, 1) - ys * np.roll(xs, 1)).sum())) / 2 <= 0.65 * bw * bh  # a triangle, not a
+        if tri and bw <= 1.5 * th and bh <= 1.5 * th:  # column / wall-end square (EFA 'Science SWR': a wall line + column)
+            heads.append((float(xs.mean()), float(ys.mean()), float(max(xs.max() - xs.min(), ys.max() - ys.min()))))
+    if not heads:
+        return None
+    best = None
+    lo_x, lo_y, hi_x, hi_y = ((box[0] - reach) * ppt, (box[1] - reach) * ppt, (box[2] + reach) * ppt,
+                              (box[3] + reach) * ppt)
+    for a, w, dark in pg["strokes"]:
+        if not 2 <= len(a) <= 4:
+            continue
+        if not any(lo_x <= x <= hi_x and lo_y <= y <= hi_y for x, y in a):
+            continue  # no end near the label
+        pts = [(float(x) / ppt, float(y) / ppt) for x, y in a]
+        p, q = max(((u, v) for u in pts for v in pts), key=lambda t: math.hypot(t[0][0] - t[1][0], t[0][1] - t[1][1]))
+        L_ = math.hypot(q[0] - p[0], q[1] - p[1])
+        if L_ <= 0 or any(abs((q[0] - p[0]) * (r[1] - p[1]) - (q[1] - p[1]) * (r[0] - p[0])) / L_ > 0.5 for r in pts):
+            continue  # one straight line (a path drawn there and back counts), not a polyline
+        for s_, e_ in ((p, q), (q, p)):
+            ds, de = dbox(s_), dbox(e_)
+            ln = math.hypot(e_[0] - s_[0], e_[1] - s_[1])
+            if ds > reach or de < ds + 2 * th or ln < 2 * th:
+                continue
+            h = [hd for hd in heads if math.hypot(hd[0] - e_[0], hd[1] - e_[1]) <= max(1.0 * th, hd[2])]
+            if not h:
+                continue
+            if best is None or ds < best[0]:
+                ux, uy = (e_[0] - s_[0]) / ln, (e_[1] - s_[1]) / ln
+                k = h[0][2] + 2.0  # past the head
+                best = (ds, (e_[0] + ux * k, e_[1] + uy * k))
+    return best[1] if best else None
+
+
 def _measure_labels(pdf: str, page: int, labs: list[dict], n: float) -> list | None:
     from stoa.evidence import linework as L
 
     out = []
     for lab in labs:
-        m = L.measure_room(pdf, page, lab["pt"], n, tag_box=tuple(lab["bbox"]))
+        m = _measure(pdf, page, lab["pt"], n, tuple(lab["bbox"]))
         if m is None:
             return None
         out.append((lab, m))
@@ -940,8 +1028,78 @@ def _skirting(pdf: str, page: int, n: float, m: dict) -> dict | None:
         if nxt - b_s > step:
             runs.append([[round(x, 2), round(y, 2)] for x, y in piece(b_s, nxt)])
     per = total_pt * m_per_pt
+    rev = _reveals(ring, total_pt, openings, tol / ppt, m_per_pt) if SKIRT_REVEALS else 0.0
+    per -= rev
     val = per - sum(o[2] for o in outs)
-    return {"perimeter_m": round(per, 3), "value_m": round(val, 3), "openings": outs, "runs": runs}
+    return {"perimeter_m": round(per, 3), "value_m": round(val, 3), "openings": outs, "runs": runs,
+            "reveals_m": round(rev, 3)}
+
+
+SKIRT_REVEALS = bool(int(__import__("os").environ.get("E1_SKIRT_REVEALS", "0")))  # OFF: traced copies cut openings part-way down a jamb (cycle 10)
+REVEAL_W = tuple(float(x) for x in __import__("os").environ.get("E1_REVEAL_W", "0.8,1.6").split(","))  # wall-line fit window (m)
+REVEAL_MAX_M = 0.7  # a wall's depth: deeper 'recesses' are alcoves / corridors, not door reveals
+
+
+def _reveals(ring, total_pt: float, openings: list, tol_pt: float, m_per_pt: float) -> float:
+    """Door REVEALS on the outline (H 20:37, Ziying's Multi-Purpose Hall on Stoa's DfE PNG: inner wall faces, 'door
+    reveals not added'; our trace on the picture ran into every door recess up to the door line, +4.5 m). At each
+    opening the room's WALL LINE is fitted through the outline 0.8-1.6 m either side of it (straight, else skipped); the
+    outline's EXCURSION beyond that line, on the side away from the room (a recess, <= REVEAL_MAX_M deep), is longer than
+    its straight chord by the two jambs -> that excess is not wall face. Independent of where the opening's ends were
+    put (on traced copies they sit part-way down a jamb). A column standing into the room bulges the other way."""
+    import numpy as np
+    from shapely.geometry import Polygon
+
+    def pt(sv):
+        q = ring.interpolate(sv % total_pt)
+        return np.array([q.x, q.y])
+
+    try:
+        cen = np.array(Polygon(ring.coords).centroid.coords[0])
+    except Exception:  # noqa: BLE001
+        return 0.0
+    w0, w1, lim = REVEAL_W[0] / m_per_pt, REVEAL_W[1] / m_per_pt, REVEAL_MAX_M / m_per_pt
+    st = max(tol_pt, 0.5)
+    out = 0.0
+    for a_s, b_s, _ln in openings:
+        if b_s - a_s > 3.0 / m_per_pt:
+            continue
+        back = [pt(a_s - t) for t in np.arange(w0, w1, st)]
+        fwd = [pt(b_s + t) for t in np.arange(w0, w1, st)]
+        line = None
+        # one straight wall line through both sides; else (a door next to a corner) the one straight side alone
+        for P in (np.array(back + fwd), np.array(back), np.array(fwd)):
+            if len(P) < 4:
+                continue
+            c = P.mean(axis=0)
+            _, _, vt = np.linalg.svd(P - c)
+            if float(np.abs((P - c) @ vt[1]).max()) <= 1.5 * tol_pt:
+                line = (c, vt[1])
+                break
+        if line is None:
+            continue  # no straight wall line next to the opening
+        c, nrm = line
+
+        def dist(q):
+            return float((q - c) @ nrm)
+
+        s1 = a_s
+        while s1 > a_s - w0 and abs(dist(pt(s1))) > tol_pt:
+            s1 -= st
+        s2 = b_s
+        while s2 < b_s + w0 and abs(dist(pt(s2))) > tol_pt:
+            s2 += st
+        ds = [dist(pt(x)) for x in np.arange(s1, s2, st)]
+        if not ds:
+            continue
+        far = max(ds, key=abs)
+        depth = abs(far)
+        if not 0.05 / m_per_pt <= depth <= lim or np.sign(far) == np.sign(dist(cen)):
+            continue  # too shallow / too deep, or it bulges INTO the room
+        excess = (s2 - s1) - float(np.hypot(*(pt(s2) - pt(s1))))
+        if excess > 0:
+            out += min(excess, 2 * depth + 2 * tol_pt) * m_per_pt
+    return out
 
 
 _NO_DEDUCT = re.compile(r"\b(?:do(?:es)?\s*n[o’']t|not|without|no)\s+(?:subtract\w*|deduct\w*|minus\w*|remov\w*|"
@@ -1006,7 +1164,7 @@ def _baseboard_answer(path: str, pdf: str, page: int, q: str, n: float, labs: li
         return None
     rows, missed = [], []
     for lab in picked:
-        m = L.measure_room(pdf, page, lab["pt"], n, tag_box=tuple(lab["bbox"]))
+        m = _measure(pdf, page, lab["pt"], n, tuple(lab["bbox"]))
         sk = _skirting(pdf, page, n, m) if m is not None else None
         if sk is None or (whole and not 1.0 <= m["area_m2"] <= 1500):
             if not whole:
@@ -1041,6 +1199,7 @@ def _baseboard_answer(path: str, pdf: str, page: int, q: str, n: float, labs: li
         op_txt = ", ".join(f"{o[2]:.2f}" for o in ops) or "none"
         dm = sk.get("dims")
         terms.append(f"{name} {sk['perimeter_m']:.2f}" + (f" (printed {dm[0]} x {dm[1]} mm)" if dm else "")
+                     + (f" (door reveals {sk['reveals_m']:.2f} m left out)" if sk.get("reveals_m") else "")
                      + f" - ({op_txt}) = {sk['value_m']:.2f} m")
         for i, run in enumerate(sk["runs"]):
             ev.append(Evidence(file=path, page=page, bbox=_poly_bbox(run), bbox_space="pdf_pt", exact=False,
@@ -1074,8 +1233,41 @@ def _baseboard_answer(path: str, pdf: str, page: int, q: str, n: float, labs: li
                   trace=[f"lineplan: skirting on a line-only sheet at printed 1:{n:g}: " + "; ".join(terms)])
 
 
+_RANGE = re.compile(r"(?<![\w.])(\d{1,2})\s*(?:to|through|thru|until|bis|–|—|-)\s*"
+                    r"(?:([A-Za-z][\w/&.]*(?:\s+[A-Za-z][\w/&.]*)?)\s+)?(\d{1,2})(?![\w.])", re.I)
+_RANGE_STOP = {"of", "the", "from", "between", "in", "and", "for", "all", "area", "areas", "floor", "floors", "level",
+               "levels", "storey", "storeys", "story", "stories", "sheet", "sheets", "page", "pages", "grid", "grids",
+               "axis", "axes", "bay", "bays", "total", "to", "is", "are", "what", "how", "big", "metres", "meters", "m",
+               "mm", "cm", "ft", "sq", "square", "step", "steps", "figure", "fig", "note", "notes", "detail", "details"}
+
+
+def expand_ranges(q: str) -> str:
+    """'English 1 to English 5' / 'Classroom 3-6' -> 'English 1, English 2, English 3, English 4 and English 5' (X1 scan
+    sc-077: the numbered range found no label and abstained; the list sums 5 rooms = 277.1 vs gold 275 on the PDF)."""
+    def rep(m):
+        a, lab2, b = int(m.group(1)), m.group(2), int(m.group(3))
+        if not 1 <= b - a <= 11:
+            return m.group(0)
+        before = q[:m.start()].rstrip().split()
+        if lab2:
+            k = len(lab2.split())
+            lab = " ".join(before[-k:]) if len(before) >= k else ""
+            if lab.lower() != lab2.lower():
+                return m.group(0)
+        else:
+            lab = before[-1] if before else ""
+        if not lab or not re.fullmatch(r"[A-Za-z][\w/&.]*(?:\s+[A-Za-z][\w/&.]*)?", lab) or \
+                lab.split()[-1].lower() in _RANGE_STOP:
+            return m.group(0)
+        names = [f"{lab} {i}" for i in range(a, b + 1)]
+        mid = names[1:-1]
+        return f"{a}, {', '.join(mid)} and {names[-1]}" if mid else f"{a} and {names[-1]}"
+    return _RANGE.sub(rep, q)
+
+
 def answer(path: str, question: str, page: int = 0) -> Answer | None:
     try:
+        question = expand_ranges(question)
         return _answer(path, question, page)
     except Exception:  # noqa: BLE001 — a reader of last resort never breaks the cascade
         return None
@@ -1162,7 +1354,7 @@ def _answer(path: str, question: str, page: int) -> Answer | None:
     door_med, n_doors = _door_check(pdf, page, n)
     if door_med is not None and not 0.6 <= door_med <= 1.3:
         return None  # door leaves are ~0.7-1.0 m: the printed scale is not this view's (or the arcs are not doors)
-    m = L.measure_room(pdf, page, seed, n, tag_box=tag_box)
+    m = _measure(pdf, page, seed, n, tag_box) if tag_box else L.measure_room(pdf, page, seed, n)
     if m is None:
         return None
     poly = m["polygon"]
@@ -1176,6 +1368,12 @@ def _answer(path: str, question: str, page: int) -> Answer | None:
                    f"{2 * m['gap_m']:.2f} m, line thickness corrected; {m['support']} of {m['n_readings']} readings "
                    "agree)"]
     missing = ["no room area is printed on the sheet: a printed area or a CAD/IFC twin would make it exact"]
+    if "bridge@" in str(m.get("variant")) and not m.get("reveal_cut"):  # E1 c8 fallback: EFA probe 1 W / 2 L of 3 former abstentions -> rough
+        conf = min(conf, 0.4)
+        assumptions.append("openings wider than a door were closed along their wall line (the room otherwise runs "
+                           "into its neighbours): a rough outline")
+    if m.get("seed_note"):
+        assumptions.append(m["seed_note"])
     if door_med is not None:
         assumptions.append(f"scale check: {n_doors} door swings measure a median {door_med:.2f} m at 1:{n:g} "
                            "(a door leaf is ~0.7-1.0 m) ✓")

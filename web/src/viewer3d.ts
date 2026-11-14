@@ -11,7 +11,8 @@ import { OrbitControls } from "three/examples/jsm/controls/OrbitControls.js";
 import { mergeGeometries } from "three/examples/jsm/utils/BufferGeometryUtils.js";
 import * as WebIFC from "web-ifc";
 import wasmUrl from "web-ifc/web-ifc.wasm?url";
-import { CLAY, CLAY_GLASS, Look3D, clayify, rimGlow } from "./look3d";
+import { CLAY, CLAY_GLASS, Look3D, LookPanel, MAX_DPR, ROLE, ROOM_HEX, ROOM_TYPES, areaColor, clayify, getLook, onLook, rimGlow,
+  roomType, type RoomType } from "./look3d";
 
 export interface Storey {
   id: number;
@@ -37,10 +38,47 @@ interface Bucket {
   pos: number[];
   nrm: number[];
   col: number[];
+  /** the 'Rooms' look: one colour per element kind (walls warm white, doors wood, glass light blue; W7) */
+  role?: number[];
+  /** thin edges of a solid bucket (W7), a child of its mesh */
+  edges?: THREE.LineSegments;
   idx: number[];
   ranges: Range[];
   mesh?: THREE.Mesh;
 }
+
+/** The 'Rooms' look's element colours by IFC type (sRGB hex; muted, Apple-like). Anything else = warm off-white walls. */
+const ROLE_HEX: [number[], string][] = [
+  [[WebIFC.IFCDOOR], "#b48d66"],
+  [[WebIFC.IFCWINDOW], "#f3f2ef"],
+  [[WebIFC.IFCSLAB], "#e4e1db"],
+  [[WebIFC.IFCROOF], "#d3d0ca"],
+  [[WebIFC.IFCRAILING], "#b4b8be"],
+  [[WebIFC.IFCSTAIR, WebIFC.IFCSTAIRFLIGHT, WebIFC.IFCRAMP, WebIFC.IFCRAMPFLIGHT], "#e2ded6"],
+  [[WebIFC.IFCCOLUMN, WebIFC.IFCBEAM, WebIFC.IFCMEMBER], "#e7e4de"],
+  [[WebIFC.IFCCOVERING], "#f1efeb"],
+];
+const ROLE_WALL = "#eeebe5";
+/** thin edges: a soft warm grey, a touch of the model's own definition while orbiting (the AO comes on still frames) */
+const EDGE_HEX = "#9a978f";
+const ROLE_GLASS = "#9cc4e2";
+const ROLE_FURN = "#d1ccc3";
+const roleByType = new Map<number, THREE.Color>();
+for (const [types, hex] of ROLE_HEX) for (const t of types) roleByType.set(t, new THREE.Color(hex));
+const roleWall = new THREE.Color(ROLE_WALL), roleGlass = new THREE.Color(ROLE_GLASS), roleFurn = new THREE.Color(ROLE_FURN);
+
+/** Room floors of one storey, tinted by room type (W7): one merged mesh; per space its triangle range and floor area. */
+interface Tint {
+  storey: number;
+  mesh: THREE.Mesh;
+  /** the room-type colours (linear), kept to restore after an area ramp */
+  typeCol: Float32Array;
+  spaces: { id: number; type: RoomType; area: number; v0: number; v1: number }[];
+}
+/** A floor's name beside the building: its sampled plan points (x, z) and the label height (world y, stacked). */
+interface FloorLabel { el: HTMLDivElement; storey: number; pts: THREE.Vector3[]; y: number }
+/** fade of the room tints toward white while an answer is lit (shared uniform of the tint materials) */
+const TINT_FADE = { value: 0 };
 
 let apiPromise: Promise<WebIFC.IfcAPI> | null = null;
 function ifcApi(): Promise<WebIFC.IfcAPI> {
@@ -75,7 +113,7 @@ function rankMat(k: number, space: boolean): THREE.MeshLambertMaterial {
 const calmView = () => document.body.dataset.view !== "expert";
 
 /** One merged highlight (one material, one storey): its x-ray twin and its place in the floor-by-floor reveal. */
-interface HlPart { mesh: THREE.Mesh; xray?: THREE.Mesh; opacity: number; xrayOpacity: number; at: number }
+interface HlPart { mesh: THREE.Mesh; xray?: THREE.Mesh; opacity: number; xrayOpacity: number; at: number; storey: number }
 
 export class Viewer3D {
   readonly el: HTMLElement;
@@ -121,12 +159,22 @@ export class Viewer3D {
   furnitureCount = 0;
   /** fps note: frames counted by benchOrbit() */
   private benchFrames = 0;
+  /** W7: room floors by type (one mesh per storey), the legend + look switches, an area answer's ramp */
+  private tints: Tint[] = [];
+  private panel: LookPanel;
+  private areaIds: number[] | null = null;
+  private typeOfId = new Map<number, number>();
+  /** 'Explode floors': lift offset per storey (world y) and each storey's cut plane; null = stacked */
+  private explode: Map<number, { dy: number; plane: THREE.Plane }> | null = null;
+  /** floor names beside the building (whole-building view and exploded floors) */
+  private floorLabels: FloorLabel[] = [];
 
   constructor(el: HTMLElement) {
     this.el = el;
     el.classList.add("v3d");
-    this.renderer = new THREE.WebGLRenderer({ antialias: true, preserveDrawingBuffer: true });
-    this.renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+    // no preserveDrawingBuffer (W7: an extra copy per frame on laptop GPUs); snapshot() reads right after its own render
+    this.renderer = new THREE.WebGLRenderer({ antialias: true });
+    this.renderer.setPixelRatio(Math.min(window.devicePixelRatio, MAX_DPR));
     // the canvas colour follows the page theme (--canvas-3d: light grey, or dark grey in dark mode)
     this.renderer.localClippingEnabled = true;
     el.append(this.renderer.domElement);
@@ -154,6 +202,9 @@ export class Viewer3D {
     this.scene.add(sun, this.root, this.hlGroup);
     new ResizeObserver(() => this.resize()).observe(el);
     this.installPick();
+    this.panel = new LookPanel(el);
+    this.panel.onExplode = (on) => this.setExploded(on);
+    onLook(() => this.updateMaterials());
     const loop = () => {
       requestAnimationFrame(loop);
       if (this.tween) {
@@ -282,25 +333,180 @@ export class Viewer3D {
     mat.dispose();
   }
 
+  /** World y → its exploded y (the offset of the storey whose floor is at or below it). */
+  private liftY(y: number): number {
+    if (!this.explode) return y;
+    let best = -Infinity, dy = 0;
+    for (const [id, e] of this.explode) {
+      const b = this.storeyBaseY.get(id);
+      if (b !== undefined && b <= y + 0.3 && b > best) { best = b; dy = e.dy; }
+    }
+    return y + dy;
+  }
+
   private placeLabels() {
+    this.placeFloorLabels();
     if (!this.labels.length) return;
     const w = this.renderer.domElement.clientWidth, h = this.renderer.domElement.clientHeight;
     for (const l of this.labels) {
       if (l.rail) {
         let best: THREE.Vector3 | null = null;
+        const ry = this.liftY(l.rail.y);
         for (const p of l.rail.pts) {
-          const v = new THREE.Vector3(p.x, l.rail.y, p.z).project(this.camera);
+          const v = new THREE.Vector3(p.x, ry, p.z).project(this.camera);
           if (v.z < 1 && (!best || v.x < best.x)) best = v;
         }
         l.el.style.display = best ? "" : "none";
         if (best) l.el.style.transform = `translate(${Math.max(18, ((best.x + 1) / 2) * w - 14)}px, ${((1 - best.y) / 2) * h}px) translate(-100%, -50%)`;
         continue;
       }
-      const v = l.p.clone().project(this.camera);
+      const v = l.p.clone().setY(this.liftY(l.p.y)).project(this.camera);
       const vis = v.z < 1 && Math.abs(v.x) <= 1.02 && Math.abs(v.y) <= 1.02;
       l.el.style.display = vis ? "" : "none";
       if (vis) l.el.style.transform = `translate(${((v.x + 1) / 2) * w}px, ${((1 - v.y) / 2) * h}px) translate(-50%, -110%)`;
     }
+  }
+
+  /** Floor names on the RIGHT of each floor (answer pins use the left rail): whole-building view and exploded floors,
+   * customer view only, not while one storey is shown. */
+  private placeFloorLabels() {
+    if (!this.floorLabels.length) return;
+    const show = calmView() && this.activeStorey === null && this.el.dataset.state === "ready";
+    const w = this.renderer.domElement.clientWidth, h = this.renderer.domElement.clientHeight;
+    // one column right of the building (the rightmost floor point), each label at its floor's height, kept >= 22 px
+    // apart from the floor below (bottom up)
+    const at: { f: FloorLabel; x: number; y: number }[] = [];
+    for (const f of this.floorLabels) {
+      const e = this.explode?.get(f.storey);
+      const on = show && (!this.explode || !!e);
+      f.el.style.display = "none";
+      if (!on) continue;
+      const y = f.y + (e?.dy ?? 0);
+      let best: THREE.Vector3 | null = null;
+      for (const p of f.pts) {
+        const v = new THREE.Vector3(p.x, y, p.z).project(this.camera);
+        if (v.z < 1 && (!best || v.x > best.x)) best = v;
+      }
+      if (best) at.push({ f, x: ((best.x + 1) / 2) * w, y: ((1 - best.y) / 2) * h });
+    }
+    if (!at.length) return;
+    if (!this.explode) {
+      // stacked: all floors at the building's one right corner (the rightmost plan point of any floor), so the labels
+      // run up that corner evenly
+      let corner: THREE.Vector3 | null = null, cx = -Infinity;
+      for (const a of at) for (const p of a.f.pts) {
+        const v = new THREE.Vector3(p.x, a.f.y, p.z).project(this.camera);
+        if (v.z < 1 && v.x > cx) { cx = v.x; corner = p; }
+      }
+      if (corner) for (const a of at) {
+        const v = new THREE.Vector3(corner.x, a.f.y, corner.z).project(this.camera);
+        a.x = ((v.x + 1) / 2) * w;
+        a.y = ((1 - v.y) / 2) * h;
+      }
+    }
+    const x = Math.min(w - 90, Math.max(...at.map((a) => a.x)) + 14);
+    at.sort((a, b) => b.y - a.y);
+    let prev = Infinity;
+    for (const a of at) {
+      const y = Math.min(a.y, prev - 22);
+      prev = y;
+      a.f.el.style.display = "";
+      a.f.el.style.transform = `translate(${x}px, ${y}px) translate(0, -50%)`;
+    }
+  }
+
+  /** The storeys that are floors people use: those with rooms (IfcSpace floors), else every storey with geometry. */
+  private roomStoreys(): number[] {
+    const withRooms = new Set(this.tints.map((t) => t.storey));
+    const ids = this.storeys.map((s) => s.id).filter((id) => this.storeyBaseY.has(id));
+    const rooms = ids.filter((id) => withRooms.has(id));
+    return rooms.length >= 2 ? rooms : ids;
+  }
+
+  /** People's floor names: '2.korrus' → 'Floor 2', 'Erdgeschoss' → 'Ground floor' (the model's own name otherwise). */
+  private floorName(name: string): string {
+    const n = name.trim();
+    const m = n.match(/^(-?\d+)\s*\.?\s*(korrus|kerros|floor|etage|stock|og|plan|pietro|piętro|våning|vaning|patro|emelet|etaj)$/i);
+    if (m) return `Floor ${m[1]}`;
+    const k: [RegExp, string][] = [[/^erdgeschoss|^eg$|^ground/i, "Ground floor"], [/^dachgeschoss|^dg$|^attic|^pööning/i, "Attic"],
+      [/^kellergeschoss|^keller|^kelder|^basement|^untergeschoss|^ug$/i, "Basement"], [/^vundament|^foundation|^fundament/i, "Foundation"],
+      [/^katus|^roof|^dach$/i, "Roof"]];
+    for (const [re, out] of k) if (re.test(n)) return out;
+    return n;
+  }
+
+  private buildFloorLabels() {
+    for (const f of this.floorLabels) f.el.remove();
+    this.floorLabels = [];
+    if (!this.labelLayer.isConnected) {
+      this.labelLayer.className = "v3d-labels";
+      this.el.append(this.labelLayer);
+    }
+    const ids = this.roomStoreys();
+    if (ids.length < 2) return;
+    for (const id of ids) {
+      const base = this.storeyBaseY.get(id)!;
+      const pts: THREE.Vector3[] = [];
+      for (const b of this.buckets) {
+        if (b.storey !== id || b.transparent || b.furniture) continue;
+        const step = Math.max(3, Math.floor(b.pos.length / 3 / 150) * 3);
+        for (let i = 0; i + 2 < b.pos.length; i += step) pts.push(new THREE.Vector3(b.pos[i], 0, b.pos[i + 2]));
+      }
+      if (!pts.length) continue;
+      const el = document.createElement("div");
+      el.className = "v3d-floor";
+      const s = this.storeys.find((x) => x.id === id)!;
+      el.textContent = this.floorName(s.name);
+      el.title = s.name;
+      this.labelLayer.append(el);
+      this.floorLabels.push({ el, storey: id, pts, y: base + 1.2 });
+    }
+  }
+
+  /** 'Explode floors' (W7): the floors with rooms lifted apart, each cut 1.3 m above its floor like a plan, the others
+   * hidden; the camera looks down a little more. Off = stacked as built. */
+  setExploded(on: boolean) {
+    const ids = on ? this.roomStoreys() : [];
+    if (on && ids.length < 2) on = false;
+    this.panel.setExploded(on);
+    if (!on) {
+      this.explode = null;
+    } else {
+      if (this.activeStorey !== null) this.activeStorey = null;
+      const box = new THREE.Box3().setFromObject(this.root);
+      const size = box.getSize(new THREE.Vector3());
+      const sorted = ids.slice().sort((a, b) => this.storeyBaseY.get(a)! - this.storeyBaseY.get(b)!);
+      const gap = Math.max(6, 0.45 * Math.min(size.x, size.z));
+      this.explode = new Map(sorted.map((id, i) => [id, { dy: i * gap, plane: new THREE.Plane(new THREE.Vector3(0, -1, 0), this.storeyBaseY.get(id)! + i * gap + 1.3) }]));
+    }
+    this.look.setBands(this.explode ? [...this.explode].map(([id, e]) => ({ base: this.storeyBaseY.get(id)! + e.dy - 0.8, cut: e.plane.constant })) : null);
+    this.updateMaterials();
+    this.frame(this.root, true);
+  }
+
+  get isExploded() { return !!this.explode; }
+
+  /** Exploded floors are seen from the LONG side of the footprint (its main axis from the room floors' vertices), a
+   * quarter turn off square and ~45° from above, so a long slab building does not hide its floors behind each other. */
+  private explodeDir(): THREE.Vector3 {
+    let n = 0, mx = 0, mz = 0, sxx = 0, szz = 0, sxz = 0;
+    for (const t of this.tints) {
+      const pos = t.mesh.geometry.attributes.position as THREE.BufferAttribute;
+      const step = Math.max(1, Math.floor(pos.count / 2000));
+      for (let i = 0; i < pos.count; i += step) { const x = pos.getX(i), z = pos.getZ(i); n++; mx += x; mz += z; sxx += x * x; szz += z * z; sxz += x * z; }
+    }
+    const fallback = new THREE.Vector3(0.6, 1.15, 0.9);
+    if (n < 10) return fallback;
+    mx /= n; mz /= n;
+    const cxx = sxx / n - mx * mx, czz = szz / n - mz * mz, cxz = sxz / n - mx * mz;
+    const ang = 0.5 * Math.atan2(2 * cxz, cxx - czz); // the long axis
+    // the side normal nearer the usual view (+x, +z), turned 30° toward the long axis
+    let nx = -Math.sin(ang), nz = Math.cos(ang);
+    if (nx * 0.6 + nz * 0.9 < 0) { nx = -nx; nz = -nz; }
+    const lx = Math.cos(ang) * (Math.cos(ang) * 0.6 + Math.sin(ang) * 0.9 >= 0 ? 1 : -1), lz = Math.sin(ang) * (Math.cos(ang) * 0.6 + Math.sin(ang) * 0.9 >= 0 ? 1 : -1);
+    const k = Math.tan(Math.PI / 6);
+    const h = new THREE.Vector3(nx + k * lx, 0, nz + k * lz).normalize();
+    return new THREE.Vector3(h.x, 1.0, h.z);
   }
 
   private resize() {
@@ -409,21 +615,58 @@ export class Viewer3D {
         vertexColors: true, transparent: b.transparent, opacity: b.transparent ? 0.35 : 1, side: THREE.DoubleSide,
         depthWrite: !b.transparent,
       });
-      clayify(mat, b.transparent, b.furniture);
+      clayify(mat, b.transparent, b.furniture, !!b.role);
       b.mesh = this.toMesh(b, mat);
       b.mesh.userData.bucket = b;
       this.root.add(b.mesh);
     }
     this.computeStoreyBases();
+    this.buildTints();
+    this.explode = null;
+    this.panel.setExploded(false);
+    this.look.setBands(null);
+    this.buildFloorLabels();
+    this.panel.setExplodeAvailable(this.roomStoreys().length >= 2);
     this.updateMaterials();
     this.look.setGround(this.root);
     this.frame(this.root, false);
     this.el.dataset.state = "ready";
     onProgress("");
+    void this.buildEdges(token);
+  }
+
+  /** Thin edges on the solid parts (W7, captain 'walls warm off-white with thin edges'): EdgesGeometry (creases > 35°)
+   * per opaque bucket, built bucket by bucket in idle time after the model is shown, drawn as a child of the bucket
+   * (same lift / cut / visibility). `?edges=0` turns them off. */
+  private edgeStats = { ms: 0, segments: 0 };
+  private async buildEdges(token: number) {
+    if (/[?&]edges=0\b/.test(location.search)) return;
+    const t0 = performance.now();
+    let segs = 0;
+    for (const b of this.buckets) {
+      if (token !== this.loadToken) return;
+      if (b.transparent || !b.mesh) continue;
+      await new Promise<void>((r) => ("requestIdleCallback" in window ? requestIdleCallback(() => r(), { timeout: 200 }) : setTimeout(r, 16)));
+      if (token !== this.loadToken || !b.mesh) return;
+      const eg = new THREE.EdgesGeometry(b.mesh.geometry, 35);
+      segs += eg.attributes.position.count / 2;
+      const lines = new THREE.LineSegments(eg, new THREE.LineBasicMaterial({ color: EDGE_HEX, transparent: true, opacity: 0.55, depthWrite: false }));
+      lines.raycast = () => {};
+      lines.userData.edges = true;
+      b.mesh.add(lines);
+      b.edges = lines;
+    }
+    this.edgeStats = { ms: Math.round(performance.now() - t0), segments: segs };
+    this.updateMaterials();
   }
 
   private clear() {
     this.clearHighlights();
+    for (const b of this.buckets) if (b.edges) { b.edges.geometry.dispose(); (b.edges.material as THREE.Material).dispose(); }
+    this.tints = [];
+    for (const f of this.floorLabels) f.el.remove();
+    this.floorLabels = [];
+    this.explode = null;
     for (const o of this.root.children) {
       const m = o as THREE.Mesh;
       m.geometry?.dispose();
@@ -503,6 +746,11 @@ export class Viewer3D {
       const b = bucketFor(id, pg.color.w < 0.99);
       const base = b.pos.length / 3;
       const start = b.idx.length;
+      const rc = b.key.startsWith("space:") ? null : this.roleColor(id, b);
+      if (rc) {
+        b.role ??= [];
+        for (let k = 0; k < v.length; k += 6) b.role.push(rc.r, rc.g, rc.b);
+      }
       for (let k = 0; k < v.length; k += 6) {
         const x = v[k], y = v[k + 1], z = v[k + 2];
         b.pos.push(t[0] * x + t[4] * y + t[8] * z + t[12], t[1] * x + t[5] * y + t[9] * z + t[13], t[2] * x + t[6] * y + t[10] * z + t[14]);
@@ -518,6 +766,127 @@ export class Viewer3D {
       this.elementBuckets.set(id, list);
       geom.delete();
     }
+  }
+
+  /** The 'Rooms' look's colour of one element: glass, furniture, else by its IFC type (walls warm white). */
+  private roleColor(id: number, b: Bucket): THREE.Color {
+    if (b.transparent) return roleGlass;
+    if (b.furniture) return roleFurn;
+    let t = this.typeOfId.get(id);
+    if (t === undefined) {
+      let k = 0;
+      try {
+        k = this.api!.GetLineType(this.modelID, id);
+      } catch {
+        k = 0;
+      }
+      this.typeOfId.set(id, k);
+      t = k;
+    }
+    return roleByType.get(t) ?? roleWall;
+  }
+
+  /** Room floors tinted by room type (from each IfcSpace's name), one merged mesh per storey (W7). The floor of a
+   * space = its lowest triangles (within 5 cm of its bottom), drawn 2 cm above it; its area = their plan area. */
+  private buildTints() {
+    for (const t of this.tints) { t.mesh.geometry.dispose(); this.root.remove(t.mesh); }
+    this.tints = [];
+    if (!this.api) return;
+    const by = new Map<number, { pos: number[]; col: number[]; spaces: Tint["spaces"] }>();
+    for (const [id, b] of this.spaceBuckets) {
+      const p = b.pos, ix = b.idx;
+      if (ix.length < 3) continue;
+      let minY = Infinity;
+      for (let i = 1; i < p.length; i += 3) minY = Math.min(minY, p[i]);
+      const tris: number[] = [];
+      let area = 0;
+      for (let k = 0; k + 2 < ix.length; k += 3) {
+        const a = ix[k] * 3, c1 = ix[k + 1] * 3, c2 = ix[k + 2] * 3;
+        if (p[a + 1] > minY + 0.05 || p[c1 + 1] > minY + 0.05 || p[c2 + 1] > minY + 0.05) continue;
+        const ar = Math.abs((p[c1] - p[a]) * (p[c2 + 2] - p[a + 2]) - (p[c1 + 2] - p[a + 2]) * (p[c2] - p[a])) / 2;
+        if (ar < 1e-6) continue;
+        area += ar;
+        tris.push(a, c1, c2);
+      }
+      if (!tris.length) continue;
+      let line: { Name?: { value?: string }; LongName?: { value?: string } } = {};
+      try {
+        line = this.api.GetLine(this.modelID, id);
+      } catch {
+        /* nameless */
+      }
+      const type = roomType(line.LongName?.value, line.Name?.value);
+      const col = new THREE.Color(ROOM_HEX[type]);
+      let g = by.get(b.storey);
+      if (!g) by.set(b.storey, (g = { pos: [], col: [], spaces: [] }));
+      const v0 = g.pos.length / 3;
+      for (const a of tris) {
+        g.pos.push(p[a], minY + 0.02, p[a + 2]);
+        g.col.push(col.r, col.g, col.b);
+      }
+      g.spaces.push({ id, type, area, v0, v1: g.pos.length / 3 });
+    }
+    for (const [storey, g] of by) {
+      const geo = new THREE.BufferGeometry();
+      geo.setAttribute("position", new THREE.Float32BufferAttribute(g.pos, 3));
+      const nrm = new Float32Array(g.pos.length);
+      for (let i = 1; i < nrm.length; i += 3) nrm[i] = 1;
+      geo.setAttribute("normal", new THREE.BufferAttribute(nrm, 3));
+      const typeCol = new Float32Array(g.col);
+      geo.setAttribute("color", new THREE.BufferAttribute(new Float32Array(g.col), 3));
+      geo.computeBoundingBox();
+      geo.computeBoundingSphere();
+      const mesh = new THREE.Mesh(geo, tintMaterial());
+      mesh.renderOrder = 1;
+      mesh.userData.tint = true;
+      this.root.add(mesh);
+      this.tints.push({ storey, mesh, typeCol, spaces: g.spaces });
+    }
+  }
+
+  /** An area answer over several rooms ('biggest room', 'rooms by size'): every room on those floors coloured on a
+   * light → deep blue ramp by its floor area, with a legend in m²; null = back to room types. */
+  private setAreaRamp(ids: number[] | null) {
+    this.areaIds = ids;
+    for (const t of this.tints) {
+      const attr = t.mesh.geometry.attributes.color as THREE.BufferAttribute;
+      (attr.array as Float32Array).set(t.typeCol);
+      attr.needsUpdate = true;
+    }
+    if (!ids) return;
+    const storeys = new Set(ids.map((id) => this.storeyOf.get(id) ?? -1));
+    const tints = this.tints.filter((t) => storeys.has(t.storey) || storeys.has(-1));
+    const areas = tints.flatMap((t) => t.spaces.map((s) => s.area)).filter((a) => a >= 0.5);
+    if (!areas.length) return;
+    const min = Math.min(...areas), max = Math.max(...areas);
+    for (const t of tints) {
+      const attr = t.mesh.geometry.attributes.color as THREE.BufferAttribute;
+      const arr = attr.array as Float32Array;
+      for (const s of t.spaces) {
+        const c = areaColor(s.area, min, max);
+        for (let v = s.v0; v < s.v1; v++) arr.set([c.r, c.g, c.b], v * 3);
+      }
+      attr.needsUpdate = true;
+    }
+    this.rampRange = { min, max };
+  }
+  private rampRange: { min: number; max: number } | null = null;
+
+  /** The legend: room types of the floors in view (or the whole model), or the area ramp. */
+  private updateLegend() {
+    if (!this.panel) return; // the constructor's first theme pass runs before the panel exists
+    const calm = calmView();
+    if (!calm || getLook() !== "rooms" || !this.tints.length) return this.panel.setLegend(null);
+    if (this.areaIds && this.rampRange) return this.panel.setLegend(null, { ...this.rampRange, title: "Room floor area (3D model)" });
+    const n = new Map<RoomType, number>();
+    for (const t of this.tints) {
+      if (this.activeStorey !== null && t.storey !== this.activeStorey) continue;
+      for (const s of t.spaces) n.set(s.type, (n.get(s.type) ?? 0) + 1);
+    }
+    // stacked whole building: the slabs hide the room floors, say how to see them
+    const hidden = this.activeStorey === null && !this.explode && this.roomStoreys().length >= 2;
+    this.panel.setLegend(ROOM_TYPES.filter((t) => n.get(t.key)).map((t) => ({ key: t.key, label: t.label, hex: t.hex, n: n.get(t.key)! })),
+      null, hidden ? "Pick a floor or explode the floors to see the rooms" : "");
   }
 
   private computeStoreyBases() {
@@ -555,6 +924,7 @@ export class Viewer3D {
     g.setAttribute("position", new THREE.Float32BufferAttribute(b.pos, 3));
     g.setAttribute("normal", new THREE.Float32BufferAttribute(b.nrm, 3));
     g.setAttribute("color", new THREE.Float32BufferAttribute(b.col, 3));
+    if (b.role) g.setAttribute("role", new THREE.Float32BufferAttribute(b.role, 3));
     g.setIndex(b.idx);
     g.computeBoundingBox();
     g.computeBoundingSphere();
@@ -630,6 +1000,7 @@ export class Viewer3D {
     this.hlGroup.clear();
     this.hlParts = [];
     this.look?.setGlow([]);
+    if (this.areaIds) this.setAreaRamp(null);
   }
 
   /** Highlight elements by GlobalId; returns how many were found. Storey GUIDs select that storey.
@@ -681,7 +1052,7 @@ export class Viewer3D {
       if (calm && !p.space) rimGlow(mat, 0.5);
       const mesh = new THREE.Mesh(geom, mat);
       mesh.renderOrder = 10;
-      const part: HlPart = { mesh, opacity: mat.opacity, xrayOpacity: 0, at: t0 + floors.indexOf(p.storey) * step };
+      const part: HlPart = { mesh, opacity: mat.opacity, xrayOpacity: 0, at: t0 + floors.indexOf(p.storey) * step, storey: p.storey };
       this.hlGroup.add(mesh);
       if (calm && !p.space) {
         // the x-ray twin: only where something nearer hides the element (depth GREATER), faint, no depth write
@@ -695,10 +1066,21 @@ export class Viewer3D {
       }
       this.hlParts.push(part);
     }
+    // W7: a ranking of rooms ('biggest room', 'rooms by size') colours the floors by area (light → deep blue, legend in m²)
+    const rankedSpaces = [...rank.keys()].map((g) => this.guidToId.get(g)).filter((id): id is number => id !== undefined && this.spaceBuckets.has(id));
+    if (calm && rank.size >= 2 && rankedSpaces.length === rank.size) this.setAreaRamp(rankedSpaces);
     this.setGhost(found > 0);
     // the halo in the calm look (twins included: they share the outline instead of hiding it in the depth pass)
     this.look.setGlow(calm ? [...this.hlGroup.children] : []);
-    if (found && frame) this.frame(this.hlGroup);
+    if (found && frame) {
+      // an area ramp is about the whole floor: frame its rooms, not only the lit ones (W7)
+      const tints = this.areaIds ? this.tints.filter((t) => this.areaIds!.some((id) => (this.storeyOf.get(id) ?? -1) === t.storey)) : [];
+      if (tints.length) {
+        const g = new THREE.Group();
+        for (const t of tints) { const m = new THREE.Mesh(t.mesh.geometry); m.position.copy(t.mesh.position); g.add(m); }
+        this.frame(g);
+      } else this.frame(this.hlGroup);
+    }
     // the reveal: every part starts invisible and fades in at its floor's time (no animation with reduced motion or in
     // the expert view)
     if (!reduced && calm && this.hlParts.length) {
@@ -781,6 +1163,12 @@ export class Viewer3D {
   /** Show one storey (others faded); null shows all. */
   setStorey(id: number | null) {
     this.activeStorey = id;
+    if (id !== null && this.explode) {
+      // one floor shown = stacked again (the storey filter's cut + fade take over)
+      this.explode = null;
+      this.panel.setExploded(false);
+      this.look.setBands(null);
+    }
     this.updateMaterials();
   }
 
@@ -795,8 +1183,16 @@ export class Viewer3D {
     const calm = calmView();
     // clay: the customer view mixes the model's colours toward a warm white (all the way while an answer is lit, so the
     // blue stands out); the expert view keeps the model's own colours
-    CLAY.value = calm ? (this.ghost ? 0.95 : 0.88) : 0;
-    CLAY_GLASS.value = calm ? 0.5 : 0;
+    // W7 'Rooms' look (default): role colours + room floors by type; an answer fades them (walls toward white, room
+    // tints toward white) so the accent blue stands out; an area ramp keeps its colours
+    const rooms = calm && getLook() === "rooms";
+    ROLE.value = rooms ? 1 : 0;
+    CLAY.value = !calm ? 0 : rooms ? (this.ghost ? 0.55 : 0) : this.ghost ? 0.95 : 0.88;
+    CLAY_GLASS.value = !calm ? 0 : rooms ? (this.ghost ? 0.5 : 0) : 0.5;
+    TINT_FADE.value = this.ghost && !this.areaIds ? 0.72 : 0;
+    this.panel?.el.classList.toggle("faded", TINT_FADE.value > 0); // the legend dims with the floors it explains
+    for (const t of this.tints) t.mesh.visible = rooms && (this.activeStorey === null || t.storey === this.activeStorey);
+    this.updateLegend();
     this.look?.setClip(clipY !== null ? [this.clipPlane] : null);
     // x-ray twins belong to the calm look only (a switch to the expert view keeps the lit answer, without them)
     for (const p of this.hlParts) if (p.xray) p.xray.visible = calm && p.mesh.visible;
@@ -814,6 +1210,33 @@ export class Viewer3D {
       // with a storey filter: hide storeys above it and elements without a storey (roof proxies, annotations)
       b.mesh!.visible = !(other && ((b.storey > -1 && this.storeyAbove(b.storey)) || b.storey === -1)) && (!b.furniture || this.showFurniture)
         && !(b.ceiling && this.activeStorey !== null);
+      if (b.edges) {
+        const lm = b.edges.material as THREE.LineBasicMaterial;
+        lm.opacity = !calm ? 0 : other ? 0.04 : this.ghost ? 0.3 : 0.55;
+        b.edges.visible = lm.opacity > 0;
+        lm.clippingPlanes = mat.clippingPlanes;
+      }
+      // exploded floors: lifted, cut like a plan, ceilings and floors without rooms hidden
+      const e = this.explode?.get(b.storey);
+      b.mesh!.position.y = e?.dy ?? 0;
+      if (this.explode) {
+        mat.clippingPlanes = e ? [e.plane] : null;
+        if (b.edges) (b.edges.material as THREE.Material).clippingPlanes = mat.clippingPlanes;
+        if (!e || b.ceiling) b.mesh!.visible = false;
+      }
+    }
+    for (const t of this.tints) {
+      const e = this.explode?.get(t.storey);
+      t.mesh.position.y = e?.dy ?? 0;
+      if (this.explode && !e) t.mesh.visible = false;
+    }
+    for (const p of this.hlParts) {
+      const e = this.explode?.get(p.storey);
+      for (const m of [p.mesh, p.xray]) {
+        if (!m) continue;
+        m.position.y = e?.dy ?? 0;
+        (m.material as THREE.Material).clippingPlanes = e ? [e.plane] : null;
+      }
     }
     this.needsRender = true;
   }
@@ -841,7 +1264,9 @@ export class Viewer3D {
     // a door or a few windows are shown with their surroundings: the framed box is at least 10 m wide
     const MIN_HALF = 5;
     box.expandByVector(new THREE.Vector3(MIN_HALF, MIN_HALF, MIN_HALF).sub(box.getSize(new THREE.Vector3()).multiplyScalar(0.5)).max(new THREE.Vector3()));
-    const dir = new THREE.Vector3(0.6, 0.75, 0.9).normalize();
+    // W7: exploded floors and a single floor are seen a little more from above (more of each floor's rooms visible)
+    const dir = (this.explode ? this.explodeDir() : this.activeStorey !== null ? new THREE.Vector3(0.55, 1.0, 0.85)
+      : new THREE.Vector3(0.6, 0.75, 0.9)).normalize();
     // exact fit: the closest camera distance along `dir` that keeps the elements inside the view (+ margin), so the lit
     // elements fill the pane instead of a sphere around the box diagonal
     const fwd = dir.clone().negate();
@@ -916,7 +1341,65 @@ export class Viewer3D {
     this.frame(this.root);
   }
 
+  /** Exploded floors are cut 1.3 m above each floor: a hit above its storey's cut is not really there. */
+  private belowCut(h: THREE.Intersection): boolean {
+    const b = h.object.userData.bucket as Bucket | undefined;
+    const e = b ? this.explode?.get(b.storey) : undefined;
+    return !e || h.point.y <= e.plane.constant;
+  }
+
+  /** The room whose tinted floor this ray hit (W7), or null. */
+  private roomAt(hit: THREE.Intersection): Tint["spaces"][number] | null {
+    if (!hit.object.userData.tint || hit.faceIndex == null) return null;
+    const t = this.tints.find((x) => x.mesh === hit.object);
+    const v = hit.faceIndex * 3;
+    return t?.spaces.find((s) => v >= s.v0 && v < s.v1) ?? null;
+  }
+
+  /** Hovering a room's floor shows its name, type and area (W7): one floor shown or floors exploded, Rooms look,
+   * customer view; tinted floors only (cheap: a few thousand triangles), ~15 times a second at most. */
+  private installHover() {
+    const ray = new THREE.Raycaster();
+    const tip = document.createElement("div");
+    tip.className = "v3d-tip";
+    tip.hidden = true;
+    let last = 0, shown = -1;
+    const hide = () => { tip.hidden = true; shown = -1; };
+    this.renderer.domElement.addEventListener("pointerleave", hide);
+    this.renderer.domElement.addEventListener("pointermove", (e) => {
+      const now = performance.now();
+      if (now - last < 66) return;
+      last = now;
+      if (e.buttons || !this.api || !calmView() || getLook() !== "rooms" || (this.activeStorey === null && !this.explode)) return hide();
+      const r = this.renderer.domElement.getBoundingClientRect();
+      ray.setFromCamera(new THREE.Vector2(((e.clientX - r.left) / r.width) * 2 - 1, -((e.clientY - r.top) / r.height) * 2 + 1), this.camera);
+      const hit = ray.intersectObjects(this.tints.filter((t) => t.mesh.visible).map((t) => t.mesh), false)[0];
+      const room = hit ? this.roomAt(hit) : null;
+      if (!room) return hide();
+      // a wall in front of the floor wins (as a click would pick the wall): only the solid parts of the shown floor(s)
+      ray.far = hit!.distance - 0.05;
+      const front = ray.intersectObjects(this.buckets.filter((b) => b.mesh!.visible && !b.transparent && (b.mesh!.material as THREE.Material).opacity > 0.1)
+        .map((b) => b.mesh!), false).find((h) => !this.explode || this.belowCut(h));
+      ray.far = Infinity;
+      if (front) return hide();
+      if (!tip.isConnected) this.labelLayer.append(tip);
+      if (shown !== room.id) {
+        this.ensureGuidIndex();
+        const guid = this.idToGuid.get(room.id);
+        const name = (guid && this.spaceTitle(guid)) || "Room";
+        const kind = ROOM_TYPES.find((t) => t.key === room.type)?.label ?? "";
+        tip.innerHTML = `<b></b><span></span>`;
+        tip.querySelector("b")!.textContent = name;
+        tip.querySelector("span")!.textContent = `${kind} · ${room.area >= 100 ? Math.round(room.area) : room.area.toFixed(1)} m²`;
+        shown = room.id;
+      }
+      tip.hidden = false;
+      tip.style.transform = `translate(${e.clientX - r.left + 14}px, ${e.clientY - r.top + 14}px)`;
+    });
+  }
+
   private installPick() {
+    this.installHover();
     const ray = new THREE.Raycaster();
     let down = { x: 0, y: 0 };
     this.renderer.domElement.addEventListener("pointerdown", (e) => (down = { x: e.clientX, y: e.clientY }));
@@ -925,8 +1408,26 @@ export class Viewer3D {
       const r = this.renderer.domElement.getBoundingClientRect();
       ray.setFromCamera(new THREE.Vector2(((e.clientX - r.left) / r.width) * 2 - 1, -((e.clientY - r.top) / r.height) * 2 + 1), this.camera);
       const targets = this.buckets.filter((b) => b.mesh!.visible && (b.mesh!.material as THREE.Material).opacity > 0.1).map((b) => b.mesh!);
-      const hit = ray.intersectObjects(targets, false)[0];
+      // W7: a room's tinted floor picks the ROOM (IfcSpace), not the slab under it
+      targets.push(...this.tints.filter((t) => t.mesh.visible).map((t) => t.mesh));
+      const hit = ray.intersectObjects(targets, false).find((h) => !this.explode || this.belowCut(h));
       if (!hit || hit.faceIndex == null) return;
+      const room = this.roomAt(hit);
+      if (room) {
+        this.ensureGuidIndex();
+        const guid = this.idToGuid.get(room.id);
+        const line = this.api.GetLine(this.modelID, room.id);
+        if (!guid) return;
+        const props: Record<string, string> = {
+          type: "IFCSPACE", name: line.Name?.value ?? "", longName: line.LongName?.value ?? "", GlobalId: guid,
+          storey: this.storeys.find((s) => s.id === this.storeyOf.get(room.id))?.name ?? "",
+          "room type": ROOM_TYPES.find((t) => t.key === room.type)?.label ?? "", "floor area (3D model)": `${room.area.toFixed(2)} m²`,
+        };
+        this.highlight([guid], false);
+        this.onPick(guid, this.spaceTitle(guid) ?? `Space ${props.name}`, props);
+        return;
+      }
+      if (!hit.object.userData.bucket) return;
       const b = hit.object.userData.bucket as Bucket;
       const tri = hit.faceIndex * 3;
       const range = b.ranges.find((x) => tri >= x.start && tri < x.start + x.count);
@@ -1041,4 +1542,18 @@ export class Viewer3D {
     const l = this.api.GetLine(this.modelID, id);
     return `${this.api.GetNameFromTypeCode(l.type) ?? ""} ${l.Name?.value ?? ""} ${l.LongName?.value ?? ""}`.trim();
   }
+}
+
+/** The room tints' material: flat colour (the legend's swatch exactly; AO still shades the corners), faded toward white
+ * by TINT_FADE while an answer is lit; drawn a hair in front of the floor slab. */
+function tintMaterial(): THREE.MeshBasicMaterial {
+  const m = new THREE.MeshBasicMaterial({ vertexColors: true, side: THREE.DoubleSide, polygonOffset: true, polygonOffsetFactor: -1, polygonOffsetUnits: -4 });
+  m.onBeforeCompile = (sh) => {
+    sh.uniforms.uFade = TINT_FADE;
+    sh.fragmentShader = sh.fragmentShader
+      .replace("void main() {", "uniform float uFade;\nvoid main() {")
+      .replace("#include <color_fragment>", "#include <color_fragment>\n  diffuseColor.rgb = mix(diffuseColor.rgb, vec3(0.86, 0.855, 0.84), uFade);");
+  };
+  m.customProgramCacheKey = () => "w7-tint";
+  return m;
 }

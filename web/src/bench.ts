@@ -7,6 +7,12 @@
  * Colours: categorical slots 1–3 of the dataviz reference palette (validated all-pairs, light mode). Aqua is
  * below 3:1 on white, so every bar carries a visible value label (the rows double as the table view).
  */
+/** Held-out numbers for drawings unlike the dataset's (RL's release truth pass, KNOWLEDGE 20:22; AUDIT REPORT-1951 'Claims
+ *  to change': never apply the sealed 87.7 % to uploads). Update them with RL's next truth pass. */
+const NEW_DRAWINGS = {
+  inTen: 5,
+  detail: "held-out sibling sheets 53 %, real drawings 51 %; scans and phone photos lower (4 of 20, 0 of 4 in the audit)",
+};
 const esc = (s: unknown) => String(s ?? "").replace(/[&<>"']/g, (c) => `&#${c.charCodeAt(0)};`);
 
 type Run = {
@@ -70,14 +76,15 @@ function customerHtml(b: Bench): string {
     <i style="width:${v === null || v === undefined ? 0 : Math.max(v * 100, 0.8)}%"></i><span>${pct(v, 0)}</span></div>`;
   return `
     <div class="bc-head"><h2>How accurate is it?</h2><button class="bn-close" aria-label="Close">✕</button></div>
-    <p class="bc-lead">About <b>${inTen(main.accuracy)} in 10</b> answers right on drawings it had never seen${vlm ? ` — a general AI model gets about <b>${inTen(vlm.accuracy)} in 10</b>` : ""}.</p>
+    <p class="bc-lead">About <b>${inTen(main.accuracy)} in 10</b> answers right on the dataset's sealed test${vlm ? ` — a general AI model gets about <b>${inTen(vlm.accuracy)} in 10</b>` : ""}.
+      <b>On new drawings from elsewhere, expect about ${NEW_DRAWINGS.inTen} in 10</b> (${esc(NEW_DRAWINGS.detail)}): that is why answers point to where they come from and say how sure they are.</p>
     <div class="bc-tiles">
       <div class="bc-tile"><div class="v">${pct(main.accuracy, 0)}</div><div class="k">Right answers</div>
-        <div class="s">${main.n.toLocaleString("en")} questions on drawings kept apart while we built it</div></div>
+        <div class="s">${main.n.toLocaleString("en")} questions of the dataset's sealed test (its drawings kept apart while we built it; same collections)</div></div>
       ${cal?.hi_conf_acc ? `<div class="bc-tile"><div class="v">${pct(cal.hi_conf_acc, 0)}</div><div class="k">Right on its most confident answers</div>
-        <div class="s">about ${inTen(cal.hi_conf_share)} in 10 answers are in this group (confidence 0.8 or more); the others ask you to check</div></div>` : ""}
+        <div class="s">about ${inTen(cal.hi_conf_share)} in 10 answers are in this group (confidence 0.8 or more; on the dataset — new drawings give fewer sure answers); the others ask you to check</div></div>` : ""}
       <div class="bc-tile"><div class="v">${cents === null ? "–" : cents < 1 ? "&lt;1¢" : `${Math.round(cents)}¢`}</div><div class="k">Per 1,000 questions</div>
-        <div class="s">${centsTxt} in computing cost: mostly rules on a normal computer</div></div>
+        <div class="s">${centsTxt} in computing cost on the dataset: mostly rules on a normal computer (scans and photos need text recognition and cost more)</div></div>
       ${share !== null ? `<div class="bc-tile"><div class="v">${pct(share, 0)}</div><div class="k">${shareWords} answered with no AI</div>
         <div class="s">read straight from the drawing's own lines, text and model data</div></div>` : ""}
     </div>
@@ -86,7 +93,8 @@ function customerHtml(b: Bench): string {
       ${kinds.map((k) => `<div class="bc-row"><div class="bc-kind">${esc(KIND[k])}</div>
         ${bar(p.by_source[k].accuracy, "ours", "Blueprint Evidence")}${bar(vlm.by_source?.[k]?.accuracy, "gen", "General AI model")}</div>`).join("")}
       <div class="bc-note">Share of right answers per kind of drawing (development set, ${p.n.toLocaleString("en")} questions).</div></div>` : ""}
-    <details class="bc-tech"><summary>Technical details</summary><div class="bc-tech-body"></div></details>`;
+    <details class="bc-tech"><summary>Technical details</summary><div class="bc-tech-body"></div></details>
+    <p class="bc-built">Built with Gemini 3.1 Pro · NVIDIA Nemotron · trained and benchmarked on Verda</p>`;
 }
 
 export function renderBench(el: HTMLElement, b: Bench, customer = false) {

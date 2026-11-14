@@ -14,15 +14,15 @@ defaults are what produced the results in [RESULTS.md](RESULTS.md).
 | `CC5K_PYTHON` | `.venv-cc5k/bin/python` / `a.PY` | Python with torch for live CPU inference (default: `.venv-cc5k/bin/python`); cached counts need none | `stoa/extras/cc5k_model/adapter.py`, `stoa/extras/room_graph/graph.py`, `stoa/solvers/raster_cc5k/__init__.py` (+1) |
 | `CC5K_THREADS` | `6` | optional; CPU threads for live inference (default 6) | `stoa/extras/cc5k_model/predict.py` |
 | `CC5K_WEIGHTS` | `.stoa/models/cc5k/model_best_val_loss_var.pkl` | pretrained CubiCasa5K weights `.pkl` (CC BY-NC 4.0, outside git) | `stoa/extras/cc5k_model/predict.py` |
-| `GEMINI_API_KEY` | unset | your own Google AI Studio key; escalation only, keep it out of bulk evals | `stoa/eval/runner.py`, `stoa/llm.py` |
+| `GEMINI_API_KEY` | unset | your own Google AI Studio key; escalation only, keep it out of bulk evals | `stoa/eval/runner.py`, `stoa/llm.py`, `stoa/solvers/piping.py` |
 | `GEMINI_MAX_CALLS_PER_DAY` | `200` | optional; per-day call cap for Gemini | `stoa/llm.py` |
 | `GEMINI_MODEL` | `gemini-3-flash-preview` | Gemini model for hosted steps (Gemini 3.1 Pro is chosen explicitly for hard cases) | `stoa/llm.py` |
-| `JUNCTION_SHARED` | `.stoa` / `/root/shared` / … | local state folder (splits, leaderboard, caches, artifacts); default `.stoa` | `deploy/verda/lone_split.py`, `deploy/verda/quick_report.py`, `deploy/verda/report.py` (+21) |
+| `JUNCTION_SHARED` | `.stoa` / `/root/shared` / … | local state folder (splits, leaderboard, caches, artifacts); default `.stoa` | `deploy/verda/lone_split.py`, `deploy/verda/quick_report.py`, `deploy/verda/report.py` (+30) |
 | `JUNCTION_VENV` | unset | Python env (`$JUNCTION_VENV/bin/python`) | `web/mock/stoaApi.ts` |
 | `LLM2_API_KEY` | unset | optional Bearer token for an authenticated `local` / `local2` endpoint (e.g. Verda serverless); unset = no auth | `stoa/llm.py` |
-| `LLM2_BASE_URL` | `http://127.0.0.1:8002/v1` | second local OpenAI-compatible server (`local2` backend, :8002) | `stoa/llm.py` |
+| `LLM2_BASE_URL` | `http://127.0.0.1:8002/v1` / empty | second local OpenAI-compatible server (`local2` backend, :8002) | `stoa/features/takeoff.py`, `stoa/llm.py`, `stoa/netguard.py` |
 | `LLM_API_KEY` | unset | optional Bearer token for an authenticated `local` / `local2` endpoint (e.g. Verda serverless); unset = no auth | `stoa/llm.py` |
-| `LLM_BASE_URL` | `http://127.0.0.1:8001/v1` | local OpenAI-compatible server, default `http://127.0.0.1:8001/v1` | `stoa/llm.py` |
+| `LLM_BASE_URL` | `http://127.0.0.1:8001/v1` / empty | local OpenAI-compatible server, default `http://127.0.0.1:8001/v1` | `stoa/features/takeoff.py`, `stoa/llm.py`, `stoa/netguard.py` |
 | `LLM_MODEL` | `default` | served model name on the local server (`default` = whatever it serves) | `stoa/llm.py` |
 | `LLM_NEVER_UP_WAIT` | `15` | seconds a model step waits for a local model server that never answered in this process (default 15) | `stoa/llm.py` |
 | `LLM_RESTART_WAIT` | `300` | seconds a model step waits for a local model server that went down and is restarting (default 300) | `stoa/llm.py` |
@@ -36,14 +36,14 @@ defaults are what produced the results in [RESULTS.md](RESULTS.md).
 | `STOA_API_MODEL_LORA` | empty | hosted model that answers the local-only adapters' prompts (default = STOA_API_MODEL; "none" = fail fast). No logprobs there, so the solver's confidence falls back to its constant (0.3). | `stoa/llm.py` |
 | `STOA_API_MODEL_TEXT` | unset | model for "local2" free-text steps (default = STOA_API_MODEL) | `stoa/llm.py` |
 | `STOA_API_VERIFY` | `1` | HTTP API only: `1` = NVIDIA Nemotron second opinion on unsure answers without located evidence | `stoa/api.py` |
-| `STOA_CACHE` | `tempfile.gettempdir()` / `Path.home() / ".cache" / "stoa"` | Cache for page renders of read-only inputs (default ~/.cache/stoa; writable inputs get them alongside) | `stoa/evidence/dxfplan.py`, `stoa/formats/normalize.py` |
+| `STOA_CACHE` | `tempfile.gettempdir()` / `tmp` / … | Cache for page renders of read-only inputs (default ~/.cache/stoa; writable inputs get them alongside) | `stoa/evidence/dxfplan.py`, `stoa/features/privacy.py`, `stoa/features/region.py` (+2) |
 | `STOA_DATA` | `DEFAULT_DATA` / `junction-dataset` / … | dataset root (contains `questions.jsonl`, `data/`) | `stoa/data.py`, `stoa/extras/cc5k_model/adapter.py`, `stoa/extras/raster_scale/find_areas.py` (+6) |
 | `STOA_DWG2DXF` | unset | path of a LibreDWG `dwg2dxf` binary | `stoa/formats/dwg.py` |
-| `STOA_GEMINI_ESCALATE` | `0` | `1` = Gemini escalation / Nemotron verify after the cascade (API/demo default); evals and gates set `0` | `stoa/pipeline.py` |
+| `STOA_GEMINI_ESCALATE` | `0` / `1` | `1` = Gemini escalation / Nemotron verify after the cascade (API/demo default); evals and gates set `0` | `stoa/pipeline.py`, `stoa/solvers/piping.py` |
 | `STOA_LLM_CACHE` | unset | `1` = on-disk cache of temperature-0 model responses | `stoa/llm.py` |
-| `STOA_MODE` | empty | API-only mode without a local GPU: STOA_MODE=api (see README) | `stoa/cli.py`, `stoa/llm.py` |
+| `STOA_MODE` | empty | API-only mode without a local GPU: STOA_MODE=api (see README) | `stoa/cli.py`, `stoa/llm.py`, `web/server/ask_upload.py` |
 | `STOA_OCR_PYTHON` | `.venv-ocr/bin/python` | Python of a separate env with PaddleOCR (OCR runs as a subprocess there) | `stoa/ocr/__init__.py` |
-| `STOA_TEXT_BACKEND` | empty | backend for free-text model steps (multi-part splits, IFC fact-card answers): `local2`, `verda` | `stoa/llm.py`, `web/mock/stoaApi.ts` |
+| `STOA_TEXT_BACKEND` | empty | backend for free-text model steps (multi-part splits, IFC fact-card answers): `local2`, `verda` | `stoa/agent/private.py`, `stoa/llm.py`, `web/mock/stoaApi.ts` (+1) |
 | `STOA_VERIFY` | `0` | `1` = Gemini escalation / Nemotron verify after the cascade (API/demo default); evals and gates set `0` | `stoa/pipeline.py` |
 | `VERDA_INFERENCE_API_KEY` | unset | key for Verda Inference (EU-hosted, text only); used with `STOA_TEXT_BACKEND=verda` | `stoa/llm.py` |
 | `VERDA_MODEL` | `deepseek-4-1-flash-1017` | model on Verda Inference for `STOA_TEXT_BACKEND=verda` | `stoa/llm.py` |
@@ -59,8 +59,29 @@ Tuning and experiment switches. Read the module named in the last column for wha
 | `CC5K_MAX_SIDE` | `3000` | `stoa/extras/cc5k_model/predict.py` |
 | `CC5K_RESIZE_TO` | `2000` | `stoa/extras/cc5k_model/predict.py` |
 | `CC5K_SAVE_MAPS` | unset; `stoa/extras/raster_scale/scale.py` sets `str(LIVE_MAPS)` when unset | `stoa/extras/cc5k_model/predict.py`, `stoa/extras/raster_scale/scale.py` |
+| `CC5K_SAVE_NAME` | unset | `stoa/extras/cc5k_model/predict.py`, `stoa/extras/raster_scale/scale.py` |
 | `DRY` | `0` | `serving/watchdog.sh` |
+| `E1_ANCHORED` | `1` | `stoa/evidence/linework.py` |
+| `E1_ARROW_SEED` | `1` | `stoa/evidence/lineplan.py` |
+| `E1_BRIDGE` | `1` | `stoa/evidence/linework.py` |
+| `E1_BRIDGE_M` | `2.5` | `stoa/evidence/linework.py` |
+| `E1_DASH_GAP_PT` | `4.0` | `stoa/evidence/slabs.py` |
+| `E1_DOOR_LEAVES` | `1` | `stoa/evidence/linework.py` |
+| `E1_DOOR_SEMI` | `1` | `stoa/evidence/linework.py` |
+| `E1_DROP_DASHED` | `1` | `stoa/evidence/linework.py` |
 | `E1_FILL_GROW_M` | `0.08` | `stoa/evidence/linework.py` |
+| `E1_HATCH_RINGS` | `1` | `stoa/evidence/slabs.py` |
+| `E1_HATCH_RING_PT` | `2.5` | `stoa/evidence/slabs.py` |
+| `E1_KEEP_SEPARATIONS` | `1` | `stoa/evidence/linework.py` |
+| `E1_NUM_PT_TRACED` | `20.0` | `stoa/evidence/slabs.py` |
+| `E1_OCR_BLOCKS` | `1` | `stoa/evidence/slabs.py` |
+| `E1_REVEAL_CUT` | `1` | `stoa/evidence/linework.py` |
+| `E1_REVEAL_W` | `0.8,1.6` | `stoa/evidence/lineplan.py` |
+| `E1_SKIRT_REVEALS` | `0` | `stoa/evidence/lineplan.py` |
+| `E1_TABLE_OCR` | `1` | `stoa/evidence/areatable.py` |
+| `E1_TRACED_DASHES` | `1` | `stoa/evidence/linework.py` |
+| `E1_TRACED_FILLS` | `0` | `stoa/evidence/linework.py` |
+| `E1_TRACED_WALL_PT` | `1.0` | `stoa/evidence/linework.py` |
 | `EXTRA_ARGS` | empty | `serving/start.sh` |
 | `FREE_GB` | `$(free_gb)` | `serving/watchdog.sh` |
 | `GEMINI_BASE_URL` | `https://generativelanguage.googleapis.com/v1beta/openai/` | `stoa/llm.py` |
@@ -84,6 +105,7 @@ Tuning and experiment switches. Read the module named in the last column for wha
 | `NO_LORA` | `0` | `serving/start.sh` |
 | `NVIDIA_BASE_URL` | `https://integrate.api.nvidia.com/v1` | `stoa/llm.py` |
 | `ORIG` | unset | `deploy/verda/lone_split.py` |
+| `OUT` | unset | `stoa/solvers/raster/photo.py` |
 | `PADDLE_PDX_CACHE_HOME` | unset; `stoa/ocr/engine.py` sets `".stoa/paddlex"` when unset | `stoa/ocr/engine.py` |
 | `PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK` | unset; `stoa/ocr/engine.py` sets `"True"` when unset | `stoa/ocr/engine.py` |
 | `PORT` | `8001` | `serving/start.sh`, `serving/stop.sh` |
@@ -98,6 +120,43 @@ Tuning and experiment switches. Read the module named in the last column for wha
 | `STOA_API_PRICES` | `{}` | `stoa/cost.py` |
 | `STOA_API_URL` | unset | `web/mock/stoaApi.ts` |
 | `STOA_AREA_CHECK_BELOW` | `0.7` | `stoa/agent/vision.py` |
+| `STOA_ASK_CONTEXT` | unset | `stoa/agent/click.py`, `stoa/features/region.py`, `stoa/formats/normalize.py` (+1) |
+| `STOA_BACKED_CONF` | `0.6` | `stoa/agent/vision.py` |
+| `STOA_CORRECTIONS_DIR` | unset | `stoa/features/corrections.py` |
+| `STOA_DET_PXM` | `46` | `stoa/solvers/door_detect.py` |
+| `STOA_DET_ROOMS` | `0` | `stoa/solvers/door_detect.py` |
+| `STOA_DET_TIMEOUT` | `30` / `40` | `stoa/features/takeoff.py`, `stoa/solvers/door_detect.py` |
+| `STOA_DET_URL` | `http://127.0.0.1:8140` | `stoa/features/takeoff.py`, `stoa/solvers/door_detect.py`, `stoa/solvers/openings.py` |
+| `STOA_DR_ANGLED` | `1` | `stoa/solvers/openings.py` |
+| `STOA_DR_ARCLESS` | `1` | `stoa/solvers/openings.py` |
+| `STOA_DR_DET_MAX_QUEUE` | `4` | `stoa/solvers/openings.py` |
+| `STOA_DR_DET_TIMEOUT` | `30` / `25` | `stoa/features/takeoff.py`, `stoa/solvers/openings.py` |
+| `STOA_DR_EXTERIOR` | `0` | `stoa/solvers/openings.py` |
+| `STOA_DR_IMAGES` | `1` | `stoa/solvers/openings.py` |
+| `STOA_DR_SLIDING` | `1` | `stoa/solvers/openings.py` |
+| `STOA_DR_TRACE` | `1` | `stoa/solvers/openings.py` |
+| `STOA_DR_VWIN` | `1` | `stoa/features/takeoff.py`, `stoa/solvers/openings.py` |
+| `STOA_DR_VWIN_DET` | `0` | `stoa/solvers/openings.py` |
+| `STOA_DR_WHOLE_IMG` | `1` | `stoa/solvers/openings.py` |
+| `STOA_DR_WIN_PROFILE` | `1` | `stoa/solvers/openings.py` |
+| `STOA_DR_XCHECK_TIMEOUT` | `10` | `stoa/solvers/openings.py` |
+| `STOA_EU_ONLY` | `0` / empty | `stoa/agent/private.py`, `stoa/llm.py`, `stoa/netguard.py` (+1) |
+| `STOA_EXAMPLES_DIR` | empty | `stoa/features/takeoff.py`, `web/mock/stoaApi.ts` |
+| `STOA_F5_BLUR` | `1` | `stoa/features/revcompare.py` |
+| `STOA_F5_DEMO_DIR` | (computed in code) | `stoa/features/revcompare.py` |
+| `STOA_F5_DENSE` | `1` | `stoa/features/revcompare.py` |
+| `STOA_F5_DENSE_DIFF` | `0.45` | `stoa/features/revcompare.py` |
+| `STOA_F5_GHOST` | `0.25` | `stoa/features/revcompare.py` |
+| `STOA_F5_GHOST_PAPER` | `p90` | `stoa/features/revcompare.py` |
+| `STOA_F5_OCR` | `1` | `stoa/features/revcompare.py` |
+| `STOA_F5_OCR_SCORE` | `0.8` | `stoa/features/revcompare.py` |
+| `STOA_F5_OCR_WAIT` | `6` | `stoa/features/revcompare.py` |
+| `STOA_F5_R` | `3` | `stoa/features/revcompare.py` |
+| `STOA_F5_SET_MAX` | `40` | `stoa/features/revcompare.py` |
+| `STOA_F5_TEXT_DIFF` | `0.3` | `stoa/features/revcompare.py` |
+| `STOA_F5_TEXT_NCC` | `0.6` | `stoa/features/revcompare.py` |
+| `STOA_FEATURES` | empty | `stoa/agent/click.py`, `stoa/features/__init__.py`, `stoa/features/corrections.py` (+3) |
+| `STOA_FEAT_CACHE` | `tmp / "stoa-feat"` / `Path(tempfile.gettempdir()) / "stoa-feat"` | `stoa/features/privacy.py`, `stoa/features/revcompare.py` |
 | `STOA_GATE_PASSWORD` | empty | `deploy/gate.py` |
 | `STOA_GEMINI_BELOW` | `0.5` | `stoa/agent/escalate.py` |
 | `STOA_GEMINI_PLANNER` | `gemini-3.1-pro-preview` | `stoa/agent/gemini.py` |
@@ -105,49 +164,99 @@ Tuning and experiment switches. Read the module named in the last column for wha
 | `STOA_GEMINI_TEAM_CAP` | `800` | `stoa/agent/escalate.py` |
 | `STOA_GEMINI_VISION` | `gemini-3.1-pro-preview` | `stoa/agent/vision.py` |
 | `STOA_GEMINI_VISION_STEP` | `1` | `stoa/agent/escalate.py` |
-| `STOA_HOSTED_TIMEOUT_S` | unset | `web/mock/stoaApi.ts` |
+| `STOA_HOSTED_DEADLINE_S` | `100` | `stoa/llm.py` |
+| `STOA_HOSTED_TIMEOUT_S` | `75` | `stoa/llm.py`, `web/mock/stoaApi.ts` |
 | `STOA_IMAGE_MAX_SIDE` | `str(IMAGE_MAX_SIDE)` | `stoa/formats/normalize.py` |
 | `STOA_KG_REPO` | unset | `web/mock/stoaApi.ts` |
 | `STOA_LEADERBOARD` | unset | `web/mock/stoaApi.ts` |
+| `STOA_LIKE_THR` | `0.8` | `stoa/agent/click.py` |
 | `STOA_LLM_CACHE_DIR` | `str(SHARED / "artifacts" / "llm-cache")` | `stoa/llm.py` |
+| `STOA_LLM_REPLAY` | unset | `stoa/agent/escalate.py`, `stoa/llm.py` |
 | `STOA_LOCAL2_FALLBACK` | `1` | `stoa/llm.py` |
+| `STOA_NETGUARD` | `1` | `stoa/netguard.py` |
 | `STOA_O1_ARC_THREADS` | `6` | `stoa/solvers/raster/doorarcs.py` |
 | `STOA_O1_BRIDGE` | `2.0` | `stoa/solvers/raster/measure.py` |
 | `STOA_O1_BRIDGE_MIN` | `90` | `stoa/solvers/raster/measure.py` |
 | `STOA_O1_CALLOUTS` | `1` | `stoa/solvers/raster/callouts.py` |
 | `STOA_O1_CHAINS` | `1` | `stoa/solvers/raster/chains.py` |
+| `STOA_O1_DIM_GUARD` | `1` | `stoa/solvers/raster/textqa.py` |
+| `STOA_O1_GRID` | `0` | `stoa/solvers/raster/measure.py` |
 | `STOA_O1_GROW` | `60` | `stoa/solvers/raster/measure.py` |
+| `STOA_O1_LABEL_ABBR` | `1` | `stoa/solvers/raster/measure.py` |
 | `STOA_O1_LABEL_CUT` | `1` | `stoa/solvers/raster/measure.py` |
 | `STOA_O1_LARGE_SHEET` | `1` | `stoa/solvers/raster/textqa.py` |
+| `STOA_O1_LEAF_GATE` | `1` | `stoa/solvers/raster/doorarcs.py` |
+| `STOA_O1_LEAK_LABELS` | `10` | `stoa/solvers/raster/measure.py` |
+| `STOA_O1_LOOSE_CHAINS` | `1` | `stoa/solvers/raster/chains.py` |
 | `STOA_O1_NOTES` | `1` | `stoa/solvers/raster/notes.py` |
+| `STOA_O1_OCR_GATE` | `1` | `stoa/ocr/quality.py` |
+| `STOA_O1_PHOTO` | `1` | `stoa/solvers/raster/photo.py` |
+| `STOA_O1_PHOTO_F` | `1` | `stoa/solvers/raster/photo.py` |
+| `STOA_O1_PHOTO_FLAT` | `1` | `stoa/solvers/raster/photo.py` |
 | `STOA_O1_PIXEL_DPI` | `1` | `stoa/solvers/raster/scalebar.py` |
+| `STOA_O1_PRINTED_SIZE` | `1` | `stoa/solvers/raster/textqa.py` |
+| `STOA_O1_PRINTED_SUM` | `1` | `stoa/solvers/raster/textqa.py` |
+| `STOA_O1_RICHER` | `1` | `stoa/solvers/raster/textlayer.py` |
+| `STOA_O1_SCAN_FILL_CAP` | `1` | `stoa/solvers/raster/textqa.py` |
 | `STOA_O1_SECTOR` | `1.2` | `stoa/solvers/raster/measure.py` |
 | `STOA_O1_SEED_SKIP` | `1` | `stoa/solvers/raster/measure.py` |
+| `STOA_O1_SHEET_NOTE` | `1` | `stoa/solvers/raster/scalebar.py` |
+| `STOA_O1_STICKY` | `1` | `stoa/solvers/raster/textlayer.py` |
+| `STOA_O1_TILE_JOIN` | `0` | `stoa/solvers/raster/textlayer.py` |
+| `STOA_O1_UNION` | `1` | `stoa/solvers/raster/textlayer.py` |
+| `STOA_OCR_NEG_TTL` | `1800` | `stoa/ocr/__init__.py` |
+| `STOA_OCR_SERVER_BG` | `1800` | `stoa/ocr/__init__.py` |
 | `STOA_OCR_SIZE` | `small` | `stoa/ocr/engine.py` |
-| `STOA_OCR_THREADS` | `8` | `stoa/ocr/__init__.py`, `stoa/ocr/engine.py` |
+| `STOA_OCR_SMALL_MP` | `3` | `stoa/ocr/__init__.py` |
+| `STOA_OCR_SMALL_WAIT` | `6` | `stoa/ocr/__init__.py` |
+| `STOA_OCR_THREADS` | `4` / `8` | `stoa/features/revcompare.py`, `stoa/ocr/__init__.py`, `stoa/ocr/engine.py` |
 | `STOA_OCR_TIMEOUT` | `120` | `stoa/ocr/__init__.py` |
 | `STOA_OCR_UPSCALE` | `0` | `stoa/ocr/engine.py` |
 | `STOA_OCR_URL` | `http://127.0.0.1:8110` | `stoa/ocr/__init__.py` |
-| `STOA_PAGE_DIR` | `Path(tempfile.gettempdir()) / "stoa-pages"` | `stoa/pipeline.py` |
+| `STOA_PAGE_DIR` | `Path(tempfile.gettempdir()) / "stoa-pages"` | `stoa/features/privacy.py`, `stoa/pipeline.py` |
 | `STOA_PICK_PAGE` | `1` | `stoa/pipeline.py` |
+| `STOA_PRIVATE` | `0` / empty | `stoa/agent/private.py`, `stoa/features/privacy.py`, `stoa/features/takeoff.py` (+5) |
+| `STOA_PROJECTS_DIR` | unset | `stoa/features/privacy.py`, `stoa/features/project.py` |
 | `STOA_QUESTION_CALLS` | `12` | `stoa/router/budget.py` |
 | `STOA_QUESTION_TOKENS` | `20000` | `stoa/router/budget.py` |
 | `STOA_RECOGNIZE` | `1` | `stoa/pipeline.py` |
+| `STOA_REGION_CACHE` | unset | `stoa/features/region.py` |
+| `STOA_REGION_CROP` | unset | `stoa/features/region.py` |
+| `STOA_SANDBOX_SECONDS` | `3` | `stoa/sandbox.py` |
+| `STOA_SCAN_TEXT` | `1` | `stoa/formats/pages.py` |
+| `STOA_SCAN_TEXT_ASK_PAGES` | `4` | `stoa/formats/pages.py` |
+| `STOA_SCAN_TEXT_PAGES` | `12` | `stoa/formats/pages.py` |
+| `STOA_SELFCHECK_ROOTS` | empty | `stoa/features/selfcheck.py` |
+| `STOA_SHEET_PX` | `4500` | `stoa/pipeline.py` |
 | `STOA_STYLE_GUESS` | `1` | `stoa/data.py` |
+| `STOA_TAKEOFF_AGENT` | `0` | `stoa/features/takeoff.py` |
+| `STOA_TAKEOFF_CACHE` | empty | `stoa/features/privacy.py`, `stoa/features/takeoff.py`, `web/server/glance.py` |
+| `STOA_TAKEOFF_LLM` | `0` | `stoa/features/takeoff.py` |
+| `STOA_TAKEOFF_MAX_ROOMS` | `80` | `stoa/features/takeoff.py` |
+| `STOA_TAKEOFF_Q_BUDGET` | `75` | `stoa/features/takeoff.py` |
 | `STOA_TEXT_CACHE` | `1` | `stoa/ocr/__init__.py`, `stoa/solvers/raster/textlayer.py` |
 | `STOA_TEXT_ENGINE` | `auto` | `stoa/solvers/raster/sheet.py`, `stoa/solvers/raster/textlayer.py` |
+| `STOA_TILE_JOIN` | `1` | `stoa/solvers/raster/textlayer.py` |
 | `STOA_TR_CONJ` | `1` | `stoa/llm.py` |
-| `STOA_UPLOADS` | unset | `web/mock/stoaApi.ts` |
+| `STOA_UPLOADS` | `Path(tempfile.gettempdir()) / "stoa-uploads"` | `stoa/features/corrections.py`, `stoa/features/privacy.py`, `stoa/features/project.py` (+6) |
+| `STOA_UPLOAD_SWEEP_MIN` | `15` | `stoa/features/privacy.py` |
+| `STOA_UPLOAD_TTL_HOURS` | `0` | `stoa/features/privacy.py` |
 | `STOA_UPLOAD_WORKERS` | unset | `web/mock/stoaApi.ts` |
+| `STOA_VECTOR_BUDGET` | `30` | `stoa/solvers/upload.py` |
 | `STOA_VERIFIER_MODEL` | `nvidia/nemotron-3.5-super-vl-120b-a12b` | `stoa/agent/verify.py` |
 | `STOA_VERIFY_BELOW` | `0.8` | `stoa/agent/escalate.py` |
 | `STOA_VISION_CAP` | `0.45` | `stoa/agent/vision.py` |
 | `STOA_VISION_SECOND` | `1` | `stoa/agent/vision.py` |
+| `STOA_VISION_WAIT` | `25` | `stoa/agent/vision.py` |
+| `STOA_WARM_GRACE` | `3` | `stoa/formats/warm.py` |
+| `STOA_WARM_HOSTED` | empty | `stoa/formats/warm.py` |
+| `STOA_WARM_WAIT` | `240` | `stoa/formats/warm.py` |
 | `UNTIL` | `19:00` | `serving/watchdog.sh` |
+| `VERDA_BASE_URL` | empty | `stoa/netguard.py` |
 | `VERDA_CLIENT_ID` | unset | `deploy/verda/verda.py` |
 | `VERDA_CLIENT_SECRET` | unset | `deploy/verda/verda.py` |
 | `VERDA_DEPLOYMENT` | `junction-vlm` | `deploy/verda/serverless.py` |
-| `VERDA_INFERENCE_BASE_URL` | `https://inference.verda.com/v1` | `stoa/llm.py` |
+| `VERDA_INFERENCE_BASE_URL` | `https://inference.verda.com/v1` | `stoa/llm.py`, `stoa/netguard.py` |
 | `VERDA_S3_ENDPOINT` | `https://objects.eu-north-3.verda.storage` | `deploy/verda/s3.py` |
 | `VERDA_S3_KEYFILE` | `Path.home() / ".config/junction-verda/s3.json"` | `deploy/verda/s3.py` |
 | `VERDA_S3_REGION` | `eu-north-3` | `deploy/verda/s3.py` |

@@ -15,6 +15,8 @@ plan text cues: m², room numbers, door/window tags). Cheap: no rendering, no mo
 
 from __future__ import annotations
 
+import os
+
 import re
 from pathlib import Path
 
@@ -51,14 +53,25 @@ _PLAN_COLON = re.compile(r"(?:floor\s*plan|plan|plattegrond|grundriss|rzut\w*|po
 _PLAN_TAIL = re.compile(r"^\s*(\S.{0,30}?)\s+(?:floor\s+)?plan\s*$", re.I)
 
 
+# a title line that ENDS with the storey and has no 'plan' word (P1 20:15, the EFA sheets: 'Secondary Type 3 600 Ground
+# Floor'); used only when the page names exactly ONE such storey (a room-count table lists every floor)
+_FLOOR_TAIL = re.compile(r"(?:^|\s)((?:lower\s+|upper\s+)?(?:ground|first|second|third|fourth|fifth|sixth|seventh|eighth|"
+                         r"basement|mezzanine|roof|attic|\d{1,2}(?:st|nd|rd|th))\s+(?:floor|storey|story|level)|"
+                         r"level\s+-?\d{1,2})\s*$", re.I)
+
+
 def sheet_storey(text: str) -> str | None:
     """The storey a sheet's title names: '… — Floor plan: 2. Level' / 'Grundriss: EG' -> '2. Level' / 'EG';
-    'GROUND FLOOR PLAN' -> 'GROUND'. None if no title line says it."""
-    for ln in text.splitlines()[:400]:
+    'GROUND FLOOR PLAN' -> 'GROUND'; else a short line ending with one storey ('… 600 Ground Floor' -> 'Ground Floor')
+    when it is the only storey named that way. None if no title line says it."""
+    lines = text.splitlines()[:400]
+    for ln in lines:
         m = _PLAN_COLON.search(ln) or _PLAN_TAIL.match(ln)
         if m:
             return m.group(1).strip()
-    return None
+    tails = {" ".join(m.group(1).split()).title() for ln in lines if len(ln.strip()) <= 60
+             and (m := _FLOOR_TAIL.search(ln.strip()))}
+    return next(iter(tails)) if len(tails) == 1 else None
 
 
 def _stream_bytes(page) -> int:
@@ -83,20 +96,158 @@ def page_scores(path: str | Path) -> list[dict]:
     except OSError:
         key = None
     if key is not None and key in _SCORES:
-        return [dict(pg) for pg in _SCORES[key]]
+        return _with_scan_texts(path, [dict(pg) for pg in _SCORES[key]])
     out = []
     with fitz.open(path) as d:
         for i, p in enumerate(d):
             text = p.get_text("text") or ""
             out.append({"page": i, "vector_bytes": _stream_bytes(p), "areas": len(_AREA.findall(text)),
-                        "room_numbers": len(_ROOMNO.findall(text)), "chars": len(text), "text": text})
+                        "room_numbers": len(_ROOMNO.findall(text)), "chars": len(text), "own_chars": len(text),
+                        "text": text})
     if key is not None:
         if len(_SCORES) > 64:
             _SCORES.clear()
         _SCORES[key] = out
-    return [dict(pg) for pg in out]
+    return _with_scan_texts(path, [dict(pg) for pg in out])
 
 
+# ------------------------------------------------------------------------------------- scanned sets (P1 19:40)
+# Captain 18:50: 'a building can have 8 floor plans' as a SCANNED set (every page one image, no text layer): page
+# picking then only had 'the page with the most ink' (P1's 3-page scanned EFA set: 9/24 questions on the right page,
+# every one to the ground floor). Each page's image is read once (the raster text layer of the page's scan PNG = the
+# very file a question on that page reads, so the reading is shared) and its text cached beside the set, so the
+# naming / storey rules below work on scans as on CAD sets. Read by warm at upload, or by the first question.
+SCAN_TEXT_PAGES = int(os.environ.get("STOA_SCAN_TEXT_PAGES", "12"))  # read at most this many scanned pages per set
+# a QUESTION reads them itself only on small sets (warm did not run, or ran out of time): each page costs one text
+# layer (~1-3 min cold on a busy CPU), and the picked page's reading is needed anyway
+SCAN_TEXT_ASK_PAGES = int(os.environ.get("STOA_SCAN_TEXT_ASK_PAGES", "4"))
+SCAN_TEXT_VERSION = 1
+
+
+def scanned_set(pages: list[dict]) -> bool:
+    """Every page one picture: (almost) no vector content and no text layer of its own."""
+    return len(pages) > 1 and max(pg["vector_bytes"] for pg in pages) < 20_000 and \
+        max(pg.get("own_chars", pg["chars"]) for pg in pages) < 200
+
+
+def _scan_text_file(path: str | Path) -> Path:
+    from stoa.formats.normalize import _cache_dir
+
+    src = Path(path)
+    return Path(_cache_dir(src)) / f"{src.stem}.pagetext.json"
+
+
+def _scan_key(path: str | Path) -> list:
+    st = Path(path).stat()
+    return [SCAN_TEXT_VERSION, st.st_size, st.st_mtime_ns]
+
+
+def cached_scan_texts(path: str | Path) -> dict[int, str]:
+    """{page: text} read earlier for this scanned set ({} when none, or the file changed since)."""
+    import json
+
+    try:
+        d = json.loads(_scan_text_file(path).read_text())
+        if d.get("key") != _scan_key(path):
+            return {}
+        return {int(k): v for k, v in d.get("texts", {}).items()}
+    except (OSError, ValueError, AttributeError):
+        return {}
+
+
+def read_scan_texts(path: str | Path, limit: int | None = None) -> dict[int, str]:
+    """Read every scanned page's text (<= limit pages, default SCAN_TEXT_PAGES; none when the set is bigger) and cache
+    it. A page that cannot be read gets ''. Cost: one raster text layer per page (OCR for scans), billed by it."""
+    import json
+
+    from stoa.formats.normalize import _cache_dir, scan_png, tmp_path
+
+    got = cached_scan_texts(path)
+    pages = page_scores(path)
+    if not scanned_set(pages) or len(pages) > (SCAN_TEXT_PAGES if limit is None else limit):
+        return got
+    if len(got) == len(pages):
+        return got
+    from stoa.solvers.raster import textlayer as T
+
+    texts = dict(got)
+    f = _scan_text_file(path)
+    for k in range(len(pages)):
+        if k in texts:
+            continue
+        try:
+            copy = one_page_copy(path, k, _cache_dir(Path(path)))
+            scan = scan_png(copy)
+            texts[k] = "\n".join(it.text for it in T.text_layer(scan[0]).items) if scan else ""
+        except Exception:  # noqa: BLE001 — that page keeps 'no text'
+            texts[k] = ""
+        try:  # after EVERY page: a warm stopped by its caller's timeout keeps what it read, the next reader goes on
+            tmp = tmp_path(f)
+            tmp.write_text(json.dumps({"key": _scan_key(path), "texts": {str(k): v for k, v in texts.items()}}))
+            os.replace(tmp, f)
+        except OSError:
+            pass
+    return texts
+
+
+def classify_scan_page(path: str | Path, page: int):
+    """T3's project loop on a SCANNED set (captain 18:50: '8 floor plans as a scan'): stoa.sheet.sets.classify reads a PDF
+    page's own text, which a scan does not have, so every page came out 'level not read'. This classifies the page from
+    what the upload warm-up already read (its scan PNG's cached text layer, else the page text in <stem>.pagetext.json):
+    a stoa.sheet.sets.Sheet with file / page of the ORIGINAL set, or None when nothing was read yet. Never renders or
+    reads anything (no 20-60 s cold read): call it after the warm (or again when it lands)."""
+    from stoa.formats.normalize import _cache_dir
+    from stoa.sheet import sets as S
+
+    src = Path(path)
+    cdir = Path(_cache_dir(src))
+    png = cdir / f"{src.stem}.p{int(page) + 1}.scan.png"
+    if not png.exists() and int(page) == 0:
+        png = cdir / f"{src.stem}.scan.png"  # a one-page scan: normalize.scan_png's own copy
+    sh = None
+    if png.exists():
+        try:
+            from stoa.solvers.raster.sheet import cached_layer
+
+            layer = cached_layer(str(png))
+            if layer is not None:
+                sh = S.classify(str(png), 0, layer=layer)
+        except Exception:  # noqa: BLE001 — fall back to the page text below
+            sh = None
+    text = cached_scan_texts(path).get(int(page)) or ""
+    if sh is None:
+        if not text:
+            return None
+        sh = S.Sheet(file=str(path), page=int(page), confidence=0.4)
+        kind = _sheet_kind(text)
+        sh.kind = {"plan": "floor_plan", "elev": "elevation"}.get(kind, kind) if kind else "unknown"
+    sh.file, sh.page = str(path), int(page)
+    if sh.storey is None and text:
+        name = sheet_storey(text)
+        if name:
+            k, nm = S._storey_of(name if re.search(r"\b(?:floor|level|storey|story|plan)\b", name, re.I)
+                                 else f"{name} floor")
+            if k is not None:
+                sh.storey, sh.storey_name = k, nm or name
+    return sh
+
+
+def _with_scan_texts(path: str | Path, pages: list[dict]) -> list[dict]:
+    """page_scores rows with a scanned page's cached text in place of its (empty) own text."""
+    if not scanned_set(pages):
+        return pages
+    texts = cached_scan_texts(path)
+    for pg in pages:
+        t = texts.get(pg["page"])
+        if t and pg["own_chars"] < 20:
+            pg.update(text=t, chars=len(t), areas=len(_AREA.findall(t)), room_numbers=len(_ROOMNO.findall(t)),
+                      scan_text=True)
+    return pages
+
+
+_QTY_Q = re.compile(r"\b(?:how\s+(?:many|much|big|large|long|wide|tall|high|deep)|area|size|length|width|depth|"
+                    r"perimeter|distance|count|number\s+of|total|sum|m²|m2|sq\.?\s*(?:m|ft)|square|metres?|meters?|"
+                    r"feet|ft)\b", re.I)
 _HEIGHT_Q = re.compile(r"\b(?:how\s+(?:tall|high)|height|ridge|eaves|hoch|höhe|korkeus|hauteur|altezza)\b", re.I)
 _PLAN_TITLE = re.compile(r"\b(?:floor|level|storey|story|ground|first|second|third|basement|attic|\d+(?:st|nd|rd|th))\b"
                          r"[^\n]{0,24}\bplan\b|\bgrundriss|\bpohjapiirustus|\bplan d['’]étage|\bplanta\b", re.I)
@@ -223,18 +374,95 @@ def related(path: str | Path, question: str, exclude: int = -1, n: int = 3) -> l
     return out
 
 
+_PHRASE_STOP = _COMMON | {"the", "a", "an", "of", "in", "on", "at", "to", "for", "and", "or", "is", "are", "be", "how",
+                          "big", "large", "wide", "long", "high", "tall", "does", "do", "did", "need", "we", "you", "i",
+                          "me", "give", "tell", "show", "net", "gross", "size", "metres", "meters", "square", "m2", "m",
+                          "what's", "whats", "s", "it", "its", "if", "not", "all", "each", "every", "per", "by", "go",
+                          "around", "skirting", "baseboard", "perimeter", "linear", "would", "run", "openings",
+                          "deducted", "subtract", "doors", "please", "level", "storey", "story"}
+
+
+def _phrases(q: str) -> set[str]:
+    """Name-like word runs of the question ('Science Lab 3', 'PE Store', 'Learning Resource Centre'): 2-4 words, content
+    words at both ends, at least one capitalised (X1 / G1 18:35-18:56: 'Science Lab 3' printed on one page of a 3-page set
+    lost to 'the most drawing' because 'science' and 'lab' alone are on every page or none)."""
+    toks = re.findall(r"[^\W_][\w\-]*(?:\.\d+)?", q or "", re.U)
+    out = set()
+    for n in (4, 3, 2):
+        for i in range(len(toks) - n + 1):
+            g = toks[i:i + n]
+            if g[0].lower() in _PHRASE_STOP or g[-1].lower() in _PHRASE_STOP:
+                continue
+            if any(t.lower() in ("of", "the", "is", "are", "and", "or") for t in g[1:-1]):
+                continue
+            if not any(t[0].isupper() for t in g if t[0].isalpha()):
+                continue
+            out.add(" ".join(g))
+    return out
+
+
+def _phrase_in(phrase: str, text: str) -> bool:
+    """The phrase as whole tokens with any whitespace between ('Lab 3' is not 'Lab 30')."""
+    rx = r"\s+".join(re.escape(w) for w in phrase.split())
+    return re.search(rf"(?<![\w.]){rx}(?![\w.])", text, re.I) is not None
+
+
+_SCHED_Q = re.compile(r"\b(?:(door|window|room|finish(?:es)?|hardware|fixture|equipment|lighting|luminaire|panel|"
+                      r"plumbing|opening|area|wall|partition|frame|glazing|louver|louvre)\s+)?schedules?\b", re.I)
+_SEE = re.compile(r"\b(?:see|refer|ref\.?|per|as\s+(?:per|shown))\b", re.I)
+
+
+def _schedule_pages(pages: list[dict], q: str) -> tuple[set[int], str] | None:
+    """({pages}, 'DOOR SCHEDULE') when the question names a schedule ('the door schedule', 'according to the
+    schedule') and some, not all, pages carry a title line that starts with that schedule's name (an optional sheet
+    number first: 'A-602 DOOR SCHEDULE'); cover / index pages and 'SEE DOOR SCHEDULE' notes do not count."""
+    m = _SCHED_Q.search(q or "")
+    if not m:
+        return None
+    noun = m.group(1)
+    head = re.compile(r"^\W*(?:[A-Z]{1,3}-?\d{1,4}(?:\.\d+)?[A-Z]?\s+)?" + (re.escape(noun.rstrip("s")) + r"s?\s+"
+                      if noun else r"(?:[A-Za-z]+\s+){0,2}") + r"schedules?\b", re.I)
+    hit = set()
+    for pg in pages:
+        t = pg["text"]
+        if len(_INDEX_LINE.findall(t)) >= 4 or _INDEX_WORDS.search(t):
+            continue
+        if any(head.search(ln) and not _SEE.search(ln) for ln in t.splitlines() if 0 < len(ln.strip()) <= 60):
+            hit.add(pg["page"])
+    if not hit or len(hit) == len(pages):
+        return None
+    return hit, (f"{noun} schedule" if noun else "schedule").upper()
+
+
 def pick_page(path: str | Path, question: str = "") -> tuple[int, str]:
     """(0-based page, reason). One-page files -> (0, 'single page')."""
     pages = page_scores(path)
     if len(pages) <= 1:
         return 0, "single page"
     q = question or ""
+    read_note = ""
+    if q.strip() and scanned_set(pages) and len(cached_scan_texts(path)) < len(pages) and \
+            len(pages) <= SCAN_TEXT_ASK_PAGES and os.environ.get("STOA_SCAN_TEXT", "1") != "0":
+        read_scan_texts(path)  # the first question on a scanned set that warm did not (fully) read
+        pages = page_scores(path)
+    if any(pg.get("scan_text") for pg in pages):
+        read_note = " (scanned pages: text read from their images)"
+    # 0. X1 21:22: 'according to the door schedule …' -> the page whose title is that schedule (A-602 DOOR SCHEDULE),
+    #    not the plan page that prints the module names more often
+    sched = _schedule_pages(pages, q)
+    if sched and len(sched[0]) == 1:
+        k = next(iter(sched[0]))
+        return k, f"page {k + 1} prints the {sched[1]} the question names{read_note}"
     # 1. what the question names: a sheet number, a quoted name, or a distinctive word found on only some pages
     named = set(_SHEET.findall(q)) | set(re.findall(r"[\"'“„«‘]([^\"'”“»’]{1,60})[\"'”“»’]", q))
     inner = {m for n in named for m in re.findall(r"\(([^()]{1,20})\)", n)}  # 'Bathroom (1.5)' prints '1.5' alone
     words = {w.lower() for w in _WORD.findall(q)} - _COMMON
+    # P1 19:55 (scanned set): 'the three MFL classrooms' -> 'MFL' (2-4 capitals) is a name too short for _WORD
+    acronyms = {a for a in re.findall(r"\b[A-Z]{2,4}\b", q) if a.lower() not in _COMMON} - named
     big = {n: {pg["page"] for pg in pages if _token(n, pg["text"]) and _printed_big(path, pg["page"], n)}
            for n in named if _SHEET.fullmatch(n)}  # 'on sheet M-101A' -> the page whose title block prints it
+    phrase_pages = {ph: {pg["page"] for pg in pages if _phrase_in(ph, pg["text"])} for ph in _phrases(q) - named}
+    phrase_pages = {ph: ps for ph, ps in phrase_pages.items() if len(ps) == 1}  # printed on exactly ONE page
     want = _HEIGHT_Q.search(q) and "elev" or "plan"  # the kind of sheet the question is about
     kinds = [_sheet_kind(pg["text"]) for pg in pages]
     has_kind = want in kinds
@@ -243,9 +471,17 @@ def pick_page(path: str | Path, question: str = "") -> tuple[int, str]:
         out = [w]
         if w.endswith("es") and len(w) > 5:
             out.append(w[:-2])
-        if w.endswith("s") and len(w) > 4:
+        if w.endswith("s") and len(w) > 3 and not w.endswith("ss"):  # 'labs' -> 'lab' (not 'glass' -> 'glas')
             out.append(w[:-1])
         return tuple(out)
+
+    def found(w: str, pg) -> bool:
+        return any(x in pg["text"].lower() for x in stems(w))
+
+    # a question word printed on exactly ONE page counts twice there (P1's scanned set: 'maths classrooms' -> the
+    # only page printing 'Maths 1'..'Maths 4'; one match alone was below the 2 this rule needs)
+    lone = {w for w in words if sum(1 for pg in pages if found(w, pg)) == 1}
+    lone |= {a for a in acronyms if sum(1 for pg in pages if _token(a, pg["text"])) == 1}
 
     def hits(pg) -> int:
         low = pg["text"].lower()
@@ -261,15 +497,29 @@ def pick_page(path: str | Path, question: str = "") -> tuple[int, str]:
             elif _token(n, pg["text"]):
                 score += 1
         score += sum(2 for m in inner if _token(m, pg["text"]))
+        score += 6 if any(pg["page"] in ps for ps in phrase_pages.values()) else 0  # a name printed only here
         score += sum(1 for w in words if any(x in low for x in stems(w)))
+        score += sum(1 for a in acronyms if _token(a, pg["text"]))
+        score += sum(1 for w in lone if (found(w, pg) if w in words else _token(w, pg["text"])))
+        if sched and pg["page"] in sched[0]:  # the schedule the question names, continued on several pages
+            score += 8
         if has_kind and kinds[pg["page"]] == want:  # X1 farm set: 'How long is the house?' went to the GENERAL
             score += 2                               # NOTES page ('house' x many), 'bedrooms' to the cover
         return score
 
     ranked = sorted(pages, key=hits, reverse=True)
     h1, h2 = hits(ranked[0]), hits(ranked[1])
+    top_pg = ranked[0]
+    drawn = [pg for pg in pages if pg["vector_bytes"] >= 50_000 or pg["areas"] >= 10]
+    if h1 < 6 and _QTY_Q.search(q) and drawn and top_pg not in drawn and top_pg["vector_bytes"] < 20_000 and \
+            not top_pg["areas"] and not top_pg.get("scan_text"):
+        # S0 21:16 (d27, up_fmt2 pdf3_last): a COVER page ('APARTMENT BUILDING - TENDER DRAWINGS / 1 Cover 2 Legend 3
+        # Floor plan') won a quantity question with 2 weak word matches over the plan page (203 kB, 48 area labels)
+        # whose labels are French. Weak matches on a page with no drawing never beat a page that carries one.
+        h1 = 0
     if h1 >= 2 and h1 > h2:  # one page clearly names it (ties: fall back to the drawing content)
-        return ranked[0]["page"], f"page {ranked[0]['page'] + 1} names what the question asks about ({h1} matches)"
+        return ranked[0]["page"], (f"page {ranked[0]['page'] + 1} names what the question asks about ({h1} matches)"
+                                   f"{read_note}")
     # 2. an everyday storey mention ('on the ground floor', 'level 2', 'im 1. OG') against each page's title storey
     labels = [sheet_storey(pg["text"]) for pg in pages]
     if len({x for x in labels if x}) >= 2 and not (want == "elev" and has_kind):  # 'roof ridge' is not a storey
@@ -284,10 +534,10 @@ def pick_page(path: str | Path, question: str = "") -> tuple[int, str]:
             if len(hit) == 1:
                 idx, swhy = hit[0], f"'basement' -> storey '{labels[hit[0]]}'"
         if idx is not None:
-            return idx, f"page {idx + 1} is the sheet of storey '{labels[idx]}' ({swhy})"
+            return idx, f"page {idx + 1} is the sheet of storey '{labels[idx]}' ({swhy}){read_note}"
     # 3. the page with the most drawing on it
     vmax = max(pg["vector_bytes"] for pg in pages) or 1
-    if vmax < 20_000 and max(pg["chars"] for pg in pages) < 200:
+    if scanned_set(pages):
         # a SCANNED set (every page one image, no text layer): the plan is the page with the most ink
         ink = _ink(path)
         if ink and max(ink) > 0:
@@ -328,5 +578,9 @@ def one_page_copy(path: str | Path, page: int, out_dir: str | Path | None = None
         with fitz.open(src) as d:
             out = fitz.open()
             out.insert_pdf(d, from_page=page, to_page=page)
-            out.save(dst, garbage=3, deflate=True)
+            from stoa.formats.normalize import tmp_path
+
+            tmp = tmp_path(dst)  # X1 19:24: atomic, a parallel question never opens a half-written copy
+            out.save(tmp, garbage=3, deflate=True)
+            os.replace(tmp, dst)
     return str(dst)

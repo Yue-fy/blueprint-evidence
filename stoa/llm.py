@@ -121,6 +121,79 @@ def api_mode() -> bool:
     return os.environ.get("STOA_MODE", "").strip().lower() == "api"
 
 
+# ------------------------------------------------------------------------------------------- private mode (P1)
+# STOA_PRIVATE=1 (W5's Private switch sets it for an upload's question; captain 18:53 'no external calls'): a hard
+# guard here, where every model call starts, instead of each caller's own flags (gemini=0, verify=0, STOA_MODE unset).
+# A call to a backend whose server is not on this machine or our private network raises ExternalCallBlocked before
+# any request (and before the response cache: a hosted model's cached reply is not served either). Callers already
+# handle LocalModelUnavailable / RuntimeError as 'that reader is unavailable', so the answer comes from local readers.
+class ExternalCallBlocked(LocalModelUnavailable):
+    """A hosted model was asked for in private mode (STOA_PRIVATE=1)."""
+
+
+def private_mode() -> bool:
+    """STOA_PRIVATE=1 (process-wide, W5's upload worker) OR G1's request-level flag (stoa.agent.private, set by
+    Pipeline(private=1) / the API's private=1 for one request): either one blocks every hosted call made here, so a
+    private request is guarded even where only one of the two signals is set (audit 19:51 risk 3 / fix 3, T2)."""
+    if os.environ.get("STOA_PRIVATE", "").strip().lower() in ("1", "true", "yes", "on"):
+        return True
+    try:  # G1's module may not be on this branch yet; its context var defaults to False
+        from stoa.agent import private as _gp
+
+        return bool(_gp._CTX.get())
+    except Exception:
+        return False
+
+
+_OUR_NETS = ("127.0.0.0/8", "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "169.254.0.0/16", "100.64.0.0/10",
+             "::1/128", "fc00::/7", "fe80::/10")  # T2 20:43: an explicit list (is_private also admits TEST-NET etc.)
+
+
+def _private_host(url: str) -> bool:
+    """Loopback, RFC 1918, link-local, or the Tailscale / CGNAT range: a server we run, not a hosted API."""
+    import ipaddress
+    from urllib.parse import urlparse
+
+    host = (urlparse(url).hostname or "").strip("[]").lower()
+    if host in ("localhost", ""):
+        return host == "localhost"
+    try:
+        ip = ipaddress.ip_address(host)
+    except ValueError:
+        return False  # a DNS name: assume hosted
+    return any(ip in ipaddress.ip_network(n) for n in _OUR_NETS if ipaddress.ip_network(n).version == ip.version)
+
+
+def check_private(backend: str) -> None:
+    """Raise ExternalCallBlocked when private mode is on and `backend` is not one of our own servers."""
+    if not private_mode():
+        return
+    cfg = BACKENDS.get(backend) or {}
+    if backend == "verda" and os.environ.get("STOA_EU_ONLY", "").strip() == "1":
+        return  # W5's 'EU' option in the Private switch: Verda's EU-hosted text model stays allowed
+    if not _private_host(str(cfg.get("base_url", ""))):
+        raise ExternalCallBlocked(f"private mode: the hosted model '{backend}' was not called (STOA_PRIVATE=1)")
+
+
+def _netguard_blocked(e: BaseException) -> bool:
+    """T2's socket backstop (stoa.netguard.PrivateNetworkBlocked) anywhere in the exception's cause chain."""
+    seen = 0
+    while e is not None and seen < 12:
+        if type(e).__name__ == "PrivateNetworkBlocked":
+            return True
+        e = e.__cause__ or e.__context__
+        seen += 1
+    return False
+
+
+def check_private_url(url: str, what: str = "service") -> None:
+    """The same guard for a non-LLM service URL (OCR $STOA_OCR_URL, door detector $STOA_DET_URL, ...): those callers use
+    urllib directly, so a URL pointed at a hosted machine would send the drawing out in private mode. Call before the
+    request; raises ExternalCallBlocked (a LocalModelUnavailable / RuntimeError: 'that reader is unavailable')."""
+    if private_mode() and not _private_host(str(url or "")):
+        raise ExternalCallBlocked(f"private mode: the {what} at {url} is not on this server or our network (not called)")
+
+
 def api_route(backend: str, model: str | None) -> tuple[str, str | None]:
     """(backend, model) a call actually uses: unchanged unless STOA_MODE=api and the backend is local."""
     if not (api_mode() and is_local(backend)):
@@ -400,6 +473,7 @@ _clients_lock = threading.Lock()
 def _client(backend: str):
     from openai import OpenAI
 
+    check_private(backend)  # P1: no client for a hosted model in private mode, whoever asks
     with _clients_lock:
         if backend not in _clients:
             cfg = BACKENDS[backend]
@@ -585,6 +659,7 @@ def chat(
     extra_body: dict | None = None,
     logprobs: int = 0,
     purpose: str | None = None,
+    deadline: float | None = None,
 ) -> ChatResult:
     """One chat completion.
 
@@ -598,6 +673,9 @@ def chat(
     logprobs : K > 0 -> return per-token logprobs of the first choice with the top-K alternatives in
                `ChatResult.logprobs` (see `answer_prob`). Free on vLLM; use it for a real confidence.
     purpose  : backend "gemini" only: why this call is made (logged; COMMON.md asks for every call's purpose).
+    deadline : hosted backends only: seconds for the whole call incl. retries (default $STOA_HOSTED_DEADLINE_S = 100;
+               each attempt <= $STOA_HOSTED_TIMEOUT_S = 75). QA 20:37: a Gemini timeout + retries held a demo answer
+               150-190 s while a local reading was ready; 3.1 Pro's own p99 is 60 s (813 logged calls).
     """
     rerouted = api_mode() and is_local(backend)
     if rerouted:  # STOA_MODE=api (P1): this local step runs on a hosted model
@@ -606,6 +684,7 @@ def chat(
         logprobs = 0  # hosted OpenAI-compatible endpoints don't return vLLM-style top logprobs
         # Gemini 3 thinks even at 'low' and max_tokens includes the thinking: a local 64-token budget would come back empty
         max_tokens = max(max_tokens, int(os.environ.get("STOA_API_MIN_TOKENS", 2048)))
+    check_private(backend)  # P1: before the response cache, so a hosted model's cached reply is not used either
     cfg = BACKENDS[backend]
     if images and "coords" in cfg and cfg["coords"] is None:
         raise ValueError(f"backend {backend!r} is text only (no images)")
@@ -667,10 +746,20 @@ def chat(
         if cpath.exists():
             d = json.loads(cpath.read_text())
             return _charge(ChatResult(images=infos, cached=True, **d))
+    if not is_local(backend) and os.environ.get("STOA_LLM_REPLAY") == "1":
+        # S0 gate arbitration replay (captain 18:56): hosted models (Gemini / NVIDIA / Verda) only from the disk
+        # cache, never a new call; a miss fails like an unreachable API (callers keep their local answer)
+        raise RuntimeError(f"STOA_LLM_REPLAY=1: no cached {backend} response (replay makes no new calls)")
 
     from openai import APIConnectionError, APIStatusError, APITimeoutError, RateLimitError
 
     client = _client(backend)
+    t_start = time.time()
+    if is_local(backend):
+        deadline = None
+    elif deadline is None:
+        deadline = float(os.environ.get("STOA_HOSTED_DEADLINE_S", 100))
+    per_try = float(os.environ.get("STOA_HOSTED_TIMEOUT_S", 75))
     delay = 2.0
     last_err: Exception | None = None
     restart_budget = float(os.environ.get("LLM_RESTART_WAIT", 300))  # local server restarts take ~2 min
@@ -684,8 +773,14 @@ def chat(
                 _gemini_guard()
             _nvidia_throttle(backend)
         t0 = time.time()
+        left = None if deadline is None else deadline - (t0 - t_start)
+        if left is not None and left < 1.0:
+            last_err = last_err or TimeoutError(f"no time left of the {deadline:.0f} s deadline")
+            break
         try:
-            resp = client.chat.completions.create(**kwargs)
+            c = client if left is None or not hasattr(client, "with_options") else \
+                client.with_options(timeout=min(per_try, left))
+            resp = c.chat.completions.create(**kwargs)
             if backend == "gemini":
                 _gemini_log(model, purpose, True, "200", t0, resp)
             ch = resp.choices[0]
@@ -726,10 +821,18 @@ def chat(
                 ra = float(e.response.headers.get("retry-after"))  # type: ignore[union-attr]
             except Exception:  # noqa: BLE001
                 pass
+            if deadline is not None and time.time() - t_start + (ra or delay) >= deadline:
+                break
             time.sleep(ra if ra else delay)
             delay = min(delay * 2, 60)
         except (APIConnectionError, APITimeoutError) as e:  # server restarting / overloaded
             last_err = e
+            if _netguard_blocked(e):  # T2 20:43: stoa.netguard refused the socket in private mode: never retry
+                raise ExternalCallBlocked(f"private mode: the network guard refused {backend} ({e!r})") from e
+            if backend == "gemini":  # QA 20:37: failed calls were missing from the log (they still count at Google)
+                _gemini_log(model, purpose, False, "timeout" if isinstance(e, APITimeoutError) else "connection", t0)
+            if deadline is not None and time.time() - t_start + delay >= deadline:
+                break
             if backend == "local2" and os.environ.get("STOA_LOCAL2_FALLBACK", "1") != "0":
                 # the optional second server (D21: 35B for free text) is gone: answer on :8001 NOW instead of waiting
                 # up to LLM_RESTART_WAIT for it (a demo must not hang), and tell text_backend() for the next 60 s
@@ -755,11 +858,14 @@ def chat(
             if backend == "gemini":
                 _gemini_log(model, purpose, False, str(e.status_code), t0)
             if e.status_code in (500, 502, 503, 504):
+                if deadline is not None and time.time() - t_start + delay >= deadline:
+                    break
                 time.sleep(delay)
                 delay = min(delay * 2, 30)
                 continue
             raise  # 400 etc.: the request itself is wrong (e.g. prompt too long) — don't retry
-    raise RuntimeError(f"chat failed after {attempt} attempts ({waited:.0f}s waiting) on {backend}: {last_err!r}")
+    took = f", {time.time() - t_start:.0f} s of a {deadline:.0f} s deadline" if deadline is not None else ""
+    raise RuntimeError(f"chat failed after {attempt} attempts ({waited:.0f}s waiting{took}) on {backend}: {last_err!r}")
 
 
 def _logprobs_of(choice: Any) -> list[dict] | None:

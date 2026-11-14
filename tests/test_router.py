@@ -359,8 +359,12 @@ def test_upload_window_route():
     from stoa.router.intent import parse
 
     up = "/tmp/some_upload/plan.png"
-    assert route(up, parse("How many windows are shown on this floor plan?"))[:2] == ["raster", "vlm_lora"]
-    assert route(up, parse("How many doors are shown on this floor plan?"))[:2] == ["vlm_lora", "raster"]
+    win, door = (route(up, parse(f"How many {k} are shown on this floor plan?")) for k in ("windows", "doors"))
+    # G1 c6/c7: DR's 'openings' / V1's door_detect lead (doors) or follow W3's raster (windows) on uploads; both
+    # abstain for free when they cannot read the sheet. Behind them the W3 order is unchanged.
+    assert "door_detect" in win and "door_detect" in door
+    assert [c for c in win if c not in ("door_detect", "openings")][:2] == ["raster", "vlm_lora"]
+    assert [c for c in door if c not in ("door_detect", "openings")][:2] == ["vlm_lora", "raster"]
     assert route("data/cubicasa5k/colorful-10052.png", parse("How many windows are shown on this floor plan?"))[:2] == \
         ["raster", "vlm_lora"]
 

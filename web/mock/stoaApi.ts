@@ -410,7 +410,7 @@ function mockAsk(body: { path: string; question: string; solver?: string; solver
     fx.recorded_at ? `(mock API: replay of the live answer recorded ${fx.recorded_at})` : "(mock API: precomputed fixture)"] };
   return {
     value: null, unit: null, confidence: 0, evidence: [], solver: "mock",
-    trace: ["mock API: no fixture for this question", "start W4's API on :8100 for live answers"],
+    trace: ["mock API: no fixture for this question", "start the API (stoa.api) on :8100 for live answers"],
     assumptions: [], missing: ["live API (stoa.api on port 8100) not reachable"],
     cost: { llm_tokens_in: 0, llm_tokens_out: 0, gpu_seconds: 0, api_calls: 0, llm_calls: 0, wall_seconds: 0 },
   };
@@ -444,7 +444,7 @@ const UPLOAD_EXT = new Set([".pdf", ".png", ".jpg", ".jpeg", ".ifc", ".dxf", ".s
 const CONVERT_EXT = new Set([".webp", ".tif", ".tiff", ".bmp", ".gif", ".heic", ".heif"]);
 const IMAGE_EXT = new Set([".png", ".jpg", ".jpeg", ...CONVERT_EXT]);
 const NORMALIZE = path.resolve(__dirname, "../server/normalize_upload.py");
-const IMAGE_NORM_V = "|norm-2"; // bump when normalize_upload.image() changes what it writes
+const IMAGE_NORM_V = "|norm-3"; // bump when normalize_upload.image() changes what it writes (3: P1 shrink_image on night = PNG size tag for paper-from-pixels)
 /** Phone photos upright (EXIF), WebP/TIFF/BMP/GIF → PNG, a lone DXF → a PDF sheet drawn from it (same stem). */
 function normalizeUpload(kind: "image" | "dxf" | "dwg", abs: string): Promise<{ abs: string; note: string; error?: string }> {
   return new Promise((resolve) => {
@@ -504,7 +504,7 @@ function uploadInfo(virtual: string, extra: Record<string, unknown> = {}) {
     if (names.length > 1) set = names.map((n) => `${vdir}/${n}`);
   }
   return { path: virtual, source: "upload", ext, siblings, n_questions: 0, license: "your file", style, set,
-    credit: "your upload: not in the dataset, kept only on this machine (temp folder)", title: path.basename(virtual), source_url: "", ...extra };
+    credit: "your upload: not in the dataset, stored on this server only (temporary folder)", title: path.basename(virtual), source_url: "", ...extra };
 }
 /** R2's image-content style guess (experiments/r2/style/style.py, ~0.1 s, no model call; p >= 0.8 is 96.7 % right on
  * held-out drawings). Only "cubicasa5k" changes how the file is read (stored under data/cubicasa5k/: Q 09:58 measured
@@ -522,18 +522,29 @@ function guessStyle(abs: string): Promise<{ style: string; p: number } | null> {
     });
   });
 }
-/** P1 17:24: read an image upload's text layer + drawing kind right when it arrives (`python -m stoa.formats.warm`,
+/** P1 17:24: read an image (or PDF) upload's text layer + drawing kind right when it arrives (`python -m stoa.formats.warm`,
  * one JSON line, never raises; disk caches are keyed by content, so the ask workers find it). Detached, not awaited;
  * a question asked before it ends just reads the file itself. Only on trees that have it (night-P1 cb0fc1d). */
 const WARM_PY = path.join(KG_REPO, "stoa/formats/warm.py");
 const warming = new Set<string>();
-function warmUpload(abs: string) {
+/** RL 19:21: the warm-up reads the text layer (VLM tiles) before any question, so it must follow the Private switch too:
+ * the same rules as ask_upload.py privacy() — a hosted text backend falls back to the local server (Verda's EU one stays
+ * when `eu`), STOA_MODE=api (no local GPU: tiles would go to Gemini Flash) is lifted, STOA_PRIVATE=1 / STOA_EU_ONLY=1. */
+const HOSTED_TEXT = new Set(["gemini", "nvidia", "api", "verda"]);
+function privateEnv(eu: boolean): NodeJS.ProcessEnv {
+  const env: NodeJS.ProcessEnv = { ...askEnv(), STOA_PRIVATE: "1", ...(eu ? { STOA_EU_ONLY: "1" } : {}) };
+  const tb = (env.STOA_TEXT_BACKEND ?? "").trim().toLowerCase();
+  if (HOSTED_TEXT.has(tb) && !(eu && tb === "verda")) env.STOA_TEXT_BACKEND = "local";
+  if ((env.STOA_MODE ?? "").trim().toLowerCase() === "api") delete env.STOA_MODE;
+  return env;
+}
+function warmUpload(abs: string, priv = false, eu = false) {
   if (!selfCheck.ok || warming.has(abs) || warming.size >= 2 || !fs.existsSync(WARM_PY)) return;
   warming.add(abs);
-  execFile(PY, ["-m", "stoa.formats.warm", abs], { cwd: KG_REPO, timeout: 300_000, maxBuffer: 4 << 20, env: askEnv() },
+  execFile(PY, ["-m", "stoa.formats.warm", abs], { cwd: KG_REPO, timeout: 300_000, maxBuffer: 4 << 20, env: priv ? privateEnv(eu) : askEnv() },
     () => warming.delete(abs));
 }
-async function saveUpload(name: string, body: Buffer, style = "", raw = false) {
+async function saveUpload(name: string, body: Buffer, style = "", raw = false, priv = false, eu = false) {
   const safe = path.basename(name).replace(/[^\w.\- ()]+/g, "_").replace(/^\.+/, "").slice(-120) || "upload";
   const ext = path.extname(safe).toLowerCase();
   if (!UPLOAD_EXT.has(ext) && !CONVERT_EXT.has(ext)) throw Object.assign(new Error(unsupported(path.basename(name), ext)), { status: 415 });
@@ -543,7 +554,10 @@ async function saveUpload(name: string, body: Buffer, style = "", raw = false) {
   // 1. the file as uploaded, in a folder named by its content; made readable (photo upright, PNG, DXF → sheet)
   // images: the folder id also names the normalize rule (18:20: a sheet stored before the clean-preserving shrink kept
   // its grey copy, because an existing upload is not normalized again); PDFs and models keep their plain content id
-  const plainId = createHash("sha256").update(body).update(image ? IMAGE_NORM_V : "").digest("hex").slice(0, 12);
+  // and the file NAME (QA 18:56: the same bytes uploaded under another name showed the earlier visitor's name next to
+  // the new one, 'dfe-school.png + dfe-special-school-plan-level00.png'; another visitor's file name is their data). The
+  // readers' disk caches are keyed by content, so a renamed copy is still read fast.
+  const plainId = createHash("sha256").update(body).update(image ? IMAGE_NORM_V : "").update(`|name:${safe}`).digest("hex").slice(0, 12);
   let abs = path.join(UPLOADS, plainId, safe);
   fs.mkdirSync(path.dirname(abs), { recursive: true });
   if (!fs.existsSync(abs)) fs.writeFileSync(abs, body);
@@ -567,7 +581,9 @@ async function saveUpload(name: string, body: Buffer, style = "", raw = false) {
     abs = r.abs;
     extra.upload_note = r.note;
   }
-  if (image) warmUpload(abs);
+  // P1 41b0f36: a one-page PDF whose text is drawn as outlines gets its page render + OCR here (D1's AW-29 M-101: first
+  // question 1,148 s); text PDFs are a no-op for warm, multi-page sets are skipped by warm itself
+  if (image || ext === ".pdf") warmUpload(abs, priv, priv && eu);
   const stored = path.basename(abs);
   // 2. the drawing style (images): declared, or guessed from the image (no model call)
   let guess: { style: string; p: number } | null = null;
@@ -578,7 +594,7 @@ async function saveUpload(name: string, body: Buffer, style = "", raw = false) {
   }
   if (style && (!UPLOAD_STYLES.has(style) || !image)) style = "";
   if (!style) return uploadInfo(`upload/${plainId}/${stored}`, extra);
-  const id = createHash("sha256").update(style).update(body).digest("hex").slice(0, 12);
+  const id = createHash("sha256").update(style).update(body).update(`|name:${safe}`).digest("hex").slice(0, 12); // + name: see plainId
   const dir = path.join(UPLOADS, id, "data", style);
   fs.mkdirSync(dir, { recursive: true });
   if (!fs.existsSync(path.join(dir, stored))) fs.copyFileSync(abs, path.join(dir, stored));
@@ -697,13 +713,19 @@ function askViaWorker(req: Record<string, unknown>) {
     pumpAsk();
   });
 }
-function askUpload(b: { path: string; question?: string; solver?: string; solver_args?: Record<string, unknown> }, abs: string) {
-  const key = JSON.stringify([b.path, (b.question ?? "").trim(), b.solver ?? "pipeline", b.solver_args ?? {}]);
+function askUpload(b: { path: string; question?: string; solver?: string; solver_args?: Record<string, unknown>; page?: number; private?: unknown; eu?: unknown; context?: unknown }, abs: string) {
+  // page: the page of a multi-page PDF the visitor turned to (ask_upload.py page_on_screen); absent = the solver picks
+  const page = Number.isInteger(b.page) && (b.page as number) >= 0 ? (b.page as number) : undefined;
+  // private: no hosted model for this question (captain 18:53; ask_upload.py privacy()); eu: Verda's EU text model allowed
+  const priv = !!b.private, eu = priv && !!b.eu;
+  // context: what the visitor pointed at (feature plug-ins: point / region / view; ask_upload.py passes it on) — part of the key
+  const context = b.context && typeof b.context === "object" ? b.context as Record<string, unknown> : undefined;
+  const key = JSON.stringify([b.path, (b.question ?? "").trim(), b.solver ?? "pipeline", b.solver_args ?? {}, page ?? null, priv, eu, context ?? null]);
   const hit = uploadAnswers.get(key);
   if (hit) return hit.then((a) => ({ ...a, cached: true }));
   if (!selfCheck.ok) // D42: say what is wrong instead of a Python traceback line ('No module named pydantic')
     return Promise.reject(new Error(`uploads are off on this server: its Python (${PY}) cannot load the solvers (${selfCheck.error}). The sample projects still work; restart the server with JUNCTION_VENV set`));
-  const req = { abs, virtual: b.path, question: b.question ?? "", solver: b.solver, solver_args: b.solver_args };
+  const req = { abs, virtual: b.path, question: b.question ?? "", solver: b.solver, solver_args: b.solver_args, ...(page !== undefined ? { page } : {}), ...(priv ? { private: true, eu } : {}), ...(context ? { context } : {}) };
   const p = MAX_WORKERS > 0 ? askViaWorker(req) : new Promise<Record<string, unknown>>((resolve, reject) => {
     const child = execFile(PY, [ASK_UPLOAD], { cwd: KG_REPO, timeout: 600_000, maxBuffer: 64 << 20, env: askEnv() },
       (err, stdout, stderr) => {
@@ -782,7 +804,7 @@ async function saveThumb(req: http.IncomingMessage, res: http.ServerResponse, re
   return send(res, 200, { ok: true }, "disk");
 }
 async function handleThumb(res: http.ServerResponse, rel: string) {
-  const abs = isUpload(rel) ? uploadAbs(rel) : safeAbs(rel);
+  const abs = isUpload(rel) ? uploadAbs(rel) : safeAbs(rel) ?? exampleAbs(rel);
   if (abs && /\.ifc$/i.test(abs) && fs.existsSync(thumbPath(abs))) {
     res.setHeader("Content-Type", "image/png");
     res.setHeader("X-Stoa-Backend", "disk");
@@ -841,6 +863,27 @@ async function handleShapes(req: Connect.IncomingMessage, res: http.ServerRespon
  * flag a printed scale its doors contradict (X1 14:31). Cached per file + page. */
 const DOOR_SCALE = path.resolve(__dirname, "../server/door_scale.py");
 const doorCache = new Map<string, Promise<Record<string, unknown>>>();
+/** The sheets of a drawing set (multi-page PDF), each labelled (number, kind, storey, title) for the page picker
+ * (web/server/sheet_index.py: VP's stoa.sheet.sets when present, else P1's stoa.formats.pages; 1-3 s for ~10 pages).
+ * GET /api/sheets?path= -> {pages: [{page, number, kind, storey, title}], n, source}. Cached per file. */
+const SHEET_INDEX = path.resolve(__dirname, "../server/sheet_index.py");
+const sheetCache = new Map<string, Promise<Record<string, unknown>>>();
+async function handleSheets(res: http.ServerResponse, rel: string) {
+  const abs = isUpload(rel) ? uploadAbs(rel) : safeAbs(rel);
+  if (!abs || !/\.pdf$/i.test(abs)) return send(res, 200, { pages: [], n: 0, why: "not a PDF" }, "disk");
+  if (!sheetCache.has(abs)) {
+    sheetCache.set(abs, new Promise((resolve) => {
+      execFile(PY, ["-W", "ignore", SHEET_INDEX, abs], { cwd: KG_REPO, timeout: 60_000, maxBuffer: 8 << 20, env: pyEnv() }, (err, stdout) => {
+        try {
+          resolve(JSON.parse(String(stdout).trim().split("\n").slice(-1)[0]));
+        } catch {
+          resolve({ pages: [], n: 0, error: err ? String(err.message).slice(0, 200) : "unreadable" });
+        }
+      });
+    }));
+  }
+  send(res, 200, await sheetCache.get(abs)!, "disk");
+}
 async function handleDoorScale(res: http.ServerResponse, rel: string, page: number) {
   const abs = isUpload(rel) ? uploadAbs(rel) : safeAbs(rel);
   if (!abs || !/\.pdf$/i.test(abs)) return send(res, 200, { ok: false, why: "not a PDF" }, "disk");
@@ -859,10 +902,51 @@ async function handleDoorScale(res: http.ServerResponse, rel: string, page: numb
   send(res, 200, await doorCache.get(key)!, "disk");
 }
 /** Requests about an uploaded file, answered here (never forwarded: the API would refuse the path). */
+/** The catalogue's example sheets (captain 21:02: Stoa's own sheets as project cards). A sheet path in
+ *  fixtures/projects.json that is not data/… or upload/… names a file found by its base name in the example folders
+ *  (outside git: Stoa's PNGs, the original vector PDFs, X1's scan, DfE's other levels). POST /api/case?path=[&private=1]
+ *  opens it as an upload on this server (same store, warm-up and answer cache as a visitor's); GET /api/thumb takes it.
+ *  W6's phone page has the same route (/api/m/case); both read the one catalogue. */
+const EXAMPLE_DIRS = [process.env.STOA_EXAMPLES_DIR ?? "", path.resolve(__dirname, "../../samples/examples")].filter(Boolean);
+function catalogueSheets(): Set<string> {
+  try {
+    const ps = JSON.parse(fs.readFileSync(path.resolve(__dirname, "../fixtures/projects.json"), "utf8")) as { sheets?: { path?: string }[] }[];
+    return new Set(ps.flatMap((p) => (p.sheets ?? []).map((x) => x.path ?? "")).filter((x) => /\.(pdf|png|jpe?g)$/i.test(x)));
+  } catch {
+    return new Set();
+  }
+}
+function exampleAbs(v: string): string | null {
+  if (!v || v.startsWith("data/") || v.startsWith("upload/") || !catalogueSheets().has(v)) return null;
+  const base = path.basename(v);
+  for (const d of EXAMPLE_DIRS) {
+    const abs = path.join(d, base);
+    if (fs.existsSync(abs)) return abs;
+  }
+  return null;
+}
+const caseOpen = new Map<string, Promise<Record<string, unknown>>>();
+
 async function handleUpload(req: Connect.IncomingMessage, res: http.ServerResponse, route: string, url: URL): Promise<boolean> {
+  if (route === "/case" && req.method === "POST") {
+    const v = url.searchParams.get("path") ?? "";
+    const priv = url.searchParams.get("private") === "1", eu = priv && url.searchParams.get("eu") === "1";
+    const abs = exampleAbs(v);
+    if (!abs) return send(res, 404, { detail: catalogueSheets().has(v) ? "this example sheet is not on this server" : "not a sheet of the catalogue" }, "disk"), true;
+    const key = `${v}|${priv}|${eu}`;
+    if (!caseOpen.has(key)) caseOpen.set(key, saveUpload(path.basename(abs), fs.readFileSync(abs), "", false, priv, eu) as Promise<Record<string, unknown>>);
+    try {
+      send(res, 200, { ...(await caseOpen.get(key)!), catalogue: v }, "disk");
+    } catch (e) {
+      caseOpen.delete(key);
+      send(res, (e as { status?: number }).status ?? 500, { detail: (e as Error).message }, "disk");
+    }
+    return true;
+  }
   if (route === "/upload" && req.method === "POST") {
     try {
-      const info = await saveUpload(url.searchParams.get("name") ?? "upload", await readBody(req), url.searchParams.get("style") ?? "", url.searchParams.get("raw") === "1");
+      const q = url.searchParams;
+      const info = await saveUpload(q.get("name") ?? "upload", await readBody(req), q.get("style") ?? "", q.get("raw") === "1", q.get("private") === "1", q.get("eu") === "1");
       send(res, 200, info, "disk");
     } catch (e) {
       send(res, (e as { status?: number }).status ?? 500, { detail: (e as Error).message }, "disk");
@@ -914,11 +998,23 @@ async function handleUpload(req: Connect.IncomingMessage, res: http.ServerRespon
   }
   if (route === "/ask" && req.method === "POST") {
     const raw = await readBody(req);
-    let b: { path?: string; question?: string; solver?: string; solver_args?: Record<string, unknown> } = {};
+    let b: { path?: string; question?: string; solver?: string; solver_args?: Record<string, unknown>; page?: number; private?: unknown; eu?: unknown; context?: unknown } = {};
     try {
       b = JSON.parse(raw.toString() || "{}");
     } catch {
       /* empty */
+    }
+    // a drawn area (F1's region, >= 3 points) on a DATASET sheet: the API's /ask does not scope by region on this tree,
+    // so the upload worker answers it (same pipeline; ask_upload.py's region hook), evidence on the dataset path
+    const ctx = b.context && typeof b.context === "object" ? b.context as { region?: unknown } : undefined;
+    const regionAbs = !isUpload(b.path) && Array.isArray(ctx?.region) && ctx!.region.length >= 3 ? safeAbs(b.path ?? "") : null;
+    if (regionAbs) {
+      try {
+        send(res, 200, await askUpload(b as { path: string }, regionAbs), "live");
+      } catch (e) {
+        send(res, 500, { detail: (e as Error).message }, "live");
+      }
+      return true;
     }
     if (!isUpload(b.path)) {
       (req as Connect.IncomingMessage & { stoaBody?: Buffer }).stoaBody = raw; // not ours: hand the body on
@@ -972,8 +1068,35 @@ async function handle(req: Connect.IncomingMessage, res: http.ServerResponse, ne
   const route = url.pathname.replace(/^\/api/, "");
   try {
     if (route === "/selfcheck" && req.method === "GET") return send(res, 200, selfCheck, "disk");
+    // W6's phone plugin answers this first when its tree has it (night-W6 df850e5); otherwise 'not here', not a 404
+    if (route === "/m/pdfscale" && req.method === "GET") return send(res, 200, { ok: false, why: "printed-scale endpoint not on this tree" }, "disk");
     if (route === "/shapes" && req.method === "POST") return void (await handleShapes(req, res));
     if (route === "/doorscale" && req.method === "GET") return void (await handleDoorScale(res, url.searchParams.get("path") ?? "", Number(url.searchParams.get("page") ?? 0) || 0));
+    // QA 20:32: is this upload's text still being read (stoa.formats.warm)? The intro says 'Reading the scale…' meanwhile,
+    // not 'No scale found', and reads the scale again the moment the warm-up ends. GET /api/warming?path= -> {warming}
+    if (route === "/warming" && req.method === "GET") {
+      const abs = uploadAbs(url.searchParams.get("path") ?? "");
+      // a style-folder copy (upload/<id>/<style>/x.png) is warmed under its plain upload path: same file name
+      const on = !!abs && (warming.has(abs) || [...warming].some((w) => path.basename(w) === path.basename(abs)));
+      return void send(res, 200, { warming: on }, "none");
+    }
+    // captain 21:14 'This floor at a glance': F2's finished takeoff of this sheet, summarised (web/server/glance.py; reads
+    // F2's result.json only, never starts a takeoff). GET /api/glance?path=&page= -> {ok, scale, rooms, area_m2, types, …}
+    if (route === "/glance" && req.method === "GET") {
+      const rel = url.searchParams.get("path") ?? "";
+      const abs = isUpload(rel) ? uploadAbs(rel) : safeAbs(rel);
+      if (!abs || !/\.(pdf|png|jpe?g)$/i.test(abs)) return void send(res, 200, { ok: false, why: "not a 2D sheet we have" }, "disk");
+      const page = String(Math.max(0, Math.min(999, parseInt(url.searchParams.get("page") ?? "0", 10) || 0)));
+      return void execFile(PY, [path.resolve(__dirname, "../server/glance.py"), abs, page, rel], { cwd: KG_REPO, timeout: 60_000, maxBuffer: 16 << 20 },
+        (err, out) => {
+          try {
+            send(res, 200, JSON.parse(String(out).trim().split("\n").pop()!), "disk");
+          } catch {
+            send(res, 200, { ok: false, why: String(err?.message ?? "glance failed").slice(0, 200) }, "disk");
+          }
+        });
+    }
+    if (route === "/sheets" && req.method === "GET") return void (await handleSheets(res, url.searchParams.get("path") ?? ""));
     if (route === "/thumb" && req.method === "GET") return void (await handleThumb(res, url.searchParams.get("path") ?? ""));
     if (route === "/thumb" && req.method === "POST") return void (await saveThumb(req, res, url.searchParams.get("path") ?? ""));
     if (await handleUpload(req, res, route, url)) return;

@@ -12,6 +12,8 @@ What this project uses, who made it, and under which licence. Short version:
   one screenshot that shows the Open Government Licence drawing, and recorded answers for the web app's offline mode.
   A few of those answers are about CubiCasa5K plans, which are **non-commercial only**; they are labelled as such (see the
   table at the end).
+- **Paid use needs more than our MIT licence:** what must be licensed or replaced first, and what happens to a
+  customer's drawings, is under [Before paid use](#before-paid-use).
 
 This page summarises; it is not legal advice. The licence text and credit line of each dataset file are in
 `data/<source>/LICENSE.md` inside the dataset.
@@ -135,6 +137,47 @@ them from your copy of the dataset (`STOA_DATA`).
 
 `samples/README.md` has the full credit lines and a few questions with expected answers (`samples/questions.jsonl`).
 
+## Before paid use
+
+Our MIT licence covers our own code. It does not make the data, weights, libraries or hosted models we used free for
+commercial use, and Stoa's permission to use them in the challenge is not a licence for a paid product. Before this
+project is sold or run as a paid service:
+
+| Component | Today | Before paid use |
+|---|---|---|
+| The Stoa Junction 2026 dataset | For non-commercial use in the Junction challenge; every file keeps its own licence, some NC, SA or ND | Use only files whose own licence allows it, or other licensed drawings. `stoa/router/train_stats.json` (numbers and hashes of question templates, no text) was computed from its `train` questions: regenerate it from licensed data (`python -m stoa.router.train_stats --write`) |
+| Our LoRA adapters `cc-v2`, `cc-v3` (and `cc-wild`) | **Non-commercial**: trained on CubiCasa5K images (CC BY-NC-SA 4.0) | Retrain on drawings licensed for commercial use, or serve the base model without them (`NO_LORA=1` in `serving/start.sh`; counts on CubiCasa-style images get worse, by about 12 points on CubiCasa5K) |
+| CubiCasa5K checkpoint (optional, `CC5K_WEIGHTS`) | **CC BY-NC 4.0** | Leave `CC5K_WEIGHTS` unset (the `raster_cc5k` solver then abstains on new images), or obtain a commercial licence from CubiCasa |
+| `web/fixtures/` entries about CubiCasa5K plans | **CC BY-NC-SA 4.0**, labelled | Remove the entries whose `"licence"` field says non-commercial |
+| Door and window detector (optional service, not in this repository) | Fine-tuned from torchvision's COCO-pretrained Faster R-CNN on renders of Swiss Dwellings `train` floors (CC BY 4.0) | Check the terms of the pretrained weights and of their training images; keep the Swiss Dwellings credit |
+| Qwen3-VL-8B-Instruct | Apache-2.0 (official release) | Use the official Hugging Face release (see the note under Models) |
+| PyMuPDF | **AGPL-3.0**, or Artifex's commercial licence | A paid service with closed-source changes needs Artifex's commercial licence. Under AGPL-3.0, the whole service, changes included, must be offered in source form to its users |
+| IfcOpenShell (LGPL-3.0), web-ifc (MPL-2.0), LibreDWG (GPL-3.0, a separate program) | Used unmodified, or called as a program | Keep them unmodified or publish your changes to them under their own licences; if you hand out LibreDWG with the product, hand out its source too |
+| Google Gemini, NVIDIA Nemotron (hosted, optional) | Called with your own API keys | The provider's terms for paid API use apply, including what it may keep from your requests |
+
+**Customer drawings: what the code does today.**
+
+- **Stored.** An upload is saved in `STOA_UPLOADS` (a temporary folder by default), in a sub-folder named by a hash
+  of the file's content and name, with its format copies (PNG of a photo, PDF of a DXF) next to it. Readings made from it
+  (text layer, OCR, page renders, model replies) are cached on the same server, under `.stoa/` (or
+  `JUNCTION_SHARED`), `STOA_CACHE` and `STOA_LLM_CACHE_DIR` (see [CONFIGURATION.md](CONFIGURATION.md)). Our code
+  never trains on uploads.
+- **Kept.** Nothing expires on its own: files stay until the operator deletes them (a temporary folder may also be
+  cleared when the machine restarts). A deployment for customers should set a retention period and clear old
+  uploads on a schedule.
+- **Deleted.** With the optional `privacy` feature on (`STOA_FEATURES=privacy`), the app's Privacy panel shows
+  what is stored where and has a **Delete my files** button (`POST /feat/privacy/delete`): it removes the upload, its
+  format copies and the cached readings tied to it, and lists the caches it cannot tie to the file (model replies and
+  PDF page renders, named by a hash of a request) instead of skipping them silently. Without the feature, the
+  operator deletes the upload's folder. Either way the hash-named caches must be cleared separately, or kept
+  short-lived.
+- **Processed.** In private and EU-only mode every step runs on servers you run. In hybrid mode an unsure answer
+  may send a page image or an evidence crop to Google or NVIDIA, and every answer says where its data went (see
+  [Cost, latency and data governance](../README.md#cost-latency-and-data-governance)).
+
+For a pilot, write these down with the customer before the first drawing arrives: where the files live, for how
+long, who deletes them, and whether hosted models may see them.
+
 ## The real-drawing exam (not included)
 
 Our real-drawing exam uses public files from outside the Stoa dataset: Wikimedia Commons, Finna, the opensourceBIM
@@ -156,3 +199,9 @@ drawing sets. Only the DfE sheet is bundled (as a sample); the others are not. T
 | A-2 Second Floor Plan T-shape, Permanent Party Enlisted Dormitory standard design drawings (April 2026) | Air Force Civil Engineer Center, via wbdg.org | Public domain (work of the U.S. federal government) |
 
 The held-out sibling sheets come from the same sets and are not listed, so that they stay unseen.
+
+The web app's start view opens these sheets (Stoa's PNG copies of three of them, the S-100F vector PDF, the DfE
+Level 01 sheet and our simulated scan of the DfE sheet) by file name. They are not bundled: the PNG copies are
+image files Stoa sent us, and publishing them is not our call. `samples/examples/README.md` lists each file with
+its source, licence and the sha1 of our copy; put the files in `samples/examples/` (or `STOA_EXAMPLES_DIR`) to
+open them in the app.

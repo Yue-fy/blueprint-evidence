@@ -89,12 +89,15 @@ _COUNT_CUE = re.compile(
     r"\b(how many|number of|count|kuinka monta|montako|wie viele|anzahl|combien|nombre de|quant[ie]|hur många|"
     r"hvor mange|hoeveel|cuánt[oa]s|ile)\b", re.I)
 _MEASURE = re.compile(r"\b(area|m²|m2|ft²|sq\.? ?ft|square|volume|m³|length|long|width|wide|height|fläche|"
-                      r"pinta-ala|surface|superficie|meters|metres)\b", re.I)
+                      r"pinta-ala|surface|superficie|meters|metres|suuri|pitkä|leveä|korkea|leveys|pituus|korkeus|"
+                      r"neliö\w*)\b|\w*(?:pinta-?ala|fläche)\b", re.I)  # compounds: lattiapinta-ala, Wohnfläche
 
 
 # count words that tolerate one typo ('Kunika monta', 'How mnay'); not 'count'/'number'/'quanto'/'viel' (county,
 # room numbers, 'quanto costa', 'wie viel kostet' are not counts). 'many' only right after 'how' (not the month 'May').
-_FUZZY_CUES = ("monta", "montako", "kuinka", "anzahl", "combien", "många", "hoeveel", "cuántos", "cuántas")
+# not 'kuinka' alone: it is 'how' ('Kuinka suuri on keittiön lattiapinta-ala?' = how big is the kitchen floor area ->
+# was counted as 1 kitchen @0.45, X1 x1-173); a typo'd 'kuinka monta' still has 'monta'
+_FUZZY_CUES = ("monta", "montako", "anzahl", "combien", "många", "hoeveel", "cuántos", "cuántas")
 
 
 def _osa(a: str, b: str) -> int:

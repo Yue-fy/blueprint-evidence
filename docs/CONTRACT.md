@@ -58,9 +58,25 @@ class MySolver(BaseSolver):
            "api_tokens_in": 0, "api_tokens_out": 0, "llm_calls": 0, "wall_seconds": 0.0},
   "recognition": {"kind": "ifc_plan", "label": "BIM-exported floor plan", "confidence": 0.95,   // D31, optional
                   "scale": "1:100", "scale_source": "printed", "storey": "2", "pages": 1, "page": 0,
-                  "reader": "pdf_vector", "why": "..."}
+                  "reader": "pdf_vector", "why": "..."},
+  "clarify": {"ask": "Two readings disagree: which area do you mean?", "why": "two readings disagree",   // D47, optional
+              "options": [{"label": "net floor area", "value": 61.69, "unit": "m2", "evidence": [0],
+                           "question": "What is the net floor area of slab D13?"}], "click": null},
+  "data_used": ["local", "gemini"],                                                                        // D47, optional
+  "support": {"state": "approximate", "why": "traced outline, not a printed area", "shown": null, "of": null}  // D50, optional
 }
 ```
+`clarify` (D47, additive, optional, default `null`): a question back to the user when two readings disagree or the
+scale is unknown. `value` stays the best answer; each option is a full alternative answer (`evidence` = indices into
+`Answer.evidence`, `question` = the sharper wording to ask next); `click` is `"room"` / `"scale"` when the UI should
+let the user click a room or two points instead. Solvers also write one `clarify: …` trace line.
+`data_used` (D47, additive, optional, default `null`): where this question's drawing data went (`local`, `gemini`,
+`nvidia`, `verda`); the pipeline also writes a `data_used: …` trace line, and private mode keeps it `["local"]`.
+`support` (D50, additive, optional, default `null`): does the located evidence support the value? `state` is
+`supported` (located evidence of the asked quantity: exact geometry, a printed label of the right kind, one box per
+counted object), `approximate` (located but estimated, e.g. `Evidence.exact` false, a traced outline, or a count with
+`shown` < `of`) or `unlocated` (no box / GUID: prior, image-only VLM). Set by `stoa.trust.support.mark_support()` at the
+end of `Pipeline.solve`, which also writes a `support: <state> — <why>` trace line. It is not the same as evidence coverage.
 `recognition` (D31, additive, optional, default `null`): what `stoa.router.recognize.recognize(path)` read from the
 file's content alone (drawing kind, storey, printed scale, page picked of N; `page` is 0-based like `Evidence.page`).
 The UI's "Recognised as … [Change]" chip reads it. Until every caller sets it, the same JSON is also the first trace

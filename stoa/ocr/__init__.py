@@ -23,6 +23,7 @@ import re
 import subprocess
 import sys
 import threading
+import time
 import urllib.request
 from pathlib import Path
 
@@ -73,8 +74,24 @@ def _key(path: str) -> Path:
     return CACHE_DIR / f"{Path(path).stem[:60]}.{h}.json"
 
 
+def _private_ok() -> bool:
+    """P1 20:41 / T2 private mode: the OCR server URL must be on this machine or our network (stoa.llm guard, when the
+    checkout has it). Checked on every call (private mode may be per request); blocked -> the local engine subprocess."""
+    try:
+        from stoa.llm import check_private_url
+    except ImportError:
+        return True
+    try:
+        check_private_url(OCR_URL, "OCR server")
+    except Exception:  # noqa: BLE001 - ExternalCallBlocked
+        return False
+    return True
+
+
 def server_up(timeout: float = 0.5) -> bool:
     global _server_ok, _server_engine
+    if not _private_ok():
+        return False
     if _server_ok is None:
         try:
             with urllib.request.urlopen(OCR_URL, timeout=timeout) as r:
@@ -107,24 +124,105 @@ def cached(path: str) -> bool:
     return str(_abspath(path)) in _mem or _key(path).exists()
 
 
-def _run(path: str) -> dict:
+BUDGET_MSG = f"OCR over its {TIMEOUT:.0f} s budget (STOA_OCR_TIMEOUT)"
+# S0 18:18: a read over the budget was not remembered, so EVERY question on that file paid the budget again (a 14 MB
+# .scan.png: 'OCR failed … over its 120 s budget' x5+). Now (1) the subprocess engine writes the cache itself and is
+# left running past the budget (detached), so a later question finds the read; (2) a '<key>.timeout' marker makes the
+# next questions skip OCR at once (-> the VLM text layer) for NEG_TTL seconds unless the cache has landed meanwhile.
+NEG_TTL = float(os.environ.get("STOA_OCR_NEG_TTL", "1800") or 0)
+
+
+SERVER_BG_TIMEOUT = float(os.environ.get("STOA_OCR_SERVER_BG", "1800") or 1800)
+
+
+def _write_atomic(f: Path, d: dict) -> None:
+    try:
+        tmp = f.with_name(f".{f.name}.tmp{os.getpid()}")
+        tmp.write_text(json.dumps(d))
+        os.replace(tmp, f)
+    except OSError:
+        pass
+
+
+# O1 c10 (E1 20:49, F5 21:08): the server reads one image at a time, so a small crop (E1's area-table OCR, ~1000x1500 px,
+# 6 s on its own) queued behind whole-sheet reads and hit the 120 s budget -> no table for 30 min (the .timeout marker).
+# A small image waits SMALL_WAIT s for the server, then runs the engine itself (~7.5 s incl. the model load); whichever
+# lands first writes the cache (atomic replace, same reading).
+SMALL_PX = float(os.environ.get("STOA_OCR_SMALL_MP", "3") or 0) * 1e6
+SMALL_WAIT = float(os.environ.get("STOA_OCR_SMALL_WAIT", "6") or 6)
+
+
+def _pixels(path: str) -> int:
+    try:
+        from PIL import Image
+
+        Image.MAX_IMAGE_PIXELS = None
+        with Image.open(_abspath(path)) as im:
+            return im.size[0] * im.size[1]
+    except Exception:  # noqa: BLE001
+        return 0
+
+
+def _run(path: str, cache: Path | None = None) -> dict:
     if _server_for(path):
-        req = urllib.request.Request(OCR_URL, data=json.dumps({"path": path}).encode(),
+        # O1 c8 (captain 20:08 audit): a server read over the budget used to be ABANDONED — the server finished it but
+        # nobody kept the result, so after the negative-cache TTL the next question paid the budget again. The request
+        # now continues in a daemon thread (no extra CPU: the server is computing it anyway) and writes `cache` when
+        # the answer arrives; a later question (same server process: the API) finds it. O1 c10: the request also names
+        # `out` = the cache file, which a server of this checkout writes itself when the read is done — so the reading
+        # lands even when the asking process has exited (an eval worker, `python -m stoa.formats.warm`).
+        body = {"path": path, **({"out": str(cache)} if cache is not None else {})}
+        req = urllib.request.Request(OCR_URL, data=json.dumps(body).encode(),
                                      headers={"Content-Type": "application/json"})
-        try:
-            with urllib.request.urlopen(req, timeout=TIMEOUT) as r:
-                return json.loads(r.read())
-        except TimeoutError:
-            raise RuntimeError(f"OCR over its {TIMEOUT:.0f} s budget (STOA_OCR_TIMEOUT)") from None
-        except OSError as e:
-            if "timed out" in str(e):
-                raise RuntimeError(f"OCR over its {TIMEOUT:.0f} s budget (STOA_OCR_TIMEOUT)") from None
-            pass  # fall through to the subprocess
+        box: dict = {}
+
+        def call():
+            try:
+                with urllib.request.urlopen(req, timeout=max(TIMEOUT, SERVER_BG_TIMEOUT)) as r:
+                    d = json.loads(r.read())
+                box["d"] = d
+                if cache is not None and "error" not in d and box.get("late"):
+                    _write_atomic(cache, d)
+            except Exception as e:  # noqa: BLE001
+                box["e"] = e
+
+        th = threading.Thread(target=call, daemon=True, name=f"ocr-{Path(path).name[:30]}")
+        th.start()
+        small = cache is not None and SMALL_PX > 0 and Path(OCR_PY).exists() and 0 < _pixels(path) <= SMALL_PX
+        th.join(min(SMALL_WAIT, TIMEOUT) if small else TIMEOUT)
+        if th.is_alive():
+            box["late"] = True
+            if "d" in box and cache is not None and "error" not in box["d"]:  # landed between join and the flag
+                _write_atomic(cache, box["d"])
+                return box["d"]
+            if not small:
+                raise RuntimeError(BUDGET_MSG + "; the server read continues for later questions")
+            # a small image behind a busy server: read it here (below); the server's late answer may still land first
+        elif "d" in box:
+            return box["d"]
+        e = box.get("e")
+        if isinstance(e, TimeoutError) or "timed out" in str(e):
+            raise RuntimeError(BUDGET_MSG)
+        # any other server error: fall through to the subprocess
     env = {**os.environ, "OMP_NUM_THREADS": os.environ.get("STOA_OCR_THREADS", "8")}
+    if cache is not None:
+        with open(cache.with_suffix(".err"), "w") as errf:
+            proc = subprocess.Popen([OCR_PY, str(ENGINE_FILE), path, "--out", str(cache)], env=env,
+                                    stdout=subprocess.DEVNULL, stderr=errf, start_new_session=True)
+        try:
+            proc.wait(timeout=TIMEOUT)
+        except subprocess.TimeoutExpired:  # left running: it writes `cache` when done
+            raise RuntimeError(BUDGET_MSG + "; the read continues in the background for later questions") from None
+        if cache.exists():
+            try:
+                return json.loads(cache.read_text())
+            except ValueError:  # never: both writers replace the file atomically
+                pass
+        raise RuntimeError("OCR engine failed: " + cache.with_suffix(".err").read_text()[-400:])
     try:
         out = subprocess.run([OCR_PY, str(ENGINE_FILE), path], capture_output=True, text=True, timeout=TIMEOUT, env=env)
     except subprocess.TimeoutExpired:
-        raise RuntimeError(f"OCR over its {TIMEOUT:.0f} s budget (STOA_OCR_TIMEOUT)") from None
+        raise RuntimeError(BUDGET_MSG) from None
     lines = [ln for ln in out.stdout.splitlines() if ln.startswith("{")]
     if not lines:
         raise RuntimeError(f"OCR engine failed: {out.stderr[-400:]}")
@@ -139,6 +237,11 @@ def read(path: str) -> dict:
         if p in _mem and _cache_on():
             return _mem[p]
         f = _key(path)
+        mark = f.with_suffix(".timeout")
+        if not f.exists() and _cache_on() and NEG_TTL > 0 and mark.exists() and \
+                time.time() - mark.stat().st_mtime < NEG_TTL:
+            raise RuntimeError(f"OCR skipped: this file's read went over its {TIMEOUT:.0f} s budget "
+                               f"{time.time() - mark.stat().st_mtime:.0f} s ago (a background read may still land)")
         if f.exists() and _cache_on():
             d = json.loads(f.read_text())
         else:
@@ -153,7 +256,15 @@ def read(path: str) -> dict:
                     if f.exists() and _cache_on():
                         d = json.loads(f.read_text())
                     else:
-                        d = _run(p)
+                        try:
+                            d = _run(p, f if _cache_on() else None)
+                        except RuntimeError as e:
+                            if "budget" in str(e):
+                                try:
+                                    mark.touch()
+                                except OSError:
+                                    pass
+                            raise
                         if "error" in d:
                             raise RuntimeError(d["error"])
                         try:
@@ -186,6 +297,25 @@ def area_units(items: list) -> tuple[list, int]:
     return out, n
 
 
+def charge(d: dict) -> None:
+    """Bill one reading (like the VLM layer: once per process, also when read from the disk cache = cold-run
+    accounting; 0 GPU, 0 LLM tokens). P1 20:57: a reading with the engine's measured `cpu_s` (all threads) is charged
+    exactly that through stoa.cost.record_cpu; older cached readings (no cpu_s) or a checkout without record_cpu keep
+    record_cost(cpu_seconds=<engine wall seconds>) as before."""
+    cpu = d.get("cpu_s")
+    if cpu:
+        try:
+            from stoa.cost import record_cpu
+        except ImportError:
+            record_cpu = None
+        if record_cpu is not None:
+            record_cpu(cpu)
+            return
+    from stoa.contract import record_cost
+
+    record_cost(cpu_seconds=float(d.get("seconds", 0.0)))
+
+
 def text_layer(path: str, min_score: float = MIN_SCORE):
     """The OCR reading as a raster TextLayer (items in original-image px, 0 LLM tokens). Wall/CPU time is the
     engine's own `seconds` (charged once, when the sheet is first read; the eval measures wall time itself)."""
@@ -201,15 +331,19 @@ def text_layer(path: str, min_score: float = MIN_SCORE):
                    seconds=float(d.get("seconds", 0.0)))
     if n_fix:
         tl.notes.append(f"{n_fix} room-area label(s) read as m³ / m on a sheet of m² labels: taken as m²")
-    from stoa.contract import record_cost
-
-    # billed like the VLM layer: once per process, also when read from the disk cache (cold-run accounting).
-    # cpu_seconds = the engine's wall time with STOA_OCR_THREADS (8) CPU threads; 0 GPU, 0 LLM tokens.
-    record_cost(cpu_seconds=float(d.get("seconds", 0.0)))
+    charge(d)
     nv = sum(1 for i in d["items"] if i.get("rot"))
     tl.notes.append(f"text read by {d.get('engine', 'PP-OCRv6')} on CPU ({len(items)} lines"
                     + (f", {nv} vertical" if nv else "") + ")")
     return tl
+
+
+def verdict(path: str, min_score: float = MIN_SCORE):
+    """stoa.ocr.quality.Verdict of this file's (cached) OCR reading: garbled = worth a VLM re-read (O1 c8)."""
+    from stoa.ocr import quality
+
+    d = read(path)
+    return quality.judge([i for i in d["items"] if i.get("score", 1.0) >= min_score])
 
 
 def index(paths: list[str], jobs: int = 3) -> None:

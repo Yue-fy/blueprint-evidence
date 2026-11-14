@@ -28,6 +28,9 @@ class Upload(Pipeline):
 
     def solve(self, path: str, question: str) -> Answer:
         t0 = time.perf_counter()
+        from stoa.formats.warm import wait_for_warm
+
+        waited = wait_for_warm(path)  # the upload's pre-read still running: use its caches instead of reading twice
         prep = prepare(path, question)
         if prep.kind == "page" and whole_house_count(question):
             whole = self._whole_set(prep, question)
@@ -70,8 +73,11 @@ class Upload(Pipeline):
             if q_read != question:
                 prep.notes.append(f"sheet {prep.sheet} named in the question: its page was read as '{q_read}'")
         if ans is None:
+            from stoa.formats.normalize import ask_context_on
+
             try:
-                ans = super().solve(prep.path, q_read)
+                with ask_context_on(prep):  # a right-click point / region in the solved copy's coordinates
+                    ans = super().solve(prep.path, q_read)
             except Exception as e:  # noqa: BLE001 — never an error page: a plain answer that says what went wrong
                 ans = Answer.abstain("upload", f"the drawing could not be read: {type(e).__name__}: {e}")
                 ans.missing = [*ans.missing, "a readable copy of the drawing (PDF, PNG/JPG, IFC or DXF); this file "
@@ -107,6 +113,9 @@ class Upload(Pipeline):
         if prep.kind != "as_is":
             ans.trace = [f"upload: {Path(prep.original).suffix.lower()} -> {prep.kind} ({Path(prep.path).name})",
                          *ans.trace]
+        if waited >= 0.5:
+            ans.trace = [*ans.trace, f"upload: waited {waited:.1f} s for this file's pre-read (stoa.formats.warm) to "
+                                     "finish, then answered from its caches"]
         ans.cost.wall_seconds = round(max(ans.cost.wall_seconds, time.perf_counter() - t0), 4)
         return ans
 
@@ -138,18 +147,25 @@ class Upload(Pipeline):
             if not isinstance(v, (int, float)) or isinstance(v, bool) or v < 0 or float(v) != int(v):
                 return None
             parts.append((k, storey, copy, part))
-        total = int(sum(int(p.value) for *_, p in parts))
+        # W5 19:33 (DAF dorm SD set): every floor sheet prints the same ROOM COUNT table, and each sheet's reading was
+        # its printed 'TOTAL = 144 DORMS' row -> 144 + 144 + 144 = 432 (gold 144). Equal readings that all come from a
+        # printed TOTAL row are the building's total once, not one count per floor.
+        same_total = len(parts) >= 2 and len({int(p.value) for *_, p in parts}) == 1 and all(
+            any("printed total row" in str(t) for t in p.trace) for *_, p in parts)
+        total = int(parts[0][3].value) if same_total else int(sum(int(p.value) for *_, p in parts))
         orig = dataset_rel(src)
         first = parts[0][3]
         ans = first.model_copy(deep=True)
         ans.value, ans.unit = total, first.unit or "count"
-        ans.confidence = round(min(WHOLE_CAP, *(float(p.confidence or 0) for *_, p in parts)), 3)
+        ans.confidence = round(min(1.0 if same_total else WHOLE_CAP, *(float(p.confidence or 0) for *_, p in parts)), 3)
         solvers = list(dict.fromkeys(str(p.solver or "") for *_, p in parts))
         ans.solver = solvers[0] if len(solvers) == 1 else "upload/sheets(" + "+".join(solvers) + ")"
         each = " + ".join(f"{p.value} on the {storey} plan (page {k + 1})" for k, storey, _, p in parts)
+        how = (f"every sheet's reading is the same printed building TOTAL row, so the answer is that total once, not "
+               f"their sum: {each} -> {total}") if same_total else f"summed: {each} = {total}"
         ans.evidence, ans.trace, ans.assumptions, ans.missing = [], [
             f"upload: whole-house count on a {prep.pages}-page set: counted on each of its {len(parts)} floor-plan "
-            f"sheets and summed: {each} = {total}"], [], []
+            f"sheets and {how}"], [], []
         cost = None
         for k, storey, copy, p in parts:
             names = {str(copy), dataset_rel(str(copy)), str(Path(copy).resolve())}
@@ -170,7 +186,9 @@ class Upload(Pipeline):
             ans.trace.append(f"upload: confidence capped at {WHOLE_CAP} (a sum over sheets)")
         prep.notes = [n for n in prep.notes if not n.startswith("multi-page PDF")]
         prep.notes.append(f"multi-page PDF ({prep.pages} pages): a whole-house count, so every floor-plan sheet was "
-                          f"read and the counts added ({each}); site, roof, ceiling and elevation sheets were not counted")
+                          + (f"read; each prints the same building total ({each}), so that total was used once"
+                             if same_total else f"read and the counts added ({each})")
+                          + "; site, roof, ceiling and elevation sheets were not counted")
         prep.kind = "sheets"  # evidence is already on the uploaded file's pages; restore() only adds the notes
         return restore(ans, prep)
 
@@ -193,7 +211,7 @@ class Upload(Pipeline):
         except Exception as e:  # noqa: BLE001 — the PDF answer stands
             ans0.trace = [*ans0.trace, f"upload: page as image failed ({type(e).__name__}: {e})"]
             return ans0
-        if _no_reader(ans):
+        if _no_reader(ans) and not _flagged_zero(ans):
             ans0.trace = [*ans0.trace, f"upload: page as image ({Path(png).name}) gave no reading either "
                                        f"({ans.solver}: {ans.value!r})"]
             return ans0
@@ -207,6 +225,9 @@ class Upload(Pipeline):
                      *(t for t in ans.trace if not (rec0 and str(t).startswith("recognised:")))]
         if chip0:
             ans.assumptions = [*(a for a in ans.assumptions if not str(a).startswith("recognised as:")), *chip0]
+        from stoa.trust.sanity import range_guard  # T1 (Ziying): CubiCasa-fitted ranges only on CubiCasa flats
+
+        ans = range_guard(ans, kind=_recognised(ans0) or "other")  # the render itself looks like a CubiCasa plan
         ans.cost = ans.cost.add(ans0.cost)  # both readings were paid for
         if ans.confidence > 0.5:
             # the image readers' confidences were measured on CubiCasa renders and scans, not on rendered CAD sheets:
@@ -216,7 +237,12 @@ class Upload(Pipeline):
             ans.trace = [*ans.trace, "upload: confidence capped at 0.5 (a vector sheet read as a picture)"]
         prep.path, prep.scan_zoom = png, zoom * (prep.paper_f or 1.0)  # px per point of the UPLOADED page
         prep.kind = {"page": "page+render", "svg_pdf": "svg_pdf+render"}.get(prep.kind, "render")
-        prep.notes.append(f"no PDF reader could read this sheet (e.g. its text is drawn as outlines): the page was "
+        # captain 20:47/20:49 (Ziying, dfe-08): 'no PDF reader could read this sheet' next to 'a text layer (145 lines)'
+        # contradicted itself; with a text layer the PDF WAS read, only no vector reader answered THIS question
+        prep.notes.append(f"no vector reader answered this question from the PDF's drawing (its text layer, "
+                          f"{seeded} lines, was read): the page was also read as an image at {72 * zoom:.0f} dpi"
+                          if seeded else
+                          f"no PDF reader could read this sheet (e.g. its text is drawn as outlines): the page was "
                           f"read as an image at {72 * zoom:.0f} dpi")
         return ans
 
@@ -227,34 +253,79 @@ class Upload(Pipeline):
         position at the printed 1:N; label_count). Kept only when one of VECTOR_READERS gives a number; evidence comes
         back as image pixels (px = pt * dpi / 72)."""
         from stoa.formats import vectorize as V
-        from stoa.formats.normalize import _cache_dir
 
         hit, how = V.paper(prep.path), "from its metadata"
         if hit is None:  # E1 17:29: Stoa's sheets carry no (or PyMuPDF's 96) dpi tag; their pixel size is the sheet
             from stoa.formats.paper import paper_of_image
             from stoa.solvers.raster import textlayer as T
 
+            how = "from its pixel size and the sheet size it prints"
             try:  # the image readers ran first, so the text layer is cached
-                hit = paper_of_image(prep.path, [i.text for i in T.text_layer(prep.path).items])
+                texts = [i.text for i in T.text_layer(prep.path).items]
+                hit = paper_of_image(prep.path, texts)
+                if hit is None:
+                    # O1 20:48 (c9 patch): a deskewed phone photo has no dpi tag and no export pixel size; its paper = the
+                    # photographed sheet's corners + the one sheet size it prints (10 photo rows 4/10 -> 6/10, W 2 / L 1;
+                    # W6 DfE photo kitchen: raster leak 65.52 m2 -> lineplan 36.43, alt gold 35.61)
+                    from stoa.solvers.raster.photo import named_paper
+
+                    hit = named_paper(prep.path, texts)
+                    if hit is not None:
+                        how = "from the photographed sheet's corners and the sheet size it prints"
             except Exception:  # noqa: BLE001
                 hit = None
-            how = "from its pixel size and the sheet size it prints"
-        if hit is None:
+            if hit is None:  # X1 19:20: a scan / crop that is no standard paper: its scale bar x its printed 1:N
+                from stoa.formats.paper import paper_of_bar
+
+                try:
+                    bar = paper_of_bar(prep.path, T.text_layer(prep.path))
+                except Exception:  # noqa: BLE001
+                    bar = None
+                if bar is not None:
+                    hit, how = bar[:2], bar[2]
+        if hit is None:  # X1 19:20: this used to return silently
+            ans0.trace = [*ans0.trace, "upload: image not traced as vector lines (no paper size from its metadata or "
+                                       "its pixel size, and no metric scale bar with a printed 1:N)"]
             return ans0
         dpi, sheet = hit
-        src = Path(prep.path)
-        out = _cache_dir(src) / f"{src.stem}.vec{V.VERSION}.pdf"
         try:
-            if not out.exists() or out.stat().st_mtime < src.stat().st_mtime:
-                V.to_vector_pdf(str(src), str(out), dpi=dpi)
-            ans = super().solve(str(out), question)
+            out = Path(V.traced_copy(prep.path, dpi))
         except Exception as e:  # noqa: BLE001 — the image answer stands
             ans0.trace = [*ans0.trace, f"upload: image as vector lines failed ({type(e).__name__}: {e})"]
             return ans0
-        reader = str(ans.solver or "").split("/")[-1]
-        if reader not in VECTOR_READERS or not isinstance(ans.value, (int, float)) or isinstance(ans.value, bool):
+        # S0 18:42: 4 slab questions on S-100F each spent 60-167 s here for nothing -> remember 'nothing' per sheet. X1 20:38:
+        # keyed by the intent alone ('area unknown') one miss blocked DIFFERENT questions of that kind on the sheet
+        # (sc-035/044 after a pdf_text miss; EFA 1F skirting sc-074/080/081 after one 'length room'): now per question.
+        try:  # X1 20:43: a re-traced copy (new text layer) gets a fresh try
+            built = out.stat().st_mtime_ns
+        except OSError:
+            built = 0
+        key = (f"{out}@{built}", _intent_key(ans0), _question_key(question))
+        if key in _VEC_NONE:
+            ans0.trace = [*ans0.trace, f"upload: image as vector lines skipped ({out.name}: {_VEC_NONE[key]} for the "
+                                       f"same question asked earlier on this sheet)"]
+            return ans0
+        def late(a):  # the pass finished after the budget, in its daemon thread: remember only 'it gives nothing'
+            if a is not None and not _measured(a):
+                _VEC_NONE.setdefault(key, f"no measured reading ({a.solver}; finished after the budget)")
+
+        try:
+            ans, took = _solve_within(lambda: Pipeline.solve(self, str(out), question), VECTOR_BUDGET_S, late)
+        except Exception as e:  # noqa: BLE001 — the image answer stands
+            ans0.trace = [*ans0.trace, f"upload: image as vector lines failed ({type(e).__name__}: {e})"]
+            return ans0
+        if ans is None:
+            # S0 19:18 (gate d25, load 260): NOT remembered. The first pass on a sheet also reads the traced copy cold;
+            # memoising 'ran over' denied a later classrooms question its right answer (151.79 -> raster 1003.53). The
+            # pass runs on in the background (warming the copy's caches) and memos only if it then gives nothing.
+            ans0.trace = [*ans0.trace, f"upload: image traced as vector lines ({out.name}): no reading within "
+                                       f"{VECTOR_BUDGET_S:.0f} s (STOA_VECTOR_BUDGET); the image answer stands (the "
+                                       "readers finish in the background: a later question on this sheet tries again)"]
+            return ans0
+        if not _measured(ans):
+            _VEC_NONE[key] = f"no measured reading ({ans.solver})"
             ans0.trace = [*ans0.trace, f"upload: image traced as vector lines ({out.name}) gave no measured reading "
-                                       f"({ans.solver}: {ans.value!r})"]
+                                       f"({ans.solver}: {ans.value!r}, {took:.0f} s)"]
             return ans0
         from stoa.data import dataset_rel
 
@@ -281,8 +352,9 @@ class Upload(Pipeline):
             ans.confidence = VECTOR_CAP
             ans.trace = [*ans.trace, f"upload: confidence capped at {VECTOR_CAP} (lines traced from a picture)"]
         prep.kind = "vector" if prep.kind == "as_is" else f"{prep.kind}+vector"  # restore() adds the note
-        prep.notes.append(f"the image's metadata gives {'an' if sheet[0] in 'AE' else 'a'} {sheet} sheet at {dpi:.0f} dpi: its lines were traced into a "
-                          f"vector drawing (text from the image's OCR layer) and measured at the printed scale")
+        what = "a sheet of its own size" if sheet == "custom" else f"{'an' if sheet[0] in 'AE' else 'a'} {sheet} sheet"
+        prep.notes.append(f"the image is {what} at {dpi:.0f} dpi ({how}): its lines were traced into a vector drawing "
+                          "(text from the image's OCR layer) and measured at the printed scale")
         return ans
 
 
@@ -319,7 +391,70 @@ def whole_house_count(question: str) -> bool:
 
 
 VECTOR_INTENTS = ("area", "length", "count")
-VECTOR_READERS = ("plan_rooms", "label_count", "line_rooms")  # readers that MEASURE / count the traced linework
+VECTOR_BUDGET_S = float(__import__("os").environ.get("STOA_VECTOR_BUDGET", "30"))  # the traced copy's readers, per question
+_VEC_NONE: dict[tuple[str, str, str], str] = {}  # (traced copy, 'area slab', question words) -> why it got nothing
+
+
+def _question_key(question: str) -> str:
+    """The question's words, lower case, without punctuation or a trailing sheet / page reference."""
+    return " ".join(re.findall(r"[a-z0-9äöåéèüß]+", (question or "").lower()))
+
+
+def _intent_key(ans: Answer) -> str:
+    """'area slab' from the pipeline's 'intent: area slab [drawing] (lang en)' trace line ('' when absent)."""
+    for t in ans.trace[:6]:
+        if str(t).startswith("intent: "):
+            return " ".join(str(t)[8:].split("[")[0].split()[:2])
+    return ""
+
+
+def _measured(ans: Answer) -> bool:
+    """One of VECTOR_READERS gave a number on the traced copy, or E1's slab_area a DIMENSION-CONFIRMED one (>= 0.5: the
+    printed dimensions OCR'd and the traced slab agree; E1 19:36, Stoa's S-100F PNG '150 SLAB-ON-GRADE W/ D13 @ 300'
+    22.32 raster -> 61.69 m2 = gold). Traced-only slab areas come back @0.25 and stay out (D16 194 vs 214.5)."""
+    reader = str(ans.solver or "").split("/")[-1]
+    number = isinstance(ans.value, (int, float)) and not isinstance(ans.value, bool)
+    return number and (reader in VECTOR_READERS or (reader == "slab_area" and ans.confidence >= 0.5))
+
+
+def _solve_within(fn, budget: float, late=None):
+    """(fn(), seconds) or (None, budget) when fn takes longer: it runs on in a daemon thread (Python threads cannot be
+    stopped), its answer discarded for this question; late(answer) is then called in that thread when it finishes.
+    The cost meter's context goes with it."""
+    import contextvars
+    import threading
+
+    box: dict = {}
+    ctx = contextvars.copy_context()
+    lock = threading.Lock()
+
+    def run():
+        try:
+            box["ans"] = ctx.run(fn)
+        except BaseException as e:  # noqa: BLE001 — re-raised in the caller
+            box["err"] = e
+        with lock:
+            gone = box.get("gone")
+        if gone and late is not None:
+            try:
+                late(box.get("ans"))
+            except Exception:  # noqa: BLE001 — a background bookkeeping step
+                pass
+
+    t0 = time.perf_counter()
+    th = threading.Thread(target=run, daemon=True, name="upload-vector")
+    th.start()
+    th.join(budget)
+    with lock:
+        if th.is_alive():
+            box["gone"] = True
+            return None, budget
+    if "err" in box:
+        raise box["err"]
+    return box.get("ans"), time.perf_counter() - t0
+# readers that MEASURE / count the traced linework; 'openings' (DR 19:59, d25 sl-086 Stoa's DfE PNG: its door count on the
+# traced copy was dropped, 91 vs truth ~101, vlm_lora 70 @0.22 answered; per-room door counts = the vector PDF's on 14/17)
+VECTOR_READERS = ("plan_rooms", "label_count", "line_rooms", "openings")
 VECTOR_CAP = 0.5
 
 
@@ -387,6 +522,17 @@ def _recognised(ans: Answer) -> str | None:
             except ValueError:
                 return None
     return None
+
+
+def _flagged_zero(ans: Answer) -> bool:
+    """T1 21:07: T1's sanity guard turned an implausible 0 (windows on a facade) into 'none found' (value None + the
+    reason + where we looked): still a reading, preferred over the PDF pass's dataset prior. False before T1's module."""
+    try:
+        from stoa.trust.sanity import flagged_zero
+
+        return bool(flagged_zero(ans))
+    except Exception:  # noqa: BLE001
+        return False
 
 
 def _no_reader(ans: Answer) -> bool:

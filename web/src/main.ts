@@ -1,17 +1,21 @@
 // Inter (OFL), bundled so Windows / offline machines get the designed type (captain 13:06; installed 14:01)
 import "@fontsource-variable/inter";
 import "./style.css";
-import { ask, benchmark, doorScale, exampleQuestions, fileUrl, knowledgeGraph, listFiles, onBackend, roomGraph, printedScale, roomShapes, secondOpinion, selfCheck, upload, uploadSet } from "./api";
+import { ask, benchmark, doorScale, exampleQuestions, fileUrl, knowledgeGraph, listFiles, onBackend, privacy, roomGraph, printedScale, roomShapes, secondOpinion, selfCheck, sheetLabels, upload, uploadSet, warming, barScale, openCase, glance as glanceOf, type SheetLabel } from "./api";
+import { tradeoffLine } from "./governance";
+import { downloadTakeoff, recordAnswer, takeoffCount, updateShown } from "./takeoff";
 import { renderBench } from "./bench";
-import { agentAsks, crossChecks, renderCard, roomKindsIn } from "./card";
+import { agentAsks, crossChecks, fmtValue, renderCard, roomKindsIn, unitLabel } from "./card";
 import { markAnswerCheck, renderKg } from "./kg";
 import type { Answer, FileInfo, KgRoom, RoomGraph } from "./types";
 import { roomKind, roomName, roomShown, Viewer2D } from "./viewer2d";
 import type { Viewer3D } from "./viewer3d"; // loaded lazily: web-ifc + three are ~4 MB
+import { emitAnswer, emitClarifyPick, emitDrawing, emitMeasure, emitScale, emitUpload, featureAnswer, initFeatures, enabled as enabledFeature, type AskContext, type DrawingPt, type PointerCtx } from "./features/registry";
+import "./features"; // feature plug-ins (append-only list in web/src/features/index.ts)
 import tourSteps from "../fixtures/tour.json";
 import tourCustomer from "../fixtures/tour-customer.json";
-import { agrees, diffQuestion, diffsHtml, heroHtml, isGuess, needsMeasuring, readerGuess, SCALE_PILL, roomPhrases, calm, heroLoadingHtml, initialView, landingHtml, numbered, numberMax, connectionInfo, projectDifferences, spreadOf, approxEvidence, projectOf, PROJECTS, saveView, kindChoices, rankOf, recognitionHtml, recognitionMenuHtml, recognitionOf, type Difference, type FloorGroup, type Recognition, type View } from "./customer";
-import { floorName, type Project } from "./projects";
+import { agrees, clarifyOf, wholeOutline, perSheet, printedReading, rivalReading, secondChoiceAnswer, type ClarifyOpt, diffQuestion, diffsHtml, heroHtml, isGuess, needsMeasuring, readerGuess, SCALE_PILL, roomPhrases, calm, heroLoadingHtml, initialView, landingHtml, numbered, numberMax, connectionInfo, projectDifferences, spreadOf, approxEvidence, projectOf, PROJECTS, saveView, kindChoices, rankOf, recognitionHtml, recognitionMenuHtml, recognitionOf, type Difference, type FloorGroup, type Recognition, type View } from "./customer";
+import { floorName, sameSheet, type Project } from "./projects";
 import { dxfToPdf, matchEvidence, planGeo, type PlanGeo } from "./plangeo";
 import { Measure, doorScaleOf, fmtM, printedScaleOf, scaleFromAnswer, scaleGuessed, scaleLabel, type Scale } from "./measure";
 
@@ -97,7 +101,10 @@ function drawGeometry(a: Answer) {
       const m = own.match(LEN_IN_NOTE);
       const single = a.evidence.filter((x) => x.polyline).length === 1 && typeof a.value === "number";
       // a gap gets no tag (it would cover the short line it marks; the evidence list says 'opening 0.82 m (no skirting)')
-      v2d.setValueTag(i, gap ? "" : m ? `${m[1].replace(",", ".")} ${m[2]}` : single ? `${a.value} ${a.unit ?? "m"}` : "");
+      // QA 19:59 (2): the answer is the whole outline ('without deducting doors'): the run is tagged with that, not 45.03
+      const outl = own.match(/=\s*outline\s+([\d.,]+)\s*m\b/i);
+      const whole = outl && wholeOutline(a, $<HTMLTextAreaElement>("question").value, Number(outl[1].replace(",", ".")));
+      v2d.setValueTag(i, gap ? "" : whole ? `${outl![1].replace(",", ".")} m` : m ? `${m[1].replace(",", ".")} ${m[2]}` : single ? `${a.value} ${a.unit ?? "m"}` : "");
     }
   });
 }
@@ -125,8 +132,9 @@ async function outlineAreas(a: Answer) {
   for (const { e, i } of on) {
     // the last m² in the note is the room's area ("2.13 m²: printed '11.05 m²'": OCR took the room number for an area)
     // not the cross-check's other rooms, nor the other reading in brackets: "35.38 m² (plan prints 29.03 m² ✗)" and
-    // "29.03 m² as printed (DXF polygon 35.38 m² ✗)" both tag the area the total used (E1 4c83367: it leads the note)
-    const own = (e.note ?? "").split(/;\s*cross-?check:/i)[0].replace(/\s*\((?:plan prints|DXF polygon|drawn outline)[^)]*\)/gi, "");
+    // "29.03 m² as printed (DXF polygon 35.38 m² ✗)" both tag the area the total used (E1 4c83367: it leads the note);
+    // 'TOILET: 1900 x 2054 mm = 3.903 m² (printed dimensions; traced 3.37 m² at 1:50)' tags 3.903 (QA 18:56: it said 3.37)
+    const own = (e.note ?? "").split(/;\s*cross-?check:/i)[0].replace(/\s*\((?:plan prints|DXF polygon|drawn outline|printed dimensions)[^)]*\)/gi, "");
     const all = [...own.matchAll(new RegExp(AREA_IN_NOTE.source, "gi"))];
     const m = all[all.length - 1];
     v2d.setValueTag(i, m ? `${m[1].replace(",", ".")} ${unit}` : single ? `${a.value} ${unit}` : "");
@@ -140,10 +148,24 @@ function applyPlan3D(a: Answer) {
 }
 
 const v2d = new Viewer2D($("v2d"));
+// an open feature panel (right of the viewer) covers part of the drawing: 'click to zoom' centres left of it (F3 20:30)
+v2d.insetRight = () => {
+  const host = document.getElementById("featPanels");
+  if (!host || host.hidden) return 0;
+  const open = [...host.querySelectorAll<HTMLElement>(".feat-panel")].filter((p) => !p.hidden && p.offsetWidth > 0);
+  if (!open.length) return 0;
+  const vr = $("v2d").getBoundingClientRect();
+  const left = Math.min(...open.map((p) => p.getBoundingClientRect().left));
+  return left < vr.right && left > vr.left ? vr.right - left + 8 : 0;
+};
 (window as unknown as { __v2d: Viewer2D }).__v2d = v2d; // dev hook: __v2d.labels() (label search checks)
 // measure on the drawing: set the scale with two clicks, then lengths and room areas (src/measure.ts)
 const measure = new Measure(v2d, $("pane2d"), roomShapes);
-measure.onScale = () => state.answer && renderHero(state.answer, hero.roundTripMs);
+measure.onScale = (s) => {
+  if (state.answer) renderHero(state.answer, hero.roundTripMs);
+  emitScale(s ? { unitsPerM: s.unitsPerM, space: v2d.space, label: s.label, user: !!s.user, file: state.file?.path ?? null, page: v2d.numPages > 1 ? v2d.page : 0 } : null);
+};
+measure.onMeasure = (m) => emitMeasure({ ...m, file: state.file?.path ?? "", page: v2d.numPages > 1 ? v2d.page : 0, space: v2d.space });
 let v3d: Viewer3D | null = null;
 
 /** 'Show furniture' (captain 16:00): on by default; one switch for the IFC viewer and the 3D made from a Swiss plan.
@@ -492,6 +514,8 @@ const APARTMENT_QUESTIONS = [
 // An uploaded sheet linked to the IFC model uploaded with it: the IFC rules answer about the sheet's own storey (W1 reads
 // it from the sheet's title when the file name says nothing). W5 cycle 8: all six right on a renamed esplanades sheet
 // (A102.pdf + house.ifc: 42 doors, 60 rooms, 156 walls, 3 rooms > 40 m², KORIDOR (202) 78.40 m², 60 windows).
+/** a question about the 3D model itself ('Do the plan and the 3D model agree …', 'in the whole building / model') */
+const MODEL_Q = /\b(3D|model|IFC)\b|\bwhole building\b|\bhow tall\b|\bwhich storey\b/i;
 const SHEET_MODEL_QUESTIONS = [
   "How many doors are on this floor plan?",
   "Which rooms on this floor plan are larger than 40 m²?",
@@ -629,19 +653,32 @@ async function uploadFiles(files: File[]) {
     }
     step(linked ? 2 : 1);
     if (linked) got = await uploadSet(got.map((f) => f.path));
+    else if (got.length > 1 && got.every((f) => f.path.split("/").length === 3)) {
+      // T3 20:20: drawings dropped together become ONE folder (one project: FileInfo.set lists the sheets; F7's memory
+      // and P1's set readers key on the folder); on any error they stay separate uploads
+      try {
+        got = await uploadSet(got.map((f) => f.path));
+      } catch {
+        /* keep the separate uploads */
+      }
+    }
     step(steps.length - 1);
     for (const f of [...got].reverse()) if (!uploads.some((u) => u.path === f.path)) uploads.unshift(f);
+    // several drawings dropped together (nothing to link them): one set to flip through with the page control
+    upGroup = !linked ? got.filter((f) => f.ext !== ".ifc" && f.ext !== ".dxf") : [];
+    if (upGroup.length < 2) upGroup = [];
     const first = got.find((f) => f.ext !== ".ifc" && f.ext !== ".dxf" && f.siblings?.[".ifc"]) ?? got.find((f) => f.ext !== ".dxf") ?? got[0];
     $<HTMLSelectElement>("source").value = "";
     $<HTMLInputElement>("search").value = "";
     await refreshFiles();
     $("landing").hidden = true; // the drawing opens right away
     await openFile(first);
+    emitUpload(got);
     steps.forEach((x) => (x.state = "done"));
     showUpload(steps);
     const g = first.style_guess;
     $("uploadMsg").textContent = linked ? `${names} · linked as one building: ask below`
-      : files.length > 1 ? `${files.length} files uploaded · ask below`
+      : files.length > 1 ? `${files.length} files uploaded as one set · flip through them under the drawing · ask below`
       : `${files[0].name}${g && first.style === g.style ? ` · looks like a ${STYLE_NAMES[g.style] ?? g.style}` : ""}${first.upload_note ? ` · ${first.upload_note}` : ""} · ask it anything below`;
     $("question").focus();
   } catch (e) {
@@ -678,8 +715,8 @@ function uploadIntro(f: FileInfo) {
   const style = f.style ? " It looks like a Nordic apartment plan, so the readers trained on such plans help." : "";
   const made = f.upload_note ? ` <span class="tip">${esc(f.upload_note.replace(/^\w/, (c) => c.toUpperCase()))}.</span>` : "";
   return `<b>Ready.</b> Ask about areas, lengths or counts in your own words. Answers come from the drawing's own lines and text,
-    and each one shows where it comes from. With no 3D model behind it, some answers are estimates: we say which.${style}${made}`
-    + (f.ext === ".pdf" && !f.siblings?.[".dxf"] ? ` <span class="tip">Have its .ifc model or .dxf file? Drop them together for exact answers.</span>` : "");
+    and each one points to where it comes from, or says what it could not find. With no 3D model behind it, some answers are estimates: we say which.${style}${made}`
+    + (f.ext === ".pdf" && !f.siblings?.[".dxf"] ? ` <span class="tip">Have its .ifc model or .dxf file? Drop them together: the answers can then be checked against them.</span>` : "");
 }
 /** What happens to an upload, said before the first question. */
 function uploadHint(f: FileInfo) {
@@ -779,8 +816,12 @@ async function openFile(f: FileInfo, question = "", keep: Answer | null = null, 
     label.textContent = "rendering drawing…";
     try {
       pageByUser = false;
+      if (pagedFile !== f.path) pagedFile = "";
       await v2d.load(f.path, fileUrl(f.path));
       pageCtl();
+      loadSheetLabels(f.path);
+      drawingLoaded();
+      if (f.source === "upload" && f.ext === ".pdf" && isCustomer() && !keep) void drawingChips(f);
       if (f.siblings?.[".svg"] && f.source === "ifc_models") {
         const n = await v2d.loadGuidLayer(fileUrl(f.siblings[".svg"]));
         $("fileMeta").textContent += ` · ${n} IFC elements linked on the sheet`;
@@ -849,7 +890,8 @@ async function loadExamples(f: FileInfo) {
     for (let k = 0; interleaved.length < uniq.length; k++)
       for (const l of byType.values()) if (l[k]) interleaved.push(l[k]);
     const proj = isCustomer() ? projectOf(f.path) : undefined;
-    const pchips = proj ? (f.ext === ".ifc" && proj.modelChips ? proj.modelChips : proj.chips) : [];
+    // captain 21:02: no questions ABOUT the 3D model (answers come from the drawings; 3D is their visual layer)
+    const pchips = proj ? proj.chips.filter((q) => enabledFeature("modelcheck") || !MODEL_Q.test(q)) : [];
     if (proj) {
       chips.innerHTML = pchips.map((q) => `<button type="button" class="chip" title="${esc(q)}">${esc(q)}</button>`).join("");
       chips.querySelectorAll<HTMLButtonElement>(".chip").forEach((b, i) => b.addEventListener("click", () => {
@@ -862,8 +904,8 @@ async function loadExamples(f: FileInfo) {
     const pick = qs.length ? [...english.filter((q) => q.has_fixture), ...interleaved.filter((q) => !q.has_fixture)].slice(0, 4)
       : general.map((question) => ({ question, type: "", unit: null }));
     if (isCustomer() && !proj) pick.splice(4); // 3–4 suggestions, not a menu
-    if (!proj) chips.innerHTML = pick.map((q) => `<button type="button" class="chip" title="${esc(q.question)}">${esc(q.question.length > 64 ? q.question.slice(0, 61) + "…" : q.question)}</button>`).join("");
-    if (!proj) chips.querySelectorAll<HTMLButtonElement>(".chip").forEach((b, i) => b.addEventListener("click", () => {
+    if (!proj && chipsFromDrawing !== f.path) chips.innerHTML = pick.map((q) => `<button type="button" class="chip" title="${esc(q.question)}">${esc(q.question.length > 64 ? q.question.slice(0, 61) + "…" : q.question)}</button>`).join("");
+    if (!proj && chipsFromDrawing !== f.path) chips.querySelectorAll<HTMLButtonElement>(".chip").forEach((b, i) => b.addEventListener("click", () => {
       $<HTMLTextAreaElement>("question").value = pick[i].question;
       void runAsk();
     }));
@@ -969,7 +1011,26 @@ $("question").addEventListener("keydown", (e) => {
   }
 });
 
+/** 'Takeoff · 3 answers · Export CSV' under the question once something was answered (captain 18:50). */
+function takeoffBar() {
+  const el = $("takeoff");
+  const n = takeoffCount();
+  el.hidden = n === 0;
+  if (!n) return;
+  // captain 20:12: ONE export. With F2's takeoff feature on, the link opens its panel (whole-sheet takeoff + this visit's
+  // answers via takeoffRows(), CSV or XLSX); without it, this visit's answers as CSV
+  const full = () => document.querySelector<HTMLButtonElement>('#featBar .feat-btn[data-feature="takeoff"][data-id="takeoff"]');
+  el.innerHTML = `<span>Takeoff: <b>${n}</b> answer${n === 1 ? "" : "s"} this visit</span> <button type="button" class="link" id="takeoffCsv" title="Every answer of this visit as a spreadsheet: the number, unit, sheet, how sure, method, evidence and a link back">${full() ? "Export" : "Export CSV"}</button>`;
+  $("takeoffCsv").addEventListener("click", () => {
+    if (state.file) updateShown($("hero"), $<HTMLTextAreaElement>("question").value.trim(), state.file.path);
+    const b = full();
+    if (b && !b.hidden) b.click();
+    else downloadTakeoff();
+  });
+}
+
 async function runAsk() {
+  if (state.file && state.answer) updateShown($("hero"), new URL(location.href).searchParams.get("q") ?? "", state.file.path);
   pageByUser = false; // a new question: show the page its answer points at
   const f = state.file;
   const q = $<HTMLTextAreaElement>("question").value.trim();
@@ -993,18 +1054,36 @@ async function runAsk() {
     el.textContent = s >= 2 ? `${Math.floor(s)} s` : "";
     const he = $("hero").querySelector<HTMLElement>(".elapsed");
     // G1 15:34: Gemini looking at a phone photo takes 1–4 min; the request waits up to 10 min (upload workers)
-    if (he) he.textContent = s >= 2 ? `${Math.floor(s)} s${s >= 25 ? " · asking Gemini to look at the drawing… a photo can take 1–4 minutes" : s >= 7 ? " · not sure yet, so a second model is looking at the drawing" : ""}` : "";
+    // QA 19:11: do not name Gemini by elapsed time (the slow part is often our own reading of a scan, private mode calls
+    // no hosted model, and the team's Gemini cap can be reached); say what may be happening, and that it can take minutes
+    if (he) he.textContent = s >= 2 ? `${Math.floor(s)} s${s >= 25 ? (privacy.on ? " · reading the drawing closely on our server… a photo or scan can take a few minutes the first time"
+      : " · reading the drawing closely, maybe with a second model… a photo or scan can take a few minutes the first time")
+      : s >= 7 ? " · not sure yet, so we are reading the drawing again" : ""}` : "";
     const slow = card.querySelector<HTMLElement>(".slow");
     if (slow && s >= 15) slow.hidden = false;
   }, 1000);
   try {
-    const a = await ask(f.path, q, readAs?.file === f.path && readAs.solver ? readAs.solver : undefined);
+    const mine = chosenReader.get(choiceKey(f.path, q)); // the visitor chose our reader for this question earlier
+    const ctx = nextAskCtx;
+    nextAskCtx = undefined;
+    const own = ctx ? null : featureAnswer(q, f); // a plug-in that answers this question itself (T3 'This building')
+    const a = own ? await own : ctx ? await featAsk(q, ctx) : await ask(f.path, q, mine?.solver ?? (readAs?.file === f.path && readAs.solver ? readAs.solver : undefined), undefined, onPage(q));
     if (state.file?.path !== f.path) return;
-    await showAnswer(a, performance.now() - t0);
+    await showAnswer(withChosenSecond(f.path, q, a), performance.now() - t0);
   } catch (e) {
     card.className = "card error";
     card.innerHTML = `<p><b>Request failed.</b> ${esc(e)}</p>`;
-    $("hero").innerHTML = `<div class="hero-error"><b>Sorry, that did not work.</b> <small>${esc(e)}</small></div>`;
+    // QA 19:59: no /tmp paths or env-var names up front; say what happened in plain words + 'Ask again'; details folded
+    const raw = String((e as Error)?.message ?? e).replace(/^Error:\s*/, "");
+    const plain = /OCR|took too long|budget|timed? ?out|timeout|over its \d+ s/i.test(raw) ? "Reading this drawing took too long. Ask again: the second try is faster (what was read so far is kept)."
+      : /worker stopped|died|killed|please ask again/i.test(raw) ? "The reader stopped while working on this drawing. Ask again: it usually works the second time."
+      : /failed to fetch|network|502|503|ECONN/i.test(raw) ? "The server could not be reached for a moment. Ask again."
+      : /private mode/i.test(raw) ? raw
+      : "Something went wrong while answering. Ask again, or try another wording.";
+    $("hero").innerHTML = `<div class="hero-error"><b>Sorry, that did not work.</b> <span>${esc(plain)}</span>
+      <button type="button" class="hs-btn primary" id="askAgain">Ask again</button>
+      <details><summary>Details</summary><small>${esc(raw)}</small></details></div>`;
+    $("askAgain").addEventListener("click", () => void runAsk());
   } finally {
     window.clearInterval(tick);
     $<HTMLButtonElement>("askBtn").disabled = false;
@@ -1014,26 +1093,222 @@ async function runAsk() {
 /** Multi-page PDFs (an uploaded drawing set): a page control on the drawing; an answer opens the page its evidence
  *  is on, unless the visitor picked a page since the question. */
 let pageByUser = false;
+/** The upload whose pages the visitor turned: its questions are about the page on screen (X1 18:38: the solver picks a
+ *  set's page from the question alone, 'Science Lab 3' on page 3 was answered from page 1). '' = the solver picks. */
+let pagedFile = "";
+/** A question that names its own sheet or page, or asks about the whole set, keeps the solver's own page pick. */
+const OWN_PAGE_Q = /\b(sheets?|pages?|drawings?|blatt|seite|arkki|sivu)\s+[\w.-]*\d|\b[A-Z]{1,2}-\d{2,4}[A-Z]?\b|\b(whole|entire|all)\s+(building|house|set|floors|storeys|levels|sheets|pages)\b|\bevery\s+(floor|storey|level|sheet|page)\b/i;
+function onPage(q = ""): number | undefined {
+  const f = state.file;
+  if (!f || f.source !== "upload" || f.ext !== ".pdf" || v2d.numPages < 2 || pagedFile !== f.path || OWN_PAGE_Q.test(q)) return undefined;
+  return v2d.page;
+}
+function onPageLine() {
+  const el = $("onPage");
+  const k = onPage();
+  el.hidden = k === undefined;
+  const lab = k === undefined ? "" : sheetName(sheetList.find((x) => x.page === k));
+  if (k !== undefined) el.innerHTML = `About page ${k + 1} of ${v2d.numPages}${lab ? ` · ${esc(lab)}` : ""} (on screen) · <button type="button" class="link" id="anyPage">any page</button>`;
+}
+/** A drawing set's sheets, labelled (captain 18:50 project view, first step): 'First Floor Plan', 'Ground floor',
+ *  'A-101 · Area Plan · Second floor' (web/server/sheet_index.py). */
+let sheetList: SheetLabel[] = [];
+let sheetListFile = "";
+/** Sheet names the visitor corrected (captain 18:50: auto-labelled and correctable), per file, in this browser. */
+const SHEET_NAMES_KEY = "be.sheetNames";
+function sheetNamesOf(path: string): Record<string, string> {
+  try {
+    return (JSON.parse(localStorage.getItem(SHEET_NAMES_KEY) ?? "{}") as Record<string, Record<string, string>>)[path] ?? {};
+  } catch {
+    return {};
+  }
+}
+function setSheetName(path: string, page: number, name: string) {
+  try {
+    const all = JSON.parse(localStorage.getItem(SHEET_NAMES_KEY) ?? "{}") as Record<string, Record<string, string>>;
+    const mine = { ...(all[path] ?? {}) };
+    if (name) mine[page] = name;
+    else delete mine[page];
+    all[path] = mine;
+    localStorage.setItem(SHEET_NAMES_KEY, JSON.stringify(all));
+  } catch {
+    /* private window: the name lasts until the page reloads */
+    (sheetNameMem[path] ??= {})[page] = name;
+  }
+}
+const sheetNameMem: Record<string, Record<string, string>> = {};
+function sheetName(x?: SheetLabel): string {
+  if (!x) return "";
+  const own = state.file ? ownSheetName(state.file.path, x.page) : "";
+  if (own) return own;
+  const t = x.title ? calm(x.title.replace(/\s+/g, " ").trim()) : "";
+  const st = x.storey ? calm(x.storey) + (/\b(floor|level|storey|story|geschoss)\b|^\d+$/i.test(x.storey) ? "" : " floor") : "";
+  const kind = !t && x.kind ? x.kind.replace(/^\w/, (c) => c.toUpperCase()) : "";
+  return [x.number, t || kind, st && !t.toLowerCase().includes(x.storey.toLowerCase()) ? st : ""].filter(Boolean).join(" · ");
+}
+function loadSheetLabels(path: string) {
+  if (v2d.numPages < 2 || sheetListFile === path) return;
+  sheetListFile = path;
+  sheetList = [];
+  void sheetLabels(path).then((l) => {
+    if (sheetListFile !== path || state.file?.path !== path) return;
+    sheetList = l;
+    pageCtl();
+  });
+}
+$("onPage").addEventListener("click", (e) => {
+  if (!(e.target as HTMLElement).closest("#anyPage")) return;
+  pagedFile = "";
+  onPageLine();
+});
+/** What the page control flips through: the pages of a multi-page PDF, or the drawings the visitor dropped together
+ *  (several sheets as PNG / JPG / PDF without a 3D model or CAD file to link them: captain 18:50 'many images'). */
+type Nav = { n: number; k: number; word: string; name: (k: number) => string; thumb: (k: number) => Promise<string>; go: (k: number) => Promise<void>; key: (k: number) => [string, number] };
+let upGroup: FileInfo[] = [];
+const stemName = (p: string) => calm(p.split("/").pop()!.replace(/\.[^.]+$/, "").replace(/[_]+|(?<=\D)-(?=\D)/g, " ").replace(/\s+/g, " ").trim());
+function nav(): Nav | null {
+  const f = state.file;
+  if (!f) return null;
+  if (v2d.numPages >= 2) return { n: v2d.numPages, k: v2d.page, word: "Page", name: (k) => sheetName(sheetOf(k)), thumb: (k) => v2d.thumb(k), go: showPage, key: (k) => [f.path, k] };
+  const k = upGroup.length > 1 ? upGroup.findIndex((g) => g.path === f.path) : -1;
+  if (k < 0) return null;
+  const g = upGroup;
+  return { n: g.length, k, word: "Sheet",
+    name: (j) => ownSheetName(g[j].path, 0) || stemName(g[j].path),
+    thumb: (j) => (/\.pdf$/i.test(g[j].path) ? v2d.thumbOf(fileUrl(g[j].path), 0) : Promise.resolve(fileUrl(g[j].path))),
+    go: async (j) => {
+      if (g[j] && g[j].path !== state.file?.path) await openFile(g[j]);
+    },
+    key: (j) => [g[j].path, 0] };
+}
+const ownSheetName = (path: string, page: number) => sheetNamesOf(path)[page] ?? sheetNameMem[path]?.[page] ?? "";
 function pageCtl() {
+  onPageLine();
   const el = $("pageCtl");
-  el.hidden = v2d.numPages < 2;
-  if (el.hidden) return;
-  el.innerHTML = `<button type="button" data-p="-1" aria-label="Previous page" ${v2d.page <= 0 ? "disabled" : ""}>‹</button>`
-    + `<span>Page <b>${v2d.page + 1}</b> of ${v2d.numPages}</span>`
-    + `<button type="button" data-p="1" aria-label="Next page" ${v2d.page >= v2d.numPages - 1 ? "disabled" : ""}>›</button>`;
+  const nv = nav();
+  el.hidden = !nv;
+  if (!nv) return;
+  const lab = nv.name(nv.k);
+  const wasOpen = !!el.querySelector<HTMLElement>(".pc-menu:not([hidden])");
+  // every set gets the sheet browser (captain 18:50 project view): a thumbnail per sheet, its name (auto, correctable)
+  const items = Array.from({ length: nv.n }, (_, k) => {
+    const nm = nv.name(k);
+    return `<div class="pc-sheet${k === nv.k ? " on" : ""}"><button type="button" role="menuitem" class="pc-item" data-k="${k}" aria-label="Sheet ${k + 1}${nm ? `: ${esc(nm)}` : ""}">`
+      + `<span class="pc-th" data-k="${k}" aria-hidden="true"></span><span class="pc-lab"><span class="pc-k">${k + 1}</span><span class="pc-nm" title="${esc(nm || `Sheet ${k + 1}`)}">${esc(nm || `Sheet ${k + 1}`)}</span></span></button>`
+      + `<button type="button" class="pc-edit" data-k="${k}" aria-label="Correct the name of sheet ${k + 1}" title="Correct the name">✎</button></div>`;
+  }).join("");
+  const many = nv.word === "Sheet" ? "You dropped these together. ✎ corrects a name." : "Names are read from each sheet. ✎ corrects one.";
+  el.innerHTML = `<button type="button" data-p="-1" aria-label="Previous ${nv.word.toLowerCase()}" ${nv.k <= 0 ? "disabled" : ""}>‹</button>`
+    + `<button type="button" class="pc-name" aria-haspopup="true" aria-expanded="${wasOpen}" title="All sheets of this set">${nv.word} <b>${nv.k + 1}</b> of ${nv.n}${lab ? ` · ${esc(lab)}` : ""} <span class="pc-caret" aria-hidden="true">▾</span></button>`
+    + `<button type="button" data-p="1" aria-label="Next ${nv.word.toLowerCase()}" ${nv.k >= nv.n - 1 ? "disabled" : ""}>›</button>`
+    + `<div class="pc-menu" role="menu" ${wasOpen ? "" : "hidden"}><div class="pc-head"><b>${nv.n} sheets</b><span>${many}</span></div><div class="pc-grid">${items}</div></div>`;
+  if (wasOpen) sheetThumbs();
+}
+const sheetOf = (k: number): SheetLabel => sheetList.find((x) => x.page === k) ?? ({ page: k } as SheetLabel);
+/** Thumbnails for the sheets in view in the open browser, one at a time (pdf.js), nearest the page on screen first. */
+let thumbObs: IntersectionObserver | null = null;
+function sheetThumbs() {
+  const menu = $("pageCtl").querySelector<HTMLElement>(".pc-menu");
+  if (!menu || menu.hidden) return;
+  // as wide as the drawing area beside the answer card allows (1024 px: the grid slid under the card), centred on the control
+  const pane = $("pane2d").getBoundingClientRect(), pc = $("pageCtl").getBoundingClientRect(), side = $("side").getBoundingClientRect();
+  const cx = pc.left + pc.width / 2;
+  const left = side.width && side.right > pane.left && side.right < cx ? side.right : pane.left;
+  menu.style.width = `${Math.max(240, Math.min(780, 2 * (Math.min(cx - left, pane.right - cx) - 16)))}px`;
+  thumbObs?.disconnect();
+  const file = state.file?.path;
+  thumbObs = new IntersectionObserver((ents) => {
+    for (const e of ents) {
+      if (!e.isIntersecting) continue;
+      const th = e.target as HTMLElement;
+      thumbObs?.unobserve(th);
+      const nv = nav();
+      if (!nv) return;
+      void nv.thumb(Number(th.dataset.k)).then((src) => {
+        if (state.file?.path !== file || th.querySelector("img")) return;
+        const img = new Image();
+        img.alt = "";
+        img.src = src;
+        th.append(img);
+      }).catch(() => th.classList.add("none"));
+    }
+  }, { root: menu, rootMargin: "200px" });
+  const ths = [...menu.querySelectorAll<HTMLElement>(".pc-th")];
+  const at = nav()?.k ?? 0;
+  ths.sort((a, b) => Math.abs(Number(a.dataset.k) - at) - Math.abs(Number(b.dataset.k) - at)).forEach((t) => thumbObs!.observe(t));
+  menu.querySelector<HTMLElement>(".pc-sheet.on")?.scrollIntoView({ block: "nearest" });
+}
+/** ✎: the name becomes a text field; Enter keeps it (an empty name goes back to the one read from the sheet), Esc cancels. */
+function editSheetName(k: number) {
+  const nv = nav();
+  const box = $("pageCtl").querySelector<HTMLElement>(`.pc-item[data-k="${k}"] .pc-lab`);
+  const card = box?.closest<HTMLElement>(".pc-sheet");
+  if (!nv || !box || !card) return;
+  const [path, page] = nv.key(k);
+  const input = document.createElement("input");
+  input.type = "text";
+  input.className = "pc-input";
+  input.value = nv.name(k);
+  input.placeholder = "e.g. Second floor plan";
+  input.setAttribute("aria-label", `Name of sheet ${k + 1}`);
+  const done = (keep: boolean) => {
+    if (keep) setSheetName(path, page, input.value.trim());
+    pageCtl();
+    if (keep && state.answer && perSheet(state.answer)) void showAnswer(state.answer, hero.roundTripMs); // the per-floor table names sheets
+  };
+  input.addEventListener("keydown", (e) => {
+    e.stopPropagation();
+    if (e.key === "Enter") done(true);
+    else if (e.key === "Escape") done(false);
+  });
+  input.addEventListener("blur", () => done(true), { once: true });
+  input.addEventListener("click", (e) => e.stopPropagation());
+  box.style.visibility = "hidden"; // the field sits over the name (an input inside the button would not take focus)
+  card.append(input);
+  input.focus();
+  input.select();
 }
 async function showPage(k: number) {
   const f = state.file;
   if (!f || k < 0 || k >= v2d.numPages || k === v2d.page) return;
   pageByUser = true;
+  pagedFile = f.path;
   await v2d.load(f.path, fileUrl(f.path), k);
   pageCtl();
+  drawingLoaded();
+  // examples from this page's own room names (the set's other pages name other rooms)
+  if (f.source === "upload" && f.ext === ".pdf" && isCustomer() && !state.answer) void drawingChips(f);
   if (state.answer) await showAnswer(state.answer, hero.roundTripMs);
 }
 $("pageCtl").addEventListener("click", (e) => {
   e.stopPropagation();
-  const b = (e.target as HTMLElement).closest<HTMLButtonElement>("button[data-p]");
-  if (b) void showPage(v2d.page + Number(b.dataset.p));
+  const t = e.target as HTMLElement;
+  const b = t.closest<HTMLButtonElement>("button[data-p]");
+  const nv = nav();
+  if (b && nv) return void nv.go(nv.k + Number(b.dataset.p));
+  const ed = t.closest<HTMLButtonElement>(".pc-edit[data-k]");
+  if (ed) return void editSheetName(Number(ed.dataset.k));
+  if (t.closest(".pc-input")) return;
+  const it = t.closest<HTMLButtonElement>(".pc-item[data-k]");
+  if (it && nv) {
+    $("pageCtl").querySelector<HTMLElement>(".pc-menu")!.hidden = true;
+    return void nv.go(Number(it.dataset.k));
+  }
+  const nm = t.closest<HTMLButtonElement>(".pc-name");
+  const menu = $("pageCtl").querySelector<HTMLElement>(".pc-menu");
+  if (nm && menu) {
+    menu.hidden = !menu.hidden;
+    nm.setAttribute("aria-expanded", String(!menu.hidden));
+    sheetThumbs();
+  }
+});
+document.addEventListener("keydown", (e) => {
+  const menu = $("pageCtl").querySelector<HTMLElement>(".pc-menu");
+  if (e.key === "Escape" && menu && !menu.hidden) menu.hidden = true;
+});
+document.addEventListener("click", () => {
+  const menu = $("pageCtl").querySelector<HTMLElement>(".pc-menu");
+  if (menu && !menu.hidden) menu.hidden = true;
 });
 $("pageCtl").addEventListener("pointerdown", (e) => e.stopPropagation());
 /** The page this answer's evidence is on (first one), when it is not the page on screen. */
@@ -1075,10 +1350,25 @@ async function cadToSheet(a: Answer): Promise<Answer> {
   };
 }
 
+/** Every shown answer goes to the feature plug-ins once (a re-render of the same answer object does not). */
+let emitted: Answer | null = null;
 async function showAnswer(a: Answer, roundTripMs: number) {
+  await renderAnswer(a, roundTripMs);
+  if (state.answer && state.answer !== emitted) {
+    emitted = state.answer;
+    emitAnswer(state.answer, $<HTMLTextAreaElement>("question").value.trim());
+  }
+}
+async function renderAnswer(a: Answer, roundTripMs: number) {
   a = await cadToSheet(a);
   await evidencePage(a);
   state.answer = a;
+  if (state.file) { // one row per question and sheet: a re-render of the same answer replaces it
+    const q = $<HTMLTextAreaElement>("question").value.trim();
+    const url = new URL(location.href);
+    recordAnswer(a, { path: state.file.path, page: v2d.numPages > 1 ? v2d.page : null, question: q, link: url.toString() });
+    takeoffBar();
+  }
   hero = { groups: undefined, roundTripMs };
   // rooms / symbols found by the pretrained CubiCasa5K model (O1's raster reader): its weights are CC BY-NC 4.0, demo use
   // only, so they are credited under the drawing while its marks show (O1 14:43)
@@ -1127,7 +1417,11 @@ async function showAnswer(a: Answer, roundTripMs: number) {
       return { answer, ms: performance.now() - t0 };
     },
   });
-  if (askedPath === v2d.openFile) measure.setAutoScale(scaleFromAnswer(a, v2d.space));
+  if (askedPath === v2d.openFile) {
+    const sc = scaleFromAnswer(a, v2d.space);
+    if (sc) measure.setAutoScale(sc);
+    else measure.dropLearned();
+  }
   v2d.setEvidence(a.evidence);
   drawGeometry(a);
   v2d.markEvidence(approxEvidence(a), "approx");
@@ -1135,7 +1429,7 @@ async function showAnswer(a: Answer, roundTripMs: number) {
   // set before the numbers so each number rides on its tag
   const ranked = isCustomer() ? rankOf(a, $<HTMLTextAreaElement>("question").value) : null;
   ranked?.forEach((i) => {
-    const own = (a.evidence[i]?.note ?? "").split(/;\s*cross-?check:/i)[0].replace(/\s*\((?:plan prints|DXF polygon|drawn outline)[^)]*\)/gi, "");
+    const own = (a.evidence[i]?.note ?? "").split(/;\s*cross-?check:/i)[0].replace(/\s*\((?:plan prints|DXF polygon|drawn outline|printed dimensions)[^)]*\)/gi, "");
     const m = [...own.matchAll(new RegExp(AREA_IN_NOTE.source, "gi"))].at(-1) ?? own.match(/(\d+(?:[.,]\d+)?)\s*m(?![²\w])/);
     if (m) v2d.setValueTag(i, `${m[1].replace(",", ".")} ${m[0].includes("²") || /m2|sq/i.test(m[0]) ? "m²" : "m"}`);
   });
@@ -1362,10 +1656,8 @@ $("tourBtn").addEventListener("click", async () => {
   note.innerHTML = `<b>${tourStep + 1}/${tourList().length}</b> ${esc(t.note)}`;
   $("bench").hidden = true;
   if (t.bench) return $("benchBtn").click();
-  if (state.file?.path !== t.file) {
-    const src = t.file.split("/")[1];
-    const f = state.files.find((x) => x.path === t.file) ?? (await listFiles("", t.file, 5)).find((x) => x.path === t.file)
-      ?? (await listFiles(src, t.file, 5, false)).find((x) => x.path === t.file);
+  if (!sameSheet(t.file, state.file?.path ?? "")) {
+    const f = await fileInfo(t.file); // a dataset sheet, or a catalogue example sheet (opened as an upload)
     if (!f) return;
     roomsOn = !!t.rooms; // each step sets the room overlay itself; drawn as soon as the plan is loaded
     await openFile(f, t.q);
@@ -1391,7 +1683,7 @@ function applyView(v: View) {
   ($("how") as HTMLDetailsElement).open = v === "expert";
   const names: Record<string, [string, string]> = { "2d": ["Drawing", "Plan"], "3d": ["3D model", "3D"], split: ["Side by side", "Side by side"] };
   document.querySelectorAll<HTMLButtonElement>("#modes button").forEach((b) => (b.textContent = names[b.dataset.mode!][v === "customer" ? 1 : 0]));
-  $<HTMLTextAreaElement>("question").placeholder = v === "customer" ? "Ask anything about this project…" : "e.g. How many doors are shown on the floor plan?";
+  setPlaceholder(v);
   if (state.file) {
     projectChrome(state.file);
     void loadExamples(state.file);
@@ -1409,6 +1701,48 @@ $("viewToggle").addEventListener("click", () => {
     if (!state.file) void fileInfo(DEMO[0]).then((f) => f && openFile(f));
   }
 });
+// --- PRIVATE MODE (captain 18:53): drawings never leave our server; remembered per browser, ?private=1 in the URL ---
+let privTimer = 0;
+function privNote(on: boolean) {
+  const n = $("privNote");
+  n.innerHTML = (on
+    ? `<b>Private mode is on.</b> Your drawings and questions stay on our server: no Gemini or NVIDIA steps, only our own readers and local models.<small>${esc(tradeoffLine())}</small>`
+    : `<b>Private mode is off.</b> When we are unsure, a step may ask Gemini 3.1 Pro (Google) or NVIDIA Nemotron for a second reading. Each answer says where its data went.`)
+    + `<button type="button" class="pn-x" aria-label="Close">✕</button>`;
+  n.hidden = false;
+  n.querySelector(".pn-x")?.addEventListener("click", () => (n.hidden = true));
+  window.clearTimeout(privTimer);
+  privTimer = window.setTimeout(() => (n.hidden = true), 12000);
+}
+function setPrivate(on: boolean, tell = true) {
+  privacy.on = on;
+  const b = $("privBtn");
+  b.setAttribute("aria-checked", String(on));
+  b.title = on ? "Private mode is on: drawings never leave our server. Click to allow Gemini / NVIDIA second readings."
+    : "Private mode: drawings never leave our server (no Gemini or NVIDIA steps)";
+  document.body.classList.toggle("private", on);
+  try {
+    localStorage.setItem("be.private", on ? "1" : "0");
+  } catch {
+    /* storage off: the URL still says it */
+  }
+  const url = new URL(location.href);
+  if (on) url.searchParams.set("private", "1");
+  else url.searchParams.delete("private");
+  history.replaceState(null, "", url);
+  if (tell) privNote(on);
+}
+$("privBtn").addEventListener("click", () => setPrivate(!privacy.on));
+setPrivate((() => {
+  const u = new URL(location.href).searchParams.get("private");
+  if (u !== null) return u === "1";
+  try {
+    return localStorage.getItem("be.private") === "1";
+  } catch {
+    return false;
+  }
+})(), false);
+
 // the guided demo from the top bar also works from the home page
 $("tourBtn").addEventListener("click", () => {
   if (!$("landing").hidden) $("landing").hidden = true;
@@ -1418,7 +1752,7 @@ function showLanding(on: boolean) {
   const el = $("landing");
   el.hidden = !on;
   if (!on) return;
-  el.innerHTML = landingHtml();
+  el.innerHTML = landingHtml(enabledFeature("privacy"));
   void selfCheck().then((c) => { // D42: a server whose Python cannot load the solvers says so before anyone uploads
     const ls = document.getElementById("landStatus");
     if (!c || c.ok || !ls || !ls.hidden) return;
@@ -1454,6 +1788,11 @@ function showLanding(on: boolean) {
 }
 $("projectsBtn").addEventListener("click", () => showLanding(true));
 $("askMore").addEventListener("click", () => document.body.classList.remove("answered"));
+/** The question box's hint: a short one at every width (the long 'Ask anything about this project…' wrapped and was cut
+ * at 1024 px and, in the upload view, at 1440 px too). */
+function setPlaceholder(v: string) {
+  $<HTMLTextAreaElement>("question").placeholder = v === "customer" ? "Ask a question…" : "e.g. How many doors are shown on the floor plan?";
+}
 /** Customer view: the question box grows with its text (a chip or a tour step can be long). */
 function fitQuestion() {
   const ta = $<HTMLTextAreaElement>("question");
@@ -1463,6 +1802,8 @@ function fitQuestion() {
 $("question").addEventListener("input", fitQuestion);
 
 async function fileInfo(path: string): Promise<FileInfo | undefined> {
+  // a catalogue example sheet (Stoa's sheets): opened on the server as an upload
+  if (!path.startsWith("data/") && !path.startsWith("upload/")) return openCase(path).catch(() => undefined);
   return state.files.find((x) => x.path === path)
     ?? (await listFiles("", path, 5).catch(() => [])).find((x) => x.path === path)
     ?? (await listFiles(path.split("/")[1], path, 5, false).catch(() => [])).find((x) => x.path === path);
@@ -1475,6 +1816,81 @@ async function openProject(p: Project, sheet = 0, question = "") {
   if (question) await runAsk();
 }
 
+/** 'This floor at a glance' (captain 21:14, replaces the drawing-vs-model differences): F2's finished takeoff of the open
+ *  sheet (GET /api/glance) as one card — scale and its source, rooms and net area, rooms by type, doors, windows,
+ *  skirting; each line shows its places on the plan; 'Full takeoff' opens F2's panel, 'Export' downloads the rows. */
+let glanceFor = "";
+async function glanceCard(f: FileInfo) {
+  const el = $("glance");
+  const page = v2d.numPages > 1 ? v2d.page : 0;
+  const key = `${f.path}|${page}`;
+  if (!isCustomer() || !/\.(pdf|png|jpe?g)$/i.test(f.path)) {
+    el.hidden = true;
+    glanceFor = "";
+    return;
+  }
+  if (glanceFor === key) return;
+  glanceFor = key;
+  el.hidden = true;
+  const g = await glanceOf(f.path, page);
+  if (glanceFor !== key || state.file?.path !== f.path) return;
+  const full = () => document.querySelector<HTMLButtonElement>('#featBar .feat-btn[data-feature="takeoff"][data-id="takeoff"]');
+  if (!g.ok || !g.rows) {
+    // no takeoff yet: offer F2's (when that feature is on), else nothing
+    el.hidden = !full();
+    el.innerHTML = `<div class="gl-head"><b>This floor at a glance</b></div><p class="gl-none">Rooms, areas, doors, windows and skirting of this sheet, each with its place on the drawing (about 2–4 minutes).</p>
+      <div class="gl-actions"><button type="button" class="hs-btn primary gl-full">Generate the takeoff</button></div>`;
+    el.querySelector(".gl-full")?.addEventListener("click", () => full()?.click());
+    return;
+  }
+  const rows = g.rows;
+  const n = (v: number, d = 1) => v.toLocaleString("en", { maximumFractionDigits: d });
+  const line = (k: string, label: string, val: string, sub = "") => `<li><button type="button" class="gl-line" data-k="${esc(k)}"><span class="gl-l">${esc(label)}${sub ? ` <small>${esc(sub)}</small>` : ""}</span><b>${esc(val)}</b></button></li>`;
+  const types = (g.types ?? []).slice(0, 6);
+  el.innerHTML = `<div class="gl-head"><b>This floor at a glance</b>${g.scale ? ` <span class="gl-scale">Scale ${esc(g.scale)}${g.scale_source && !/^1:\d+$/.test(g.scale_source) ? ` · ${esc(g.scale_source.replace(/^1:\d+\s*/, ""))}` : ""}</span>` : ""}</div>
+    <ul class="gl-list">
+      ${line("rooms", "Rooms", `${g.rooms} · ${n(g.area_m2 ?? 0)} m²`, "net floor area, inner wall faces")}
+      ${types.map((t, i) => line(`type${i}`, `· ${t.type}`, `${t.n} · ${n(t.m2)} m²`)).join("")}
+      ${g.doors ? line("doors", "Doors", String(g.doors.value), "whole sheet") : ""}
+      ${g.windows ? line("windows", "Windows", String(g.windows.value), "whole sheet") : ""}
+      ${g.skirting_m ? line("skirting", "Skirting", `${n(g.skirting_m)} m`, `${g.skirting_rooms} rooms, door openings deducted`) : ""}
+    </ul>
+    <p class="gl-foot">${g.unread ? `${g.unread} room${g.unread > 1 ? "s" : ""} could not be read and are not in the totals. ` : ""}Each line shows its places on the drawing.</p>
+    <div class="gl-actions">${full() ? `<button type="button" class="hs-btn gl-full">Full takeoff</button>` : ""}<button type="button" class="hs-btn gl-csv">Export to Excel (CSV)</button></div>`;
+  const pick = (k: string): { idx: number[]; value: number; unit: string; what: string } | null => {
+    const area = (ids: number[]) => ids.reduce((s, i) => s + Number(rows[i]?.value ?? 0), 0);
+    if (k === "rooms") { const ids = (g.types ?? []).flatMap((t) => t.rows); return { idx: ids, value: area(ids), unit: "m2", what: `net floor area of the ${ids.length} rooms read on this sheet` }; }
+    if (k.startsWith("type")) { const t = types[Number(k.slice(4))]; return t ? { idx: t.rows, value: t.m2, unit: "m2", what: `${t.type.toLowerCase()}: ${t.n} rooms` } : null; }
+    if (k === "doors" && g.doors) return { idx: [g.doors.row], value: g.doors.value, unit: "count", what: "doors on this sheet" };
+    if (k === "windows" && g.windows) return { idx: [g.windows.row], value: g.windows.value, unit: "count", what: "windows on this sheet" };
+    if (k === "skirting") { const ids = rows.filter((r) => r.section === "room" && r.quantity === "baseboard" && r.status === "ok").map((r) => r.i); return { idx: ids, value: g.skirting_m ?? 0, unit: "m", what: `skirting of ${ids.length} rooms, door openings deducted` }; }
+    return null;
+  };
+  el.querySelectorAll<HTMLButtonElement>(".gl-line").forEach((b) => b.addEventListener("click", () => {
+    const s = pick(b.dataset.k ?? "");
+    if (!s) return;
+    const ev = s.idx.flatMap((i) => (rows[i]?.evidence ?? []).map((e) => ({ ...e, note: e.note || `${rows[i].item}: ${rows[i].value} ${rows[i].unit}` })));
+    const a = { value: Math.round(s.value * 100) / 100, unit: s.unit, confidence: 0.5, solver: "takeoff", evidence: ev,
+      trace: [`takeoff (F2) of this sheet: ${s.what}; ${s.idx.length} row${s.idx.length === 1 ? "" : "s"}`, ...(g.scale ? [`scale: ${g.scale} ${g.scale_source ?? ""}`] : [])],
+      assumptions: [s.what], cost: { llm_tokens_in: 0, llm_tokens_out: 0, gpu_seconds: 0, api_calls: 0, wall_seconds: 0 } } as unknown as Answer;
+    $<HTMLTextAreaElement>("question").value = `This floor at a glance: ${s.what}`;
+    void showAnswer(a, 0);
+  }));
+  el.querySelector(".gl-full")?.addEventListener("click", () => full()?.click());
+  el.querySelector(".gl-csv")?.addEventListener("click", () => {
+    const q = (v: unknown) => `"${String(v ?? "").replace(/"/g, '""')}"`;
+    const csv = ["sheet,section,item,quantity,value,unit,status,confidence,method",
+      ...rows.map((r) => [f.path.split("/").pop(), r.section, r.item, r.quantity, r.value, r.unit, r.status, r.confidence ?? "", r.method ?? ""].map(q).join(","))].join("\n");
+    const url = URL.createObjectURL(new Blob([csv], { type: "text/csv" }));
+    const aEl = document.createElement("a");
+    aEl.href = url;
+    aEl.download = `${(f.path.split("/").pop() ?? "sheet").replace(/\.\w+$/, "")}-takeoff.csv`;
+    aEl.click();
+    window.setTimeout(() => URL.revokeObjectURL(url), 2000);
+  });
+  el.hidden = false;
+}
+
 /** Customer view chrome for the open file: project name, its sheets as tabs, the one-line credit, differences. */
 let diffsFor = "";
 let diffs: Difference[] = [];
@@ -1483,19 +1899,22 @@ function projectChrome(f: FileInfo) {
   $("projHead").hidden = !isCustomer();
   $("projName").textContent = p?.name ?? (f.source === "upload" ? "Your drawing" : f.title || f.path.split("/").pop()!);
   const files = (f.set?.length ? f.set : [f.path]).map((x) => x.split("/").pop()).join(" + ");
-  $("projPlace").textContent = p ? `${p.place} · ${p.contents}` : f.source === "upload" ? `${files} · kept only on this computer` : "";
+  $("projPlace").textContent = p ? `${p.place} · ${p.contents}` : f.source === "upload" ? `${files} · stored on this server only` : "";
   const tabs = $("sheetTabs");
   tabs.hidden = !isCustomer() || !p || p.sheets.length < 2;
-  tabs.innerHTML = p ? p.sheets.map((s) => `<button type="button" role="tab" class="${s.path === f.path ? "on" : ""}" data-path="${esc(s.path)}">${esc(s.label)}</button>`).join("") : "";
+  tabs.innerHTML = p ? p.sheets.map((s) => `<button type="button" role="tab" class="${sameSheet(s.path, f.path) ? "on" : ""}" data-path="${esc(s.path)}">${esc(s.label)}</button>`).join("") : "";
   tabs.querySelectorAll<HTMLButtonElement>("button").forEach((b) => b.addEventListener("click", () => {
     const i = p!.sheets.findIndex((s) => s.path === b.dataset.path);
-    if (i >= 0 && b.dataset.path !== state.file?.path) void openProject(p!, i);
+    if (i >= 0 && !sameSheet(b.dataset.path ?? "", state.file?.path ?? "")) void openProject(p!, i);
   }));
   $("credit").innerHTML = isCustomer() && p ? esc(p.credit) : creditLine(f);
+  void glanceCard(f);
   // differences: once per project (the knowledge graph of every floor plan, cached by the dev server)
   const el = $("diffs");
   const pill = $("diffPill");
-  if (!isCustomer() || !p) {
+  // captain 21:02: the drawing-vs-model 'differences' are elements above / below the plan's cut, not errors, and confuse
+  // an engineer: off unless the 'modelcheck' feature flag is on (?features=modelcheck)
+  if (!isCustomer() || !p || !enabledFeature("modelcheck")) {
     el.hidden = true;
     pill.hidden = true;
     return;
@@ -1558,6 +1977,91 @@ function humanLabel(a: Answer, i: number): string | undefined {
 /** What the hero was last drawn with (the floor groups arrive once the 3D model has loaded). */
 let hero: { groups: FloorGroup[] | undefined; roundTripMs: number; named?: boolean } = { groups: undefined, roundTripMs: 0 };
 
+/** the upload whose example chips came from its own labels (loadExamples then leaves them) */
+let chipsFromDrawing = "";
+/** printed words that name a room (any of them in a label makes it a room name for the example chips) */
+const ROOM_WORDS = /\b(rooms?|office|hall|kitchen|laundry|classroom|store|storage|toilets?|wc|corridor|lobby|bedroom|bath(room)?|living|dining|lounge|garage|entry|vestibule|reception|conference|dormitory|dorm|studio|library|gym|fitness|workshop|plant|utility|pantry|closet|changing|shower|sauna|nursery|staff|meeting|server|comms|cafe|canteen|retail|vending|break|therapy|hygiene|sensory|music|science|zimmer|küche|bad|flur|keittiö|olohuone|makuuhuone)\b/iu;
+/** Example chips for an uploaded vector PDF from its own room labels ('How big is the Multi-Purpose Hall?'), so the
+ *  first suggestions show the drawing was read: one room's area, the total of a name printed several times, one
+ *  room's skirting, then doors. Areas first (Stoa: areas > lengths > counts). Keeps the general chips when the sheet
+ *  has fewer than 2 room labels (slab, piping, elevation sheets; scans). */
+async function drawingChips(f: FileInfo) {
+  const nice = (t: string) => (/\p{Ll}/u.test(t) ? t : calm(t)).replace(/\s+/g, " ").replace(/\/\s*/g, "/").trim();
+  const NOT_NAME = /\b(notes?|general|design|drawing|title|legend|count|footage|total|key|schedule|types?|module|plan|issue|project|client|revision|scale|sheet|level|floor|area|wing|see|typ)\b/i;
+  const all = await v2d.labels();
+  const kindQs = sheetKindChips(all.map((l) => l.text));
+  if (kindQs) return void setDrawingChips(f, kindQs);
+  let labs = all.filter((l) => l.text.length >= 3 && l.text.length <= 32 && /^[\p{L}][\p{L} '&/.-]*$/u.test(l.text)
+    && ROOM_WORDS.test(l.text) && !NOT_A_ROOM.test(l.text) && !NOT_NAME.test(l.text));
+  // rooms printed in mixed case ('NCOIC Office'): the all-caps lines are title block and notes ('ENTRY/ ADMINISTRATION')
+  if (labs.filter((l) => /\p{Ll}/u.test(l.text)).length >= 3) labs = labs.filter((l) => /\p{Ll}/u.test(l.text));
+  if (state.file?.path !== f.path || labs.length < 3) return;
+  const byName = new Map<string, { text: string; n: number }>();
+  for (const l of labs) byName.set(l.compact, { text: byName.get(l.compact)?.text ?? l.text, n: (byName.get(l.compact)?.n ?? 0) + 1 });
+  // a part of a longer printed name ('Classroom' under 'Secondary Classroom') is not a name of its own
+  const names = [...byName.entries()].filter(([k, v]) => ![...byName.entries()].some(([k2, v2]) => k2 !== k && k2.includes(k) && v2.n >= v.n))
+    .map(([, v]) => ({ text: nice(v.text), n: v.n }))
+    // a whole name ends in a room noun ('Head's Office'), not half of a two-line one ('Fitness and Sports' / 'Manager Office')
+    .filter((x) => /(rooms?|office|hall|kitchen|laundry|classroom|store|toilets?|wc|lobby|bedroom|bath(room)?|lounge|garage|reception|dormitory|dorm|studio|library|gym|workshop|pantry|nursery|cafe|canteen|sauna|suite|zimmer|küche|bad|keittiö|olohuone|makuuhuone)$/iu.test(x.text));
+  // circulation and service spaces make dull examples ('How big is the Entrance Lobby?')
+  const plain = (t: string) => !/\b(corridor|lobby|entrance|wc|toilets?|store|storage|stair|lift|circulation|vestibule|riser|cupboard|plant|shower|changing)\b/i.test(t);
+  const once = names.filter((x) => x.n === 1 && plain(x.text)).sort((a, b) => Math.abs(a.text.length - 14) - Math.abs(b.text.length - 14));
+  const many = names.filter((x) => x.n >= 2 && x.n <= 40 && plain(x.text)).sort((a, b) => b.n - a.n);
+  if (once.length + many.length < 2) return; // a legend or a title block, not a floor plan's rooms
+  const plural = (t: string) => /s$/i.test(t) ? t : /[^aeiou]y$/i.test(t) ? `${t.slice(0, -1)}ies` : /(ch|sh|x)$/i.test(t) ? `${t}es` : `${t}s`;
+  // one room by name: printed once, else a name printed in two views of the same plan (floor plan + ceiling plan)
+  const single = once.length ? once : names.filter((x) => x.n === 2 && plain(x.text)).sort((a, b) => Math.abs(a.text.length - 14) - Math.abs(b.text.length - 14));
+  const total = many.find((x) => x.n >= 3);
+  // rooms with their area printed next to the name ('NCOIC Office / 2.05 / 81 SF', AFCEC): two rooms read from the
+  // print (a total over such a sheet summed one tag, 18:25; skirting there found no closed outline)
+  const printed = all.filter((l) => /^\s*[\d,.]+\s*(sf|sq\.?\s*ft|m²|m2)\s*$/i.test(l.text)).length >= 3;
+  const qs = (printed ? [
+    single[0] && `How big is the ${single[0].text}?`,
+    single[1] && `What is the floor area of the ${single[1].text}?`,
+    "How many doors are shown on this floor plan?",
+  ] : [
+    single[0] && `How big is the ${single[0].text}?`,
+    total && `What is the total floor area of all ${plural(total.text)}?`,
+    (single[1] ?? single[0]) && `How many metres of skirting does the ${(single[1] ?? single[0]).text} need?`,
+    "How many doors are shown on this floor plan?",
+  ]).filter(Boolean) as string[];
+  setDrawingChips(f, qs);
+}
+function setDrawingChips(f: FileInfo, qs: string[]) {
+  if (qs.length < 3 || state.file?.path !== f.path || state.answer) return;
+  const chips = $("chips");
+  chipsFromDrawing = f.path;
+  chips.innerHTML = qs.map((q) => `<button type="button" class="chip" title="${esc(q)}">${esc(q)}</button>`).join("");
+  chips.querySelectorAll<HTMLButtonElement>(".chip").forEach((b, i) => b.addEventListener("click", () => {
+    $<HTMLTextAreaElement>("question").value = qs[i];
+    void runAsk();
+  }));
+}
+/** Examples for sheets that are not room plans (QA 18:56: Stoa's piping sheet offered 'How big is the largest room?'),
+ *  from the sheet's own printed words: a piping plan (valve tags, pumps, headers, filter separators: Stoa's M-101A
+ *  questions) or a foundation / slab plan (its slab labels: '300 SLAB-ON-GRADE W/ D16'). null = a room plan or unknown. */
+function sheetKindChips(texts: string[]): string[] | null {
+  const has = (re: RegExp) => texts.filter((t) => re.test(t)).length;
+  if (has(/\b(pumps?|valves?|header|suction|discharge|piping|filter separators?)\b/i) >= 3) {
+    const qs: string[] = [];
+    if (has(/^\s*CV-?\d+\s*$/i) >= 2 || has(/\bcheck valves?\b/i)) qs.push(`How many check valves${has(/^\s*CV-?\d+\s*$/i) >= 2 ? " (CV)" : ""} are there?`);
+    if (has(/\bfilter separators?\b/i)) qs.push("How many filter separators are there?");
+    if (has(/\bpumps?\b/i)) qs.push("How many pumps are there?");
+    if (has(/\bheader\b/i)) qs.push(has(/\bsuction\b/i) ? "What size is the suction header?" : has(/\bdischarge\b/i) ? "What size is the pump discharge header?" : "What size is the header pipe?");
+    if (qs.length >= 3) return qs.slice(0, 4); // else maybe a slab plan with a pump trench (S-100F): go on
+  }
+  if (has(/\b(slab|footings?|foundation|grade beam)\b/i) >= 3) {
+    const slabs = [...new Set(texts.filter((t) => /^\s*\d{2,4}\s+slab\b/i.test(t) && t.length <= 48)
+      .map((t) => t.replace(/\s+(W\/|WITH)\s*$/i, "").replace(/-\s*$/, "").replace(/\s+/g, " ").trim()))]
+      .filter((t, _, xs) => !xs.some((u) => u !== t && u.startsWith(t))); // '300 SLAB-ON' is part of '300 SLAB-ON-GRADE W/ D16'
+    if (!slabs.length) return null;
+    // not 'What is the total slab area?': 102,000 m² @0.03 on S-100F (17:40), an example must not fail
+    return [...slabs.slice(0, 2).map((t) => `What is the area of the ${t}?`), has(/\bfootings?\b/i) >= 2 ? "How many footings are there?" : "",
+      "What is the scale of this drawing?"].filter(Boolean).slice(0, 3);
+  }
+  return null;
+}
+
 /** An upload, right after it opens: its scale is read in the background (title block, scale bar, vision model). On a
  *  photo or scan this is also the slow first reading of its text (~1-2 min, cached per drawing), so the visitor's own
  *  first question comes back sooner. The scale goes to the measure tool and the hero's scale line. */
@@ -1598,10 +2102,59 @@ async function prereadScale(f: FileInfo) {
     if (state.file?.path === f.path) measure.setAutoScale(s);
     const r = recognitionOf(a, f.path); // what the drawing was taken for (the chip above the first answer)
     if (r && !kindMemo.has(f.path)) kindMemo.set(f.path, r.kind);
-    line(s && scaleGuessed(s) ? `Scale unknown: no scale is printed, so we use about <b>${esc(s.label)}</b> (${esc(scaleWhy(s))}). Areas and lengths will be best estimates. <button type="button" class="link intro-measure">Set the scale</button>`
-      : s ? `Scale <b>${esc(s.label)}</b> ${esc(s.source)} · <button type="button" class="link intro-measure">check it or measure</button>`
-      : `No scale found on the drawing: areas and lengths will be estimates. <button type="button" class="link intro-measure">Set the scale</button> (two clicks on a length you know).`);
-    intro()?.querySelector(".intro-measure")?.addEventListener("click", () => measure.open(true, s && !scaleGuessed(s) ? "area" : "scale"));
+    const image = !/\.pdf$/i.test(f.path);
+    const here = () => state.file?.path === f.path && !state.answer;
+    const found = (sc: Scale, extra = "") => {
+      line(`Scale <b>${esc(sc.label)}</b> ${esc(sc.source)}${extra} · <button type="button" class="link intro-measure">check it or measure</button>`);
+      intro()?.querySelector(".intro-measure")?.addEventListener("click", () => measure.open(true, "area"));
+    };
+    const askScale = (html: string) => {
+      line(html);
+      intro()?.querySelector(".intro-measure")?.addEventListener("click", () => measure.open(true, "scale"));
+    };
+    const guessLine = (g: Scale) => `Scale unknown: no scale is printed, so we use about <b>${esc(g.label)}</b> (${esc(scaleWhy(g))}). Areas and lengths will be best estimates. <button type="button" class="link intro-measure">Set the scale</button>`;
+    if (!image || (s && !scaleGuessed(s))) {
+      if (s && !scaleGuessed(s)) found(s);
+      else askScale(s ? guessLine(s) : `No scale found on the drawing: areas and lengths will be estimates. <button type="button" class="link intro-measure">Set the scale</button> (two clicks on a length you know).`);
+      return;
+    }
+    // An image with no usable scale yet (QA 20:32: 'No scale found' on Stoa's DfE PNG, which prints 1:200 and a bar; a
+    // printed '1:200' alone does not size an image's pixels). Say we are still reading, then (1) the scale bar (W6's
+    // /api/m/barscale: waits for the upload's text warm-up, ~1 s once it is in), (2) the readers once more after the
+    // warm-up; only then 'No scale found'.
+    const printedN = typeof a.value === "string" ? a.value.match(/^\s*1\s*[:/]\s*(\d{1,5})\s*$/)?.[1] : undefined;
+    const reading = await warming(f.path);
+    askScale(`<span class="spinner-sm"></span> Reading the scale… ${reading ? "the drawing's text is still being read (1–2 minutes the first time; ask away meanwhile)" : "looking for a scale bar on the drawing"}. <button type="button" class="link intro-measure">Set it yourself</button>`);
+    const noScale = printedN ? `Scale <b>1:${esc(printedN)}</b> is printed, but no scale bar could be read on this image, so its size in pixels is unknown: <button type="button" class="link intro-measure">Set the scale</button> (two clicks on a length you know).`
+      : s ? guessLine(s) : `No scale found on the drawing: areas and lengths will be estimates. <button type="button" class="link intro-measure">Set the scale</button> (two clicks on a length you know).`;
+    const bar = await barScale(f.path);
+    if (!here()) return;
+    if (bar) {
+      const sb: Scale = { unitsPerM: bar.px_per_m, label: scaleLabel(bar.px_per_m, "image_px"), source: "from the scale bar on the drawing" };
+      measure.setAutoScale(sb);
+      return void found(sb, printedN ? ` (printed 1:${esc(printedN)})` : "");
+    }
+    const again = async () => {
+      if (!here()) return;
+      try {
+        const b = await ask(f.path, "Which scale is printed on this drawing?");
+        const s2 = scaleFromAnswer(b, "image_px");
+        if (!here()) return;
+        if (!s2 || scaleGuessed(s2)) return void askScale(noScale);
+        measure.setAutoScale(s2);
+        found(s2, " (found once the drawing's text was read)");
+      } catch {
+        if (here()) askScale(noScale);
+      }
+    };
+    // poll the warm-up (5 s, at most 5 min); then one more read of the scale from the text now in the cache
+    const t0 = Date.now();
+    const poll = async () => {
+      if (!here()) return;
+      if ((await warming(f.path)) && Date.now() - t0 < 300_000) return void window.setTimeout(poll, 5000);
+      void again();
+    };
+    void poll();
   } catch {
     line("");
   }
@@ -1613,11 +2166,14 @@ function heroScale(el: HTMLElement, a: Answer) {
   const task = a.intent?.task;
   if (isCustomer() && f && needsMeasuring(a, $<HTMLTextAreaElement>("question").value, f.path, sheetAtScale())) return measureFirst(el, a, f.path);
   if (!isCustomer() || !f || !/\.(pdf|png|jpe?g)$/i.test(f.path) || (task !== "area" && task !== "length")) return;
+  // a size read off a printed tag ('16 inches' for 'What size is the suction header?', parsed as area: QA 18:56) or any
+  // unit that is neither an area nor a length: the drawing's scale plays no part
+  if (a.unit && !/^(m2|m²|sq ?m|ft2|ft²|sf|sq ?ft|m|mm|cm|ft|feet|lf|metres?|meters?)$/i.test(String(a.unit))) return;
   // measured in the 3D model or the CAD file (real-world units): the drawing's scale plays no part
   const solver = String(a.solver ?? "");
   if (/\b(ifc|dxf|svg_ifc|schedule)\b/.test(solver) || a.evidence.some((e) => e.ifc_guid)) return;
   const s = measure.scale;
-  const printed = a.evidence.some((e) => /plan prints|printed '|as printed/i.test(e.note ?? ""));
+  const printed = a.evidence.some((e) => /plan prints|printed '|as printed/i.test(e.note ?? "")) || !!printedReading(a);
   const div = document.createElement("div");
   div.className = "hero-scale";
   // no number came back (a plan marked 'not to scale', no scale bar, no printed areas): the visitor can still measure
@@ -1662,8 +2218,8 @@ function heroScale(el: HTMLElement, a: Answer) {
       // our own estimate (door swings / the usual 1:100) is not what the reader used: say only that the scale is unknown
       ? `No scale is printed on this drawing, so this number is an estimate. Set the scale for an exact answer <small>(until then the measure tool uses about ${esc(s.label)}, ${esc(why)})</small>.`
       : `No scale printed: we assumed <b>${esc(s.label)}</b> (${esc(why)}). Set it for an exact answer.`) : `Scale <b>${esc(s.label)}</b> ${esc(s.source)}`
-    : printed ? "Scale not found." : "Scale not found on the drawing, so this is an estimate."}</span>
-    <button type="button" class="hs-btn${guessed || unsure ? " primary" : ""}">${unsure ? (task === "length" ? "Measure a length" : "Measure the room") : s && !guessed ? "Measure yourself" : "Set the scale"}</button>`;
+    : printed ? "No scale needed for a printed figure." : "Scale not found on the drawing, so this is an estimate."}</span>
+    ${printed && !s && !redo ? "" : `<button type="button" class="hs-btn${guessed || unsure ? " primary" : ""}">${unsure ? (task === "length" ? "Measure a length" : "Measure the room") : s && !guessed ? "Measure yourself" : "Set the scale"}</button>`}`;
   // a printed scale its door swings contradict (X1 14:31: '222 Exhibition St' prints 1:100, its doors say 1:200)
   if (s && !s.user && !guessed && !printed && /\.pdf$/i.test(f.path)) void doorCheck(div, s, f.path);
   // no printed scale and the number came from another reader: offer our own measurement next to it
@@ -1676,7 +2232,7 @@ function heroScale(el: HTMLElement, a: Answer) {
       if (state.file?.path === f.path && v2d.openFile === f.path && !measure.scale) measure.setAutoScale(doorScaleOf(d));
     });
   }
-  div.querySelector("button")!.addEventListener("click", () => {
+  div.querySelector("button")?.addEventListener("click", () => {
     if (state.mode !== "2d" && state.mode !== "split") setMode("2d");
     measure.open(true, s && !guessed ? (task === "length" ? "length" : "area") : "scale");
   });
@@ -2021,7 +2577,8 @@ function recognitionChip(el: HTMLElement, a: Answer, sheet?: string) {
   const f = state.file;
   if (!isCustomer() || !f || /\.ifc$/i.test(f.path)) return;
   const sc = measure.scale;
-  const printedAs = sc && !sc.user ? sc.source.match(/^printed on the drawing \((.+)\)$/)?.[1] : undefined; // 1/4" = 1'-0" → '1/4" = 1'-0" (1:48)'
+  const paper = sc && !sc.user ? sc.source.match(/^printed as (1:\d+) for (A\d) paper/) : null; // '1:200 @ A1' on an A3 page
+  const printedAs = sc && !sc.user ? (sc.source.match(/^printed on the drawing \((.+)\)$/)?.[1] ?? (paper ? `${paper[1]} @ ${paper[2]}` : undefined)) : undefined; // 1/4" = 1'-0" → '1/4" = 1'-0" (1:48)'
   const scale = sc ? (sc.user ? `${sc.label} (yours)` : printedAs ? `${printedAs} (${sc.label})` : /estimated|door swings/.test(sc.source) ? `${sc.label} (estimated)` : /assumed/.test(sc.source) ? `${sc.label} (assumed)` : /unsure/.test(sc.source) ? `${sc.label} (unsure)` : sc.label) : undefined;
   const mine = readAs?.file === f.path ? readAs : null;
   let r: Recognition | null = recognitionOf(a, f.path, { sheet, scale });
@@ -2101,13 +2658,29 @@ document.addEventListener("click", (e) => {
 
 /** The open PDF page at its known (not guessed) scale: {m2, diag} in metres, for the hero's plausibility check. */
 function sheetAtScale(): { m2: number; diag: number } | undefined {
-  const s = measure.scale, pt = v2d.sheetPt;
-  if (!s || scaleGuessed(s) || !pt || v2d.space !== "pdf_pt" || !(s.unitsPerM > 0)) return undefined;
+  const s = measure.scale;
+  // a PDF page in pt; an image in px at a scale bar's px per m (S-100F PNG: '10,000 m²' on a ~44 × 30 m sheet)
+  const pt = v2d.space === "pdf_pt" ? v2d.sheetPt : v2d.space === "image_px" && /\.(png|jpe?g)$/i.test(v2d.openFile ?? "") ? v2d.size : null;
+  if (!s || scaleGuessed(s) || !pt || !(s.unitsPerM > 0)) return undefined;
   const w = pt[0] / s.unitsPerM, h = pt[1] / s.unitsPerM;
   return { m2: w * h, diag: Math.hypot(w, h) };
 }
 
+/** AUDIT 19:51 (4): a wrong large value ('≈ 67,651.11', '102,000') ran out of the card: the big number shrinks in 4 px
+ *  steps until its line fits (not below 28 px). */
+function fitHeroNumber() {
+  for (const box of document.querySelectorAll<HTMLElement>("#hero .hero-value")) {
+    const big = box.querySelector<HTMLElement>(".big");
+    if (!big || big.classList.contains("name")) continue;
+    big.style.fontSize = "";
+    const unit = box.querySelector<HTMLElement>(".unit");
+    const tooWide = () => box.scrollWidth > box.clientWidth + 1 || (!!unit && unit.offsetTop > big.offsetTop + big.offsetHeight / 2); // or the unit wrapped
+    let fs = parseFloat(getComputedStyle(big).fontSize) || 80;
+    for (let i = 0; i < 14 && tooWide() && fs > 28; i++) big.style.fontSize = `${(fs -= 4)}px`;
+  }
+}
 function renderHero(a: Answer, roundTripMs: number) {
+  queueMicrotask(fitHeroNumber);
   const el = $("hero");
   el.hidden = false;
   document.body.classList.add("answered");
@@ -2144,8 +2717,338 @@ function renderHero(a: Answer, roundTripMs: number) {
     b.addEventListener("mouseleave", () => v2d.hoverEvidence(null));
   });
   heroScale(el, a);
+  rivalChoice(el, a);
+  sheetBreakdown(el, a);
   bindScalePill(el);
 }
+
+/** A whole-building answer on a drawing set: one row per floor-plan sheet with its own number and a jump to that sheet
+ *  (its marks are only drawn on its own page), the total, and a warning when every sheet gave the same printed total. */
+function sheetBreakdown(el: HTMLElement, a: Answer) {
+  const f = state.file;
+  const ps = isCustomer() && f && v2d.numPages > 1 ? perSheet(a) : null;
+  if (!f || !ps) return;
+  const name = (r: { storey: string; page: number }) => sheetName(sheetList.find((x) => x.page === r.page)) || `${calm(r.storey)} floor plan`;
+  const div = document.createElement("div");
+  div.className = "hero-sheets";
+  div.innerHTML = `<div class="hs-title">By floor · ${ps.rows.length} floor-plan sheets of this set</div>
+    ${ps.rows.map((r) => `<button type="button" class="hs-row${r.page === v2d.page ? " on" : ""}" data-k="${r.page}"><span class="pc-k">${r.page + 1}</span><span class="hs-n">${esc(name(r))}</span><b>${esc(r.value.toLocaleString("en"))}</b></button>`).join("")}
+    <div class="hs-total"><span>Total</span><b>${esc(ps.total.toLocaleString("en"))}</b></div>
+    ${ps.same ? `<div class="hs-warn">Every sheet gives the same printed total (${esc(ps.rows[0].value.toLocaleString("en"))}). It may be the whole building's own figure, printed on each sheet: then the answer is ${esc(ps.rows[0].value.toLocaleString("en"))}, not ${esc(ps.total.toLocaleString("en"))}. Check one sheet.</div>` : ""}`;
+  div.querySelectorAll<HTMLButtonElement>(".hs-row").forEach((b) => b.addEventListener("click", () => void showPage(Number(b.dataset.k))));
+  const strip = el.querySelector(".hero-value-strip");
+  if (strip) el.insertBefore(div, strip);
+  else el.append(div);
+}
+
+/** Two readings that disagree, as a calm choice (captain 18:56). Gemini's reading shown and ours differs: 'Show ours'
+ *  re-asks with our reader (its own marks on the drawing) and is remembered for this question on this drawing for the
+ *  session; ours shown and Gemini estimated another number: say it, and offer to measure. */
+const chosenReader = new Map<string, { solver: string; original: Answer }>();
+/** The visitor chose the second opinion's reading for this question on this drawing (QA 19:33); applied again when the
+ *  same question comes back with the same disagreement. */
+const chosenSecond = new Map<string, { value: number; original: Answer }>();
+function withChosenSecond(path: string, q: string, a: Answer): Answer {
+  const c = chosenSecond.get(choiceKey(path, q));
+  const r = c ? rivalReading(a) : null;
+  if (!c || r?.kind !== "second" || Math.abs(r.value - c.value) > 0.02 * Math.abs(c.value)) return a;
+  c.original = a;
+  return secondChoiceAnswer(a, r);
+}
+const choiceKey = (path: string, q: string) => `${path}|${q.trim().toLowerCase()}`;
+/** G1's clarify (captain 18:50 (1) / 18:56): 'Two readings disagree — 30.85 m² (this area) or 61.69 m² (this area)?' as
+ *  one choice under the hero; each option's marks get their own tone on the drawing (blue / orange); a pick re-asks the
+ *  option's own question when it has one, else shows that option's number with its marks; remembered per question. */
+const chosenClarify = new Map<string, { label: string; original: Answer }>();
+function clarifyChoice(el: HTMLElement, a: Answer): boolean {
+  const f = state.file;
+  if (!isCustomer() || !f) return false;
+  const q = $<HTMLTextAreaElement>("question").value.trim();
+  const key = choiceKey(f.path, q);
+  const picked = chosenClarify.get(key);
+  const u = (x: string) => (/^count$/i.test(x) ? "" : unitLabel(x) || x);
+  const div = document.createElement("div");
+  div.className = "hero-rival clarify";
+  if (picked && (a.trace ?? []).some((l) => String(l).startsWith("you chose: "))) {
+    div.innerHTML = `<span>Your choice: <b>${esc(picked.label)}</b>.</span><button type="button" class="hs-btn">Show both again</button>`;
+    div.querySelector("button")!.addEventListener("click", () => {
+      chosenClarify.delete(key);
+      void showAnswer(picked.original, 0);
+    });
+  } else {
+    const c = clarifyOf(a);
+    if (!c) return false;
+    const tone = ["cl-a", "cl-b", "cl-c"];
+    const val = (o: ClarifyOpt) => (typeof o.value === "number" ? `${o.value.toLocaleString("en", { maximumFractionDigits: 2 })}${o.unit ? ` ${u(o.unit)}` : ""}` : String(o.value ?? ""));
+    div.innerHTML = `<span><b>${esc(c.ask)}</b>${c.why ? ` ${esc(c.why)}` : ""}${c.click ? ` <small>${esc(c.click)}</small>` : ""}</span>
+      <div class="cl-opts">${c.options.slice(0, 3).map((o, i) => `<button type="button" class="hs-btn cl-opt" data-i="${i}"><i class="cl-dot ${tone[i]}" aria-hidden="true"></i>${esc(o.label)}${o.value !== null ? ` · <b>${esc(val(o))}</b>` : ""}</button>`).join("")}</div>`;
+    c.options.slice(0, 3).forEach((o, i) => v2d.markEvidence(o.evidence, tone[i]));
+    div.querySelectorAll<HTMLButtonElement>(".cl-opt").forEach((b) => {
+      const o = c.options[Number(b.dataset.i)];
+      b.addEventListener("mouseenter", () => o.evidence.length && v2d.setRank(o.evidence));
+      b.addEventListener("mouseleave", () => v2d.setRank(null));
+      b.addEventListener("click", async () => {
+        b.disabled = true;
+        try {
+          let next: Answer;
+          // an option that only repeats the asked question (G1's 'Two readings disagree' options, F7 21:09) is a choice
+          // of VALUE: asking it again would return the first reading
+          const same = (x: string) => x.trim().toLowerCase().replace(/[?.!\s]+$/, "");
+          if (o.question && !(o.value !== null && o.value !== undefined && same(o.question) === same(q))) {
+            next = await ask(f.path, o.question);
+            if (state.file?.path !== f.path) return;
+          } else {
+            const ev = o.evidence.length ? o.evidence.map((i) => a.evidence[i]).filter(Boolean) : a.evidence;
+            next = { ...a, value: o.value, unit: o.unit || a.unit, evidence: ev, missing: [`the other reading: ${c.options.filter((x) => x !== o).map((x) => `${x.label} ${val(x)}`).join("; ")}`, ...(a.missing ?? [])] } as Answer;
+            delete (next as unknown as { clarify?: unknown }).clarify;
+          }
+          next.trace = [`you chose: ${o.label} (${val(o)}) — ${c.ask}`, ...(next.trace ?? []).filter((l) => !String(l).startsWith("clarify: "))];
+          chosenClarify.set(key, { label: `${o.label} · ${val(o)}`, original: a });
+          emitClarifyPick(c, o, q);
+          await showAnswer(next, 0);
+        } catch (e) {
+          b.disabled = false;
+          b.textContent = `Could not ask it (${String((e as Error).message ?? e).slice(0, 60)})`;
+        }
+      });
+    });
+  }
+  const strip = el.querySelector(".hero-value-strip");
+  if (strip) el.insertBefore(div, strip);
+  else el.append(div);
+  return true;
+}
+function rivalChoice(el: HTMLElement, a: Answer) {
+  const f = state.file;
+  if (!isCustomer() || !f) return;
+  if (clarifyChoice(el, a)) return;
+  const q = $<HTMLTextAreaElement>("question").value.trim();
+  const picked = chosenReader.get(choiceKey(f.path, q));
+  const u = (x: string) => (/^count$/i.test(x) ? "" : unitLabel(x) || x);
+  const div = document.createElement("div");
+  div.className = "hero-rival";
+  const second = chosenSecond.get(choiceKey(f.path, q));
+  if (second && (a.solver ?? "").endsWith("+second_opinion")) {
+    const g = second.original;
+    div.innerHTML = `<span>Your choice: the second model's reading. Our first answer was <b>${esc(`${fmtValue(g)} ${u(String(g.unit ?? ""))}`.trim())}</b>.</span>
+      <button type="button" class="hs-btn">Show our first answer</button>`;
+    div.querySelector("button")!.addEventListener("click", () => {
+      chosenSecond.delete(choiceKey(f.path, q));
+      void showAnswer(g, 0);
+    });
+  } else if (picked && (a.solver ?? "").endsWith(picked.solver)) {
+    const g = picked.original;
+    div.innerHTML = `<span>Your choice: our reading. Gemini 3.1 Pro read <b>${esc(`${fmtValue(g)} ${u(String(g.unit ?? ""))}`.trim())}</b> from the picture.</span>
+      <button type="button" class="hs-btn">Show Gemini's</button>`;
+    div.querySelector("button")!.addEventListener("click", () => {
+      chosenReader.delete(choiceKey(f.path, q));
+      void showAnswer(g, 0);
+    });
+  } else {
+    const r = rivalReading(a);
+    if (!r) return;
+    const val = `${r.value.toLocaleString("en", { maximumFractionDigits: 2 })}${r.unit && r.unit !== "count" ? ` ${u(r.unit)}` : ""}`;
+    if (r.kind === "ours") {
+      div.innerHTML = `<span><b>Two readings disagree.</b> Shown: Gemini 3.1 Pro's reading of the picture. Our ${esc(r.who)} found <b>${esc(val)}</b>.</span>
+        <button type="button" class="hs-btn primary">Show ours: ${esc(val)}</button>`;
+      div.querySelector("button")!.addEventListener("click", async (ev) => {
+        const b = ev.currentTarget as HTMLButtonElement;
+        b.disabled = true;
+        b.textContent = "Asking our reader…";
+        try {
+          const mine = await ask(f.path, q, r.solver);
+          if (state.file?.path !== f.path) return;
+          chosenReader.set(choiceKey(f.path, q), { solver: r.solver!, original: a });
+          // (no model name here: this answer's own steps decide its 'where the data went' line)
+          mine.trace = [`you chose our ${r.who} (${r.solver}) over the picture reading (${a.value}${a.unit && a.unit !== "count" ? ` ${a.unit}` : ""})`, ...(mine.trace ?? [])];
+          await showAnswer(mine, 0);
+        } catch (e) {
+          b.disabled = false;
+          b.textContent = `Could not ask it (${String((e as Error).message ?? e).slice(0, 60)})`;
+        }
+      });
+    } else if (r.kind === "second") {
+      // QA 19:33: the second opinion read the printed figure; shown as a choice (no new model call: its reading + our marks)
+      const where = r.quote ? ` printed on the drawing: <q>${esc(r.quote)}</q>` : "";
+      div.innerHTML = `<span><b>Two readings disagree.</b> A second model (${esc(r.who)}) checked the marked spot and reads <b>${esc(val)}</b>${where}${r.also ? `; our ${esc(r.also)} read the same` : ""}.</span>
+        <button type="button" class="hs-btn primary">Show ${esc(val)}</button>`;
+      div.querySelector("button")!.addEventListener("click", () => {
+        chosenSecond.set(choiceKey(f.path, q), { value: r.value, original: a });
+        void showAnswer(secondChoiceAnswer(a, r), 0);
+      });
+    } else {
+      const area = /m2|m²|sf|ft2|sq/i.test(String(a.unit ?? ""));
+      // the scale line above already offers 'Measure the room' as the main action: one measuring button per card
+      const offered = !!el.querySelector(".hero-scale.cta .hs-btn");
+      div.innerHTML = `<span><b>Two readings disagree.</b> Gemini 3.1 Pro estimates <b>${esc(val)}</b> from the picture (not measured); the number above is ours. Measure it on the drawing to settle it${offered ? " (Measure the room, above)" : ""}.</span>
+        ${offered ? "" : `<button type="button" class="hs-btn">${area ? "Measure the area" : "Measure it"}</button>`}`;
+      div.querySelector("button")?.addEventListener("click", () => {
+        if (state.mode !== "2d" && state.mode !== "split") setMode("2d");
+        measure.open(true, area ? "area" : "length");
+      });
+    }
+  }
+  const strip = el.querySelector(".hero-value-strip");
+  if (strip) el.insertBefore(div, strip);
+  else el.append(div);
+}
+
+// --- feature plug-ins (web/src/features/registry.ts; captain 19:54) -----------------------------------------------
+/** The open drawing's printed text (pdf.js text layer), for 'what is under the pointer'; read once per drawing / page. */
+let featLabels: { at: [number, number]; text: string }[] = [];
+let featLabelsKey = "";
+function drawingLoaded() {
+  const key = `${v2d.openFile}|${v2d.page}`;
+  if (featLabelsKey !== key) {
+    featLabelsKey = key;
+    featLabels = [];
+    if (v2d.space === "pdf_pt") void v2d.labels().then((l) => { if (featLabelsKey === key) featLabels = l; }).catch(() => undefined);
+  }
+  emitDrawing(state.file, v2d.page);
+}
+const ROOMISH = (t: string) => ROOM_WORDS.test(t) && /\p{L}{3}/u.test(t) && t.length <= 48;
+/** A room name with the room NUMBER printed right under it ('Zimmer' over '2.01' on Swiss sheets): 'Zimmer 2.01', so
+ *  a right-click question names this room, not every 'Zimmer' of the floor. */
+function withNumber(name: string, at: [number, number]): string {
+  if (/\d/.test(name)) return name;
+  const num = featLabels.find((l) => /^\d{1,3}(?:[.,]\d{1,3})?[a-z]?$/i.test(l.text.trim()) && l.at[1] - at[1] > 2 && l.at[1] - at[1] < 14 && Math.abs(l.at[0] - at[0]) < 12);
+  return num ? `${name} ${num.text.trim()}` : name;
+}
+function pointerCtx(cx: number, cy: number): PointerCtx {
+  const point = state.mode === "3d" ? null : v2d.clientToDrawing(cx, cy);
+  let label: PointerCtx["label"] = null;
+  let room: PointerCtx["room"] = null;
+  if (point && featLabels.length) {
+    const d = (a: [number, number]) => Math.hypot(a[0] - point[0], a[1] - point[1]);
+    let best = Infinity;
+    const rooms: { name: string; at: [number, number]; dist: number }[] = [];
+    for (const it of featLabels) {
+      const t = it.text.trim();
+      if (!t) continue;
+      const dist = d(it.at);
+      if (dist < best) { best = dist; label = { text: t, at: it.at, dist }; }
+      if (dist <= 220 && ROOMISH(t)) rooms.push({ name: t, at: it.at, dist }); // ~3 in on the sheet: farther is not 'this room'
+    }
+    rooms.sort((a, b) => a.dist - b.dist);
+    // a two-line name is also read line by line ('Interview' / 'Room'): the whole name at the same spot wins over its piece
+    let r = rooms[0];
+    const whole = r && rooms.find((o) => o !== r && o.name.length > r.name.length && o.name.toLowerCase().includes(r.name.toLowerCase()) && o.dist <= r.dist + 25);
+    if (whole) r = whole;
+    if (r && /^rooms?$/i.test(r.name)) r = rooms.find((o) => !/^rooms?$/i.test(o.name)) ?? r;
+    room = r ? { name: withNumber(r.name, r.at), at: r.at } : null;
+  }
+  return {
+    file: state.file, page: v2d.numPages > 1 ? v2d.page : 0, view: state.mode as PointerCtx["view"], point, space: v2d.space,
+    client: { x: cx, y: cy }, label, room, guid: null, answer: state.answer, question: $<HTMLTextAreaElement>("question").value.trim(),
+  };
+}
+/** Right-click: the room under the pointer from its traced outline (web/server/room_shape.py via /api/shapes, as the
+ *  measure tool's click-in-a-room): the printed room name INSIDE the outline, nearest its middle (a longer name at the
+ *  same spot wins: two-line names). undefined = keep the nearest label (no outline there, no name inside, > 2.5 s). */
+async function refineRoom(c: PointerCtx): Promise<PointerCtx["room"] | undefined> {
+  const path = c.file?.path;
+  if (!c.point || !path || v2d.space !== "pdf_pt" || !/\.pdf$/i.test(path) || !featLabels.length) return undefined;
+  const pt = c.point;
+  // the wall-line tracer closes door swings at the doorway when it knows 1:N (a flood fill leaks into the next room):
+  // the scale in use, else the one printed on the page (W6's /api/m/pdfscale, cached)
+  let s = measure.scale && !scaleGuessed(measure.scale) ? measure.scale : null;
+  if (!s) s = printedScaleOf(await Promise.race([printedScale(path, c.page), new Promise<null>((r) => window.setTimeout(() => r(null), 1500))]));
+  const scaleN = s ? Math.round(72 / 0.0254 / s.unitsPerM * 100) / 100 : 0;
+  // trace the 5 nearest named rooms FROM THEIR LABELS (a click point can sit on furniture lines; a label is in open
+  // floor: 24/25 Swiss rooms traced this way) in one request, each kept from swallowing the other names; the room is
+  // the one whose outline holds the pointer
+  const rooms = featLabels.filter((l) => ROOMISH(l.text.trim()) && !/^rooms?$/i.test(l.text.trim()))
+    .map((l) => ({ l, d: Math.hypot(l.at[0] - pt[0], l.at[1] - pt[1]) })).filter((x) => x.d <= 400).sort((a, b) => a.d - b.d).slice(0, 5);
+  if (!rooms.length) return undefined;
+  const names = featLabels.filter((l) => /\p{L}{3}/u.test(l.text) && l.text.length <= 30);
+  const items = rooms.map((x, i) => ({ i, bbox: [x.l.at[0] - 1, x.l.at[1] - 1, x.l.at[0] + 1, x.l.at[1] + 1],
+    others: names.filter((o) => Math.hypot(o.at[0] - x.l.at[0], o.at[1] - x.l.at[1]) > 12).map((o) => o.at),
+    ...(scaleN > 0 ? { scale_n: scaleN } : {}) }));
+  const res = await Promise.race([roomShapes(path, c.page, "pdf_pt", items), new Promise<null>((r) => window.setTimeout(() => r(null), 4000))]);
+  if (!res?.shapes) return undefined;
+  const inside = (poly: [number, number][], p: [number, number]) => {
+    let hit = false;
+    for (let i = 0, j = poly.length - 1; i < poly.length; j = i++) {
+      const [xi, yi] = poly[i], [xj, yj] = poly[j];
+      if ((yi > p[1]) !== (yj > p[1]) && p[0] < ((xj - xi) * (p[1] - yi)) / (yj - yi || 1e-9) + xi) hit = !hit;
+    }
+    return hit;
+  };
+  const hit = res.shapes.find((sh) => Array.isArray(sh.poly) && sh.poly.length >= 3 && inside(sh.poly as [number, number][], pt));
+  // every nearby named room traced and none holds the pointer: it is in an unnamed space (stair, shaft, balcony) or a
+  // room named farther away — no name beats the wrong one ('What is here?' still works); a failed trace keeps the label
+  if (!hit) return res.shapes.length === rooms.length && res.shapes.every((sh) => Array.isArray(sh.poly) && sh.poly.length >= 3) ? null : undefined;
+  const r = rooms[Number(hit.i)]?.l;
+  return r ? { name: withNumber(r.text.trim(), r.at), at: r.at } : undefined;
+}
+/** A plug-in's question with context (askWith, shown): asked through runAsk, so the visitor sees the usual waiting state. */
+let nextAskCtx: AskContext | undefined;
+async function featAskShown(q: string, c: AskContext): Promise<Answer> {
+  $<HTMLTextAreaElement>("question").value = q;
+  nextAskCtx = c;
+  await runAsk();
+  if (!state.answer) throw new Error("no answer");
+  return state.answer;
+}
+(window as unknown as { __pctx: typeof pointerCtx }).__pctx = pointerCtx; // dev hook: what the right-click menu sees
+(window as unknown as { __refineRoom: typeof refineRoom }).__refineRoom = (c) => refineRoom(c); // dev hook: the traced room
+async function featAsk(q: string, c: AskContext): Promise<Answer> {
+  const path = c.file ?? state.file?.path;
+  if (!path) throw new Error("no drawing open");
+  // the page only when the call names one, or as a normal question would send it (F4: a batch on a 9-sheet set sent
+  // page 0 for 'whole building' questions)
+  const page = c.page ?? (path === state.file?.path ? onPage(q) : undefined);
+  const context = { ...(c.point ? { point: c.point } : {}), ...(c.region ? { region: c.region } : {}), ...(c.view ? { view: c.view } : {}),
+    ...(c.point || c.region ? { space: c.space ?? v2d.space } : {}), ...(page !== undefined ? { page } : {}) };
+  return ask(path, q, c.solver, c.solver_args, page, Object.keys(context).length ? context : undefined);
+}
+initFeatures({
+  file: () => state.file,
+  answer: () => state.answer,
+  question: () => $<HTMLTextAreaElement>("question").value.trim(),
+  page: () => (v2d.numPages > 1 ? v2d.page : 0),
+  view: () => state.mode as PointerCtx["view"],
+  isCustomer,
+  pointerCtx,
+  refineRoom,
+  overlayLayer: () => v2d.featLayer,
+  toContent: (p: DrawingPt) => v2d.shown(p),
+  toClient: (p: DrawingPt) => v2d.drawingToClient(p),
+  zoom: () => v2d.zoom,
+  ask: featAsk,
+  askShown: featAskShown,
+  showAnswer: async (a: Answer, q?: string) => {
+    if (q !== undefined) $<HTMLTextAreaElement>("question").value = q;
+    await showAnswer(a, 0);
+  },
+  setQuestion: (q: string) => void ($<HTMLTextAreaElement>("question").value = q),
+  viewer3d: async () => (state.ifc || state.plan3d ? viewer3d() : null),
+  openFile: async (path: string, page?: number) => {
+    let f = state.files.find((x) => x.path === path) ?? uploads.find((x) => x.path === path);
+    if (!f) f = (await listFiles("", path, 5).catch(() => [] as FileInfo[])).find((x) => x.path === path);
+    if (!f) throw new Error(`no such file: ${path}`);
+    if (state.file?.path !== f.path) await openFile(f);
+    if (page !== undefined && v2d.numPages > 1 && page !== v2d.page) await showPage(page);
+  },
+  focus: (bbox: number[], space?: "pdf_pt" | "image_px") => void v2d.focusBox(bbox, space),
+  openPage: async (k: number) => {
+    const nv = nav();
+    if (nv && k >= 0 && k < nv.n && k !== nv.k) await nv.go(k);
+  },
+  openMeasure: (tool, at) => {
+    if (state.mode !== "2d" && state.mode !== "split") setMode("2d");
+    measure.open(true, tool ?? "area");
+    if (at && measure.scale && tool !== "scale") measure.clickAt(at);
+  },
+  uploads: () => {
+    const f = state.file;
+    if (!f || !f.path.startsWith("upload/")) return [];
+    const all = [f.path, ...upGroup.map((g) => g.path), ...(f.set ?? []), ...Object.values(f.siblings ?? {})];
+    return all.filter((p, i) => typeof p === "string" && p.startsWith("upload/") && all.indexOf(p) === i);
+  },
+  toolbar: () => document.getElementById("featBar"),
+  panelHost: () => document.getElementById("featPanels"),
+});
 
 // --- boot ---------------------------------------------------------------------------------------------------
 (async () => {

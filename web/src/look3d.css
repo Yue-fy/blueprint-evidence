@@ -1,0 +1,38 @@
+/* W7: the 3D panes' legend + look switches (src/look3d.ts LookPanel). Tokens from style.css; dark mode follows them. */
+.look3d { position: absolute; left: 12px; bottom: 10px; z-index: 3; display: flex; flex-direction: column; gap: 8px; max-width: min(260px, 60%);
+  padding: 10px 12px; border-radius: 14px; border: 1px solid var(--line); background: var(--card-glass, rgba(255, 255, 255, .86)); color: var(--ink);
+  font-size: 12px; line-height: 1.25; box-shadow: var(--shadow); backdrop-filter: saturate(180%) blur(20px); -webkit-backdrop-filter: saturate(180%) blur(20px); }
+#vp3d .look3d { bottom: 48px; } /* above the '3D generated from the floor plan' note */
+body[data-view="expert"] .look3d { display: none; }
+.look3d-legend { display: grid; gap: 4px; }
+.look3d-legend[hidden] { display: none; }
+.look3d-item { display: grid; grid-template-columns: 12px 1fr auto; align-items: center; gap: 8px; }
+.look3d-item i { width: 12px; height: 12px; border-radius: 4px; box-shadow: inset 0 0 0 1px rgba(0, 0, 0, .08); }
+.look3d-item span { color: var(--ink); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.look3d-item b { font-weight: 500; color: var(--muted); font-variant-numeric: tabular-nums; }
+.look3d-title { font-weight: 600; }
+.look3d-ramp { height: 8px; border-radius: 4px; }
+.look3d-ends { display: flex; justify-content: space-between; color: var(--muted); font-variant-numeric: tabular-nums; }
+.look3d-row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+.look3d-seg { display: inline-flex; padding: 2px; border-radius: 9px; background: var(--fill); }
+.look3d-seg button, .look3d-explode { font: inherit; font-size: 12px; border: 0; cursor: pointer; color: var(--ink); min-height: 26px; }
+.look3d-seg button { padding: 0 10px; border-radius: 7px; background: transparent; }
+.look3d-seg button[aria-pressed="true"] { background: var(--panel); box-shadow: 0 1px 3px rgba(0, 0, 0, .12); font-weight: 600; }
+.look3d-explode { padding: 0 10px; border-radius: 9px; background: var(--fill); }
+.look3d-explode[aria-pressed="true"] { background: var(--accent-soft); color: var(--accent-ink); font-weight: 600; }
+.look3d-explode[hidden] { display: none; }
+@media (pointer: coarse) { .look3d-seg button, .look3d-explode { min-height: 36px; } }
+/* floor names beside the building (viewer3d floor labels) */
+.v3d-floor { position: absolute; left: 0; top: 0; font-size: 11.5px; font-weight: 600; color: var(--muted); white-space: nowrap; pointer-events: none;
+  padding: 2px 8px; border-radius: 999px; background: var(--card-glass, rgba(255, 255, 255, .86)); border: 1px solid var(--line); }
+@media (max-width: 700px) { .look3d { max-width: calc(100% - 24px); } .look3d-legend { grid-template-columns: 1fr 1fr; column-gap: 12px; } }
+/* hovering a room's floor (viewer3d installHover): name, type, area */
+.v3d-tip { position: absolute; left: 0; top: 0; pointer-events: none; padding: 6px 10px; border-radius: 10px; font-size: 12px; line-height: 1.3;
+  background: var(--card-glass, rgba(255, 255, 255, .86)); color: var(--ink); border: 1px solid var(--line); box-shadow: var(--shadow);
+  backdrop-filter: saturate(180%) blur(20px); -webkit-backdrop-filter: saturate(180%) blur(20px); white-space: nowrap; }
+.v3d-tip[hidden] { display: none; }
+.v3d-tip b { display: block; font-weight: 600; }
+.v3d-tip span { color: var(--muted); }
+body[data-view="expert"] .v3d-tip { display: none; }
+.look3d.faded .look3d-legend { opacity: .5; transition: opacity .3s var(--ease, ease); }
+.look3d-note { margin-top: 2px; color: var(--muted); font-size: 11.5px; white-space: normal; }

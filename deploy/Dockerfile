@@ -43,11 +43,14 @@ ENV CC5K_PYTHON=/opt/venv/bin/python
 COPY stoa ./stoa
 COPY docs ./docs
 COPY deploy ./deploy
-# runtime state the router reads from $JUNCTION_SHARED (the TRAIN split, self-contained): made by deploy/pack_state.py
-# (gitignored, dataset-derived: it lives only in this private image). Without it every question fails.
-RUN test -f deploy/state/results/splits/train.jsonl \
-      || { echo "run: python deploy/pack_state.py (before docker build)" >&2; exit 1; } \
-    && mkdir -p /var/stoa /data/stoa && cp -r deploy/state/. /var/stoa/ && rm -rf deploy/state \
+# OPTIONAL runtime state the router reads from $JUNCTION_SHARED (the TRAIN split, self-contained): made by
+# deploy/pack_state.py (gitignored, dataset-derived: it then lives only in this private image). Without it (anyone
+# building from a public clone: pack_state needs the dataset) the router uses stoa/router/train_stats.json (D39, night
+# 517b67b+; RL's fresh-clone check: 12/12 bundled samples right in API mode).
+RUN mkdir -p /var/stoa /data/stoa \
+    && if [ -f deploy/state/results/splits/train.jsonl ]; then cp -r deploy/state/. /var/stoa/; \
+       else echo "no deploy/state: the router uses stoa/router/train_stats.json (deploy/pack_state.py adds the train split)"; fi \
+    && rm -rf deploy/state \
     && mkdir -p /var/stoa/logs /var/stoa/locks /var/stoa/artifacts \
     && useradd --create-home --uid 10001 stoa && chown -R stoa /var/stoa /app
 

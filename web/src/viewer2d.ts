@@ -46,6 +46,8 @@ export class Viewer2D {
   onDrawingClick: ((p: [number, number]) => void) | null = null;
   private w = 1;
   private h = 1;
+  /** Feature overlays (web/src/features/registry.ts addOverlay2D): one <g> per feature layer, emptied on load. */
+  readonly featLayer: SVGGElement;
   private z = 1;
   private tx = 0;
   private ty = 0;
@@ -80,7 +82,9 @@ export class Viewer2D {
     this.roomLayer.classList.add("room-layer");
     this.measureLayer = document.createElementNS(SVGNS, "g");
     this.measureLayer.classList.add("measure-layer");
-    this.overlay.append(this.guidLayer, this.roomLayer, this.kgLayer, this.evLayer, this.measureLayer);
+    this.featLayer = document.createElementNS(SVGNS, "g");
+    this.featLayer.classList.add("feat-layers");
+    this.overlay.append(this.guidLayer, this.roomLayer, this.kgLayer, this.evLayer, this.featLayer, this.measureLayer);
     el.append(this.stage);
     this.installPanZoom();
     // measure mode: a click (not a drag) on the drawing goes to the measure tool, in drawing coordinates
@@ -94,6 +98,75 @@ export class Viewer2D {
     }, { capture: true });
   }
 
+  /** The open PDF, kept while the same file stays open (a page turn or a sheet thumbnail does not fetch it again). */
+  private docUrl = "";
+  private docP: Promise<pdfjs.PDFDocumentProxy> | null = null;
+  private pdfDoc(url: string): Promise<pdfjs.PDFDocumentProxy> {
+    if (this.docUrl !== url || !this.docP) {
+      this.docUrl = url;
+      this.thumbs.clear();
+      this.docP = pdfjs.getDocument({ url }).promise;
+      this.docP.catch(() => { if (this.docUrl === url) this.docP = null; });
+    }
+    return this.docP;
+  }
+  /** A small picture of page k of the open PDF (the sheet strip of a drawing set, captain 18:50) as an object URL;
+   *  cached per page, rendered one at a time after the page on screen. */
+  private thumbs = new Map<string, Promise<string>>();
+  private thumbQ: Promise<unknown> = Promise.resolve();
+  thumb(k: number, side = 240): Promise<string> {
+    const url = this.docUrl;
+    if (!url || !this.docP) return Promise.reject(new Error("no PDF open"));
+    const key = `${k}|${side}`;
+    let t = this.thumbs.get(key);
+    if (!t) {
+      t = this.thumbQ.catch(() => undefined).then(async () => {
+        if (this.docUrl !== url) throw new Error("another file");
+        const doc = await this.pdfDoc(url);
+        return this.renderThumb(await doc.getPage(k + 1), side);
+      });
+      this.thumbQ = t;
+      this.thumbs.set(key, t);
+      t.catch(() => this.thumbs.delete(key));
+    }
+    return t;
+  }
+
+  /** Page k of ANOTHER PDF (a sheet of a set of files dropped together), the same small picture as thumb(). */
+  private otherDocs = new Map<string, Promise<pdfjs.PDFDocumentProxy>>();
+  thumbOf(url: string, k = 0, side = 240): Promise<string> {
+    if (url === this.docUrl) return this.thumb(k, side);
+    const key = `${url}|${k}|${side}`;
+    let t = this.thumbs.get(key);
+    if (!t) {
+      t = this.thumbQ.catch(() => undefined).then(async () => {
+        let d = this.otherDocs.get(url);
+        if (!d) this.otherDocs.set(url, (d = pdfjs.getDocument({ url }).promise));
+        const p = await (await d).getPage(k + 1);
+        return this.renderThumb(p, side);
+      });
+      this.thumbQ = t;
+      this.thumbs.set(key, t);
+      t.catch(() => this.thumbs.delete(key));
+    }
+    return t;
+  }
+  private async renderThumb(p: pdfjs.PDFPageProxy, side: number): Promise<string> {
+    const base = p.getViewport({ scale: 1 });
+    const vp = p.getViewport({ scale: side / Math.max(base.width, base.height) });
+    const c = document.createElement("canvas");
+    c.width = Math.ceil(vp.width);
+    c.height = Math.ceil(vp.height);
+    const g = c.getContext("2d")!;
+    g.fillStyle = "#fff";
+    g.fillRect(0, 0, c.width, c.height);
+    await p.render({ canvas: c, canvasContext: g, viewport: vp }).promise;
+    p.cleanup();
+    const blob = await new Promise<Blob | null>((res) => c.toBlob(res, "image/png"));
+    if (!blob) throw new Error("no picture");
+    return URL.createObjectURL(blob);
+  }
+
   /** Show a PDF page or an image. Resolves when the drawing is visible. */
   async load(file: string, url: string, page = 0): Promise<void> {
     const token = ++this.loadToken;
@@ -104,13 +177,14 @@ export class Viewer2D {
     this.kgLayer.replaceChildren();
     this.roomLayer.replaceChildren();
     this.measureLayer.replaceChildren();
+    for (const g of this.featLayer.children) g.replaceChildren();
     this.guidEls.clear();
     this.el.dataset.state = "loading";
     this.page = 0;
     this.numPages = 1;
     this.pdfPage = null;
     if (/\.pdf$/i.test(file)) {
-      const doc = await pdfjs.getDocument({ url }).promise;
+      const doc = await this.pdfDoc(url);
       page = Math.min(Math.max(0, page), doc.numPages - 1);
       const p = await doc.getPage(page + 1);
       this.page = page;
@@ -340,6 +414,12 @@ export class Viewer2D {
     return this.dToContent(p);
   }
 
+  /** Pan / zoom to a box in drawing coordinates (feature plug-ins: api.focus). */
+  focusBox(bbox: number[], space: "pdf_pt" | "image_px" = this.space) {
+    const r = this.toContent({ file: this.file, bbox, bbox_space: space });
+    return r ? this.zoomTo(r, 0.8) : false;
+  }
+
   /** Outline one knowledge-graph item (a room's pdf_pt box) and zoom to it; `null` clears the mark. */
   markBox(bbox: number[] | null, label = "", space: "pdf_pt" | "image_px" = "pdf_pt") {
     this.kgLayer.replaceChildren();
@@ -541,6 +621,17 @@ export class Viewer2D {
     return this.file;
   }
 
+  /** Drawing point → screen (client) coordinates (feature popovers). */
+  drawingToClient(p: [number, number]): { x: number; y: number } {
+    const [x, y] = this.dToContent(p);
+    const rect = this.el.getBoundingClientRect();
+    return { x: rect.left + this.tx + x * this.z, y: rect.top + this.ty + y * this.z };
+  }
+  /** Screen px per content px (feature overlays: strokeWidth = 2 / zoom → 2 screen px). */
+  get zoom(): number {
+    return this.z;
+  }
+
   /** Screen point → drawing coordinates (PDF points, y down / image pixels), or null outside the drawing. */
   clientToDrawing(cx: number, cy: number): [number, number] | null {
     const rect = this.el.getBoundingClientRect();
@@ -666,6 +757,11 @@ export class Viewer2D {
     g.dataset.cx = String((mid[0] + nxt[0]) / 2);
     g.dataset.cy = String((mid[1] + nxt[1]) / 2);
     return true;
+  }
+
+  /** The open drawing's size in its own units (PDF pt, image px) */
+  get size(): [number, number] {
+    return [this.w, this.h];
   }
 
   /** The open PDF page's size in pt (w, h), or null (images, SVG) */
@@ -862,6 +958,9 @@ export class Viewer2D {
 
   /** Screen pixels at the top that a floating toolbar covers (customer view): framing keeps the drawing below them. */
   insetTop = 0;
+  /** Screen pixels on the right that an open panel covers (feature panels, F3 20:30): a zoom to a place centres it in
+   *  the part of the viewer left of them. */
+  insetRight: () => number = () => 0;
 
   fit() {
     this.lastView = () => this.fit();
@@ -899,7 +998,14 @@ export class Viewer2D {
 
   zoomTo(r: [number, number, number, number], margin = 1.5) {
     this.lastView = () => this.zoomTo(r, margin);
-    const W = this.el.clientWidth || 800;
+    const full = this.el.clientWidth || 800;
+    let right = 0;
+    try {
+      right = Math.max(0, Math.min(this.insetRight(), full * 0.6));
+    } catch {
+      /* no panel info: the whole width */
+    }
+    const W = full - right;
     const H = (this.el.clientHeight || 600) - this.insetTop;
     const rw = Math.max(r[2] - r[0], this.w * 0.03);
     const rh = Math.max(r[3] - r[1], this.h * 0.03);

@@ -44,6 +44,11 @@ _LENGTH = re.compile(r"(\blength\b|\blong\b|\blang\b|l[aä]nge|l[æe]ngde|pituus
                      r"\bwie (?:breit|hoch|tief|dick|weit)\b|\bkuinka (?:leve|korke|syv|paks)|\bhoe (?:breed|hoog|diep|dik)\b|"
                      r"\bhur (?:bred|h[öo]g|djup|tjock)\b|\bquelle (?:est (?:la )?)?(?:largeur|hauteur|profondeur)\b|"
                      r"\bquanto [eè] (?:largo|alto|profondo)\b|"
+                     # G1 c6 (X1 17:20 x1-176 'Mikä on keittiön leveys?' was 'text'): the noun forms in other
+                     # languages (English bare 'width' stays text: schedule answers)
+                     r"\b(?:leveys|leveyden|syvyys|syvyyden|paksuus|paksuuden)\b|\bbreite\b|\btiefe\b|"
+                     r"\bbredd(?:en)?\b|\bdjup(?:et)?\b|\bbreedte\b|\bdiepte\b|\blargeur\b|\bprofondeur\b|"
+                     r"\blarghezza\b|\bprofondit[aà]\b|"
                      r"\bwhat(?:'s| is) the (?:width|depth) of (?:the |this )?(?!doors?\b|windows?\b))", re.I)
 _YESNO = re.compile(r"^\s*(is|are|does|do|has|have|can|onko|gibt es|ist|sind|y a-t-il|est-ce|c'è|ci sono|er|har)\b",
                     re.I)
@@ -64,7 +69,7 @@ _T = [
     ("bathtub", r"bath ?tubs?|badewannen?|baignoires?|vasche da bagno|vasca|kylpyamm|badekar|badkar\w*"),
     ("shower", r"showers?|duschen?|douches?|docce|doccia|suihku|duschar\w*"),
     ("sauna", r"saunas?|saunoja|saunaa|saunen|bastu\w*|badstue"),
-    ("kitchen", r"kitchens?|kitchenettes?|keitti|k[üu]chen?|cuisines?|cucin[ae]|keuken|k[øo]kken|k[öo]k\b"),
+    ("kitchen", r"kitchens?|kitchenettes?|keitti|(?<!wasch)k[üu]chen?|cuisines?|cucin[ae]|keuken|k[øo]kken|k[öo]k\b"),
     ("bedroom", r"bedrooms?|makuuhuon|schlafzimmer|chambres? [àa] coucher|camer[ae] da letto|slaapkamer|sovev[æe]relse|sovrum"),
     ("bathroom", r"bathrooms?|washrooms?|kylpy- tai pesuhuon|pesuhuon|kylpyhuon|badezimmer|salles? de bains?|bagni\b|badkamer|badrum\w*"),
     ("balcony", r"balcon(?:y|ies|e|i)|parveke|balkon\w*|balcons?"),
@@ -304,12 +309,30 @@ def _qty_unit(u: str) -> tuple[str, str]:
 
 # Stoa kind 2 (captain 16:15, X1 16:38): skirting / baseboard = a LENGTH (room perimeter minus door openings), even
 # when asked 'how many (linear) metres / LF of …'; 'how many skirting boards' was a count ('64 count' from a VLM)
-_SKIRTING = re.compile(r"\b(?:skirting|base ?boards?|base (?:molding|moulding|trim)|jalkalist\w*|golvlist\w*|"
+# X1 21:22: US specs say 'wall base' / 'cove base' / 'rubber base' ('How many linear feet of wall base …' -> length door)
+_SKIRTING = re.compile(r"\b(?:skirting|base ?boards?|base (?:molding|moulding|trim)|(?:wall|cove|rubber|resilient|vinyl) "
+                       r"base|jalkalist\w*|golvlist\w*|"
                        r"sockelleiste\w*|fu(?:ß|ss)leiste\w*|plinthes?|battiscopa|zócalos?|rodapi[eé]s?)\b", re.I)
+
+
+# G1 c7 (QA 18:56): 'What size is the suction header?' was an AREA question ('size' = how big a room is): the card showed
+# an area convention and 'Scale unknown' on '16 inches'. The size of a pipe / duct / valve / bar is its nominal
+# diameter, printed as text ('16"', 'D13'): a text question. 0 dataset rows match (10 stoa-like rows, all pipe sizes).
+_PIPE_SIZE = re.compile(r"\b(?:what(?:'s| is| are)? (?:the )?sizes?|sizes? of|how (?:big|large))\b(?:\W+\w+){0,6}?\W+"
+                        r"(?:headers?|pipes?|piping|lines?|risers?|ducts?|ductwork|valves?|conduits?|sleeves?|nozzles?|"
+                        # X1 19:3x piping rows: 'size of the cross connection from the return line', 'What size and
+                        # material is the supply from the operating tanks'
+                        r"(?:cross[- ])?connections?|supply(?!\s+(?:closet|room|cabinet|store))|supplies|"
+                        r"drains?|vents?|manifolds?|flanges?|fittings?|tubes?|hoses?|rebars?|bars?|bolts?)\b|"
+                        # QA 19:33: 'What pipe size feeds the truck fill stand?' (raster '6 ft' @0.40)
+                        r"\b(?:pipe|piping|line|header|duct|riser|main|valve|conduit|rebar|bar)\s+(?:sizes?|diameters?)\b|"
+                        r"\b(?:nominal )?diameter of the (?:\w+ )?(?:pipe|line|header|duct|riser|main)\b", re.I)
 
 
 def infer_task(q: str) -> tuple[str, str | None]:
     """-> (task, unit). Unit follows the question's own unit words (m² vs ft² etc.)."""
+    if _PIPE_SIZE.search(q):
+        return "text", None
     mq = _QTY_AFTER_COUNT.search(q)
     if mq:
         return _qty_unit(mq.group("u"))

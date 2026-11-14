@@ -13,7 +13,7 @@ questions file, and a **CPU Docker image** packages both, plus the web demo behi
 | `cloudrun.sh`, `cloudbuild.yaml` | Google Cloud Run deploy (the captain runs it) |
 | `watchdog.sh`, `watchdog.demo.conf` | keeps the stable demo alive: restarts a service only when it is dead (section 0) |
 | `gate.py` | optional shared-password proxy for a public link (not needed since 12:52) |
-| `pack_state.py` | the runtime state the image needs (self-contained TRAIN split, gitignored `deploy/state/`) |
+| `pack_state.py` | optional runtime state (self-contained TRAIN split, gitignored `deploy/state/`; the image builds without it) |
 | `vm.sh` | the same on any Docker VM (Vultr etc.) |
 
 Nothing here contains a key. Keys come from the environment (`GEMINI_API_KEY`, `DEMO_PASSWORD`); on Cloud Run from
@@ -78,7 +78,7 @@ would overwrite (e.g. the reference `unit`) is kept as `input_unit`. Re-running 
 With Docker (CPU image, API-only mode):
 
 ```bash
-.venv/bin/python deploy/pack_state.py      # once: runtime state the image needs (gitignored deploy/state/)
+.venv/bin/python deploy/pack_state.py      # optional: the TRAIN split for the router (gitignored deploy/state/)
 docker build -f deploy/Dockerfile --target api -t stoa:api .
 docker run --rm -e GEMINI_API_KEY -v /path/to/dataset:/data/stoa:ro -v "$PWD/out":/out stoa:api \
   python -m stoa.cli answer --in /data/stoa/questions.jsonl --out /out/answers.jsonl --workers 2
@@ -181,7 +181,12 @@ summary (`cost per 1k: GPU $… API $… CPU $…`, and `rates` in the summary J
   in / out, Gemini 3.1 Pro $2 / $12, Nemotron (credit-based, no list price) $0.40 / $1.60 assumed. Override with
   `STOA_API_PRICES='{"model": [in, out]}'`. Gemini's thinking tokens are billed as output (its OpenAI endpoint leaves
   them out of `completion_tokens`; we bill `total - prompt`).
-- **CPU**: wall seconds × `STOA_CPU_USD_PER_HOUR` (default $0.05/h).
+- **CPU**: core seconds × `STOA_CPU_USD_PER_HOUR` (default $0.05 per core-hour). Core seconds = the request's wall
+  seconds (one core) + the CPU services' `cpu_seconds` (the PP-OCRv6 engine; the door detector via
+  `stoa.cost.record_service`) × `STOA_SERVICE_CORES` (4.7, measured: one cold OCR of a 6000 px scan = 339 s wall,
+  1,594 CPU-s, 5.4 GB RAM, ~$0.022). More than 10 core-minutes makes the badge in-between, more than 80 expensive.
+  Per-condition $/1k and latency: `experiments/p1/cost/README.md` (vector PDF ~$0.23/1k, PNG ~$1.6, scans $6-10).
+  The Docker image below does not ship the OCR engine. If you add it, give the service at least 8 GiB.
 - **Tier badge** (Stoa judges cost on 3 tiers, not dollars): `stoa.cost.tier(cost)` → `cheap` (no AI model: geometry,
   IFC, text layer, CPU vision) / `in-between` (a few small-model calls: our 8B / LoRA, Gemini Flash) / `expensive`
   (> 30k tokens, > 6 calls, or > $0.003 of hosted calls, e.g. Gemini Pro or OCR of a whole scan), with a one-line
@@ -195,9 +200,10 @@ summary (`cost per 1k: GPU $… API $… CPU $…`, and `rates` in the summary J
 - DWG: the probe DWGs were written by LibreDWG itself (dxf2dwg); AutoCAD-written DWGs are only checked to convert
   (5 Revit sheets from data/opening_design, 0.8–9.4 s), not scored (no questions on them).
 
-- A clean container needs `deploy/pack_state.py` first (the router reads the TRAIN split from `$JUNCTION_SHARED`):
-  without it every question failed (simulated: fresh py3.12 venv from pyproject only + empty state + 30 MB subset,
-  no API key → with the state 32/32 answered, 24/24 scored right; pytest 448 in that venv).
+- `deploy/pack_state.py` is OPTIONAL since D39 (night 517b67b+): without `deploy/state/` the image builds and the router
+  falls back to the packed stoa/router/train_stats.json (RL's fresh-clone release check: 12/12 bundled samples right in
+  API mode), so anyone can build it from a public clone. With the state the router also has the TRAIN split's
+  question table (cycle 1 simulation: fresh py3.12 venv + state + 30 MB subset, 32/32 answered, 24/24 right).
 - No Docker or gcloud on the team box: the image build, Caddy and Cloud Run script are written, not run. First build:
   check `docker build -f deploy/Dockerfile --target api .` and `docker run … stoa:api python -m stoa.cli ask …`.
 - `raster_cc5k` live inference needs `--build-arg WITH_CC5K=1` + the weights mounted (`CC5K_WEIGHTS`, CC BY-NC 4.0);

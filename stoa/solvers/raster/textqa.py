@@ -162,8 +162,41 @@ def select_items(items: list, question: str, W: float, H: float, k: int) -> list
     return [items[j] for j in sorted(keep)]
 
 
+PHOTO_GUESS_CONF = 0.3  # a size measured on a deskewed photo at an ASSUMED print size (scalebar.printed_bar)
+PHOTO_BAR_AGREE = 0.03  # deskewed photo: drawn bar and the named-paper printed scale agree -> the printed one
+
+
+def _abbr_label(text: str) -> bool:
+    """An abbreviated room name with dots ('Lib.', 'Eng. St.', 'Sm. Grp. Rm.', 'SEN St.'): a splitter for room fills
+    like the full names (O1 c7: X1's crop, the LRC fill leaked into 'Lib.' and measured 12.85 m for 11.87)."""
+    from stoa.solvers.raster import measure as M
+
+    return "." in text and bool(M._NAME_WIDE.fullmatch(M._lkey(text))) and M._lkey(text) not in M._GENERIC
+
+
+def _is_photo(img_path: str) -> bool:
+    try:
+        from stoa.solvers.raster.photo import photo_family
+
+        return photo_family(str(T._abspath(img_path))) is not None
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def answer(path: str, question: str, image_path: str | None = None, backend: str = "local",
            max_texts: int = 160, solver: str = "raster", layer: T.TextLayer | None = None) -> Answer:
+    """_answer (below) + the photo-guess cap: a size read at the A3 print size a deskewed photo was ASSUMED to be."""
+    ans = _answer(path, question, image_path=image_path, backend=backend, max_texts=max_texts, solver=solver,
+                  layer=layer)
+    blob = " ".join([*map(str, ans.assumptions), *map(str, ans.trace), *(str(e.note) for e in ans.evidence)])
+    if "ASSUMING the photographed print" in blob and ans.confidence > PHOTO_GUESS_CONF:
+        ans.confidence = PHOTO_GUESS_CONF
+        ans.trace = [*ans.trace, f"photo: confidence capped at {PHOTO_GUESS_CONF} (print size assumed)"]
+    return ans
+
+
+def _answer(path: str, question: str, image_path: str | None = None, backend: str = "local",
+            max_texts: int = 160, solver: str = "raster", layer: T.TextLayer | None = None) -> Answer:
     img_path = image_path or path
     tl = layer or T.text_layer(img_path)  # layer: a ready text layer (a vector PDF's own text: pdf_textqa)
     W, H = tl.size
@@ -187,6 +220,9 @@ def answer(path: str, question: str, image_path: str | None = None, backend: str
     got = CH.overall_answer(img_path, question, tl, solver)  # overall dimension = a printed total its chain sums to
     if got is not None:
         return got
+    got = _printed_size_answer(img_path, question, tl, solver)  # 'LIVING ROOM' over "13'-5" x 13'-6"" (X1 19:33)
+    if got is not None:
+        return got
     bars = []
     ub = SB.user_bar()  # W5 'set scale' (solver_args px_per_m): the visitor's scale replaces any detected bar
     if ub is not None and _SIZE.search(question):
@@ -196,12 +232,24 @@ def answer(path: str, question: str, image_path: str | None = None, backend: str
             bars = [b for b in SB.bars(img_path, backend=backend, layer=tl) if b.unit in SB.UNIT_M]
         except Exception:  # noqa: BLE001 - a bar is a bonus, never a reason to fail the question
             bars = []
+        if bars and _is_photo(img_path):
+            # a deskewed photo: the printed 1:N over the whole sheet the note names beats a ~200-px bar fit read off
+            # the photo (EFA 1F: bar 21.70 vs sheet 21.50 px/m, true 21.53) when the two agree
+            pb = SB.printed_bar(img_path, tl)
+            if pb is not None and abs(pb.px_per_unit / bars[0].px_per_unit - 1) <= PHOTO_BAR_AGREE:
+                bars = [pb]
         if not bars:  # no drawn bar: a printed '1:100' + the image's DPI on a standard sheet size (clean renders)
             pb = SB.printed_bar(img_path, tl)
             bars = [pb] if pb is not None else []
         if not bars:  # neither: the spacing of verified dimension chains (chains.py; >= 2 chains agreeing)
             cb = CH.chain_bar(tl)
             bars = [cb] if cb is not None else []
+        if not bars:  # one evenly spaced chain with no printed total (grid bays on a screenshot crop)
+            lb = CH.loose_chain_bar(tl)
+            bars = [lb] if lb is not None else []
+        if not bars:  # a deskewed photo whose sheet names no paper size: its A3 guess, stated + capped (answer())
+            pb = SB.printed_bar(img_path, tl, photo_guess=True)
+            bars = [pb] if pb is not None else []
         if bars:
             _note_sheet(img_path, tl)
     if bars and (_SKIRT.search(question) or _PERIM.search(question)):
@@ -214,6 +262,10 @@ def answer(path: str, question: str, image_path: str | None = None, backend: str
         if got is not None:
             return got
     unit_q = _AREA_Q.search(question) and A.unit_letter(question)
+    if (_AREA_Q.search(question) or _BIG_Q.search(question)) and not unit_q:  # 'English 1 to English 5' (O1 c7)
+        got = _range_sum_answer(img_path, question, tl, bars, solver)
+        if got is not None:
+            return got
     if _AREA_Q.search(question) and _sum_scope(question, tl):
         got = _unit_area_answer(img_path, question, tl, bars, solver)
         if got is not None:
@@ -280,6 +332,9 @@ def answer(path: str, question: str, image_path: str | None = None, backend: str
     um = _NUM_UNIT.match(val)
     if um and not _NUM.match(val):  # '20,5 m²' -> 20.5 m2 (R1 08:47: such strings kept 0.75 and escaped every check)
         val, unit = um.group(1), unit or _UNIT_OF.get(um.group(2).lower().replace(" ", ""), um.group(2))
+    if _thousands(val, unit, question, cited):
+        trace.append(f"'{val}': the comma is a thousands separator ({val.replace(',', '')})")
+        val = val.strip().replace(",", "")
     if _NUM.match(val):
         v = float(val.replace(",", "."))
         value = int(v) if v.is_integer() and (unit in (None, "count")) else v
@@ -287,9 +342,24 @@ def answer(path: str, question: str, image_path: str | None = None, backend: str
         num = re.escape(val.replace(",", "."))
         in_cited = in_cited or any(re.search(rf"(?<![\d.]){num}(?![\d])", i.text.replace(",", ".")) for i in cited)
     else:
-        fm = T._FTIN.fullmatch(val.strip().rstrip('"”').strip() + '"') or T._FTIN.fullmatch(val.strip())
+        v_in = re.sub(r"(?:''|’’)\s*$", '"', _vulgar(val.strip()))  # 60'-0'' (two apostrophes as the inch mark, D1 A-101 PNG)
+        fm = T._FTIN.fullmatch(v_in.rstrip('"”').strip() + '"') or T._FTIN.fullmatch(v_in)
         if fm:  # a dimension string 187'-0" -> 187.0 ft (the printed text stays in the trace and evidence)
-            value, unit = round(int(fm.group(1)) + (T._frac(fm.group(2)) / 12 if fm.group(2) else 0), 3), "ft"
+            value, unit = round(int(fm.group(1)) + (T.inch_value(fm.group(2)) / 12 if fm.group(2) else 0), 3), "ft"
+            n = fm.group(1)
+            if not fm.group(2) and _inch_cited(n, cited):
+                # QA 19:33 / H 18:54 (M-101A PNG): the VLM wrote "16'" for the printed '16" SUCTION HEADER' -> 16 ft;
+                # the cited line prints the number with an INCH mark and no feet-inch string: inches
+                value, unit, in_cited = int(n), "in", True
+                trace.append(f"the cited text prints {n}\" (inches), not {n}' (feet)")
+    if isinstance(value, (int, float)) and not isinstance(value, bool) and unit in ("ft", "m") and \
+            not (_AREA_Q.search(question) or _BIG_Q.search(question)):
+        if unit == "ft" and _IN_M_Q.search(question):  # H 18:54: 'North wing width in metres?' -> 133.833 ft
+            trace.append(f"{value:g} ft = {value * 0.3048:.3f} m (metres asked)")
+            value, unit = round(value * 0.3048, 3), "m"
+        elif unit == "m" and _IN_FT_Q.search(question):
+            trace.append(f"{value:g} m = {value / 0.3048:.3f} ft (feet asked)")
+            value, unit = round(value / 0.3048, 3), "ft"
     cm_note = _cm_chain(value, unit, question, cited, tl)
     if cm_note:
         value, unit = round(float(value) / 100, 3), "m"
@@ -384,6 +454,22 @@ def answer(path: str, question: str, image_path: str | None = None, backend: str
         # dimension '10,000' (mm); 'English 9' = 7200 m² from '7,200'. A bare mm dimension string is a length.
         conf = min(conf, 0.05)
         missing = [*missing, "the cited number is a dimension string (mm), not a printed area"]
+    elif DIM_GUARD and (_AREA_Q.search(question) or _BIG_Q.search(question)) and isinstance(value, (int, float)) and \
+            not isinstance(value, bool) and not _LEN_Q.search(question) and not _AGG_Q.search(question) and \
+            (not in_cited or any(_DIM_PRINT.fullmatch(i.text.strip()) for i in cited)) and _dim_printed(value, tl):
+        # O1 c10 (X1 21:02, scan_light warm run): 'area of the Resistant Materials?' -> 7.2 m² @0.4 read off the grid
+        # dimensions '7,200' / '7.200' (mm) printed all over the EFA sheet, citing the room's label: at 0.4 it blocked the
+        # upload's traced-outline fallback that measured 102.67 (gold 104). A number the sheet prints only as a
+        # dimension string, and nowhere with an area unit, is a length.
+        conf = min(conf, 0.05)
+        missing = [*missing, f"{value:g} is printed on this sheet only as a dimension string (a length in mm / m), "
+                             "not as an area"]
+    if (_AREA_Q.search(question) or _BIG_Q.search(question)) and isinstance(value, (int, float)) and cited and \
+            _level_cited(value, cited):
+        # H 18:54 (S-100F PNG): 'How many square metres of 150 mm slab on grade are there?' -> 10000 m² @0.75 from the
+        # cited 'EL. = 10000' (a level in mm): a level / elevation annotation is no area
+        conf = min(conf, 0.05)
+        missing = [*missing, "the cited number is a level / elevation annotation (e.g. 'EL. = …'), not a printed area"]
     if bar_echo:
         conf = min(conf, 0.1)
         missing = [*missing, "the cited text is the graphic scale bar's own label, not a dimension of the asked element"]
@@ -442,12 +528,68 @@ def answer(path: str, question: str, image_path: str | None = None, backend: str
         conf = LABEL_COUNT_CONF
     trace.append(f"answer '{val}' from text lines {[k for k in d.get('lines', [])][:8]}"
                  + (" (literal match)" if in_cited else ""))
-    return Answer(value=value, unit=unit, confidence=conf, evidence=ev, solver=solver, trace=trace,
-                  assumptions=assumptions, missing=missing)
+    from stoa.trust.support import citation_guard  # T1 (audit 19:51): 'TOP OF SLAB EL. = 10000' is no area
+
+    return citation_guard(question, Answer(value=value, unit=unit, confidence=conf, evidence=ev, solver=solver,
+                                           trace=trace, assumptions=assumptions, missing=missing),
+                          [i.text for i in cited])
 
 
 _SHORT_LABEL = re.compile(r"[^\W\d_]{1,3}(?: [^\W\d_]{1,3})? ?\d{1,2}|[^\W\d_]{1,2} [^\W\d_]{2,}")  # 'Yr 6', 'W St', 'N St'
 _MM_DIM = re.compile(r"\d{1,3}(?:[,  ]\d{3})+|\d{4,6}")  # '10,000' / '13 500' / '7200': a mm dimension string
+# + '7.200' (a dot as the thousands mark, or metres to 3 decimals): either way a length, never an area label
+_DIM_PRINT = re.compile(r"(?:\d{1,3}(?:[,.  ]\d{3})+|\d{4,6})(?:\s?mm)?")
+_AREA_UNIT_TXT = re.compile(r"m²|m2\b|sq\.?\s?(?:m|ft)|ft²|ft2\b|\bsf\b|\bm\^2", re.I)
+DIM_GUARD = os.environ.get("STOA_O1_DIM_GUARD", "1") != "0"
+
+
+def _dim_printed(value: float, tl) -> bool:
+    """Is `value` printed on the sheet as a dimension string ('7,200' / '7.200' / '7200', read as 7.2 or 7200) and
+    nowhere as a number with an area unit ('7.20 m²')?"""
+    v = float(value)
+    hit = False
+    for i in tl.items:
+        t = str(i.text).strip()
+        if _AREA_UNIT_TXT.search(t):
+            for n in re.findall(r"\d+(?:[.,]\d+)?", t):
+                try:
+                    if abs(float(n.replace(",", ".")) - v) < 1e-6 * max(1.0, v):
+                        return False
+                except ValueError:
+                    pass
+            continue
+        if hit or not _DIM_PRINT.fullmatch(t):
+            continue
+        t = re.sub(r"\s?mm$", "", t)
+        cands = {float(re.sub(r"[,.  ]", "", t))}
+        if re.fullmatch(r"\d{1,3}[.,]\d{3}", t):
+            cands.add(float(t.replace(",", ".")))  # '7,200' read as 7.2 (decimal comma) or 7200 (thousands)
+        hit = any(abs(c - v) < 1e-6 * max(1.0, v) for c in cands)
+    return hit
+_LEVEL_TOK = re.compile(r"(?<![A-Za-z])(?:EL|ELEV|FFL|SSL|TOS|T\.O\.[SCWF]?|BOS|INV|I\.L|F\.F\.L|LVL|NIV|KORKO|\+/-)\.?\s*"
+                        r"(?:[=:]\s*)?([+\-±]?\s*\d[\d,.  ]*\d|\d)", re.I)
+
+
+def _inch_cited(n: str, cited) -> bool:
+    """A cited line prints `n` with an inch mark ('16"', '16”', "16''", '16 in', '16-INCH') and never as feet."""
+    inch = re.compile(rf"(?<![\d.'’]){re.escape(n)}\s*(?:\"|”|''|’’|-?\s*in(?:ch(?:es)?)?\b|-?\s*INCH)", re.I)
+    feet = re.compile(rf"(?<![\d.]){re.escape(n)}\s*(?:'|’|ft\b|-?\s*f(?:ee|oo)t\b)(?!')", re.I)
+    txt = [str(i.text) for i in cited]
+    return any(inch.search(t) for t in txt) and not any(feet.search(t) for t in txt)
+
+
+def _level_cited(value: float, cited) -> bool:
+    """Is `value` the number of a level annotation ('EL. = 10000', 'FFL +3.200', 'T.O.S. 98.50') in a cited line?"""
+    for i in cited:
+        for m in _LEVEL_TOK.finditer(str(i.text)):
+            t = re.sub(r"[\s+±\-]", "", m.group(1))
+            for cand in (t.replace(",", ""), t.replace(",", ".")):
+                try:
+                    if abs(float(cand) - float(value)) <= 1e-6 * max(1.0, abs(float(value))):
+                        return True
+                except ValueError:
+                    continue
+    return False
 
 # questions whose answer is a NAME though they mention a size ('Which room has the largest area?', 'Where is …')
 _NAME_ASKED = re.compile(r"\b(which|where|what (?:room|space|type|kind|name|material)|name|is there|are there|does|do|"
@@ -630,6 +772,7 @@ _TAG_Q = re.compile(r"\(\s*([A-Z]{1,5})(?:\s*-\s*(?:\.\.\.|…|n|#|x|\d+)?)?\s*\
 _DISTINCT_Q = re.compile(r"\b(different|distinct|unique|types?|kinds?|verschiedene\w*|eri\w*|olika)\b", re.I)
 _NOT_TAGS = {"KG", "EG", "OG", "UG", "DG", "SG", "ZG"}  # storeys named in parentheses ('auf dem Erdgeschoss (EG)')
 TAG_CONF = 0.6
+REPEAT_TYPES = 1.5
 
 
 def _tag_count_answer(img_path: str, question: str, tl: T.TextLayer, solver: str) -> Answer | None:
@@ -662,12 +805,19 @@ def _tag_count_answer(img_path: str, question: str, tl: T.TextLayer, solver: str
         val, how = len(distinct), f"{len(distinct)} different {ab}-n codes: {', '.join(ab + '-' + c for c in distinct[:30])}"
         ev_items = [next(i for c2, i in codes if c2 == c) for c in distinct]
     else:
-        repeated = len(distinct) < len(codes)  # numbered codes that repeat are TYPES (PS-8 x5); unique ones are IDs
+        # numbered codes that repeat are TYPES (PS-8 x5: count every tag); unique ones are IDs. A FEW repeats among IDs
+        # are notes / callouts naming a tag again (D1 17:46, USACE M-101 sibling: 'FP-3, (OPTIONAL STANDBY, SEE NOTE 1)'
+        # -> FP-1..3 counted 4, gold 3): types only when tags >= REPEAT_TYPES x codes (Stoa M-101A PS 41/23 = 1.78,
+        # sibling 38/22 = 1.73; FP 4/3 = 1.33)
+        repeated = len(codes) >= REPEAT_TYPES * len(distinct)
         n_num = len(codes) if repeated else len(distinct)
         val = n_num + len(bares)
         how = (f"{len(bares)} '{ab}' tags" if bares else "") + (" + " if bares and codes else "") + \
               (f"{n_num} numbered {ab}-n tags" + (" (codes repeat: each tag is one item)" if repeated else
-                                                  f" ({', '.join(ab + '-' + c for c in distinct[:12])})") if codes else "")
+                                                  f" ({', '.join(ab + '-' + c for c in distinct[:12])})"
+                                                  + (f"; {len(codes) - len(distinct)} repeated mention(s) of a code "
+                                                     "counted once (a note / callout naming the tag again)"
+                                                     if len(codes) > len(distinct) else "")) if codes else "")
         ev_items = bares + [i for _, i in codes]
     ev = [Evidence(file=img_path, page=0, bbox=[round(x, 1) for x in i.box], bbox_space="image_px",
                    note=f"tag '{i.text[:30]}'") for i in ev_items[:80]]
@@ -772,22 +922,55 @@ def _cm_chain(value, unit, question: str, cited: list, tl: T.TextLayer) -> str |
             "opening sizes in metres (e.g. 0.90 / 2.10) and its integer dimension chains in cm")
 
 
-_NUM_UNIT = re.compile(r"^\s*(-?\d+(?:[.,]\d+)?)\s*(m²|m2|sq\.? ?ft|ft²|ft2|m|ft|cm|mm)\.?\s*$", re.I)
+_NUM_UNIT = re.compile(r"^\s*(-?\d+(?:[.,]\d+)*)\s*(m²|m2|sq\.? ?ft|ft²|ft2|sf|m|ft|cm|mm)\.?\s*$", re.I)
+# H 18:54: '7,009 SF' was read as 7.009 ft² (the comma taken as a decimal mark). A comma before exactly three digits is
+# a thousands separator when the reading is imperial (SF / ft / sq ft in the answer, the question or the cited text)
+# or has two such groups; '20,5 m²' and '3,450' on a metric sheet keep the decimal comma.
+_THOUSANDS = re.compile(r"-?\d{1,3}(?:,\d{3})+")
+_IMPERIAL = re.compile(r"\b(?:sf|sq\.?\s*f(?:ee)?t|square\s+f(?:ee|oo)t|ft2?|feet|foot|inch(?:es)?)\b|ft²", re.I)
+
+
+def _thousands(val: str, unit, question: str, cited) -> bool:
+    v = val.strip()
+    if not _THOUSANDS.fullmatch(v):
+        return False
+    if v.count(",") >= 2 or (unit and _IMPERIAL.search(str(unit))) or _IMPERIAL.search(question):
+        return True
+    return any(re.search(rf"(?<![\d,.]){re.escape(v)}\s*(?:SF|sq|ft)", i.text, re.I) for i in cited)
 # X1 (3 rows on 3 files: ks51 x1-127/128, cadss x1-151): an AREA question answered with two lengths ('12.515m x
 # 4.015m', '3,50 x 3,00', "12'-6\" x 14'") came back as a string. Two sides of a room or of a building multiply to its
 # area when it is a rectangle: say so, and keep the printed sides as the evidence.
 _SIDE = r"(\d{1,5}(?:[.,]\d{1,3})?)\s*(mm|cm|m|ft|')?"
 _TWO_LEN = re.compile(rf"^\s*{_SIDE}\s*[x×X*]\s*{_SIDE}\s*$")
-_TWO_FTIN = re.compile(r"^\s*(\d{1,3})\s*['’]\s*-?\s*(\d{1,2})?\s*[\"”]?\s*[x×X*]\s*(\d{1,3})\s*['’]\s*-?\s*(\d{1,2})?\s*[\"”]?\s*$")
+# inch mark as '"', '”' or two apostrophes (D1 17:46: A-101 footprint "60'-0'' x 50'-0''" came back as the string)
+# O1 c9 (D1's HABS probe): feet with a fraction ("15 1/2' x 39'"), inches with a fraction ("5 1/2"", a stacked '51/2"', '½')
+_FT_P = r"(\d{1,3}(?:\s+\d{1,2}/\d{1,2})?)\s*['’]\s*-?\s*(\d{2,3}/\d{1,2}(?![\d/])|\d{1,2}(?:\s*\d{1,2}/\d{1,2}(?![\d/]))?)?\s*(?:[\"”]|''|’’)?"
+_TWO_FTIN = re.compile(rf"^\s*{_FT_P}\s*[x×X*]\s*{_FT_P}\s*$")
+_VULGAR = {"½": " 1/2", "¼": " 1/4", "¾": " 3/4", "⅛": " 1/8", "⅜": " 3/8", "⅝": " 5/8", "⅞": " 7/8"}
+_LOOK = str.maketrans({"I": "1", "l": "1", "|": "1", "O": "0", "o": "0"})  # 'II'-3" X IO'-0"' (HABS OCR) = 11'-3" x 10'-0"
+
+
+def _vulgar(t: str) -> str:
+    """'4½' -> '4 1/2' (a unicode fraction the OCR / VLM layer kept as one character)."""
+    for k, v in _VULGAR.items():
+        t = t.replace(k, v)
+    return t
+
+
+def _ft_of(feet: str, inch: str | None) -> float:
+    """'15 1/2' feet + '5 1/2' / '51/2' (stacked) / '7' inches -> feet."""
+    return T._frac(feet) + (T.inch_value(inch) / 12 if inch else 0.0)
 TWO_LEN_CONF = {"cited": 0.5, "uncited": 0.3}
 
 
 def two_lengths(val: str) -> tuple[float, float, str] | None:
     """'3,50 x 3,00' / '12.515m x 4.015m' / '350 x 300 cm' / "12'-6\" x 14'" -> (a, b, 'm' | 'ft'), else None."""
-    m = _TWO_FTIN.match(val)
+    m = _TWO_FTIN.match(_vulgar(val))
     if m:
-        a = int(m.group(1)) + int(m.group(2) or 0) / 12
-        b = int(m.group(3)) + int(m.group(4) or 0) / 12
+        try:
+            a, b = _ft_of(m.group(1), m.group(2)), _ft_of(m.group(3), m.group(4))
+        except (ValueError, ZeroDivisionError):
+            return None
         return (a, b, "ft") if a > 0 and b > 0 else None
     m = _TWO_LEN.match(val)
     if not m:
@@ -803,7 +986,121 @@ def two_lengths(val: str) -> tuple[float, float, str] | None:
     return (a, b, "m") if 0.3 <= min(a, b) and max(a, b) <= 300 else None
 
 
-_UNIT_OF = {"m²": "m2", "m2": "m2", "sqft": "ft2", "sq.ft": "ft2", "ft²": "ft2", "ft2": "ft2", "m": "m", "ft": "ft",
+# printed room sizes next to a room label (X1 19:33, HABS 215 Abingdon Ave: 'LIVING ROOM' over "13'-5" x 13'-6"";
+# estate-agent plans 'Kitchen 4.20 x 3.10 m (13'9" x 10'2")'): area = the two printed sides multiplied, length / width =
+# the longer / shorter side. No scale needed; evidence = the label + the size string.
+_FTIN_PAIR = re.compile(rf"(?<![\d/]){_FT_P}\s*[x×X*]\s*{_FT_P}")
+_LEN_PAIR = re.compile(r"(?<![\d.,])\d{1,2}[.,]\d{1,3}\s*(?:m\b)?\s*[x×X*]\s*\d{1,2}[.,]\d{1,3}\s*(?:m\b)?|"
+                       r"(?<![\d.,])\d{3,5}\s*[x×X*]\s*\d{3,5}\s*(?:mm|cm)?\b")
+PRINTED_SIZE_CONF = 0.7
+_SQM_Q = re.compile(r"\b(square met(?:re|er)s?|sq\.?\s*m|sqm|m2|neliö\w*|quadratmeter\w*)\b|m²", re.I)
+_SQFT_Q = re.compile(r"\b(square (?:feet|foot)|sq\.?\s*ft|sf|ft2)\b|ft²", re.I)
+_IN_M_Q = re.compile(r"\b(?:in|into)\s+(?:met(?:re|er)s?|m)\b", re.I)
+_IN_FT_Q = re.compile(r"\b(?:in|into)\s+(?:feet|foot|ft)\b", re.I)
+
+
+def _size_in(text: str):
+    """(a, b, unit, matched string) for the first printed 'A x B' size in `text`, else None."""
+    t = _vulgar(str(text))
+    if re.search(r"['’]", t) and re.search(r"[IlO|o]['’]|['’]\s*-?\s*[IlO|o]", t):
+        t = t.translate(_LOOK)  # a feet-inch size with letters that look like digits ('II'-3" X IO'-0"')
+    for rx in (_FTIN_PAIR, _LEN_PAIR):
+        for m in rx.finditer(t):
+            got = two_lengths(m.group(0).strip())
+            if got is not None and min(got[0], got[1]) >= (5.0 if got[2] == "ft" else 1.5):  # not a door '900 x 2100'
+                return (*got, m.group(0).strip())
+    return None
+
+
+def _printed_size_answer(img_path: str, question: str, tl: T.TextLayer, solver: str) -> Answer | None:
+    from stoa.solvers.raster import measure as M
+
+    if os.environ.get("STOA_O1_PRINTED_SIZE", "1") == "0":
+        return None
+    area = bool(_AREA_Q.search(question) or _BIG_Q.search(question))
+    kind = "area" if area else "dims" if _DIMS_Q.search(question) else "width" if _WIDE_Q.search(question) else \
+        "length" if _LONG_Q.search(question) else None
+    if kind is None or _AGG_Q.search(question) or _SUM_W.search(question) or _OPENING_Q.search(question) or \
+            _HEIGHT_Q.search(question) or _PERIM.search(question) or _SKIRT.search(question):
+        return None
+    lab = M.find_label(tl, question)
+    loose = False
+    if lab is None:
+        lab, loose = M.find_label(tl, question, loose=True), True
+    if lab is None:
+        return None
+    th = max(4.0, min(lab.box[3] - lab.box[1], lab.box[2] - lab.box[0]))
+    lw, lh = lab.box[2] - lab.box[0], lab.box[3] - lab.box[1]
+    vert = len(lab.text.strip()) >= 3 and lh > 1.5 * lw  # a rotated label (vertical line box)
+    best = None
+    own = _size_in(lab.text)
+    if own is not None:
+        best = (0.0, lab, own)
+    else:
+        names = [i for i in tl.items if i is not lab and re.search(r"[^\W\d_]{3,}", i.text) and _size_in(i.text) is None]
+        for c in tl.items:
+            if c is lab:
+                continue
+            got = _size_in(c.text)
+            if got is None:
+                continue
+            dy, dx = c.cy - lab.cy, abs(c.cx - lab.cx)
+            if vert:  # O1 c9 (HABS mt0047): label and size printed rotated -> the size line sits BESIDE it (x), either side
+                if not (abs(c.cx - lab.cx) <= 3.5 * th and abs(dy) <= 0.75 * max(lh, c.box[3] - c.box[1])):
+                    continue
+            elif not (-2.0 * th <= dy <= 3.5 * th and dx <= 0.75 * max(lw, c.box[2] - c.box[0])):
+                continue
+            d = (dx * dx + dy * dy) ** 0.5
+            if any(((n.cx - c.cx) ** 2 + (n.cy - c.cy) ** 2) ** 0.5 < 0.8 * d for n in names):
+                continue  # closer to another label: that room's size
+            if best is None or d < best[0]:
+                best = (d, c, got)
+    if best is None:
+        return None
+    _, it, (a, b, u, txt) = best
+    conv = []
+    if kind == "area":
+        v, unit = a * b, ("ft2" if u == "ft" else "m2")
+        if unit == "ft2" and _SQM_Q.search(question):
+            v, unit = v * 0.09290304, "m2"
+            conv.append("1 ft² = 0.0929 m²")
+        elif unit == "m2" and _SQFT_Q.search(question):
+            v, unit = v / 0.09290304, "ft2"
+            conv.append("1 m² = 10.764 ft²")
+        value = round(v, 2)
+    else:
+        lo, hi = sorted((a, b))
+        f, unit = 1.0, u
+        if u == "ft" and _IN_M_Q.search(question):
+            f, unit = 0.3048, "m"
+            conv.append("1 ft = 0.3048 m")
+        elif u == "m" and _IN_FT_Q.search(question):
+            f, unit = 1 / 0.3048, "ft"
+            conv.append("1 m = 3.281 ft")
+        value = round(hi * f, 3) if kind == "length" else round(lo * f, 3) if kind == "width" else \
+            f"{hi * f:.2f} {unit} × {lo * f:.2f} {unit}"
+        if kind == "dims":
+            unit = None
+    sides = f"{a:g} {u} × {b:g} {u}" if u == "m" else f"{txt}"
+    conf = PRINTED_SIZE_CONF - (0.1 if loose else 0.0)
+    ev = [Evidence(file=img_path, page=0, bbox=[round(x, 1) for x in lab.box], bbox_space="image_px",
+                   note=f"room label '{lab.text}'")]
+    if it is not lab:
+        ev.append(Evidence(file=img_path, page=0, bbox=[round(x, 1) for x in it.box], bbox_space="image_px",
+                           note=f"printed room size '{it.text[:60]}'"))
+    return Answer(value=value, unit=unit, confidence=conf, solver=solver, evidence=ev,
+                  trace=[f"room label '{lab.text}' at {[round(x) for x in lab.box]}"
+                         + (" (loose name match)" if loose else ""),
+                         f"printed size '{txt}' next to it = {sides}"
+                         + (f" -> {a * b:.2f} {u}²" if kind == "area" else ""), *conv],
+                  assumptions=(["the room is a rectangle of its two printed sides (area = side × side)"]
+                               if kind == "area" else ["the printed size string gives the room's two sides"])
+                  + [f"converted: {c}" for c in conv],
+                  missing=["the drawn outline (a recess or a non-rectangular room changes the area)"] if kind == "area"
+                  else [])
+
+
+_UNIT_OF = {"m²": "m2", "m2": "m2", "sqft": "ft2", "sq.ft": "ft2", "ft²": "ft2", "ft2": "ft2", "sf": "ft2", "m": "m", "ft": "ft",
             "cm": "cm", "mm": "mm"}
 _AGG_Q = re.compile(r"\b(total|combined|sum|together|altogether|in all|both|all|largest|smallest|biggest|widest|"
                     r"longest|most|least|yhteensä|yhteenlaskettu|kaikkien|kaikki|suurin|pienin|gesamt|insgesamt|"
@@ -863,7 +1160,9 @@ def _room_dims_answer(img_path: str, question: str, tl: T.TextLayer, bars: list,
     ids = [i for i in tl.items if M._ROOM_ID.fullmatch(i.text.strip())]
     others = [i.box for i in ids if i is not lab]
     if loose:
-        others += [i.box for i in tl.items if i is not lab and M._NAME.fullmatch(T.norm(i.text))
+        others += [i.box for i in tl.items if i is not lab and (M._NAME.fullmatch(T.norm(i.text))
+                                                                or M._NAME_NUM.fullmatch(M._lkey(i.text))
+                                                                or _abbr_label(i.text))
                    and T.norm(i.text) not in M._GENERIC]
     r = M.room_area(img_path, lab.box, bar.px_per_m, **M.FILL, others=others, solid=True,
                     large=_LARGE.get(img_path, False))
@@ -973,6 +1272,13 @@ def _bounded(r: dict, bar, img_path: str) -> bool:
 
 _PERIM = re.compile(r"\b(perimeters?|umfang|piiri|ympärysmitta|périmètre|perimetro|perímetro|omkrets)\b", re.I)
 PERIM_CONF = 0.4  # gross perimeter of the traced outline (no openings deducted); LARGE_CONF on large sheets
+# G1 18:45 (D1 dfe26 'Measure the full perimeter, do not deduct door openings.'): the asked convention wins over ours
+# (same wordings as lineplan / line_rooms)
+_NO_DEDUCT = re.compile(r"\b(?:do(?:es)?\s*n[o’']t|not|without|no)\s+(?:subtract\w*|deduct\w*|minus\w*|remov\w*|"
+                        r"tak\w*\s+(?:off|out)|exclud\w*|leav\w*\s+out)\b|\b(?:ignor\w*|disregard\w*)\s+(?:the\s+|any\s+|all\s+)?"
+                        r"(?:door\s*)?(?:doors?|openings?|doorways?)|\bincluding\s+(?:the\s+|any\s+)?(?:doors?|door\s*ways?|"
+                        r"(?:door\s+)?openings?)|\bacross\s+(?:the\s+)?(?:doors?|openings?)|\b(?:door\s+)?openings?\s+"
+                        r"(?:included|ignored|not\s+deducted)|\bgross\b|\bfull\s+perimeter\b", re.I)
 
 
 def _skirting_answer(img_path: str, question: str, tl: T.TextLayer, bars: list, solver: str):
@@ -995,8 +1301,22 @@ def _skirting_answer(img_path: str, question: str, tl: T.TextLayer, bars: list, 
     pr = M.room_perimeter(img_path, r, bar.px_per_m, ink=ink)
     if pr is None or pr["net_m"] <= 0:
         return None
+    ans = _skirting_from(img_path, question, lab, bar, r, pr, solver)
+    if not _clean(img_path) and ans.confidence > SCAN_FILL_CONF and os.environ.get("STOA_O1_SCAN_FILL_CAP", "1") != "0":
+        # X1 19:42 (DfE 200-dpi scan, laundry skirting 5.71 vs 10.08 @0.4): faded / broken partition lines cut or
+        # leak the fill; at 0.4 the upload's traced-vector readers (laundry area 7.05 right there) never ran
+        ans.confidence = SCAN_FILL_CONF
+        ans.trace = [*ans.trace, f"scan (not a clean render): a traced outline is capped at {SCAN_FILL_CONF} "
+                                 "(faded or broken wall lines cut or leak the fill)"]
+    return ans
+
+
+SCAN_FILL_CONF = 0.3
+
+
+def _skirting_from(img_path, question, lab, bar, r, pr, solver):
     ft = bool(re.search(r"\b(feet|foot|ft|lf|linear feet)\b", question, re.I))
-    if not _SKIRT.search(question):  # a plain perimeter: the whole outline
+    if not _SKIRT.search(question) or _NO_DEDUCT.search(question):  # a plain perimeter / openings not deducted
         v = pr["perimeter_m"] / 0.3048 if ft else pr["perimeter_m"]
         return Answer(value=round(v, 2), unit="ft" if ft else "m",
                       confidence=LARGE_CONF if _LARGE.get(img_path, False) else PERIM_CONF, solver=solver,
@@ -1009,7 +1329,8 @@ def _skirting_answer(img_path: str, question: str, tl: T.TextLayer, bars: list, 
                       + bar.evidence(img_path),
                       trace=[f"room label '{lab.text}' at {[round(x) for x in lab.box]}", bar.describe(), *r["notes"],
                              f"perimeter of the traced outline {pr['perimeter_m']:.2f} m (door openings along it "
-                             f"{pr['openings_m']:.2f} m are included)"],
+                             f"{pr['openings_m']:.2f} m are included"
+                             + (", as the question asks: not deducted)" if _SKIRT.search(question) else ")")],
                       assumptions=[f"the room outline is the blank region around its label up to the drawn walls (inner "
                                    f"wall faces), measured with {SB.scale_source(bar)}; doorways are closed straight"],
                       missing=["printed room dimensions (the perimeter is measured on the drawing)"])
@@ -1078,7 +1399,9 @@ def _room_area_answer(img_path: str, question: str, tl: T.TextLayer, bars: list,
     others = [i.box for i in ids if i is not lab and M._ROOM_ID.fullmatch(i.text.strip())]
     if loose:  # other printed room NAMES split open regions / veto a merged solid-wall region too
         others += [i.box for i in tl.items if i is not lab and (M._NAME.fullmatch(T.norm(i.text)) or
-                                                               _SHORT_LABEL.fullmatch(M._lkey(i.text)))
+                                                               _SHORT_LABEL.fullmatch(M._lkey(i.text)) or
+                                                               M._NAME_NUM.fullmatch(M._lkey(i.text)) or
+                                                               _abbr_label(i.text))
                    and T.norm(i.text) not in M._GENERIC]
     r = M.room_area(img_path, lab.box, bar.px_per_m, **M.FILL, others=others, solid=True,
                     large=_LARGE.get(img_path, False))
@@ -1138,6 +1461,46 @@ _SUM_W = re.compile(r"\b(combined|total|together|sum|both|altogether|in all|plus
 _PLURAL_W = re.compile(r"\b(two|three|four|both|all|each|the \w+s|beiden|alle|zwei|drei|molemmat|kaikki|kaksi|"
                        r"b[åa]da|alla|deux|tous|toutes|entrambi|tutti|tutte|ambos|todos)\b", re.I)
 ROOMS_SUM_CONF = {"printed": 0.7, "measured": 0.4}
+PRINTED_SUM = os.environ.get("STOA_O1_PRINTED_SUM", "1") != "0"
+_COUNT_W = {"two": 2, "both": 2, "three": 3, "four": 4, "five": 5, "six": 6, "2": 2, "3": 3, "4": 4, "5": 5, "6": 6}
+
+
+def _count_word(question: str) -> int | None:
+    """'the two bedrooms' / 'both studies' / 'the 3 offices' -> the number of rooms the question names, else None."""
+    m = re.search(r"\b(two|both|three|four|five|six|[2-6])\s+(?:of\s+the\s+)?(?:[^\W\d_]+\s+){0,2}?[^\W\d_]+s\b",
+                  question, re.I)
+    return _COUNT_W.get(m.group(1).lower()) if m else None
+
+
+def _size_near(tl: T.TextLayer, lab) -> tuple | None:
+    """(a, b, unit, matched text, item) of the printed 'A x B' size of a room label: in the label itself, else the
+    nearest size line just under it (beside it for a rotated label) that is not closer to another name."""
+    own = _size_in(lab.text)
+    if own is not None:
+        return (*own, lab)
+    th = max(4.0, min(lab.box[3] - lab.box[1], lab.box[2] - lab.box[0]))
+    lw, lh = lab.box[2] - lab.box[0], lab.box[3] - lab.box[1]
+    vert = len(lab.text.strip()) >= 3 and lh > 1.5 * lw
+    names = [i for i in tl.items if i is not lab and re.search(r"[^\W\d_]{3,}", i.text) and _size_in(i.text) is None]
+    best = None
+    for c in tl.items:
+        if c is lab:
+            continue
+        got = _size_in(c.text)
+        if got is None:
+            continue
+        dy, dx = c.cy - lab.cy, abs(c.cx - lab.cx)
+        if vert:
+            if not (dx <= 3.5 * th and abs(dy) <= 0.75 * max(lh, c.box[3] - c.box[1])):
+                continue
+        elif not (-2.0 * th <= dy <= 3.5 * th and dx <= 0.75 * max(lw, c.box[2] - c.box[0])):
+            continue
+        d = (dx * dx + dy * dy) ** 0.5
+        if any(((n.cx - c.cx) ** 2 + (n.cy - c.cy) ** 2) ** 0.5 < 0.8 * d for n in names):
+            continue
+        if best is None or d < best[0]:
+            best = (d, (*got, c))
+    return best[1] if best else None
 
 
 def _rooms_sum_answer(img_path: str, question: str, tl: T.TextLayer, bars: list, solver: str) -> Answer | None:
@@ -1148,8 +1511,13 @@ def _rooms_sum_answer(img_path: str, question: str, tl: T.TextLayer, bars: list,
     from stoa.solvers.raster import measure as M
 
     cs = M.question_concepts(question)
-    if len(cs) < 2 or not _SUM_W.search(question) or M.RELATIONAL.search(question):
+    if not _SUM_W.search(question) or M.RELATIONAL.search(question):
         return None
+    want = _count_word(question)
+    if len(cs) < 2 and not (PRINTED_SUM and len(cs) == 1 and (want or _PLURAL_W.search(question))):
+        return None  # O1 c9: one room TYPE counts when the question is plural ('the two bedrooms', 'both studies')
+    if len(cs) == 1 and want and len(M.concept_labels(tl, question, cs[0])) != want:
+        return None  # 'the two bedrooms on the second floor' on a sheet that prints three: which two is a guess
     bar = next((b for b in bars if b.px_per_m), None)
     concept_all = [i for c in cs for i in M.concept_labels(tl, question, c)]
     ids = [i for i in tl.items if M._ROOM_ID.fullmatch(i.text.strip()) and all(i is not j for j in concept_all)]
@@ -1173,6 +1541,14 @@ def _rooms_sum_answer(img_path: str, question: str, tl: T.TextLayer, bars: list,
                 ev += [lab_ev, Evidence(file=img_path, page=0, bbox=[round(x, 1) for x in a["box"]], bbox_space="image_px",
                                         note=f"printed area '{a['line'][:40]}'")]
                 how.append(f"{lab.text} {a['value']:g} {a['unit']} (printed)")
+                continue
+            sz = _size_near(tl, lab) if PRINTED_SUM else None
+            if sz is not None:  # O1 c9 (HABS): a printed 'A x B' size next to the label ("13'-3" × 19'-1"")
+                a_, b_, u_, txt, it = sz
+                parts.append((round(a_ * b_, 3), "ft2" if u_ == "ft" else "m2"))
+                ev += [lab_ev, Evidence(file=img_path, page=0, bbox=[round(x, 1) for x in it.box], bbox_space="image_px",
+                                        note=f"printed room size '{it.text[:40]}'")]
+                how.append(f"{lab.text} {txt} = {a_ * b_:.2f} {'ft²' if u_ == 'ft' else 'm²'} (printed size)")
                 continue
             got = None
             if bar is not None:
@@ -1200,9 +1576,96 @@ def _rooms_sum_answer(img_path: str, question: str, tl: T.TextLayer, bars: list,
     if len(units) != 1:
         return None
     total = round(sum(v for v, _ in parts), 3)
-    return Answer(value=total, unit=units.pop(), confidence=ROOMS_SUM_CONF[worst], solver=solver, evidence=ev[:12],
-                  trace=[f"sum of the named rooms: {' + '.join(how)} = {total:g}"],
+    unit = units.pop()
+    conv = ""
+    if unit == "ft2" and _SQM_Q.search(question):
+        total, unit, conv = round(total * 0.09290304, 3), "m2", " (1 ft² = 0.0929 m²)"
+    return Answer(value=total, unit=unit, confidence=ROOMS_SUM_CONF[worst], solver=solver, evidence=ev[:12],
+                  trace=[f"sum of the named rooms: {' + '.join(how)} = {total:g}{conv}"],
                   assumptions=[f"the question's rooms = {', '.join(how)}; their areas are added"],
+                  missing=[] if worst == "printed" else ["some rooms are measured, not printed (each term is an estimate)"])
+
+
+# 'English 1 to English 5', 'Classrooms 3-6', 'Bedroom 2 and Bedroom 3': a numbered series named by its ends
+_RANGE_Q = re.compile(r"\b((?:[^\W\d_]+\s+){0,2}[^\W\d_]+)\s+(\d{1,3})\s*(to|through|thru|until|-|–|—|and|&)\s*"
+                      r"(?:((?:[^\W\d_]+\s+){0,2}[^\W\d_]+)\s+)?(\d{1,3})\b", re.I)
+
+
+def _range_sum_answer(img_path: str, question: str, tl: T.TextLayer, bars: list, solver: str) -> Answer | None:
+    """'Total floor area of English 1 to English 5' (X1 sl-120/127/136): every label '<name> <n>' of the range found
+    exactly once, each sized by its printed area or its outline at the scale; None unless all are. O1 c7."""
+    from stoa.solvers.raster import measure as M
+
+    m = _RANGE_Q.search(question)
+    if not m or M.RELATIONAL.search(question):
+        return None
+    a, b = int(m.group(2)), int(m.group(5))
+    nums = [a, b] if m.group(3).lower() in ("and", "&") else list(range(a, b + 1))
+    if not (2 <= len(nums) <= 12) or b <= a:
+        return None
+    words = m.group(1).split()
+    keys = {M._lkey(i.text): i for i in tl.items}
+    counts: dict = {}
+    for i in tl.items:
+        counts[M._lkey(i.text)] = counts.get(M._lkey(i.text), 0) + 1
+    labs = None
+    for n in (3, 2, 1):
+        if len(words) < n:
+            continue
+        name = " ".join(words[-n:]).lower()
+        if name in M._GENERIC:
+            continue
+        ks = [f"{T.norm(name)} {k}" for k in nums]
+        if all(counts.get(k) == 1 for k in ks):
+            labs = [keys[k] for k in ks]
+            break
+    if labs is None:
+        return None
+    bar = next((b_ for b_ in bars if b_.px_per_m), None)
+    others_all = [i.box for i in tl.items if i not in labs and (M._NAME_WIDE.fullmatch(M._lkey(i.text))
+                                                                 or M._NAME_NUM.fullmatch(M._lkey(i.text)))
+                  and M._lkey(i.text) not in M._GENERIC]
+    parts, ev, how, worst = [], [], [], "printed"
+    for lab in labs:
+        h = max(6.0, min(lab.box[3] - lab.box[1], lab.box[2] - lab.box[0]))
+
+        def d2(ar, it):
+            return ((ar["box"][0] + ar["box"][2]) / 2 - it.cx) ** 2 + ((ar["box"][1] + ar["box"][3]) / 2 - it.cy) ** 2
+        near = [ar for ar in T.areas(tl) if d2(ar, lab) < (6 * h) ** 2 and min(labs, key=lambda i: d2(ar, i)) is lab]
+        lab_ev = Evidence(file=img_path, page=0, bbox=[round(x, 1) for x in lab.box], bbox_space="image_px",
+                          note=f"room label '{lab.text}'")
+        if near:
+            ar = min(near, key=lambda ar: d2(ar, lab))
+            parts.append((ar["value"], ar["unit"]))
+            ev += [lab_ev, Evidence(file=img_path, page=0, bbox=[round(x, 1) for x in ar["box"]],
+                                    bbox_space="image_px", note=f"printed area '{ar['line'][:40]}'")]
+            how.append(f"{lab.text} {ar['value']:g} {ar['unit']} (printed)")
+            continue
+        if bar is None:
+            return None
+        r = M.room_area(img_path, lab.box, bar.px_per_m, **M.FILL, others=others_all + [i.box for i in labs
+                                                                                         if i is not lab],
+                        solid=True, large=_LARGE.get(img_path, False))
+        if r is None or not _bounded(r, bar, img_path) or r["m2"] > _area_cap(bar, img_path):
+            return None
+        parts.append((round(r["m2"], 2), "m2"))
+        ev += [lab_ev, Evidence(file=img_path, page=0, bbox=r["box"], bbox_space="image_px", polygon=r.get("polygon"),
+                                exact=False, note=f"room outline: {r['m2']:.2f} m² at 1 m = {bar.px_per_m:.1f} px from "
+                                                  f"{SB.scale_source(bar)}")]
+        how.append(f"{lab.text} {r['m2']:.2f} m2 (outline)")
+        worst = "measured"
+    units = {u for _, u in parts}
+    if len(units) != 1:
+        return None
+    total = round(sum(v for v, _ in parts), 3)
+    if bar is not None and worst == "measured":
+        ev += bar.evidence(img_path)
+    return Answer(value=total, unit=units.pop(), confidence=ROOMS_SUM_CONF[worst], solver=solver, evidence=ev[:14],
+                  trace=[f"rooms {labs[0].text} … {labs[-1].text} ({len(labs)} labels): {' + '.join(how)} = {total:g}"]
+                  + ([bar.describe()] if bar is not None and worst == "measured" else []),
+                  assumptions=[f"the question's rooms = the {len(labs)} labels {', '.join(i.text for i in labs)}; their "
+                               "areas are added" + (f"; outlines measured with {SB.scale_source(bar)}"
+                                                    if worst == "measured" else "")],
                   missing=[] if worst == "printed" else ["some rooms are measured, not printed (each term is an estimate)"])
 
 
@@ -1306,6 +1769,11 @@ def _unit_area_answer(img_path: str, question: str, tl: T.TextLayer, bars: list,
         conf = min(conf, 0.3)
         missing.append(f"the question's scope '{r['sub_missed']}' was not applied: the sum covers every numbered room "
                        "on the sheet")
+    if r["rooms"] and all(x.get("named_only") for x in r["rooms"]):
+        # rooms found only by their printed names and flood-filled (line-only sheets): a single room's reliability,
+        # and <= 0.3 lets the upload solver trace the image into vector lines first (the agent's 'the room labeled
+        # 'Resistant Materials'' took this path at 0.6 and pre-empted lineplan's closer 103.91: gate d22 + O1)
+        conf = min(conf, LARGE_AREA_CONF)
     total = round(r["value"] * k, 2)
     return Answer(value=total, unit=unit_out, confidence=conf, solver=solver, evidence=ev[:14],
                   trace=([f"apartment {r['letter']}: label '{lab.text}' at {[round(x) for x in lab.box]}; region "

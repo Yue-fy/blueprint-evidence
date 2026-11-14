@@ -187,3 +187,36 @@ def test_dedupe_prefers_the_read_with_room_to_its_tile_edge():
     assert all("room" not in i for i in out)
     # one tile (images <= MAX_SIDE): no inner edges, every read has full room, the score decides as before
     assert E._room([0, 0, 50, 20], (0, 0, 400, 300), 400, 300) == E.EDGE_ROOM
+
+
+def test_ocr_timeout_is_remembered_and_the_background_read_lands(tmp_path, monkeypatch):
+    """S0 18:18: a read over the budget made EVERY question on that file wait again. Now the engine subprocess keeps
+    running detached and writes the cache; meanwhile a '.timeout' marker skips OCR at once."""
+    import sys
+    import time
+
+    import pytest
+
+    from stoa import ocr
+
+    img = tmp_path / "sheet.png"
+    Image.new("L", (50, 40), 255).save(img)
+    fake = tmp_path / "fake_engine.py"  # sleeps past the budget, then writes the --out file like engine.py
+    fake.write_text("import json, sys, time\ntime.sleep(1.5)\nout = sys.argv[sys.argv.index('--out') + 1]\n"
+                    "json.dump({'size': [50, 40], 'items': [], 'seconds': 1.5, 'engine': 'fake'}, open(out, 'w'))\n")
+    monkeypatch.setattr(ocr, "CACHE_DIR", tmp_path / "cache")
+    (tmp_path / "cache").mkdir()
+    monkeypatch.setattr(ocr, "OCR_PY", sys.executable)
+    monkeypatch.setattr(ocr, "ENGINE_FILE", fake)
+    monkeypatch.setattr(ocr, "TIMEOUT", 0.3)
+    monkeypatch.setattr(ocr, "_server_for", lambda p: False)
+    monkeypatch.delenv("STOA_TEXT_CACHE", raising=False)
+    ocr._mem.pop(str(img), None)
+    with pytest.raises(RuntimeError, match="budget"):
+        ocr.read(str(img))
+    t = time.time()
+    with pytest.raises(RuntimeError, match="skipped"):
+        ocr.read(str(img))
+    assert time.time() - t < 0.2
+    time.sleep(2.0)
+    assert ocr.read(str(img))["engine"] == "fake"

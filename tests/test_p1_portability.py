@@ -234,3 +234,70 @@ def test_served_model_is_remembered_between_calls(monkeypatch):
     assert asked["n"] == 1
     llm._SERVED_MODEL["local"] = (llm._SERVED_MODEL["local"][0] - llm.SERVED_MODEL_TTL - 1, "qwen-vl")
     assert llm.served_model("local") == "qwen-vl" and asked["n"] == 2  # re-asked after the TTL
+
+
+def test_cpu_services_are_priced_and_tiered():
+    """Audit 19:51 (cost/latency 4/10): the OCR engine's busy time (cpu_seconds, 8 threads) was recorded but not priced,
+    and a row that OCR'd a whole scan on CPU showed 'cheap: no AI model used'. Now cpu_seconds x 8 cores are priced at
+    the per-core rate (4.7 busy cores per engine second, measured), and > 10 core-minutes of CPU services lifts the badge to in-between (> 80: expensive)."""
+    from stoa import contract, cost
+
+    clean = {"wall_seconds": 3.0}
+    assert cost.tier(clean)["tier"] == "cheap"
+    ocr_scan = {"wall_seconds": 451.5, "cpu_seconds": 390.0}  # one cold OCR of a scanned sheet (d25 scan_dev p50)
+    b = cost.breakdown(ocr_scan)
+    assert abs(b["cpu_usd"] - (451.5 + 390.0 * cost.SERVICE_CORES) * cost.CPU_USD_PER_HOUR / 3600) < 1e-9
+    t = cost.tier(ocr_scan)
+    assert t["tier"] == "in-between" and "core-minutes" in t["why"]
+    assert cost.tier({"wall_seconds": 900, "cpu_seconds": 1352})["tier"] == "expensive"  # 6,354 core-s
+    assert cost.tier({"wall_seconds": 60, "cpu_seconds": 60})["tier"] == "cheap"  # a table crop / clean sheet
+    big_llm = {"wall_seconds": 30, "llm_calls": 30, "llm_tokens_in": 90_000, "gpu_seconds": 12, "cpu_seconds": 100}
+    assert cost.tier(big_llm)["tier"] == "expensive"
+    assert "core-s" in cost.describe(ocr_scan)
+    with contract.CostMeter() as m:
+        cost.record_service(10.0, threads=16)  # the door detector: 10 s at 16 threads = 20 s of the 8-thread unit
+        cost.record_service(0)  # cache hit: nothing
+    assert abs(m.cost.cpu_seconds - 20.0) < 1e-9
+    with contract.CostMeter() as m2:
+        cost.record_cpu(1594.0)  # O1's measured engine CPU time for one cold 6000 px scan
+    assert abs(cost.core_seconds({"cpu_seconds": m2.cost.cpu_seconds}) - 1594.0) < 0.1
+
+
+def test_hosted_call_has_a_deadline(monkeypatch):
+    """QA 20:37: a hosted vision call that timed out and retried held a demo answer 150-190 s while a local reading
+    was ready. chat() now bounds a hosted call incl. retries (deadline=, $STOA_HOSTED_DEADLINE_S) and gives each
+    attempt at most the time left; local backends keep their restart patience."""
+    import time
+
+    from openai import APITimeoutError
+
+    from stoa import llm
+
+    calls = []
+
+    class Fake:
+        def with_options(self, timeout=None):
+            calls.append(timeout)
+            return self
+
+        @property
+        def chat(self):
+            return self
+
+        @property
+        def completions(self):
+            return self
+
+        def create(self, **kw):
+            time.sleep(0.3)
+            raise APITimeoutError(request=None)
+
+    monkeypatch.setattr(llm, "_client", lambda b: Fake())
+    monkeypatch.setattr(llm, "_nvidia_throttle", lambda b: None)
+    monkeypatch.delenv("STOA_PRIVATE", raising=False)
+    monkeypatch.delenv("STOA_LLM_REPLAY", raising=False)
+    t0 = time.time()
+    with pytest.raises(RuntimeError, match="deadline"):
+        llm.chat("hi", backend="nvidia", deadline=3.0, cache=False)
+    assert time.time() - t0 < 4.5
+    assert calls and all(t <= 3.0 for t in calls)

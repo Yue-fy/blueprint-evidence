@@ -38,7 +38,7 @@ export interface Project {
   /** one-line credit for the footer */
   credit: string;
   /** a small picture for the card: the file rendered by the viewer (first sheet) */
-  kind: "building" | "model" | "floor" | "schedule" | "plan" | "historic";
+  kind: "building" | "model" | "floor" | "schedule" | "plan" | "historic" | "scan" | "structural" | "piping";
 }
 
 // The catalogue itself is data: fixtures/projects.json (also read by fixtures/record.py, which records every chip's
@@ -50,9 +50,16 @@ const ESP = "data/ifc_models/bsc-esplanades_1807-ep-ar-v18";
 export const PROJECTS: Project[] = projectsJson as Project[];
 
 /** The project a dataset path belongs to (its sheets, or the same building's model / plans). */
+/** A catalogue sheet path and an open file are the same sheet: equal paths, or an example sheet ('examples/x.png',
+ *  opened through /api/case) and its upload ('upload/<id>/x.png'). */
+export function sameSheet(sheet: string, file: string): boolean {
+  if (sheet === file) return true;
+  return !sheet.startsWith("data/") && !sheet.startsWith("upload/") && file.startsWith("upload/") && sheet.split("/").pop() === file.split("/").pop();
+}
+
 export function projectOf(path: string): Project | undefined {
-  return PROJECTS.find((p) => p.sheets.some((s) => s.path === path))
-    ?? (path.startsWith(ESP) ? PROJECTS[0] : undefined);
+  return PROJECTS.find((p) => p.sheets.some((s) => sameSheet(s.path, path)))
+    ?? (path.startsWith(ESP) ? PROJECTS.find((p) => p.sheets.some((s) => s.path.startsWith(ESP))) : undefined);
 }
 
 /** A storey/floor name as people say it: '1.korrus' → "floor 1", 'Vundament' → "basement", 'EG' → "ground floor". */

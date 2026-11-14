@@ -258,12 +258,20 @@ def _run(code: str, tables: dict[str, pd.DataFrame]) -> dict:
     code = "\n".join(ln for ln in code.splitlines() if not re.match(r"\s*(import\s+(pandas|re|math|numpy)\b|from\s+\w+\s+import)", ln))
     if re.search(r"\b(import|open|exec|eval|__\w+__|os\.|sys\.|subprocess)\b", code):
         raise ValueError("code uses a forbidden construct")
+    # RL 20:21 / audit risk 3: the real `pd` is in env, so file readers / writers would pass the check above
+    # (pd.read_csv('/any/path'), read_pickle = code execution, df.to_csv(...)). The model only needs the given tables.
+    if re.search(r"\bread_\w+\s*\(|\.to_(csv|pickle|parquet|json|excel|html|sql|feather|hdf|xml|clipboard|stata|orc|latex|markdown)\b|"
+                 r"\bpd\s*\.\s*io\b|\b(getattr|setattr|globals|locals|vars|compile|breakpoint)\s*\(", code):
+        raise ValueError("code uses a forbidden construct (file I/O or reflection); use only the given DataFrames")
     if HARDCODED.search(code):
         raise ValueError("`answer` is a typed-in number; compute it from the DataFrames (filter rows, then "
                          "len()/sum()) so the result is traceable to rows")
-    env = {"pd": pd, "math": math, "re": re, "statistics": statistics, "__builtins__": SAFE_BUILTINS}
-    env.update({k: v.copy() for k, v in tables.items()})
-    exec(compile(code, "<tableqa>", "exec"), env)  # noqa: S102 - restricted namespace, local data only
+    # T2 (audit 19:51 risk #3): the generated code is untrusted; stoa.sandbox checks its AST, gives it module
+    # proxies (no pd.read_csv / pd.io / statistics.sys), refuses file / network / process access while it runs,
+    # and stops it after STOA_SANDBOX_SECONDS. Only the given DataFrames (copies) are in its namespace.
+    from stoa import sandbox
+
+    env = sandbox.run(code, tables, SAFE_BUILTINS)
     if "answer" not in env:
         raise ValueError("code did not set `answer`")
     ans = env["answer"]

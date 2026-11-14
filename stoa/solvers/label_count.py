@@ -113,6 +113,22 @@ def _matches(label: str, stems: list[str]) -> str | None:
     return None
 
 
+_IMPERATIVE_COUNT = re.compile(r"^\s*(?:please\s+)?(?:(?:can|could) you\s+)?(?:count|give (?:me )?the (?:total )?number of|"
+                               r"what(?:'s| is) the (?:total )?number of|state the number of|tell me the number of|"
+                               # H 19:24: 'Number of X?' / 'Total number of X?' / 'Tell me how many X there are.'
+                               r"(?:the\s+)?(?:total\s+)?number of|tell me how many)\s+(?:all\s+)?(?:of\s+)?(?:the\s+)?"
+                               r"(?P<x>[^.?!]+?)(?:\s+there\s+are)?\s*[.?!]?\s*$", re.I)
+
+
+def as_how_many(question: str) -> str:
+    """H 18:54 (Stoa M-101A PNG): 'Count the filter separators.' -> 'How many filter separators?' (the readers parse the
+    noun after 'how many'; 'How many filter separators are shown?' was 7 = gold, the imperative went to the agent: 1)."""
+    if re.search(r"\bnumber of the [a-z]*[^s\W](?!\w)(?!\s+[a-z]+s\b)", question or "", re.I):
+        return question  # 'What is the number of the room with the stair?' asks for a room NUMBER, not a count
+    m = _IMPERATIVE_COUNT.match(question or "")
+    return f"How many {m.group('x')}?" if m else question
+
+
 @functools.lru_cache(maxsize=16)
 def text_lines(pdf_abs: str, mtime: float = 0.0) -> tuple:
     """((text, bbox pdf_pt), ...) of every text line on page 0 (words of one line joined by a space)."""
@@ -305,7 +321,22 @@ def _image_lines(img_abs: str):
             lines = ()
         if len(lines) >= 3:
             k = src[1]
-            return tuple((t, tuple(round(c * k, 1) for c in bb)) for t, bb in lines)
+            try:  # G1 c6: the render shows the page AS DISPLAYED (/Rotate applied; 5 of Stoa's 9 PDFs are rotated
+                # 90°), text_lines are in unrotated page space: rotate first, or every box lands off its text
+                import pymupdf
+
+                with pymupdf.open(src[0]) as doc:
+                    m = doc[0].rotation_matrix
+            except Exception:  # noqa: BLE001
+                m = None
+            out = []
+            for t, bb in lines:
+                if m is not None:
+                    r = pymupdf.Rect(bb) * m
+                    r.normalize()
+                    bb = (r.x0, r.y0, r.x1, r.y1)
+                out.append((t, tuple(round(c * k, 1) for c in bb)))
+            return tuple(out)
     from stoa.solvers.raster import textlayer as T
 
     cached = False
@@ -428,6 +459,7 @@ class LabelCount(BaseSolver):
 
         from stoa.data import abspath
 
+        question = as_how_many(question)
         stems = asked_types(question)
         doors = bool(_DOORS_Q.search(question))
         stairs = bool(_STEPS_Q.search(question))
@@ -707,6 +739,7 @@ class StatedCount(BaseSolver):
     def solve(self, path: str, question: str) -> Answer:
         from stoa.data import abspath
 
+        question = as_how_many(question)
         stems = asked_types(question)
         if (not stems and not _TYPE_Q.search(question)) or _STEPS_Q.search(question):
             return self.abstain("not a 'how many <room kind>' question")

@@ -19,12 +19,15 @@ from __future__ import annotations
 import importlib
 import pkgutil
 import sys
+import threading
 import traceback
 from typing import Callable
 
 _REGISTRY: dict[str, type] = {}
 _IMPORT_ERRORS: dict[str, str] = {}
 _DISCOVERED = False
+_LOCK = threading.Lock()
+_LOCAL = threading.local()  # .busy: this thread is inside discover() (a solver calling get_solver at import time)
 
 
 def register(name: str) -> Callable[[type], type]:
@@ -38,18 +41,32 @@ def register(name: str) -> Callable[[type], type]:
     return deco
 
 
+def _modules():
+    return pkgutil.iter_modules(__path__, prefix=__name__ + ".")
+
+
 def discover() -> None:
+    """Import every solver module once. Thread-safe: a request that arrives while the first discovery is still
+    importing waits for it instead of seeing a partial registry (RL 18:21: KeyError 'unknown solver upload' on the
+    first /ask after a restart). A re-entrant call from the discovering thread itself stays a no-op."""
     global _DISCOVERED
-    if _DISCOVERED:
+    if _DISCOVERED or getattr(_LOCAL, "busy", False):
         return
-    _DISCOVERED = True
-    for mod in pkgutil.iter_modules(__path__, prefix=__name__ + "."):
-        if mod.name.rsplit(".", 1)[-1].startswith("_"):
-            continue
+    with _LOCK:
+        if _DISCOVERED:
+            return
+        _LOCAL.busy = True
         try:
-            importlib.import_module(mod.name)
-        except Exception:  # noqa: BLE001 - report and continue
-            _IMPORT_ERRORS[mod.name] = traceback.format_exc(limit=3)
+            for mod in _modules():
+                if mod.name.rsplit(".", 1)[-1].startswith("_"):
+                    continue
+                try:
+                    importlib.import_module(mod.name)
+                except Exception:  # noqa: BLE001 - report and continue
+                    _IMPORT_ERRORS[mod.name] = traceback.format_exc(limit=3)
+        finally:
+            _LOCAL.busy = False
+        _DISCOVERED = True
 
 
 def available() -> list[str]:

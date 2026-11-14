@@ -55,7 +55,9 @@ export function fmtValue(a: Answer) {
   if (typeof a.value === "boolean") return a.value ? "yes" : "no"; // Python bool (int subclass) arrives as true/false
   if (typeof a.value === "number") {
     // thousands separators only from 10,000 up (years and model ids like 2011 stay as they are)
-    const v = Math.abs(a.value) >= 10000 ? a.value.toLocaleString("en", { maximumFractionDigits: 2 })
+    // (W5 c20: area / length / volume values from 1,000 up: a printed '6,285 SF' showed as '6285')
+    const measure = /^(m2|m²|m3|m³|ft2|ft²|sf|sq ?ft|sqm|ft|m|mm|cm|lf|in|yd|ac)$/i.test(String(a.unit ?? "").trim());
+    const v = Math.abs(a.value) >= (measure ? 1000 : 10000) ? a.value.toLocaleString("en", { maximumFractionDigits: 2 })
       : Number.isInteger(a.value) ? String(a.value) : a.value.toLocaleString("en", { maximumFractionDigits: 2 });
     return v;
   }
@@ -113,23 +115,45 @@ export function crossChecks(a: Answer, asks: string[] = []): { text: string; ok:
   // solvers the general agent only relayed ("→ ask(…): 258.23 m2 (…, by pipeline/raster)"): 'agent = raster' is the
   // same reading twice, not a second source
   const relayed = new Set([...(a.trace ?? []).join("\n").matchAll(/→ ask\([^)]*\)[^\n]*?\bby pipeline\/(\w+)/g)].map((x) => x[1]));
+  const value = typeof a.value === "number" ? a.value : Number.NaN;
   const parse = (lines: string[]) => lines.flatMap((l) => {
-    const m = l.match(/cross-?check:?\s*(.*)$/i);
-    const relay = m?.[1].match(/^agent\b[^=]*=\s*(\w+)/i);
+    // 'hybrid routing (area cross-check of our raster reading @0.05): Gemini 3.1 Pro cross-check: its estimate 40.0 m2;
+    // our measurement is kept' — the check's RESULT follows the last 'cross-check:' (QA 20:32: the text from the first
+    // one read as '2 independent methods agree' for 48.68 vs Gemini's 40.0)
+    const colon = [...l.matchAll(/cross-?check:\s*/gi)].at(-1);
+    // who checked, when the line names it just before ('… : Gemini 3.1 Pro cross-check: its estimate …')
+    const who = colon && colon.index! > 0 ? l.slice(0, colon.index).match(/(?:^|[:)]\s+)([A-Z][\w .-]{1,40}?)\s*$/)?.[1] : undefined;
+    const body = colon ? (who && !/^(the )?area|^answer$/i.test(who) ? `${who}: ` : "") + l.slice(colon.index! + colon[0].length) : l.match(/cross-?check:?\s*(.*)$/i)?.[1];
+    const relay = body?.match(/^agent\b[^=]*=\s*(\w+)/i);
     if (relay && relayed.has(relay[1])) return [];
     // a calibration note that only capped the confidence ('… vs a non-numeric answer -> conf <= 0.3'): trace only
-    if (m && /non-numeric|->\s*conf(idence)?\s*(<=|≤)/i.test(m[1])) return [];
+    if (body !== undefined && /non-numeric|->\s*conf(idence)?\s*(<=|≤)/i.test(body)) return [];
     // a comparison with the training prior is a sanity note, not a second source: keep it in the trace only
     // (a route line "… ifc as asked as a cross-check" names a check without its result: not one)
-    if (!m || !m[1].replace(/[✓✗\s.]/g, "") || /^vs\.? prior\b/i.test(m[1].trim())) return [];
+    if (body === undefined || !body.replace(/[✓✗\s.]/g, "") || /^vs\.? prior\b/i.test(body.trim())) return [];
     const part = l.match(/^([^:;]+):\s/)?.[1];
     const k = asks.length ? evStep(l, asks) : -1;
-    const text = (k >= 0 ? `step ${k + 1}: ` : part && parts.has(part) ? `${part}: ` : "") + m[1].trim();
+    const text = (k >= 0 ? `step ${k + 1}: ` : part && parts.has(part) ? `${part}: ` : "") + body.trim();
     // numbers as the value shows them: "20700.0" → "20,700" (integers lose ".0"; separators from 10,000 up)
     const pretty = text.replace(/\s*[✓✗]\s*/g, " ").trim().replace(/(?<![\w.])(\d+)\.0(?![\d.])/g, "$1")
       .replace(/(?<![\w.,])\d{5,}(?![\d.,]|\w)/g, (n) => Number(n).toLocaleString("en"));
     // a check that capped the confidence ('… vs a non-numeric answer -> conf <= 0.3') is not an agreement
-    const ok = !/✗|≠|!=|disagree|differs?\b|mismatch|conflict|non-numeric|conf(idence)?\s*(<=|≤|capped|lowered)|->\s*conf/i.test(text);
+    let ok = !/✗|≠|!=|disagree|differs?\b|mismatch|conflict|non-numeric|conf(idence)?\s*(<=|≤|capped|lowered)|->\s*conf/i.test(text);
+    // a second model's own estimate that is not the answer ('its estimate 40.0 m2; our measurement is kept' for 48.68):
+    // two numbers more than 10 % apart are not an agreement, whatever the wording
+    const est = text.match(/\b(?:its (?:own )?(?:estimate|reading|value)|it (?:reads|estimates|gives|says))\s*(?:is\s*)?[~≈]?\s*(\d[\d,]*(?:\.\d+)?)\s*(m2|m²|sq ?m|ft2|ft²|sf|sq ?ft|mm|cm|m|ft)?\b/i);
+    const fam = (u: string) => (/^(m2|m²|sq ?m)$/i.test(u) ? "m2" : /^(ft2|ft²|sf|sq ?ft)$/i.test(u) ? "ft2" : u.toLowerCase());
+    const sameUnit = !est?.[2] || !a.unit || fam(est[2]) === fam(a.unit);
+    // (10 %: the hybrid's own 'agrees within 10 %'). A rough estimate 10-25 % off for the SAME room ('points inside our
+    // outline', 'our measurement is kept') neither confirms nor contradicts a measurement: no pill (EFA LRC 92.64 vs
+    // Gemini 103.68); further off, or pointing at another place, is a disagreement (DfE scan kitchen 48.68 vs 40 → none)
+    const off = est && sameUnit && Number.isFinite(value) && value > 0 ? Math.abs(Number(est[1].replace(/,/g, "")) / value - 1) : 0;
+    if (ok && off > 0.1) {
+      if (off <= 0.25 && !/points? OUTSIDE|another (room|place)/i.test(body)) return [];
+      ok = false;
+    }
+    // the second model gave no number ('its estimate - SF; our measurement is kept'): nothing was checked
+    if (/\bits (?:own )?estimate\s*[-–—]\s*(?:[a-z²0-9]+)?\s*(?:;|$)/i.test(body)) return [];
     return [{ text: askedCheck(pretty, ok), ok }];
   });
   // Evidence notes carry the specific check; the trace usually repeats it, so use the trace only as fallback.
@@ -393,13 +417,45 @@ function richText(v: string) {
 
 /** Trace lines: "[solver] text" → tag + text; long traces show the first steps and fold the rest. */
 const CALC = /\d(?:\s+[a-z]+)?\s*[x×*/÷+−-]\s*\d[^=]*=\s*-?\d/;
+/** The model (or none) behind one step, as a small credit badge (captain 18:28: the tech-challenge models visible without
+ *  clutter). A step that only tried a model and failed ('Gemini … failed', '… unavailable') gets none. */
+export function modelBadge(line: string): { label: string; cls: string } | null {
+  let t = line.toLowerCase();
+  // 'data: private mode: no hosted model was called (Gemini, NVIDIA off)' names models that did NOT run
+  if (/^\s*data(_used)?:/.test(t)) return null;
+  // a step that only tried a model, or a reader that gave no answer, earns no credit
+  if (/\b(failed|unavailable|needs \$|not called|skipped|no key|timed out|rate.?limit|abstained|declined|no answer|refused)\b/.test(t)) return null;
+  t = t.replace(/\bno (ocr|model|llm|ai)\b/g, "");
+  if (/nemotron|nvidia/.test(t)) return { label: /second|opinion|cross|agree/.test(t) ? "NVIDIA Nemotron 3.5 Super VL — second opinion" : "NVIDIA Nemotron 3.5 Super VL", cls: "nv" };
+  if (/gemini/.test(t)) return { label: /flash/.test(t) ? "Gemini 3 Flash" : "Gemini 3.1 Pro", cls: "gm" };
+  if (/\b(vlm_lora|vlm_direct|qwen\w*|local2|lora|cubicasa\w*|cc5k|raster_cc5k|room_graph|detector|pp-?ocr|ocr)\b/.test(t)) return { label: "local model", cls: "lm" };
+  if (/\b(ifc|3d model)\b/.test(t) && !/\bsvg_ifc\b/.test(t)) return { label: "read from the 3D model", cls: "rd" };
+  if (/\b(text layer|pdf_text|textqa|label_count|area_table|area_tags|plan_rooms|line_rooms|lineplan|wall lines|slab_area|printed|dxf|schedule|pdf_vector|traced|title block|scale bar)\b/.test(t)) return { label: "read from the drawing", cls: "rd" };
+  return null;
+}
+const badgeHtml = (b: { label: string; cls: string } | null) => (b ? ` <span class="mdl mdl-${b.cls}">${esc(b.label)}</span>` : "");
+/** Every model that contributed to this answer, once each, for the 'Models used' row. */
+export function modelsUsed(a: Answer): { label: string; cls: string }[] {
+  const lines = [String(a.solver ?? ""), ...(a.trace ?? []).map(String), ...(a.assumptions ?? []).map(String)];
+  const out = new Map<string, { label: string; cls: string }>();
+  for (const l of lines) {
+    const b = modelBadge(l);
+    if (b) out.set(b.label.replace(/ — second opinion$/, ""), b);
+  }
+  const order = ["gm", "nv", "lm", "rd"];
+  return [...out.values()].sort((x, y) => order.indexOf(x.cls) - order.indexOf(y.cls));
+}
+
 function traceHtml(trace: string[], keep = 6) {
+  const seen = new Set<string>(); // each model's badge once, on the first step it made (no clutter)
+  const once = (b: { label: string; cls: string } | null) => (b && !seen.has(b.label) ? (seen.add(b.label), b) : null);
   const li = (raw: string, n: number) => {
     const full = tidyCut(raw);
     const t = full.length > 260 ? `${full.slice(0, 240).replace(/\s*\n\s*/g, " ")} …` : full;
     const m = t.match(/^\[([\w:/-]+)\]\s*(.*)$/);
     const cc = /cross-?check/i.test(t) ? " class=\"cc\"" : CALC.test(t) ? " class=\"calc\"" : "";
-    return m ? `<li value="${n}"${cc}><span class="tag">${esc(m[1])}</span>${esc(m[2])}</li>` : `<li value="${n}"${cc}>${esc(t)}</li>`;
+    const bd = badgeHtml(once(modelBadge(full)));
+    return m ? `<li value="${n}"${cc}><span class="tag">${esc(m[1])}</span>${esc(m[2])}${bd}</li>` : `<li value="${n}"${cc}>${esc(t)}${bd}</li>`;
   };
   // the first steps, plus any arithmetic line further down (the jury should see "46 count x 450 = 20700" unfolded)
   const shown = trace.map((t, i) => i).filter((i) => i < keep || (CALC.test(trace[i]) && !/cross-?check/i.test(trace[i])));
@@ -459,12 +515,14 @@ const TOOL_TIP: Record<string, string> = {
 
 /** The agent's chain: one row per tool call, the ask sub-questions clickable, arithmetic shown as code. */
 function reasoningHtml(run: AgentRun, a: Answer) {
+  const seen = new Set<string>();
+  const once = (b: { label: string; cls: string } | null) => (b && !seen.has(b.label) ? (seen.add(b.label), b) : null);
   const fmtRes = (s: string) => esc(s.replace(/\bm2\b/g, "m²").replace(/\bm3\b/g, "m³").replace(/\s+count\b/, ""))
     .replace(/^(-?\d+\.\d{3,})/, (m) => String(Math.round(Number(m) * 100) / 100));
   const evCount = (input: string) => (a.evidence ?? []).filter((e) => evStep(e.note ?? "", [input]) === 0).length;
   const li = (s: AgentStep, i: number) => {
     const n = `<span class="sn">${i + 1}</span>`;
-    const tool = `<span class="tool t-${s.tool}" title="${esc(TOOL_TIP[s.tool] ?? s.tool)}">${esc(TOOL_LBL[s.tool] ?? s.tool)}</span>`;
+    const tool = `<span class="tool t-${s.tool}" title="${esc(TOOL_TIP[s.tool] ?? s.tool)}">${esc(TOOL_LBL[s.tool] ?? s.tool)}</span>${badgeHtml(once(modelBadge(`${s.by ?? ""} ${s.tool === "ask" || s.tool === "answer" ? "" : s.result.slice(0, 200)}`)))}`;
     const th = (s.thought ? `<div class="th">${esc(s.thought)}</div>` : "") + (s.warn ? `<div class="warn">⚠ ${esc(s.warn)}</div>` : "");
     if (s.tool === "ask") {
       const k = evCount(s.input);
@@ -725,6 +783,7 @@ export function renderCard(el: HTMLElement, a: Answer, opts: CardOpts) {
     ${opts.onLocate && loc ? `<div class="locate-slot"><button class="locate-btn" title="${esc(loc.title)}">${esc(loc.button)}</button></div>` : ""}
     ${opts.onSecondOpinion && /\.(png|jpe?g|pdf)$/i.test(opts.currentFile) && (tier !== "deterministic" || (a.confidence ?? 0) < 0.8)
       ? `<div class="second-slot"><button class="second-btn" title="Ask NVIDIA Nemotron 3.5 Super VL (hosted vision + reasoning model) the same question: one API call, only when you click">Second opinion · NVIDIA Nemotron</button></div>` : ""}
+    ${modelsUsed(a).length ? `<div class="models-used"><span class="mu-lbl">Models used</span>${modelsUsed(a).map((b) => `<span class="mdl mdl-${b.cls}">${esc(b.label)}</span>`).join("")}</div>` : ""}
     <div class="cost">
       <span title="${a.cached ? `Wall time when this question was first answered; this time it came from the API cache in ${Math.round(opts.roundTripMs)} ms` : "Wall time"}">⏱ ${wall < 1 ? `${Math.round(wall * 1000)} ms` : `${wall.toFixed(1)} s`}${a.cached && wall >= 1 ? " first time" : ""}</span>
       <span title="LLM tokens in / out">${tokens ? `${(c.llm_tokens_in ?? 0).toLocaleString()} / ${(c.llm_tokens_out ?? 0).toLocaleString()} tok` : "0 tokens"}</span>

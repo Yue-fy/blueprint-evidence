@@ -322,15 +322,220 @@ def text_layer(path: str, backend: str = "local", tile: int = 1100, upscale_to: 
         from stoa import ocr
 
         okey = f"{path}{file_tag(path)}|ocr"
+        gkey = f"{okey}|gated"  # the VLM layer that replaced a garbled OCR reading (kept apart: mark_ocr_exact)
+        if gkey in _mem and _cache_on():
+            return _mem[gkey]
         if okey in _mem and _cache_on():
             return _mem[okey]
         if engine == "ocr" or (ocr_suits(path) and (ocr.cached(path) or ocr.available())):
+            if engine == "auto":
+                v = _sticky_vlm(path, backend, tile, upscale_to, max_tokens, workers)
+                if v is not None:
+                    _mem[gkey] = v
+                    return v
             try:
                 tl = ocr.text_layer(path)
-                _mem[okey] = tl
-                return tl
             except Exception as e:  # noqa: BLE001 - keep answering with the VLM layer
                 print(f"[textlayer] OCR failed on {path}: {e}; using the VLM layer", file=sys.stderr)
+                if engine == "auto" and STICKY and _cache_on() and ("budget" in str(e) or "skipped" in str(e)):
+                    # X1 21:02: the first question of a cold upload got the VLM layer (OCR over budget), later ones the
+                    # OCR that landed meanwhile -> 41 of 91 values changed between a cold and a warm run of the same
+                    # files. The layer that answered first stays this file's layer (memory + a '.layer' note on disk).
+                    v = _vlm_layer(path, backend, tile, upscale_to, max_tokens, workers)
+                    _set_sticky(path, f"OCR {str(e)[:80]}")
+                    _mem[gkey] = v
+                    return v
+            else:
+                if engine == "auto":
+                    v = _ocr_gate(path, tl, backend, tile, upscale_to, max_tokens, workers)
+                    if v is not None:
+                        _mem[gkey] = v
+                        if tl.items and set(map(id, tl.items)) <= set(map(id, v.items)):
+                            _mem[okey] = tl  # a union layer: the OCR's own boxes for mark_ocr_exact (not the VLM's)
+                        return v
+                _mem[okey] = tl
+                return tl
+    return _vlm_layer(path, backend, tile, upscale_to, max_tokens, workers)
+
+
+STICKY = os.environ.get("STOA_O1_STICKY", "1") != "0"
+
+
+def _sticky_file(path: str) -> Path | None:
+    try:
+        from stoa import ocr
+
+        return ocr._key(path).with_suffix(".layer")
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _set_sticky(path: str, why: str) -> None:
+    f = _sticky_file(path)
+    if f is None:
+        return
+    try:
+        f.parent.mkdir(parents=True, exist_ok=True)
+        f.write_text(json.dumps({"layer": "vlm", "why": why, "time": time.strftime("%Y-%m-%d %H:%M:%S")}))
+    except OSError:
+        pass
+
+
+def _sticky_vlm(path: str, backend: str, tile: int, upscale_to: int, max_tokens: int,
+                workers: int) -> "TextLayer | None":
+    """The VLM layer when this file's first reading fell back to it (OCR over budget) and it is cached: later questions
+    keep it instead of switching to the OCR that landed afterwards (same answers cold and warm). STOA_O1_STICKY=0 or
+    STOA_TEXT_CACHE=0 = off."""
+    if not STICKY or not _cache_on():
+        return None
+    f = _sticky_file(path)
+    if f is None or not f.exists() or not _vlm_cached(path, backend, tile):
+        return None
+    try:
+        why = json.loads(f.read_text()).get("why", "")
+    except (OSError, ValueError):
+        why = ""
+    from dataclasses import replace
+
+    v = _vlm_layer(path, backend, tile, upscale_to, max_tokens, workers)
+    return replace(v, notes=[*v.notes, "text layer = the VLM reading this file's first question used "
+                                       f"({why or 'OCR not ready'}); kept so later answers on the file stay the same"])
+
+
+def _ocr_gate(path: str, tl: TextLayer, backend: str, tile: int, upscale_to: int, max_tokens: int,
+              workers: int) -> "TextLayer | None":
+    """O1 c8: PP-OCR on a heavily degraded scan returns word-like garbage ('Faress Roons' = Fitness Room; X1: DfE
+    200-dpi scan 1/9 questions with OCR vs 7/9 with the VLM layer). When stoa.ocr.quality calls the reading garbled,
+    read the VLM layer too and return it if its dictionary-word share beats the OCR's by quality.MARGIN and it read at
+    least half as many words; else None (keep the OCR). The OCR layer gets a note either way."""
+    from stoa import ocr
+    from stoa.ocr import quality
+
+    try:
+        vd = ocr.verdict(path)
+    except Exception:  # noqa: BLE001 - no verdict: keep the OCR
+        vd = None
+    garbled = vd is not None and vd.garbled
+    if not garbled:
+        # P1 20:05: the first question's OCR ran over its budget -> the VLM layer was read and answered; the OCR landed
+        # later and REPLACED it (EFA scan: 71 OCR lines vs 141 VLM lines with the room names; right page 12/12 -> right
+        # answer 2/12). A VLM layer that is already read (no new cost) stays when it is clearly richer.
+        if os.environ.get("STOA_O1_RICHER", "1") == "0" or not _vlm_cached(path, backend, tile):
+            return None
+        try:
+            v = _vlm_layer(path, backend, tile, upscale_to, max_tokens, workers)
+        except Exception:  # noqa: BLE001
+            return None
+        rv, ro = _richness(v), _richness(tl)
+        if rv >= RICHER * ro and rv - ro >= 10:
+            from dataclasses import replace
+
+            return replace(v, notes=[*v.notes, f"text layer = the VLM reading already read for this file: {rv} words vs "
+                                               f"{ro} in the later PP-OCR reading (the richer layer is kept)"])
+        if UNION:
+            u, n = union_layer(tl, v)
+            if n:
+                return u
+        return None
+    try:
+        v = _vlm_layer(path, backend, tile, upscale_to, max_tokens, workers)
+    except Exception as e:  # noqa: BLE001
+        tl.notes.append(f"{vd.describe()} (garbled?); the VLM re-read failed ({type(e).__name__}): OCR kept")
+        return None
+    vs = quality.dict_share(i.text for i in v.items)
+    if vs is not None and vs[0] >= vd.share + quality.MARGIN and vs[1] >= 0.5 * vd.tokens:
+        from dataclasses import replace
+
+        return replace(v, notes=[*v.notes, f"text layer = the VLM reading, not PP-OCR: {vd.describe()} (a garbled "
+                                           f"scan); the VLM reading's share {vs[0]:.2f} of {vs[1]} tokens"])
+    tl.notes.append(f"{vd.describe()}; the VLM reading was not better "
+                    f"({vs[0]:.2f} of {vs[1]} tokens): OCR kept" if vs else f"{vd.describe()}: OCR kept")
+    return None
+
+
+RICHER = 1.5  # a cached VLM layer replaces a (not garbled) OCR reading only with >= 1.5x its words (and >= 10 more)
+# O1 c9: otherwise the cached VLM layer's texts in places where PP-OCR read NOTHING are added to the OCR layer. The answer
+# on a scan / photo no longer depends on which layer happened to be read first (X1 sl-133 EFA phone photo 'How long is
+# the building overall?': VLM layer 97.63 ✓, OCR layer 20.76 ✗ - the OCR missed '97.630' / '69.600'). STOA_O1_UNION=0 = off.
+UNION = os.environ.get("STOA_O1_UNION", "1") != "0"
+UNION_SAME = 0.8  # a VLM text this close (match_score) to an OCR text a few line heights away is the same print, shifted
+
+
+def union_layer(ocr_tl: TextLayer, vlm_tl: TextLayer) -> tuple[TextLayer, int]:
+    """The OCR layer plus the VLM items that sit where the OCR read nothing: a VLM item is dropped when its centre lies
+    in an OCR box (padded by half a line height), it overlaps one (>= 30 % of the smaller box), or an OCR text within 3
+    line heights reads the same (VLM boxes are text-spotting guesses, often shifted). Only items with a digit or >= 3
+    letters are added. OCR boxes stay exactly as read (mark_ocr_exact); the added boxes are never marked exact."""
+    from dataclasses import replace
+
+    sx = ocr_tl.size[0] / max(1, vlm_tl.size[0])
+    sy = ocr_tl.size[1] / max(1, vlm_tl.size[1])
+    obs = [(o.box, max(1.0, o.box[3] - o.box[1]), norm(o.text)) for o in ocr_tl.items]
+    add = []
+    for v in vlm_tl.items:
+        nv = norm(v.text)
+        if not (re.search(r"\d", nv) or len(re.sub(r"[\W\d_]", "", nv)) >= 3):
+            continue
+        b = [v.box[0] * sx, v.box[1] * sy, v.box[2] * sx, v.box[3] * sy]
+        h = max(1.0, b[3] - b[1])
+        cx, cy = (b[0] + b[2]) / 2, (b[1] + b[3]) / 2
+        dup = False
+        for ob, oh, no in obs:
+            pad = 0.5 * max(h, oh)
+            if ob[0] - pad <= cx <= ob[2] + pad and ob[1] - pad <= cy <= ob[3] + pad:
+                dup = True
+                break
+            if _overlap_small(b, ob) >= 0.3:
+                dup = True
+                break
+            r = 3 * max(h, oh)
+            if ob[0] - r <= cx <= ob[2] + r and ob[1] - r <= cy <= ob[3] + r and (
+                    nv == no or match_score(nv, no) >= UNION_SAME or match_score(no, nv) >= UNION_SAME):
+                dup = True
+                break
+        if not dup:
+            add.append(TextItem(v.text, [round(c, 1) for c in b], v.tile))
+    if not add:
+        return ocr_tl, 0
+    items = sorted([*ocr_tl.items, *add], key=lambda i: (round(i.cy / 25), i.cx))
+    return replace(ocr_tl, items=items, notes=[*ocr_tl.notes, f"text layer = the PP-OCR reading + {len(add)} text(s) of "
+                                                               f"the VLM reading already read for this file where the OCR "
+                                                               f"read nothing (e.g. {add[0].text[:30]!r})"]), len(add)
+
+
+def _vlm_cached(path: str, backend: str = "local", tile: int = 1100) -> bool:
+    return f"{path}{file_tag(path)}|{backend}|{tile}|{_api_mode()}" in _mem or (
+        _cache_on() and _disk_key(path, tile, backend).exists())
+
+
+def _richness(tl: TextLayer) -> int:
+    """Dictionary words (>= 4 letters) in a layer, or its line count without a word list."""
+    from stoa.ocr import quality
+
+    r = quality.dict_share(i.text for i in tl.items)
+    return round(r[0] * r[1]) if r is not None else len(tl.items)
+
+
+def gate_pending(path: str) -> bool:
+    """True when text_layer(path) would still have to READ a VLM layer cold because the cached OCR reading is
+    garbled (sheet.cached_layer must not trigger that)."""
+    from stoa import ocr
+
+    if os.environ.get("STOA_TEXT_ENGINE", "auto").lower() != "auto":
+        return False
+    if f"{path}{file_tag(path)}|ocr|gated" in _mem:
+        return False
+    try:
+        vd = ocr.verdict(path) if ocr.cached(path) else None
+    except Exception:  # noqa: BLE001
+        return False
+    if vd is None or not vd.garbled:
+        return False
+    key = f"{path}{file_tag(path)}|local|1100|{_api_mode()}"
+    return key not in _mem and not _disk_key(path, 1100, "local").exists()
+
+
+def _vlm_layer(path: str, backend: str, tile: int, upscale_to: int, max_tokens: int, workers: int) -> TextLayer:
     key = f"{path}{file_tag(path)}|{backend}|{tile}|{_api_mode()}"  # (a server may overwrite one upload path with a new plan)
     with _glock:
         lk = _locks.setdefault(key, threading.Lock())
@@ -353,8 +558,83 @@ def text_layer(path: str, backend: str = "local", tile: int = 1100, upscale_to: 
                 f.write_text(json.dumps(asdict(tl)))
             except OSError:
                 pass
+        tl = _joined(tl)
         _mem[key] = tl
         return tl
+
+
+def _cut_overlap(a: str, b: str, max_k: int) -> int | None:
+    """Characters of `a`'s end that `b` repeats at its start (a tile cut reads the overlap twice; the cut letter at
+    `a`'s end may be misread: 'ENTRY VESTIE' + 'VESTIBULE - FLOOR PLAN') -> number of chars of `a` to drop. (VP's
+    stoa.sheet.views._cut_overlap, night-VP d6cd485.)"""
+    A, B = a.upper(), b.upper()
+    for drop_last in (0, 1):
+        a2 = A[:len(A) - drop_last] if drop_last else A
+        for k in range(min(len(a2), len(B), max_k), 2, -1):
+            sa, sb = a2[-k:], B[:k]
+            bad = sum(x != y for x, y in zip(sa, sb))
+            if bad <= (k - 1) // 4 and sa.strip() and sa[0] == sb[0]:
+                return k + drop_last
+    return None
+
+
+def join_tile_cuts(items: list[TextItem]) -> tuple[list[TextItem], int]:
+    """VP 19:33 (owner O1): a printed line that crosses a VLM tile border comes back as two items that OVERLAP on one
+    baseline and repeat a few characters ('MODULE 01- ENTRY VESTIE' + 'VESTIBULE - FLOOR PLAN'); join them, dropping
+    the repeated text. VP: 0 false joins on 173 cached image layers. -> (items, number of joins)."""
+    def h(i):
+        return i.box[3] - i.box[1]
+
+    def cy(i):
+        return (i.box[1] + i.box[3]) / 2
+
+    its = sorted(items, key=lambda i: (i.box[0], cy(i)))
+    used = [False] * len(its)
+    out, joins = [], 0
+    for i, a in enumerate(its):
+        if used[i]:
+            continue
+        cur = a
+        while True:
+            best = None
+            for j, b in enumerate(its):
+                if used[j] or j == i or b is cur:
+                    continue
+                if not (abs(cy(b) - cy(cur)) < 0.35 * min(h(cur), h(b)) and abs(h(b) - h(cur)) < 0.3 * max(h(cur), h(b))):
+                    continue
+                if not (cur.box[0] + 0.2 * (cur.box[2] - cur.box[0]) < b.box[0] < cur.box[2] < b.box[2]):
+                    continue
+                cw = (cur.box[2] - cur.box[0]) / max(1, len(cur.text))
+                k = _cut_overlap(cur.text, b.text, int(2 * (cur.box[2] - b.box[0]) / max(cw, 1e-6)) + 3)
+                if k is not None and (best is None or b.box[0] < best[1].box[0]):
+                    best = (j, b, k)
+            if best is None:
+                break
+            j, b, k = best
+            used[j] = True
+            joins += 1
+            cur = TextItem(cur.text[:len(cur.text) - k] + b.text,
+                           [cur.box[0], min(cur.box[1], b.box[1]), b.box[2], max(cur.box[3], b.box[3])], tile=cur.tile)
+        used[i] = True
+        out.append(cur)
+    return out, joins
+
+
+def _joined(tl: TextLayer) -> TextLayer:
+    """The VLM layer with tile cuts joined, ONLY with STOA_O1_TILE_JOIN=1 (default off, see below; VP's STOA_TILE_JOIN=0
+    also turns it off). Applied after reading AND after a disk load (in memory only: the disk cache keeps the raw read), so
+    cached layers get it without a re-read."""
+    if tl.tiles <= 1 or os.environ.get("STOA_O1_TILE_JOIN", "0") != "1" or os.environ.get("STOA_TILE_JOIN", "1") == "0":
+        # OFF by default (VP 20:07, measured on night-O1 72b0f0c): the joined layer REGRESSES E1's image area table on
+        # Stoa's dorm PNG 10/10 -> 4/10 (partial table rows pair up, so its complete crop-OCR fallback is skipped);
+        # no reader was measured to gain from it (raster smoke 60: 10 = 10). STOA_O1_TILE_JOIN=1 turns it on.
+        return tl
+    from dataclasses import replace
+
+    items, n = join_tile_cuts(tl.items)
+    if not n:
+        return tl
+    return replace(tl, items=items, notes=[*tl.notes, f"{n} line(s) cut at a tile border joined"])
 
 
 def _read(path: str, backend: str, tile: int, upscale_to: int, max_tokens: int, workers: int) -> TextLayer:
@@ -568,7 +848,26 @@ def scales(tl: TextLayer) -> list[dict]:
     return sorted(out, key=lambda s: (not s["labelled"], s["kind"] != "imperial"))
 
 
-_FTIN = re.compile(r"(?<![\d.])(\d{1,3})\s*(?:'|’|ft)\s*-?\s*(\d{1,2}(?:\s+\d/\d+|\.\d+)?)?\s*(?:\"|”)?")
+_FTIN = re.compile(r"(?<![\d.])(\d{1,3})\s*(?:'|’|ft)\s*-?\s*(\d{1,3}/\d{1,2}(?![\d/])|\d{1,2}(?:\s+\d{1,2}/\d{1,2}|\.\d+)?)?"
+                   r"\s*(?:\"|”)?")
+_STACK_DEN = (2, 4, 8, 16)
+
+
+def inch_value(s: str) -> float:
+    """The inch part of a feet-inch string -> inches. A stacked fraction loses its space in OCR and VLM layers
+    (D1 20:12: HABS ak0040 "13'-11/2"" = 13'-1 1/2", its chain sums to the printed 73'-9"): 'NM/D' with D in
+    2/4/8/16 and NM > D is N + M/D (11/2 -> 1 1/2, 51/2 -> 5 1/2, 39/16 -> 3 9/16, 113/16 -> 1 13/16). A reduced
+    fraction's numerator is odd and < D, and the whole inches stay < 12; anything else keeps the plain reading."""
+    s = s.strip()
+    m = re.fullmatch(r"(\d{2,3})/(\d{1,2})", s)
+    if m:
+        num, den = int(m.group(1)), int(m.group(2))
+        if den in _STACK_DEN and num > den:
+            for k in ((2, 1) if den == 16 and num >= 100 else (1,)):
+                whole, part = divmod(num, 10 ** k)
+                if part % 2 == 1 and part < den and whole < 12 and (k == 1 or part >= 10):
+                    return whole + part / den
+    return _frac(s)
 _AREA = re.compile(r"(\d+(?:[.,]\d+)?)\s*(m²|m2|m\^2|sq\.?\s*ft|ft²|sf)\b", re.I)
 
 
@@ -580,7 +879,7 @@ def dimensions(tl: TextLayer) -> list[dict]:
         if parse_scales(it.text):
             continue
         for m in _FTIN.finditer(it.text):
-            ft = int(m.group(1)) + (_frac(m.group(2)) / 12 if m.group(2) else 0)
+            ft = int(m.group(1)) + (inch_value(m.group(2)) / 12 if m.group(2) else 0)
             out.append({"feet": round(ft, 3), "text": m.group(0).strip(), "box": it.box})
     return out
 

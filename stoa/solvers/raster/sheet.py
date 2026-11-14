@@ -40,6 +40,7 @@ _PAT = {
     "detail": r"\bdetails?\b|yksityiskoh|detalj|d[ée]tail|dettaglio",
 }
 _BARE_PLAN = re.compile(r"\bplan\b", re.I)  # 'PLAN A-A' of a column, 'PLAN OF PINTLE': often a detail view
+_SEP = re.compile(r"[·•∙_]+")
 _NOT_FLOOR = re.compile(r"\b(?:key|roof|framing|foundation|site|plot|location|ceiling|reflected)\s+plan", re.I)
 
 # questions that need a floor plan: rooms and room fixtures (windows/doors/storeys can be read on elevations)
@@ -75,7 +76,7 @@ def title_kinds(layer: T.TextLayer, max_words: int = 8) -> list[dict]:
     are notes ('SEE PLAN ON SHEET 3'). Sorted: titles first, then by text height (bigger print = sheet title)."""
     out = []
     for it in layer.items:
-        t = it.text
+        t = _SEP.sub(" ", it.text)  # 'PLAN·AF·BOSTADS·VANINGEN.' (Helsinki archive sheets)
         for k, p in _PAT.items():
             m = re.search(p, t, re.I)
             if not m:
@@ -110,9 +111,13 @@ def cached_layer(path: str) -> T.TextLayer | None:
         from stoa import ocr
 
         okey = f"{path}{T.file_tag(path)}|ocr"
+        if f"{okey}|gated" in T._mem:
+            return T._mem[f"{okey}|gated"]
         if okey in T._mem:
             return T._mem[okey]
         if ocr.cached(path) and (eng == "ocr" or T.ocr_suits(path)):
+            if T.gate_pending(path):  # garbled OCR, VLM layer not read yet: the OCR reading, no cold VLM read
+                return ocr.text_layer(path)
             return T.text_layer(path)
     key = f"{path}{T.file_tag(path)}|local|1100"  # = text_layer's memory key
     if key in T._mem:
@@ -136,8 +141,17 @@ def sheet_kind(path: str, use_vlm: bool = True, layer: T.TextLayer | None = None
     if any(h["kind"] == "floor_plan" for h in titles):
         out["has_plan"] = True
         out["main"], out["title"] = "floor_plan", next(h for h in titles if h["kind"] == "floor_plan")
-    elif titles and not any(_BARE_PLAN.search(h["text"]) for h in hits):
-        out["has_plan"] = False
+    elif titles and not any(_BARE_PLAN.search(h["text"]) for h in hits) and not any(
+            len(i.text.split()) <= 8 and _BARE_PLAN.search(_SEP.sub(" ", i.text)) for i in layer.items):
+        # O1 c8: a 'plan' word on ANY short line defers to the VLM ('-PLAN' under a Helsinki archive plan view)
+        rooms = room_labels(layer)
+        if len(rooms) >= ROOM_LABELS_UNSURE:
+            # O1 c8: HABS 215 Abingdon Ave titles only its elevations but prints a plan with 'LIVING ROOM', 'KITCHEN?',
+            # 'BEDROOM?' (and their sizes): the text veto capped 3 right areas at 0.05. Room names can also label a
+            # section, so the text no longer decides: unknown -> the VLM look below
+            out["rooms_printed"] = rooms[:6]
+        else:
+            out["has_plan"] = False
     if out["has_plan"] is None and use_vlm:
         v = vlm_kinds(path)
         if v:
@@ -147,6 +161,25 @@ def sheet_kind(path: str, use_vlm: bool = True, layer: T.TextLayer | None = None
             same = [h for h in titles if h["kind"] == v["main"]]
             out["title"] = same[0] if same else out["title"]
     return out
+
+
+ROOM_LABELS_UNSURE = 3
+_ROOM_WORD = re.compile(r"^\W*(?:[^\W\d_]+\s+){0,2}(?:rooms?|bed\s?rooms?|kitchens?|bath(?:rooms?)?|living|dining|halls?|lobby|"
+                        r"corridor|office|toilets?|wc|closet|stor(?:e|age)|porch|parlou?r|classroom|laundry|pantry|garage|"
+                        r"study|foyer|vestibule|olohuone|makuuhuone|keittiö|kylpyhuone|eteinen|wohnen|zimmer|küche|kök|"
+                        r"sovrum|chambre|cuisine|salon|cocina|dormitorio)\b[\s?.!]*(?:\d{1,4}[A-Za-z]?)?\W*$", re.I)
+
+
+def room_labels(layer) -> list[str]:
+    """Distinct printed room names ('LIVING ROOM', 'KITCHEN?', 'Bedroom 2') on a text layer."""
+    if layer is None:
+        return []
+    seen = []
+    for i in layer.items:
+        t = str(i.text).strip()
+        if len(t) <= 30 and _ROOM_WORD.match(t) and t.lower() not in (x.lower() for x in seen):
+            seen.append(t)
+    return seen
 
 
 _ASK = re.compile(r"how\s+many|number\s+of|\bcount|\bareas?\b|\bsize\b|square|m2|m²|sq\.?\s*ft|largest|smallest|biggest|"
