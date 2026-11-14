@@ -1,0 +1,43 @@
+# Secrets
+.env
+.env.*
+!.env.example
+
+# Local state, caches, optional model weights (see README: "run from the repo root")
+.stoa/
+.venv*/
+junction-dataset*/
+
+# Node
+node_modules/
+dist/
+.vite/
+coverage/
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+*.egg-info/
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
+
+# No datasets, drawings or weights in git, except the small credited samples in samples/
+*.zip
+*.ifc
+*.dxf
+*.dwg
+*.safetensors
+*.pt
+*.pth
+*.pkl
+*.ckpt
+*.onnx
+*.gguf
+!samples/**/*.ifc
+!samples/**/*.dxf
+# page renders the format normaliser caches next to a writable input (stoa/formats/normalize.py)
+samples/**/*.r[0-9]*.png

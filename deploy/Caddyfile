@@ -1,0 +1,18 @@
+# Public demo front door (P1): one shared password in front of the web app (which proxies /api to the API).
+# DEMO_USER / DEMO_PASSWORD_HASH are set by deploy/start-demo.sh from DEMO_PASSWORD at start-up.
+{
+	admin off
+	auto_https off
+}
+
+:{$PORT} {
+	handle /healthz {
+		respond "ok" 200
+	}
+	handle {
+		basic_auth {
+			{$DEMO_USER} {$DEMO_PASSWORD_HASH}
+		}
+		reverse_proxy 127.0.0.1:5173
+	}
+}

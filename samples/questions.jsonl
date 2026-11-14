@@ -1,0 +1,11 @@
+{"path": "swiss/plan.pdf", "question": "How many doors (interior doors and entrance doors together) are drawn on this floor plan?", "answer": 8, "unit": "count", "type": "count"}
+{"path": "swiss/plan.pdf", "question": "How many windows are drawn on this floor plan?", "answer": 7, "unit": "count", "type": "count"}
+{"path": "swiss/plan.pdf", "question": "What is the net floor area of room 6.02 ('Bad') in m²?", "answer": 1.76, "unit": "m2", "type": "area"}
+{"path": "swiss/plan.pdf", "question": "What is the net floor area of room 6.04 ('Reduit') in m²?", "answer": 4.24, "unit": "m2", "type": "area"}
+{"path": "swiss/plan.png", "question": "How many rooms labelled 'Bad' are there on this floor?", "answer": 1, "unit": "count", "type": "count"}
+{"path": "fzk_house/fzk_house.ifc", "question": "How many doors are in the building?", "answer": 5, "unit": "count", "type": "count"}
+{"path": "fzk_house/fzk_house.ifc", "question": "How many windows are in the building?", "answer": 11, "unit": "count", "type": "count"}
+{"path": "dfe_school/plan.pdf", "question": "What is the area of the laundry?", "answer": 7.0, "unit": "m2", "type": "area"}
+{"path": "dfe_school/plan.pdf", "question": "What is the floor area of the fitness room?", "answer": 26.9, "unit": "m2", "type": "area"}
+{"path": "dfe_school/plan.pdf", "question": "How many group rooms are on level 00?", "answer": 10, "unit": "count", "type": "count"}
+{"path": "dfe_school/plan.pdf", "question": "How many plant rooms are shown?", "answer": 3, "unit": "count", "type": "count"}

@@ -1,0 +1,10 @@
+# OCR engine env (NOT $JUNCTION_VENV: these pins would replace its numpy 2.5 / opencv 5.0). O1, 14 Nov 2026.
+#   uv venv --python 3.12 .venv-ocr
+#   uv pip install --python .venv-ocr/bin/python -r stoa/ocr/requirements.txt
+# Models (PP-OCRv6_small_det / _rec, Apache-2.0) download on first use into $PADDLE_PDX_CACHE_HOME
+# (default here .stoa/paddlex).
+paddleocr==3.7.0
+paddlepaddle==3.3.1
+paddlex==3.7.2
+numpy==2.3.5
+opencv-contrib-python==4.10.0.84

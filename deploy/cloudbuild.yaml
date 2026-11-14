@@ -1,0 +1,13 @@
+# Cloud Build: build deploy/Dockerfile (target demo or api) from the repo root and push it (P1).
+#   gcloud builds submit --config deploy/cloudbuild.yaml \
+#     --substitutions _IMAGE=<region>-docker.pkg.dev/<project>/stoa/demo:<tag>,_TARGET=demo .
+substitutions:
+  _TARGET: demo
+steps:
+  - name: gcr.io/cloud-builders/docker
+    env: ["DOCKER_BUILDKIT=1"]
+    args: ["build", "-f", "deploy/Dockerfile", "--target", "${_TARGET}", "-t", "${_IMAGE}", "."]
+images: ["${_IMAGE}"]
+options:
+  machineType: E2_HIGHCPU_8
+timeout: 1800s

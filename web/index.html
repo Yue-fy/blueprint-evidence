@@ -1,0 +1,130 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Blueprint Evidence</title>
+    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%231d1d1f'/%3E%3Cpath d='M8 23V9h9a5 5 0 0 1 0 10h-5' stroke='%230071e3' stroke-width='3' fill='none'/%3E%3C/svg%3E" />
+  </head>
+  <body data-view="customer">
+    <header id="topbar" class="brand topbar">
+      <div class="logo" aria-hidden="true">B</div>
+      <div class="tb-name">
+        <h1>Blueprint Evidence</h1>
+        <p>Ask a drawing or a building model. Every answer shows where it came from.</p>
+      </div>
+      <div class="brand-right">
+        <span id="backend" class="badge" title="Which backend answered the last request">API …</span>
+        <button id="tourBtn" class="tour" title="Step through the demo questions">Guided demo</button>
+        <button id="viewToggle" class="view-toggle" type="button" title="Switch between the simple view and the expert view (files, solvers, costs, traces)">Expert view</button>
+      </div>
+    </header>
+    <div id="landing" class="landing" hidden></div>
+    <div id="app">
+      <aside id="side">
+        <section id="benchCaption" class="bench-caption" hidden>
+          <h2>How accurate is it?</h2>
+          <p>We asked thousands of questions about drawings the system never saw while we built it, and checked every
+            answer against the known right one. Same rules for a general AI model, for comparison.</p>
+          <button type="button" class="bc-back">‹ Back to the drawings</button>
+        </section>
+        <section id="projHead" class="proj-head" hidden>
+          <button id="projectsBtn" class="proj-back" type="button" title="All projects">‹ Projects</button>
+          <div class="ph-name" id="projName"></div>
+          <div class="ph-place" id="projPlace"></div>
+          <button id="diffPill" class="diff-pill" type="button" hidden></button>
+        </section>
+
+        <section class="panel" id="picker">
+          <div class="row">
+            <select id="source" aria-label="Source">
+              <option value="">All sources</option>
+              <option value="ifc_models">IFC models + plans</option>
+              <option value="swiss_dwellings">Swiss dwellings (PDF/DXF)</option>
+              <option value="opening_design">US drawing sets</option>
+              <option value="cubicasa5k">CubiCasa plans (PNG)</option>
+              <option value="ifc_bench">IFC-Bench models</option>
+              <optgroup label="Historical scans (no questions yet)">
+                <option value="habs">HABS / HAER (US, measured drawings)</option>
+                <option value="finna">Finna (Finnish archives)</option>
+                <option value="europeana">Europeana</option>
+                <option value="wikimedia">Wikimedia Commons</option>
+              </optgroup>
+            </select>
+            <input id="search" type="search" placeholder="Filter files…" aria-label="Filter files" />
+          </div>
+          <ul id="files" class="files"></ul>
+          <label class="upload-box" id="uploadBox" title="Your own floor plan, sheet, scan or IFC model: it is saved only on this machine and answered by the same pipeline, with no template and no twin. Select a sheet and its .ifc model together to link them.">
+            <input id="uploadInput" type="file" accept=".pdf,.png,.jpg,.jpeg,.heic,.heif,.ifc,.dxf,.dwg,.svg,.webp,.tif,.tiff,.bmp,.gif,image/*,application/pdf" multiple hidden />
+            <b>＋ Your own drawing</b><small id="uploadMsg">PDF, image or photo, IFC, DXF · or drop it here · a sheet + its .ifc or .dxf together link up</small>
+          </label>
+          <select id="uploadStyle" class="upload-style" aria-label="Drawing style of your upload" title="For images: by default the style is guessed from the image (no model call); a Nordic apartment plan (room codes like MH, OH, KPH) is then read by the readers trained on CubiCasa5K plans, which mark what they count (fine-tuned counter, symbol detector)">
+            <option value="auto">Style: guess from the image</option>
+            <option value="cubicasa5k">Style: Nordic apartment plan (CubiCasa-like)</option>
+            <option value="none">Style: other drawing (no guess)</option>
+          </select>
+        </section>
+
+        <section class="panel" id="ask">
+          <form id="askForm">
+            <textarea id="question" rows="3" placeholder="e.g. How many doors are shown on the floor plan?"></textarea>
+            <small class="any-lang">Ask in your own words, in any language.</small>
+            <button type="button" class="ask-more" id="askMore">Example questions</button>
+            <div id="chips" class="chips"></div>
+            <div class="row">
+              <select id="examples" aria-label="Example questions"><option value="">Example questions…</option></select>
+              <button id="askBtn" type="submit">Ask</button>
+            </div>
+          </form>
+        </section>
+
+        <section id="hero" class="hero" hidden></section>
+        <details id="how" class="how" open>
+          <summary>How we worked it out</summary>
+          <section id="card" class="card empty">
+            <p class="hint">Pick a drawing, then ask a question. The answer card shows the value, how sure we are,
+              what it cost, the reasoning, and the evidence to click through.</p>
+          </section>
+        </details>
+        <section id="diffs" class="diffs" hidden></section>
+      </aside>
+
+      <main id="main">
+        <div id="toolbar">
+          <div class="file-title"><span id="fileTitle">No file</span><small id="fileMeta"></small></div>
+          <div class="seg sheet-tabs" id="sheetTabs" role="tablist" hidden></div>
+          <div class="seg" id="modes" role="tablist">
+            <button data-mode="2d" role="tab">Drawing</button>
+            <button data-mode="3d" role="tab">3D model</button>
+            <button data-mode="split" role="tab">Side by side</button>
+          </div>
+          <select id="storey" aria-label="Storey" hidden></select>
+          <button id="roomsBtn" class="ghost" hidden title="Rooms and the doors that link them, read from the plan by the pretrained CubiCasa5K model + geometry rules (no language model)">Rooms &amp; doors</button>
+          <button id="fitBtn" class="ghost" title="Frame the evidence">Frame evidence</button>
+          <button id="benchBtn" class="ghost" title="Accuracy, generality and cost on held-out drawings">Accuracy report</button>
+        </div>
+        <div id="tourNote" class="tour-note"></div>
+        <div id="views" data-mode="2d">
+          <div id="xbanner" class="xbanner" hidden></div>
+          <section id="bench" class="bench" hidden aria-label="How well it works"></section>
+          <div id="pane2d" class="pane"><div id="v2d"></div>
+            <div id="pageCtl" class="pagectl" role="group" aria-label="Pages of this PDF" hidden></div>
+            <div class="zoomctl" role="group" aria-label="Zoom the drawing">
+              <button type="button" data-zoom="in" title="Zoom in" aria-label="Zoom in">+</button>
+              <button type="button" data-zoom="out" title="Zoom out" aria-label="Zoom out">−</button>
+              <button type="button" data-zoom="fit" title="Show the answer's places (double-click the drawing: whole sheet)" aria-label="Frame the answer">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M4 9V4h5M20 9V4h-5M4 15v5h5M20 15v5h-5"/></svg></button>
+            </div><div class="pane-label">Drawing</div><div id="elsewhere" class="elsewhere" hidden></div><div class="loading" id="load2d"></div><div id="rgLegend" class="rg-legend" hidden></div></div>
+          <div id="pane3d" class="pane"><div id="v3d"></div><div id="vp3d"></div><div class="pane-label" id="label3d">IFC model</div><div class="loading" id="load3d"></div>
+            <div id="p3dNote" class="p3d-note" hidden>3D generated from the floor plan · heights estimated</div>
+            <button id="furnBtn" class="furn-toggle" type="button" aria-pressed="true" hidden title="Furniture and fixtures stored in the drawing / model"><span class="furn-check" aria-hidden="true"></span><span id="furnText">Furniture</span></button>
+            <div id="pick" class="pick" hidden></div></div>
+        </div>
+        <div id="linked" class="linked"></div>
+        <div id="dropHint" class="drop-hint" hidden>Drop a drawing or model to ask about it</div>
+        <footer id="credit" class="credit"></footer>
+      </main>
+    </div>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>

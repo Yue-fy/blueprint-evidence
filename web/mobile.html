@@ -1,0 +1,68 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <meta name="theme-color" content="#f5f5f7" media="(prefers-color-scheme: light)" />
+  <meta name="theme-color" content="#000000" media="(prefers-color-scheme: dark)" />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%231d1d1f'/%3E%3Ctext x='16' y='22' font-family='-apple-system,Arial' font-size='18' font-weight='700' fill='%23fff' text-anchor='middle'%3ES%3C/text%3E%3C/svg%3E" />
+  <title>Stoa · Ask a plan</title>
+</head>
+<body data-view="customer" class="m" data-step="pick">
+  <header class="m-top">
+    <div class="m-logo" aria-hidden="true">S</div>
+    <div class="m-brand"><b>Ask a plan</b><small>photo → question → answer on the drawing</small></div>
+    <a class="m-desk" href="./">Full view</a>
+  </header>
+
+  <main class="m-main">
+    <section id="pick" class="m-card m-pick">
+      <h1>Take a photo of a floor plan</h1>
+      <p>Then ask how big a room is, the total floor area, or how many doors. The answer is drawn on your photo.</p>
+      <label class="m-btn primary huge"><input id="cam" type="file" accept="image/*" capture="environment" />
+        <span class="m-ico" aria-hidden="true">📷</span> Take a photo</label>
+      <label class="m-btn"><input id="pickf" type="file" accept="image/*,.pdf,application/pdf" /> Choose a photo or PDF</label>
+      <button type="button" class="m-link" id="sample">No plan at hand? Try a sample</button>
+    </section>
+
+    <section id="stage" class="m-stage">
+      <div id="photo" class="m-photo" aria-label="your drawing: pinch to zoom, double-tap to zoom in"></div>
+      <div id="progress" class="m-progress" hidden></div>
+      <div id="toolBar" class="m-toolbar" hidden>
+        <span id="toolHint"></span>
+        <button type="button" class="m-btn small" id="toolDone">Done</button>
+      </div>
+      <div id="scaleSheet" class="m-sheet" hidden>
+        <form id="scaleForm">
+          <label for="scaleM">Real length of the line you tapped</label>
+          <div class="m-row">
+            <input id="scaleM" type="text" inputmode="decimal" autocomplete="off" placeholder="e.g. 3.40" />
+            <span class="m-unit-in">m</span>
+            <button type="submit" class="m-btn primary small">Set</button>
+          </div>
+          <div class="m-row m-quick"><span>or</span><button type="button" class="m-chip" data-m="0.9">a door, 0.9 m</button><button type="button" class="m-chip" data-m="1">1 m</button><button type="button" class="m-chip" data-m="5">5 m</button></div>
+        </form>
+      </div>
+      <div class="m-stagebar">
+        <button type="button" class="m-btn small ghost" id="retake">New photo</button>
+        <span id="stageNote" class="m-note"></span>
+        <button type="button" class="m-btn small ghost" id="fit">Whole sheet</button>
+      </div>
+    </section>
+
+    <section id="askCard" class="m-card m-ask">
+      <div id="chips" class="m-chips"></div>
+      <form id="askForm" class="m-askrow">
+        <input id="q" type="text" enterkeyhint="send" autocomplete="off" placeholder="Ask about this drawing…" aria-label="your question" />
+        <button type="button" id="mic" class="m-mic" aria-label="speak your question" title="Speak your question">🎤</button>
+        <button type="submit" class="m-btn primary small" id="send">Ask</button>
+      </form>
+      <button type="button" class="m-btn ghost small" id="cancel" hidden>Cancel</button>
+    </section>
+
+    <section id="result" class="m-card m-result" hidden aria-live="polite"></section>
+  </main>
+  <script type="module" src="/src/mobile/main.ts"></script>
+</body>
+</html>

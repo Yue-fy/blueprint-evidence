@@ -1,0 +1,12 @@
+# BuildKit reads <Dockerfile>.dockerignore next to the Dockerfile (context = repo root)
+.git
+**/node_modules
+**/dist
+**/__pycache__
+**/*.pyc
+.env
+.env.*
+**/.env
+web/.vite
+.playwright-cli
+test-results
