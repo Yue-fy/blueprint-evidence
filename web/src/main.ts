@@ -10,7 +10,7 @@ import { roomKind, roomName, roomShown, Viewer2D } from "./viewer2d";
 import type { Viewer3D } from "./viewer3d"; // loaded lazily: web-ifc + three are ~4 MB
 import tourSteps from "../fixtures/tour.json";
 import tourCustomer from "../fixtures/tour-customer.json";
-import { diffQuestion, diffsHtml, heroHtml, needsMeasuring, readerGuess, SCALE_PILL, roomPhrases, calm, heroLoadingHtml, initialView, landingHtml, numbered, numberMax, connectionInfo, projectDifferences, spreadOf, approxEvidence, projectOf, PROJECTS, saveView, kindChoices, rankOf, recognitionHtml, recognitionMenuHtml, recognitionOf, type Difference, type FloorGroup, type Recognition, type View } from "./customer";
+import { agrees, diffQuestion, diffsHtml, heroHtml, isGuess, needsMeasuring, readerGuess, SCALE_PILL, roomPhrases, calm, heroLoadingHtml, initialView, landingHtml, numbered, numberMax, connectionInfo, projectDifferences, spreadOf, approxEvidence, projectOf, PROJECTS, saveView, kindChoices, rankOf, recognitionHtml, recognitionMenuHtml, recognitionOf, type Difference, type FloorGroup, type Recognition, type View } from "./customer";
 import { floorName, type Project } from "./projects";
 import { dxfToPdf, matchEvidence, planGeo, type PlanGeo } from "./plangeo";
 import { Measure, doorScaleOf, fmtM, scaleFromAnswer, scaleGuessed, scaleLabel, type Scale } from "./measure";
@@ -1630,17 +1630,24 @@ function heroScale(el: HTMLElement, a: Answer) {
   const guessed = scaleGuessed(s) && !printed;
   const why = !s ? "" : /door swings|assumed/.test(s.source) ? scaleWhy(s) : "from typical room sizes";
   if ((guessed || !s) && !printed) addScalePill(el);
-  div.innerHTML = `<span class="hs-ico" aria-hidden="true">📐</span><span class="hs-txt">${redo}${printed ? "Areas as printed on the drawing. " : ""}${s
+  // our guess (under 0.4, nothing agreeing) on a drawing with a known scale: measuring it is the main action (Ziying 16:26)
+  const unsure = isGuess(a, agrees(a, f.path)) && !!s && !guessed && !redo;
+  if (unsure) div.classList.add("cta");
+  div.innerHTML = `<span class="hs-ico" aria-hidden="true">📐</span><span class="hs-txt">${redo}${printed ? "Areas as printed on the drawing. " : ""}${unsure
+    ? `<b>We are unsure of this number.</b> Measure it yourself in one step: scale <b>${esc(s!.label)}</b> ${esc(s!.source)}; ${task === "length" ? "click the two ends of what you want to measure" : "click inside the room"}.`
+    : s
     ? redo ? "" : guessed ? (/door swings|assumed/.test(s.source)
       // our own estimate (door swings / the usual 1:100) is not what the reader used: say only that the scale is unknown
       ? `No scale is printed on this drawing, so this number is an estimate. Set the scale for an exact answer <small>(until then the measure tool uses about ${esc(s.label)}, ${esc(why)})</small>.`
       : `No scale printed: we assumed <b>${esc(s.label)}</b> (${esc(why)}). Set it for an exact answer.`) : `Scale <b>${esc(s.label)}</b> ${esc(s.source)}`
     : printed ? "Scale not found." : "Scale not found on the drawing, so this is an estimate."}</span>
-    <button type="button" class="hs-btn${guessed ? " primary" : ""}">${s && !guessed ? "Measure yourself" : "Set the scale"}</button>`;
+    <button type="button" class="hs-btn${guessed || unsure ? " primary" : ""}">${unsure ? (task === "length" ? "Measure a length" : "Measure the room") : s && !guessed ? "Measure yourself" : "Set the scale"}</button>`;
   // a printed scale its door swings contradict (X1 14:31: '222 Exhibition St' prints 1:100, its doors say 1:200)
   if (s && !s.user && !guessed && !printed && /\.pdf$/i.test(f.path)) void doorCheck(div, s, f.path);
   // no printed scale and the number came from another reader: offer our own measurement next to it
   if (s && guessed && /door swings|assumed/.test(s.source) && !redo) offerCompare(div, a, $<HTMLTextAreaElement>("question").value, task === "length", s);
+  // our guess at a known scale: trace the named room and set both numbers side by side (a second, independent method)
+  if (unsure) offerCompare(div, a, $<HTMLTextAreaElement>("question").value, task === "length", s!);
   // no scale known yet on a PDF: estimate it from the door swings (renders the hero again with it)
   if (!s && !printed && /^upload\//.test(f.path) && /\.pdf$/i.test(f.path) && v2d.space === "pdf_pt") {
     void doorScale(f.path, 0).then((d) => {
@@ -1698,7 +1705,7 @@ async function doorCheck(div: HTMLElement, s: Scale, path: string) {
  *  the room is measured at it, with 'Scale unknown — set it' next to the number. */
 function measureFirst(el: HTMLElement, a: Answer, path: string) {
   const q = $<HTMLTextAreaElement>("question").value;
-  const length = a.intent?.task === "length" || (a.intent?.task !== "area" && /\b(how (wide|long|tall|high|deep|far)|width|length|distance|perimeter|breite|länge|leveys|pituus)\b/i.test(q));
+  const length = a.intent?.task === "length" || (a.intent?.task !== "area" && /\b(how (wide|long|tall|high|deep|far)|width|length|distance|perimeter|skirting|base ?boards?|linear (?:metres|meters|feet)|running (?:metres|meters)|LF|breite|länge|leveys|pituus)\b/i.test(q));
   const s = measure.scale;
   const known = !!s && !scaleGuessed(s);
   const div = document.createElement("div");
@@ -1733,6 +1740,9 @@ function measureFirst(el: HTMLElement, a: Answer, path: string) {
   if (known && !s!.user && canMeasure && /\.pdf$/i.test(path)) void doorCheck(div, s!, path);
 }
 
+/** a question about a room's outline length: skirting / baseboards / perimeter */
+const PERIM_Q = /\b(skirting|base ?boards?|perimeter|umfang|sockelleiste|jalkalista|piiri)\b/i;
+
 /** an estimated scale's reason, in words: 'estimated from 14 door swings (a door is about 0.85 m wide)' */
 const scaleWhy = (s: Scale) => s.source.replace(/\s*\(unsure\)\s*$/, "").replace(/;\s*unsure\)/, ")");
 
@@ -1740,7 +1750,7 @@ const scaleWhy = (s: Scale) => s.source.replace(/\s*\(unsure\)\s*$/, "").replace
 const NOT_A_ROOM = /^\s*(whg|wohnung|apt|apartment|appartement|unit|flat|lgh|lägenhet|bostad|asunto|huoneisto|as\.|block|level|floor|storey|geschoss|kerros|plan|scale|massstab|maßstab|mittakaava|sheet|drawing|dwg|north|nord|rev|date|datum|project|projekt|client|bauherr)\b/i;
 
 /** last automatic measurement per file + question + scale (renderHero runs again on every scale change) */
-const roomMemo = new Map<string, { name: string; at: [number, number]; m: { m2: number; length: number; width: number; poly: [number, number][] } | null }>();
+const roomMemo = new Map<string, { name: string; at: [number, number]; m: { m2: number; length: number; width: number; perimeter: number; poly: [number, number][] } | null }>();
 
 /** The room the question names, found by its printed label and traced at scale s (memo per file + question + scale);
  *  null when no label matches. Draws the outline and zooms to it. */
@@ -1780,7 +1790,7 @@ function offerCompare(div: HTMLElement, a: Answer, q: string, length: boolean, s
   b.type = "button";
   b.className = "hs-btn";
   b.textContent = "Measure it on the drawing too";
-  b.title = `Find the room's printed name, trace its outline and measure it at about ${s.label} (${scaleWhy(s)})`;
+  b.title = `Find the room's printed name, trace its outline and measure it at ${scaleGuessed(s) ? `about ${s.label} (${scaleWhy(s)})` : `${s.label} (${s.source})`}`;
   div.append(b);
   b.addEventListener("click", async () => {
     b.disabled = true;
@@ -1792,9 +1802,9 @@ function offerCompare(div: HTMLElement, a: Answer, q: string, length: boolean, s
       out.innerHTML = hit ? `We found <b>${esc(hit.name)}</b>, but its outline does not close (open doorways). Measure it with the Length tool.`
         : `We could not find the room's name on the drawing: tap a point inside it with Measure → Room area.`;
     } else {
-      const ours = length ? hit.m.length : hit.m.m2;
+      const ours = PERIM_Q.test(q) ? hit.m.perimeter : length ? hit.m.length : hit.m.m2;
       const k = Math.abs(ours / (a.value as number) - 1);
-      out.innerHTML = `On the drawing at about ${esc(s.label)}: <b>${esc(fmtM(ours))} ${length ? "m" : "m²"}</b> (${esc(hit.name.toLowerCase())}, outline traced). ${k <= 0.1
+      out.innerHTML = `On the drawing at ${scaleGuessed(s) ? "about " : ""}${esc(s.label)}: <b>${esc(fmtM(ours))} ${length ? "m" : "m²"}</b> (${esc(hit.name.toLowerCase())}, outline traced). ${k <= 0.1
         ? `<span class="ok">Close to the answer above: two independent methods agree.</span>`
         : `<span class="warn">${Math.round(k * 100)} % off the answer above: set the scale to settle it.</span>`}`;
     }
@@ -1833,11 +1843,15 @@ async function measureNamedRoom(div: HTMLElement, a: Answer, q: string, length: 
   const hero = div.closest("#hero");
   const big = hero?.querySelector(".hero-value");
   const approx = guessed ? "≈ " : "";
-  if (big) big.innerHTML = length
+  // skirting / baseboards / perimeter (Stoa kind 2): the traced outline's length; doors are not deducted here (said so)
+  const perim = PERIM_Q.test(q);
+  if (big) big.innerHTML = perim
+    ? `<span class="big">${approx}${esc(fmtM(hit.m.perimeter))}</span><span class="unit">m</span>`
+    : length
     ? `<span class="big long${(approx + fmtM(hit.m.length) + fmtM(hit.m.width)).length > 9 ? " xlong" : ""}">${approx}${esc(fmtM(hit.m.length))} × ${esc(fmtM(hit.m.width))}</span><span class="unit">m</span>`
     : `<span class="big">${approx}${esc(fmtM(hit.m.m2))}</span><span class="unit">m²</span>`;
   const sen = hero?.querySelector(".hero-sentence");
-  if (sen) sen.textContent = `${length ? "length × width" : "floor area inside the walls"} of ${/^\d/.test(hit.name) ? "room " : "the "}${hit.name.toLowerCase()}, measured on the drawing ${s.user ? `at your scale ${s.label}` : guessed ? `at an estimated ${s.label}` : `at ${s.label}`}`;
+  if (sen) sen.textContent = `${perim ? "perimeter at the inner wall face (door openings not deducted yet)" : length ? "length × width" : "floor area inside the walls"} of ${/^\d/.test(hit.name) ? "room " : "the "}${hit.name.toLowerCase()}, measured on the drawing ${s.user ? `at your scale ${s.label}` : guessed ? `at an estimated ${s.label}` : `at ${s.label}`}`;
   const pill = hero?.querySelector(".hero-badges .conf");
   if (pill) {
     pill.className = guessed ? "conf est" : "conf fair";
@@ -1871,7 +1885,8 @@ function recognitionChip(el: HTMLElement, a: Answer, sheet?: string) {
   const f = state.file;
   if (!isCustomer() || !f || /\.ifc$/i.test(f.path)) return;
   const sc = measure.scale;
-  const scale = sc ? (sc.user ? `${sc.label} (yours)` : /estimated|door swings/.test(sc.source) ? `${sc.label} (estimated)` : /assumed/.test(sc.source) ? `${sc.label} (assumed)` : /unsure/.test(sc.source) ? `${sc.label} (unsure)` : sc.label) : undefined;
+  const printedAs = sc && !sc.user ? sc.source.match(/^printed on the drawing \((.+)\)$/)?.[1] : undefined; // 1/4" = 1'-0" → '1/4" = 1'-0" (1:48)'
+  const scale = sc ? (sc.user ? `${sc.label} (yours)` : printedAs ? `${printedAs} (${sc.label})` : /estimated|door swings/.test(sc.source) ? `${sc.label} (estimated)` : /assumed/.test(sc.source) ? `${sc.label} (assumed)` : /unsure/.test(sc.source) ? `${sc.label} (unsure)` : sc.label) : undefined;
   const mine = readAs?.file === f.path ? readAs : null;
   let r: Recognition | null = recognitionOf(a, f.path, { sheet, scale });
   // a whole-building answer next to 'Floor 1' (the sheet's floor) reads as a contradiction (M1 15:12): no floor then

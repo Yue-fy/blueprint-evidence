@@ -179,11 +179,136 @@ def _stair_answer(lines, question: str, path: str, space: str) -> Answer | None:
                   missing=[] if conf >= 0.7 else [f"which stair is meant (notes: {', '.join(map(str, vals))})"])
 
 
+# component TAG families on piping / mechanical sheets (captain 16:15, Stoa's M-101A): 'FP-1'..'FP-5' = 5 fuel pumps
+_TAG_ABBR_Q = re.compile(r"\(([A-Z]{1,5})(?:-[.…]*)?\)")
+_TAG_WORDS = {"fuel pump": ("FP",), "fueling pump": ("FP",), "fuelling pump": ("FP",), "check valve": ("CV",),
+              "filter separator": ("FSI", "FSR"), "pressure gauge": ("PG",), "pipe support": ("PS",),
+              "insulating flange": ("IF",), "control valve": ("FSCV",), "pressure switch": ("PSW",),
+              "air vent": ("MAV",), "manual air vent": ("MAV",), "flow switch": ("FS",), "pump": ("P",)}
+_LEGEND = re.compile(r"([A-Z][A-Z /&-]{3,60}?)\s*\(([A-Z]{1,5})\)")
+_STOPW = {"the", "a", "an", "of", "on", "in", "are", "is", "how", "many", "shown", "there", "this", "sheet", "plan",
+          "piping", "tagged", "called", "out", "with", "total", "and", "different", "types", "type", "w"}
+
+
+def _words(s: str) -> set[str]:
+    return {w.rstrip("s") for w in re.findall(r"[a-z]{3,}", s.lower()) if w not in _STOPW}
+
+
+def _tag_prefixes(question: str, lines) -> tuple[list[str], str]:
+    ab = _TAG_ABBR_Q.findall(question)
+    if ab:
+        return ab, "abbreviation in the question"
+    qw = _words(question)
+    best, src = [], ""
+    for t, _ in lines:  # the sheet's own legend: 'NON-SURGE CHECK VALVE (CV) W/ RATE OF FLOW CONTROLLER'
+        for m in _LEGEND.finditer(t):
+            lw = _words(m.group(1))
+            if len(lw & qw) >= 2 and m.group(2) not in best:
+                best.append(m.group(2))
+                src = f"legend '{m.group(0)[:50]}'"
+    if best:
+        return best[:2], src
+    ql = question.lower()
+    for k in sorted(_TAG_WORDS, key=len, reverse=True):
+        if re.search(r"\b" + k + r"(?:s|es)?\b", ql):
+            return list(_TAG_WORDS[k]), f"'{k}' = tag {'/'.join(_TAG_WORDS[k])} (common piping legend)"
+    return [], ""
+
+
+def _tag_answer(lines, question: str, path: str, space: str) -> Answer | None:
+    """'How many fuel pumps (FP) / check valves / filter separators / pressure gauges (PG) …?' on a piping or
+    mechanical sheet = the DISTINCT numbered tags of that family ('FP-1'..'FP-5' -> 5; a tag printed twice counts once),
+    or, for an un-numbered family ('PG'), every printed tag. The tag family comes from an abbreviation in the question,
+    the sheet's own legend ('… CHECK VALVE (CV) …') or a small table of common piping legend abbreviations."""
+    if not re.search(r"\bhow many\b", question, re.I):
+        return None
+    pre, src = _tag_prefixes(question, lines)
+    if not pre:
+        return None
+    nums: dict[str, dict[str, tuple]] = {p: {} for p in pre}
+    bare: dict[str, list] = {p: [] for p in pre}
+    for t, bb in lines:
+        for p in pre:
+            for m in re.finditer(r"(?<![A-Z0-9])" + p + r"-(\d{1,3}[A-Z]?)\b", t):
+                nums[p].setdefault(m.group(1), (t, bb))
+            if re.fullmatch(r"\W*" + p + r"\W*", t):
+                bare[p].append((t, bb))
+    n_num = sum(len(v) for v in nums.values())
+    if n_num:
+        n = n_num
+        used = [tb for v in nums.values() for tb in v.values()]
+        how = "; ".join(f"{p}: {', '.join(sorted(v, key=lambda s: (len(s), s)))}" for p, v in nums.items() if v)
+        conf = 0.7
+    else:
+        used = [tb for v in bare.values() for tb in v]
+        n = len(used)
+        if not n:
+            return None
+        how = f"{n} printed '{'/'.join(pre)}' tags (no numbers: every tag counts)"
+        conf = 0.6
+    ev = [Evidence(file=path, page=0, bbox=list(bb), bbox_space=space, exact=True, note=f"tag '{t[:30]}'")
+          for t, bb in used[:60]]
+    return Answer(value=n, unit="count", confidence=conf, evidence=ev, solver="label_count",
+                  trace=[f"label_count: component tags {'/'.join(pre)} ({src}): {how} -> {n}"],
+                  assumptions=[f"each distinct tag of the {'/'.join(pre)} family is one component (tag family from "
+                               f"{src})"],
+                  missing=[] if n_num else ["numbered tags (an un-numbered tag may repeat one component)"])
+
+
+COLD_LAYER_MAX_PX = 12_500_000  # S0 16:48: a cold OCR of a 10-14k px Stoa sheet took 10+ min (3 workers at once)
+
+
+def _render_source(img_abs: str):
+    """(source PDF, px per pt) when the image is our own render of a PDF page (normalize.render_png names it
+    '<stem>.r<dpi>.png' next to '<stem>.pdf'; a page copy is '<stem>.p<k>.pdf'), else None."""
+    from pathlib import Path
+
+    p = Path(img_abs)
+    m = re.fullmatch(r"(.+)\.r(\d{2,4})\.png", p.name)
+    if not m:
+        return None
+    pdf = p.with_name(m.group(1) + ".pdf")
+    return (str(pdf), int(m.group(2)) / 72.0) if pdf.exists() else None
+
+
 def _image_lines(img_abs: str):
-    """((text, box image_px), ...) from the image's text layer (O1's raster text layer: OCR on scans / photos, the
-    VLM reading on clean renders; cached in memory and on disk, the raster reader uses the same one)."""
+    """((text, box image_px), ...) for an image, WITHOUT starting a slow reading of its own (S0 16:48: label_count's
+    cold OCR of a rendered Stoa sheet cost 10+ min): (1) a render of a PDF page with a text layer -> that PDF's own
+    lines scaled to the render's pixels; (2) the image's text layer when it is already cached (raster reads the same
+    one); (3) a fresh text layer only for images up to COLD_LAYER_MAX_PX. None -> label_count abstains."""
+    import os
+
+    src = _render_source(img_abs)
+    if src is not None:
+        try:
+            lines = text_lines(src[0], os.stat(src[0]).st_mtime)
+        except Exception:  # noqa: BLE001
+            lines = ()
+        if len(lines) >= 3:
+            k = src[1]
+            return tuple((t, tuple(round(c * k, 1) for c in bb)) for t, bb in lines)
     from stoa.solvers.raster import textlayer as T
 
+    cached = False
+    try:
+        tag = T.file_tag(img_abs)
+        cached = any(k.startswith(f"{img_abs}{tag}|") for k in list(T._mem)) or \
+            T._disk_key(img_abs, 1100, "local").exists()
+        if not cached:
+            from stoa import ocr
+
+            cached = ocr.cached(img_abs)
+    except Exception:  # noqa: BLE001
+        cached = False
+    if not cached:
+        try:
+            from PIL import Image
+
+            with Image.open(img_abs) as im:
+                if im.width * im.height > COLD_LAYER_MAX_PX:
+                    return None
+        except Exception:  # noqa: BLE001
+            return None
     tl = T.text_layer(img_abs)
     return tuple((re.sub(r"\s+", " ", i.text).strip(), tuple(round(float(x), 1) for x in i.box))
                  for i in tl.items if str(i.text).strip())
@@ -206,7 +331,9 @@ class LabelCount(BaseSolver):
 
         stems = asked_types(question)
         stairs = bool(_STEPS_Q.search(question))
-        if not stems and not stairs:
+        tags = bool(_TAG_ABBR_Q.search(question) or any(re.search(r"\b" + k + r"(?:s|es)?\b", question.lower())
+                                                         for k in _TAG_WORDS if k != "pump"))
+        if not stems and not stairs and not tags:
             return self.abstain("not a 'how many <room type>' question")
         if _SCOPED.search(question) and not stairs:
             return self.abstain("scoped to an apartment / the whole building: labels carry no membership")
@@ -217,6 +344,13 @@ class LabelCount(BaseSolver):
             lines = _image_lines(p) if img else text_lines(p, os.stat(p).st_mtime)
         except Exception as e:  # noqa: BLE001
             return self.abstain(f"could not read the {'image' if img else 'PDF'} text ({type(e).__name__})")
+        if lines is None:
+            return self.abstain("a large image whose text has not been read yet (a cold reading costs minutes; the "
+                                "image readers read it)")
+        if tags or stems:
+            a = _tag_answer(lines, question, path, space)
+            if a is not None:
+                return a
         if stairs:
             a = _stair_answer(lines, question, path, space)
             if a is not None:

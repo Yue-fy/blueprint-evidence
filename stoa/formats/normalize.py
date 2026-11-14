@@ -165,10 +165,49 @@ def render_png(pdf: str, dpi: int = 0, max_side: int = 4500) -> tuple[str, float
         if not dpi:
             dpi = 150 if len((pg.get_text() or "").strip()) >= 20 else 200
         zoom = min(dpi / 72, max_side / max(pg.rect.width, pg.rect.height, 1e-9))
-        zoom = max(1, int(72 * zoom + 1e-6)) / 72  # a whole-number dpi, so the PNG's dpi tag is exact
+        # NOT snapped to a whole dpi (P1 16:58): a capped A1 render went 136 -> 135 dpi, which changed a whole-image
+        # LoRA count (6 -> 4 @0.3) and every cached reading of the old render; the tag is round(72 * zoom) (<= 0.4 %)
         dst = Path(_cache_dir(Path(pdf))) / f"{Path(pdf).stem}.r{round(72 * zoom)}.png"
         _render(pg, zoom, dst, pdf)
     return str(dst), zoom
+
+
+def seed_text_layer(pdf: str, png: str, zoom: float, min_chars: int = 20) -> int:
+    """Give the image readers the PDF's OWN words for a render of its page 0 (S0 16:48: Stoa's S-100F A1 sheet, read as
+    an image at 135 dpi, made PP-OCR run 10+ min per question, 3 at once, on a page whose text layer was already
+    there). Lines (spans joined, as pdf_textqa) scaled to render pixels go into raster.textlayer's in-process caches
+    for this PNG, so text_layer(png) returns them instead of OCR / a VLM reading. Pages with no text layer (outlined
+    text) or a junk one (custom font encodings: mostly control characters) are left to OCR. -> items seeded."""
+    import pymupdf
+
+    from stoa.solvers.raster import textlayer as T
+
+    with pymupdf.open(pdf) as d:
+        pg = d[0]
+        raw = pg.get_text() or ""
+        if len(raw.strip()) < min_chars:
+            return 0
+        printable = sum(ch.isprintable() or ch in "\n\t" for ch in raw)
+        if printable < 0.97 * len(raw):
+            return 0
+        items = []
+        for b in pg.get_text("dict").get("blocks", []):
+            for ln in b.get("lines", []):
+                t = " ".join(sp["text"].strip() for sp in ln.get("spans", []) if sp["text"].strip())
+                if t:
+                    x0, y0, x1, y1 = ln["bbox"]
+                    items.append(T.TextItem(t, [x0 * zoom, y0 * zoom, x1 * zoom, y1 * zoom]))
+    from PIL import Image
+
+    with Image.open(png) as im:
+        size = im.size
+    tl = T.TextLayer(path=png, size=size, items=items, notes=["text layer = the PDF's own text (exact; no OCR)"])
+    tag = T.file_tag(png)
+    with T._glock:
+        T._mem[f"{png}{tag}|ocr"] = tl  # what text_layer() checks first (OCR engine, backend 'local')
+        for backend in ("local", "api", "gemini", "nvidia"):
+            T._mem[f"{png}{tag}|{backend}|1100|{T._api_mode()}"] = tl  # default tile; the VLM-reading keys
+    return len(items)
 
 
 def _png_dpi(path: Path) -> float | None:

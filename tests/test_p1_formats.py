@@ -731,3 +731,39 @@ def test_paper_from_pixels_needs_the_sheet_to_name_its_size():
     assert paper_from_pixels((10200, 6600), ["ANSI D", "A1"])[1] == "ANSI D"
     assert paper_from_pixels((10200, 6600), ["1\" = 40'-0\""]) is None
     assert paper_from_pixels((1920, 1080), ["A4"]) is None and paper_from_pixels((4032, 3024), ["A3"]) is None
+
+
+def test_render_of_a_vector_page_reads_the_pdfs_own_words_not_ocr(tmp_path, monkeypatch):
+    """S0 16:48: Stoa's S-100F (A1, with a text layer) read as an image made PP-OCR run 10+ min per question. The
+    render's text layer = the PDF's words scaled to render pixels; OCR and the VLM reading are never called."""
+    from stoa.solvers.raster import textlayer as T
+
+    doc = pymupdf.open()
+    pg = doc.new_page(width=842, height=595)
+    pg.insert_text((100, 100), "PUMP ROOM", fontsize=12)
+    pg.insert_text((100, 300), "SCALE: 1 : 50", fontsize=10)
+    pg.draw_line((50, 50), (700, 50))
+    doc.save(tmp_path / "s100.pdf")
+    png, zoom = normalize.render_png(str(tmp_path / "s100.pdf"))
+    assert normalize.seed_text_layer(str(tmp_path / "s100.pdf"), png, zoom) == 2
+
+    def boom(*a, **k):
+        raise AssertionError("OCR / VLM text reading must not run on a seeded render")
+
+    monkeypatch.setattr(T, "_read", boom)
+    monkeypatch.setattr(T, "ocr_suits", lambda p: True)
+    import stoa.ocr as ocr
+
+    monkeypatch.setattr(ocr, "text_layer", boom)
+    tl = T.text_layer(png)
+    words = [i.text for i in tl.items]
+    assert words == ["PUMP ROOM", "SCALE: 1 : 50"]
+    x0, y0, x1, y1 = tl.items[0].box
+    assert abs(x0 - 100 * zoom) < 2 * zoom and y1 <= 100 * zoom + 4 * zoom  # boxes in render pixels
+    assert [s["ratio"] for s in T.scales(tl)] == [50.0]
+    # a page without a text layer (outlined text) is left to OCR
+    doc2 = pymupdf.open()
+    doc2.new_page().draw_line((50, 50), (300, 50))
+    doc2.save(tmp_path / "outlined.pdf")
+    png2, z2 = normalize.render_png(str(tmp_path / "outlined.pdf"))
+    assert normalize.seed_text_layer(str(tmp_path / "outlined.pdf"), png2, z2) == 0

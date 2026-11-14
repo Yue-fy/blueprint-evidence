@@ -610,7 +610,9 @@ class AskWorker {
       if (this.timer) clearTimeout(this.timer);
       const j = this.job;
       this.job = null;
-      j?.reject(new Error(`the solver failed on this file: ${this.tail.slice(-1)[0] ?? "the answer worker stopped"}`));
+      // the last log line that says something (not a library's FutureWarning: 'warnings.warn(' told the visitor nothing)
+      const said = [...this.tail].reverse().find((l) => !/warn|^\s*$|^\s*(File |\^)/i.test(l));
+      j?.reject(new Error(`the answer worker stopped while reading this file (${said?.trim().slice(0, 160) ?? "no message"}); please ask again`));
       this.onFree();
     };
     this.child.on("exit", gone);

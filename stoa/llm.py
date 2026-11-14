@@ -403,6 +403,12 @@ def _client(backend: str):
 
 
 _TB_SEEN: dict[str, tuple[bool, float]] = {}
+# RL 16:16: a fresh clone with no GPU waited up to LLM_RESTART_WAIT (300 s) on EVERY local LLM step (one PNG: 511 s).
+# The long wait is for a server that was up and is restarting; one never seen up in this process gets
+# LLM_NEVER_UP_WAIT (15 s), and after such a failure later calls fail at once for NEVER_UP_HOLD seconds.
+_LOCAL_SEEN_UP: dict[str, bool] = {}
+_LOCAL_DOWN_AT: dict[str, float] = {}
+NEVER_UP_HOLD = 120.0
 
 
 def text_backend(default: str = "local") -> str:
@@ -642,6 +648,7 @@ def chat(
     delay = 2.0
     last_err: Exception | None = None
     restart_budget = float(os.environ.get("LLM_RESTART_WAIT", 300))  # local server restarts take ~2 min
+    never_up_budget = float(os.environ.get("LLM_NEVER_UP_WAIT", 15))
     waited = 0.0
     attempt = 0
     while attempt <= retries:
@@ -676,6 +683,9 @@ def chat(
                 texts=[c.message.content or "" for c in resp.choices],
                 logprobs=_logprobs_of(ch) if logprobs else None,
             )
+            if is_local(backend):
+                _LOCAL_SEEN_UP[backend] = True
+                _LOCAL_DOWN_AT.pop(backend, None)
             if cpath is not None:
                 cpath.parent.mkdir(parents=True, exist_ok=True)
                 d = {k: v for k, v in res.__dict__.items() if k not in ("images", "cached")}
@@ -702,7 +712,14 @@ def chat(
                 if kwargs.get("model") not in (None, "default"):
                     kwargs["model"] = "default"
                 continue
-            if is_local(backend) and isinstance(e, APIConnectionError) and waited < restart_budget:
+            if is_local(backend) and not _LOCAL_SEEN_UP.get(backend):
+                # never answered in this process: no GPU / no server here (a fresh clone, a laptop) -> short wait, then
+                # fail fast so the cascade answers without this step
+                held = time.time() - _LOCAL_DOWN_AT.get(backend, -1e18) < NEVER_UP_HOLD
+                if held or waited >= never_up_budget:
+                    _LOCAL_DOWN_AT[backend] = time.time()
+                    break
+            elif is_local(backend) and isinstance(e, APIConnectionError) and waited < restart_budget:
                 attempt -= 1  # a restarting local server doesn't use up retries, only the time budget
             time.sleep(delay)
             waited += delay

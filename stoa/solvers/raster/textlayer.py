@@ -237,6 +237,73 @@ def ocr_suits(path: str) -> bool:
         return False
 
 
+# S0 16:48 (gate d17): Stoa's S-100F PDF rendered to '<stem>.r135.png' was OCR'd on CPU for 10+ min although the PDF
+# has its own text. P1's upload renders are '<stem>.rNNN.png' (whole single-page PDF) or '<stem>.pN.rNNN.png' (next to
+# the one-page '<stem>.pN.pdf'): read the text lines from that PDF, scaled to the image. Outlined text (0 lines) or a
+# junk font encoding ('352326(')7ð') -> None (OCR / VLM as before).
+_RENDER_NAME = re.compile(r"^(?P<stem>.+?)(?P<page>\.p\d+)?\.r(?P<dpi>\d{2,3})\.png$")
+_SANE = re.compile(r"[A-Za-z0-9ÄÖÅÜäöåüßÉéÈèÀàÇçÑñ .,:;'\"()/+\-=×x²³°%#&@!?\[\]_*~|<>±⌀Ø’‘“”´`{}^$€£¼½¾·•–—]")
+_CTRL = re.compile(r"[\x00-\x08\x0b-\x1f\x7f-\x9f]")  # a font without a usable encoding (X1 farm A0.1)
+_pdf_mem: dict[str, "TextLayer | None"] = {}
+
+
+def _cache_on() -> bool:
+    """STOA_TEXT_CACHE=0: read every text layer cold (S0 16:53: the gate measures first-question latency)."""
+    return os.environ.get("STOA_TEXT_CACHE", "1") != "0"
+
+
+def pdf_render_layer(path: str) -> "TextLayer | None":
+    p = _abspath(path)
+    m = _RENDER_NAME.match(p.name)
+    if not m:
+        return None
+    key = f"{p}{file_tag(path)}"
+    if key in _pdf_mem and _cache_on():
+        return _pdf_mem[key]
+    pdf = p.with_name(f"{m['stem']}{m['page'] or ''}.pdf")
+    tl = None
+    if pdf.exists():
+        try:
+            tl = _pdf_lines(p, pdf)
+        except Exception as e:  # noqa: BLE001 - the image readers still work
+            print(f"[textlayer] PDF text of {pdf.name} not used: {type(e).__name__}", file=sys.stderr)
+    _pdf_mem[key] = tl
+    return tl
+
+
+def _pdf_lines(png: Path, pdf: Path) -> "TextLayer | None":
+    import pymupdf
+    from PIL import Image
+
+    with pymupdf.open(str(pdf)) as doc:
+        if doc.page_count != 1:
+            return None  # which page the render shows is not known
+        pg = doc[0]
+        with Image.open(png) as im:
+            W, H = im.size
+        rect = pg.rect  # the displayed (rotated) page
+        sx, sy = W / rect.width, H / rect.height
+        if abs(sx / sy - 1) > 0.02:
+            return None  # not a render of this page
+        items, chars, sane = [], 0, 0
+        for b in pg.get_text("dict")["blocks"]:
+            for ln in b.get("lines", []):
+                t = " ".join(sp["text"].strip() for sp in ln["spans"] if sp["text"].strip())
+                if not t:
+                    continue
+                r = pymupdf.Rect(ln["bbox"]) * pg.rotation_matrix
+                items.append(TextItem(t, [round(r.x0 * sx, 1), round(r.y0 * sy, 1), round(r.x1 * sx, 1),
+                                          round(r.y1 * sy, 1)]))
+                if _CTRL.search(t):
+                    return None  # undecodable text on this page: the image readers see what is printed
+                chars += len(t)
+                sane += len(_SANE.findall(t))
+    if len(items) < 3 or sane < 0.85 * chars:
+        return None
+    return TextLayer(path=str(png), size=(W, H), items=items, tiles=0,
+                     notes=[f"text layer = the PDF's own text ({pdf.name}, {len(items)} lines; exact, no OCR/VLM)"])
+
+
 def text_layer(path: str, backend: str = "local", tile: int = 1100, upscale_to: int = 2000,
                max_tokens: int = 2500, workers: int = 6) -> TextLayer:
     """All printed text of a raster drawing with image_px boxes. Cached in memory and on disk (artifacts/W3/textlayer);
@@ -247,11 +314,15 @@ def text_layer(path: str, backend: str = "local", tile: int = 1100, upscale_to: 
     clean-render gate and long side >= 2000 px) and the OCR engine is installed, else the VLM (clean renders, small
     raster plans: OCR measured worse there). An OCR failure falls back to the VLM reading."""
     engine = os.environ.get("STOA_TEXT_ENGINE", "auto").lower()
+    if engine != "vlm":
+        tl = pdf_render_layer(path)  # an upload render of a PDF page: the PDF's own words, exact and free
+        if tl is not None:
+            return tl
     if backend == "local" and engine in ("ocr", "auto"):
         from stoa import ocr
 
         okey = f"{path}{file_tag(path)}|ocr"
-        if okey in _mem:
+        if okey in _mem and _cache_on():
             return _mem[okey]
         if engine == "ocr" or (ocr_suits(path) and (ocr.cached(path) or ocr.available())):
             try:
@@ -264,10 +335,10 @@ def text_layer(path: str, backend: str = "local", tile: int = 1100, upscale_to: 
     with _glock:
         lk = _locks.setdefault(key, threading.Lock())
     with lk:
-        if key in _mem:  # read earlier in this process (another question on the same drawing): already paid
+        if key in _mem and _cache_on():  # read earlier in this process (another question on the same drawing): paid
             return _mem[key]
         f = _disk_key(path, tile, backend)
-        if f.exists():
+        if f.exists() and _cache_on():
             d = json.loads(f.read_text())
             d["items"] = [TextItem(**i) for i in d["items"]]
             d["size"] = tuple(d["size"])

@@ -2,12 +2,14 @@
 
 **Ask a construction drawing a question in your own words. Get the number, see where it came from, and know how sure it is.**
 
-![The web app answers "How big is apartment B?" with 80.83 m². Each room in the sum is outlined on the floor plan, and the drawing's CAD file agrees.](docs/img/hero.png)
+![The web app answers "What is the area of the laundry?" on an uploaded school floor plan with 7.03 m². The laundry is outlined on the plan, and the card shows the printed scale 1:200, the convention used and the cost tier "cheap".](docs/img/hero.png)
 
-*"How big is apartment B?" The answer is 80.83 m². Every room in the sum is outlined and numbered on the plan, the
-drawing's CAD file agrees, and the cost badge says "cheap": no AI model was needed. Drawing: floor plan
-`site1000_bldg2082_floor9385` from the Stoa Junction 2026 dataset, rendered by Stoa from Swiss Dwellings v3.0.0
-(Archilyse AG, doi:10.5281/zenodo.7788422), CC BY 4.0.*
+*"What is the area of the laundry?" asked on one of the sheets Stoa sent as an example of their test, uploaded as a
+plain PDF. The answer is 7.03 m² (measured by hand: 7.0 m²) in 2.3 s. The room is traced from the wall lines at the
+scale printed on the sheet (1:200) and outlined on the plan, and the cost badge says "cheap": no AI model was needed.
+Drawing: Special School Plan Level 00 (SEN-DFE-XX-00-D-X-0201), UK Department for Education, from GOV.UK "A new model
+design for a special school". Contains public sector information licensed under the Open Government Licence v3.0.
+The sheet is bundled as [samples/dfe_school/plan.pdf](samples/dfe_school/plan.pdf).*
 
 Demo video: [video link]
 
@@ -37,22 +39,25 @@ and caveats: [docs/RESULTS.md](docs/RESULTS.md).
 
 | Test | Result | Commit |
 |---|---|---|
-| Stoa's own four example sheets (72 questions in Stoa's kinds: room and type areas, baseboards, slabs, counts, piping), as the app ships (Gemini 3.1 Pro escalation on) | **58.3%**, evidence on 98.6% of answers | `504060a` |
-| Same 72 questions, Gemini 3.1 Pro asked directly / Qwen3-VL-8B asked directly | 59.7%, no evidence / 25.0% | |
-| Stoa's example sheets, local models only (first 55 questions) | **50.9%** | `517b67b` |
-| Sibling sheets of the same drawing sets, held out (15 questions, never tuned on), local models only | **40.0%** | `4e0a4db` |
+| Stoa's own four example sheets (90 questions in Stoa's kinds: room and type areas, baseboards, slab areas, door counts, piping), local models only, no hosted model | **65.6%** (59/90), evidence on 94% of answers, 7 s per question on a new file | `5a4b058` |
+| Same 90 questions: Gemini 3.1 Pro asked directly / Qwen3-VL-8B asked directly | 61%, no evidence / 26% | |
+| Same 90 questions, earlier code with the Gemini 3.1 Pro escalation on | 61%, evidence on 98% of answers | `504060a` |
+| Sibling sheets of the same drawing sets, held out (32 questions, never tuned on), local models only | **46.9%** (15/32; 31.3% one build earlier) | `5a4b058` |
 | Stoa dataset, sealed test split (2,199 held-out questions, run twice in total) | **87.7%** micro, **79.7%** weighted | `bb94fe4` |
-| Real drawings from outside the dataset, development set (136 questions), local models only | **64.0%** | `504060a` |
-| Real drawings, held-out set (112 questions on other files, never tuned on), local models only | **49.1%** | `504060a` |
+| Real drawings from outside the dataset, development set (168 questions), local models only | **69.6%** | `5a4b058` |
+| Real drawings, held-out set (120 questions on other files, never tuned on), local models only | **49.2%** | `5a4b058` |
 | Real drawings, held-out set, as the API ships (Gemini 3.1 Pro escalation on) | **64.8%** (105 questions) | `fc0927a` |
 | For reference: Gemini 3.1 Pro asked directly, first version of the real-drawing set (125 questions) | 43.8%, no evidence | `9e1c725` |
 
 Our main metric is the first four rows: the four sheets Stoa sent as examples of their own test, and sibling sheets
 from the same public drawing sets, each uploaded alone under a meaningless name, as Stoa will test. These clean,
-large CAD sheets in metric and imperial units are far harder than the dataset. On them the app as shipped is as
-accurate as a frontier model asked directly, and it shows where each answer came from. Areas by room and slab areas
-by type are still weak for every system we tried. The real-drawing rows (public drawings from outside the dataset)
-add a warning: not every gain on the files we looked at transfers to held-out files (development rows we tuned on: 69%; newer unseen rows: 36%), while the Gemini
+large CAD sheets in metric and imperial units are far harder than the dataset. On them our local pipeline, with no
+hosted model at all, now answers more questions right than a frontier model asked directly (65.6% against 61%), at
+under a tenth of its cost per question, and it shows where each answer came from. The gain carries over to the held-out
+sibling sheets (31% to 47%). Room areas on line-only sheets (4 of 10), slab areas by type (2 of 7) and door counts
+(0 of 2) are still weak, for every system we tried. The real-drawing rows (public drawings from outside the dataset)
+add a warning: not every gain on the files we looked at transfers to held-out files (development rows we tuned on all afternoon: 78%;
+rows added later: 54%; held-out files: 49%), while the Gemini
 escalation does transfer (+15 points on held-out). Weak spots are listed in
 [docs/RESULTS.md](docs/RESULTS.md#known-weaknesses).
 

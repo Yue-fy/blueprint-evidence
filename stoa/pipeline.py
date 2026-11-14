@@ -1273,6 +1273,18 @@ class Pipeline(BaseSolver):
             ans = replace_nothing_found(path, question, ans)
         except Exception:  # noqa: BLE001
             pass
+        try:  # E1 (captain 16:15): a sheet that prints its own area table ('TOTAL WEST WING = 7,009 SF') answers from it
+            from stoa.evidence.areatable import prefer_printed_table
+
+            ans = prefer_printed_table(path, question, ans)
+        except Exception:  # noqa: BLE001
+            pass
+        try:  # E1 (captain 16:15 (d)): 'area of the 150 mm slab with D13 @ 300' traced around its printed callout
+            from stoa.evidence.slabs import prefer_slab_area
+
+            ans = prefer_slab_area(path, question, ans)
+        except Exception:  # noqa: BLE001
+            pass
         try:
             from stoa.evidence.shapes import add_dimension_lines, add_polygons, add_scale_statement, add_wall_axes
 

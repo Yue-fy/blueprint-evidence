@@ -158,3 +158,29 @@ def test_compass_axis_and_larger_rival():
     tl = _tl(items, size=(10200, 6600))
     assert CH.overall_answer("x.png", "How long is the building east to west, overall?", tl) is None
     assert CH.overall_answer("x.png", "How long is the building overall?", tl) is None  # 323'-4" is longer than 286'
+
+
+def test_upload_render_of_a_pdf_reads_the_pdf_text(tmp_path):
+    """S0 16:48: a '<stem>.r135.png' render of a PDF with real text was OCR'd for 10+ min; its PDF has the words."""
+    import pymupdf
+
+    pdf = tmp_path / "ab12.pdf"
+    doc = pymupdf.open()
+    pg = doc.new_page(width=842, height=595)
+    for k, t in enumerate(["LIVING ROOM", "KITCHEN", "SCALE 1:100", "19800"]):
+        pg.insert_text((100, 100 + 40 * k), t, fontsize=12)
+    doc.save(str(pdf))
+    png = tmp_path / "ab12.r144.png"
+    pymupdf.open(str(pdf))[0].get_pixmap(dpi=144).save(str(png))
+    tl = T.pdf_render_layer(str(png))
+    assert tl is not None and {"LIVING ROOM", "KITCHEN", "19800"} <= {i.text for i in tl.items}
+    it = next(i for i in tl.items if i.text == "KITCHEN")
+    assert abs(it.box[0] - 100 * 2) < 6  # scaled to the image (144 dpi = 2 px per pt)
+    assert T.pdf_render_layer(str(tmp_path / "other.png")) is None
+
+
+def test_total_words_near_cited_area():
+    from stoa.solvers.raster.textqa import _TOTAL_LINE
+
+    assert _TOTAL_LINE.search("Overall GIFA") and _TOTAL_LINE.search("Kerrosala yhteensä")
+    assert not _TOTAL_LINE.search("PLANT ROOM 29 m²")

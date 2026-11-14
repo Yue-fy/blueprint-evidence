@@ -747,3 +747,101 @@ def test_dxfplan_traces_rooms_between_wall_lines_of_a_lone_dxf(tmp_path):
     assert b.solver == "pipeline/cad_lines" and b.value == pytest.approx(4.0 * 5.0, rel=0.02)
     good = Answer(value=12.5, unit="m2", confidence=0.95, solver="pipeline/dxf")
     assert dxfplan.replace_nothing_found(f, "How big is the kitchen?", good) is good
+
+
+def test_lineplan_skirting_is_the_outline_minus_the_door_way(tmp_path):
+    """Captain 16:15 / Stoa kind 2: skirting (baseboard) = traced outline minus the openings in the walls; a doorway
+    chord DRAWN as a line (CAD door path: arc + leaf + chord) is still an opening; 'how many linear metres' is not a
+    count; 'the conference room and the comms room' sums both rooms (the shared door way is cut from each)."""
+    from stoa.evidence.linework import PT_TO_M_AT_1
+    from stoa.evidence.lineplan import answer
+
+    f = str(tmp_path / "lines.pdf")
+    _line_only_sheet(f)
+    k = 100 * PT_TO_M_AT_1
+    a = answer(f, "How many linear metres of skirting board does the conference room need?")
+    assert a is not None and a.unit == "m", a
+    assert abs(a.value / ((700 - 30) * k) - 1) <= 0.02, (a.value, (700 - 30) * k, a.trace)
+    ops = [e for e in a.evidence if "opening" in e.note and "no skirting" in e.note]
+    assert len(ops) == 1 and abs(float(ops[0].note.split("opening ")[1].split(" m")[0]) / (30 * k) - 1) <= 0.1
+    assert any(e.polyline and e.polygon for e in a.evidence) and all(e.exact is False for e in a.evidence)
+    b = answer(f, "How much baseboard do the conference room and the comms room need in total?")
+    assert b is not None and abs(b.value / ((700 - 30 + 500 - 30) * k) - 1) <= 0.03, (b.value, b.trace)
+    assert answer(f, "How many metres of skirting does the kitchen need?") is None  # no such room on the sheet
+
+
+def test_printed_area_table_answers_totals_types_and_wings(tmp_path):
+    """Captain 16:15 (X1 stoa-like AFCEC dorm A-2): a sheet's own area table 'LABEL = value SF' answers first: a TOTAL
+    row named by the question, else the rows of the asked type (summed across wings), in the unit asked."""
+    import pymupdf
+
+    from stoa.evidence.areatable import answer, prefer_printed_table, rows
+
+    f = str(tmp_path / "table.pdf")
+    doc = pymupdf.open()
+    pg = doc.new_page(width=600, height=400)
+    table = [("WEST WING DORMITORY =", "6,095 SF"), ("WEST WING CIRCULATION =", "914 SF"),
+             ("TOTAL WEST WING =", "7,009 SF"), ("NORTH WING DORMITORY =", "6,285 SF"),
+             ("NORTH WING CIRCULATION =", "1,403 SF"), ("TOTAL NORTH WING =", "7,688 SF"),
+             ("COMMON SPACE =", "2,911 SF"), ("TOTAL SECOND FLOOR =", "17,608 SF")]
+    for i, (lab, val) in enumerate(table):
+        pg.insert_text((60, 60 + 14 * i), lab, fontsize=8)
+        pg.insert_text((240, 60 + 14 * i), val, fontsize=8)
+    pg.insert_text((400, 300), "ROOM 101", fontsize=8)
+    pg.insert_text((400, 310), "250 SF", fontsize=8)  # a stacked room tag: not a table row
+    doc.save(f)
+    rs = rows(f)
+    assert len(rs) == 8 and ("TOTAL WEST WING", 7009.0, "ft2") == rs[2][:3]
+    a = answer(f, "What is the total area of the second floor in square metres?")
+    assert a is not None and a.unit == "m2" and abs(a.value - 17608 * 0.09290304) < 0.01 and a.evidence[0].exact
+    b = answer(f, "What is the total dormitory area across both wings?")
+    assert b is not None and b.value == 6095 + 6285 and len(b.evidence) == 2
+    assert answer(f, "How many square feet of circulation does the north wing have?").value == 1403
+    assert answer(f, "What is the total area of the west wing?").value == 7009
+    assert answer(f, "How many rooms are on this floor?") is None
+    from stoa.contract import Answer
+
+    kept = prefer_printed_table(f, "What is the total area of the west wing?", Answer(value=7009, unit="ft2",
+                                                                                      confidence=0.6, solver="x"))
+    assert kept.solver == "x" and "printed area table" in kept.trace[-1]
+    rep = prefer_printed_table(f, "What is the total area of the west wing?", Answer(value=1580.2, unit="m2",
+                                                                                     confidence=0.6, solver="x"))
+    assert rep.value == 7009 and rep.solver == "area_table" and rep.confidence == 0.85
+
+
+def test_slab_area_by_type_ignores_joints_and_dimension_lines(tmp_path):
+    """Captain 16:15 (d) / Stoa kind 4: 'area of the 150 mm slab with D13 @ 300' = the region around its printed
+    callout; a control joint (labelled CJ) and a dimension line across the slab do not split it; another type's slab
+    next to it (behind a 0.3 m beam = two lines) stays out."""
+    import pymupdf
+
+    from stoa.evidence.linework import PT_TO_M_AT_1
+    from stoa.evidence.slabs import answer
+
+    f = str(tmp_path / "slab.pdf")
+    doc = pymupdf.open()
+    pg = doc.new_page(width=842, height=595)
+    sh = pg.new_shape()
+    # slab A: x 100..500, y 100..300 pt; beam (two lines 0.3 m = 6 pt apart at 1:50) then slab B: x 506..700
+    for a, b in [((100, 100), (700, 100)), ((100, 300), (700, 300)), ((100, 100), (100, 300)), ((700, 100), (700, 300)),
+                 ((500, 100), (500, 300)), ((506, 100), (506, 300))]:
+        sh.draw_line(a, b)
+    sh.finish(color=(0, 0, 0), width=0.5)
+    sh.draw_line((300, 100), (300, 300))  # control joint
+    sh.finish(color=(0, 0, 0), width=2.0)
+    sh.draw_line((100, 200), (500, 200))  # a dimension line across slab A, its number beside it
+    sh.finish(color=(0, 0, 0), width=0.25)
+    sh.commit()
+    pg.insert_text((305, 150), "CJ", fontsize=6)
+    pg.insert_text((280, 196), "7055", fontsize=6)
+    pg.insert_text((150, 140), "150 SLAB-ON-GRADE W/ D13 @ 300", fontsize=6)
+    pg.insert_text((560, 250), "300 SLAB-ON-GRADE W/ D16 @ 300", fontsize=6)
+    pg.insert_text((600, 560), "SCALE 1:50", fontsize=8)
+    doc.save(f)
+    k = 50 * PT_TO_M_AT_1
+    a = answer(f, "What is the area of the 150 mm slab-on-grade with D13 @ 300?")
+    assert a is not None and a.unit == "m2" and abs(a.value / (400 * 200 * k * k) - 1) <= 0.03, (a and a.value, a)
+    assert a.evidence[0].polygon and a.evidence[0].exact is False and a.confidence <= 0.45
+    b = answer(f, "How big is the 300 mm slab with D16 bars?")
+    assert b is not None and abs(b.value / (194 * 200 * k * k) - 1) <= 0.04, b and b.value
+    assert answer(f, "What is the area of the 200 mm slab?") is None  # no such callout

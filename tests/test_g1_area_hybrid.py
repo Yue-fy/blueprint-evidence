@@ -118,3 +118,34 @@ def test_stair_page_picks_the_noted_page(tmp_path):
     assert _stair_page(f, "How many risers does the main staircase have?")[0] == 3
     assert _stair_page(f, "How many risers lead up to the front porch?")[0] == 2
     assert _stair_page(f, "How many doors are there?") is None
+
+
+def test_piping_tag_families():
+    from stoa.solvers.label_count import _tag_answer
+
+    L = [("FP-1", (0, 0, 1, 1)), ("FP-2", (1, 0, 2, 1)), ("FP-1", (5, 5, 6, 6)), ("FSCV-1", (2, 2, 3, 3)),
+         ("CV-1", (3, 3, 4, 4)), ("CV-2", (4, 4, 5, 5)), ("PG", (6, 6, 7, 7)), ("PG", (7, 7, 8, 8)),
+         ("FSI-1", (0, 1, 1, 2)), ("FSR-1", (1, 1, 2, 2)), ("NON-SURGE CHECK VALVE (CV) W/ RATE OF FLOW", (9, 9, 10, 10))]
+    assert _tag_answer(L, "How many fuel pumps (FP) are shown?", "x.pdf", "pdf_pt").value == 2  # FP-1 twice = 1 pump
+    assert _tag_answer(L, "How many non-surge check valves are there?", "x.pdf", "pdf_pt").value == 2  # not FSCV-1
+    assert _tag_answer(L, "How many filter separators are there?", "x.pdf", "pdf_pt").value == 2
+    assert _tag_answer(L, "How many pressure gauges (PG) are tagged?", "x.pdf", "pdf_pt").value == 2
+    assert _tag_answer(L, "How many bedrooms are there?", "x.pdf", "pdf_pt") is None
+
+
+def test_image_lines_use_the_pdf_of_a_render(tmp_path):
+    import fitz
+    from PIL import Image
+
+    from stoa.solvers.label_count import _image_lines, _render_source
+
+    d = fitz.open()
+    pg = d.new_page()
+    for i, t in enumerate(("FP-1", "FP-2", "21 Stg. 16.2/27.8")):
+        pg.insert_text((72, 72 + 20 * i), t)
+    d.save(tmp_path / "sheet.pdf")
+    Image.new("RGB", (100, 100), "white").save(tmp_path / "sheet.r144.png")
+    src = _render_source(str(tmp_path / "sheet.r144.png"))
+    assert src and src[1] == 2.0
+    lines = _image_lines(str(tmp_path / "sheet.r144.png"))
+    assert [t for t, _ in lines][:2] == ["FP-1", "FP-2"] and lines[0][1][0] > 100  # pdf_pt x 2 = render px

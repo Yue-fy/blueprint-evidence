@@ -34,6 +34,13 @@ CACHE_DIR = Path(os.environ.get("JUNCTION_SHARED", ".stoa")) / "artifacts" / \
 VERSION = "o2"  # bump to invalidate the disk cache
 MIN_SCORE = 0.5  # recogniser score below this is mostly noise on hatching / drawn lines
 _mem: dict[str, dict] = {}
+# S0 16:48: a cold OCR of a big render ran 10+ min. Over this budget the reading fails and the caller falls back (the raster
+# text layer then uses the VLM reading). STOA_TEXT_CACHE=0 skips the memory and disk caches (cold-latency gate runs).
+TIMEOUT = float(os.environ.get("STOA_OCR_TIMEOUT", "120") or 120)
+
+
+def _cache_on() -> bool:
+    return os.environ.get("STOA_TEXT_CACHE", "1") != "0"
 _locks: dict[str, threading.Lock] = {}
 _glock = threading.Lock()
 _server_ok: bool | None = None
@@ -77,12 +84,19 @@ def _run(path: str) -> dict:
         req = urllib.request.Request(OCR_URL, data=json.dumps({"path": path}).encode(),
                                      headers={"Content-Type": "application/json"})
         try:
-            with urllib.request.urlopen(req, timeout=600) as r:
+            with urllib.request.urlopen(req, timeout=TIMEOUT) as r:
                 return json.loads(r.read())
-        except OSError:
+        except TimeoutError:
+            raise RuntimeError(f"OCR over its {TIMEOUT:.0f} s budget (STOA_OCR_TIMEOUT)") from None
+        except OSError as e:
+            if "timed out" in str(e):
+                raise RuntimeError(f"OCR over its {TIMEOUT:.0f} s budget (STOA_OCR_TIMEOUT)") from None
             pass  # fall through to the subprocess
     env = {**os.environ, "OMP_NUM_THREADS": os.environ.get("STOA_OCR_THREADS", "8")}
-    out = subprocess.run([OCR_PY, str(ENGINE_FILE), path], capture_output=True, text=True, timeout=900, env=env)
+    try:
+        out = subprocess.run([OCR_PY, str(ENGINE_FILE), path], capture_output=True, text=True, timeout=TIMEOUT, env=env)
+    except subprocess.TimeoutExpired:
+        raise RuntimeError(f"OCR over its {TIMEOUT:.0f} s budget (STOA_OCR_TIMEOUT)") from None
     lines = [ln for ln in out.stdout.splitlines() if ln.startswith("{")]
     if not lines:
         raise RuntimeError(f"OCR engine failed: {out.stderr[-400:]}")
@@ -94,20 +108,32 @@ def read(path: str) -> dict:
     with _glock:
         lk = _locks.setdefault(p, threading.Lock())
     with lk:
-        if p in _mem:
+        if p in _mem and _cache_on():
             return _mem[p]
         f = _key(path)
-        if f.exists():
+        if f.exists() and _cache_on():
             d = json.loads(f.read_text())
         else:
-            d = _run(p)
-            if "error" in d:
-                raise RuntimeError(d["error"])
-            try:
-                f.parent.mkdir(parents=True, exist_ok=True)
-                f.write_text(json.dumps(d))
-            except OSError:
-                pass
+            # S0 16:48 (gate d17): 3 eval workers OCR'd the same 135-dpi render at once for 10+ min. One OCR per file
+            # across processes: the others wait on the lock and then read the cache it wrote.
+            import fcntl
+
+            f.parent.mkdir(parents=True, exist_ok=True)
+            with open(f.with_suffix(".lock"), "w") as lockf:
+                fcntl.flock(lockf, fcntl.LOCK_EX)
+                try:
+                    if f.exists() and _cache_on():
+                        d = json.loads(f.read_text())
+                    else:
+                        d = _run(p)
+                        if "error" in d:
+                            raise RuntimeError(d["error"])
+                        try:
+                            f.write_text(json.dumps(d))
+                        except OSError:
+                            pass
+                finally:
+                    fcntl.flock(lockf, fcntl.LOCK_UN)
         _mem[p] = d
         return d
 

@@ -174,3 +174,36 @@ def test_svg_ifc_reads_counts_areas_and_scale(tmp_path):
     m = s.solve(str(p), "How many doors are there in the model 'Test building'?")
     assert m.value == 4 and m.confidence <= 0.3 and m.missing
     assert s.solve(str(p), "What is the total net volume of all walls, in m³?").value is None
+
+
+def test_local_llm_never_seen_up_fails_fast(monkeypatch):
+    """RL 16:16: with no model server (fresh clone, no GPU) every local LLM step waited up to 300 s. A server never
+    seen up in this process gets LLM_NEVER_UP_WAIT (15 s), and later calls fail at once; one seen up keeps the long
+    restart budget."""
+    openai = pytest.importorskip("openai")
+
+    from stoa import llm
+
+    slept = []
+    monkeypatch.setattr(llm.time, "sleep", lambda s: slept.append(s))
+    calls = {"n": 0}
+
+    class Down:
+        class chat:  # noqa: N801
+            class completions:  # noqa: N801
+                @staticmethod
+                def create(**kw):
+                    calls["n"] += 1
+                    raise openai.APIConnectionError(request=None)
+
+    monkeypatch.setattr(llm, "_client", lambda backend: Down())
+    monkeypatch.setattr(llm, "_LOCAL_SEEN_UP", {})
+    monkeypatch.setattr(llm, "_LOCAL_DOWN_AT", {})
+    monkeypatch.setattr(llm, "served_model", lambda b: "m", raising=False)
+    with pytest.raises(RuntimeError):
+        llm.chat("hi", backend="local", cache=False)
+    assert sum(slept) <= 30  # was up to 300 s
+    slept.clear()
+    with pytest.raises(RuntimeError):
+        llm.chat("hi again", backend="local", cache=False)
+    assert sum(slept) <= 2  # held: fail at once

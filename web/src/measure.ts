@@ -59,6 +59,19 @@ export function doorScaleOf(d: { ok: boolean; ratio?: number; doors?: number; le
   return { unitsPerM: PT_PER_M_AT_1 / 100, label: "1:100", source: "assumed, the usual scale of floor plans" };
 }
 
+/** An imperial drawing scale in text: '1/4" = 1'-0"' → 48, '3/32"=1\'-0"' → 128, '1" = 40\'-0"' → 480, '1 1/2" = 1\'-0"' → 8. */
+export function imperialScale(t: string): { n: number; text: string } | null {
+  const m = t.replace(/[\u2032\u2019]/g, "'").replace(/[\u2033\u201d]/g, '"')
+    .match(/(?<![\d/.])(\d+\s+\d+\/\d+|\d+\/\d+|\d+(?:\.\d+)?)\s*(?:"|'')\s*=\s*(\d+)\s*'\s*-?\s*(?:(\d+(?:\.\d+)?)\s*(?:"|''))?/);
+  if (!m) return null;
+  const frac = (x: string) => x.trim().split(/\s+/).reduce((s, p) => s + (p.includes("/") ? Number(p.split("/")[0]) / Number(p.split("/")[1]) : Number(p)), 0);
+  const drawn = frac(m[1]);
+  const real = Number(m[2]) * 12 + Number(m[3] ?? 0);
+  const n = Math.round((real / drawn) * 100) / 100;
+  if (!(drawn > 0 && n >= 1 && n <= 50000)) return null;
+  return { n: Number.isInteger(n) ? n : Math.round(n), text: m[0].replace(/\s+/g, " ").trim() };
+}
+
 export function scaleFromAnswer(a: Answer, space: "pdf_pt" | "image_px"): Scale | null {
   const text = [...(a.trace ?? []), ...(a.assumptions ?? []), ...(a.evidence ?? []).map((e) => e.note ?? "")].join("\n");
   const px = text.match(/([\d.]+)\s*px per m\b/i);
@@ -67,8 +80,12 @@ export function scaleFromAnswer(a: Answer, space: "pdf_pt" | "image_px"): Scale 
     return { unitsPerM: u, label: scaleLabel(u, space), source: /scale bar/i.test(text) ? "from the scale bar on the drawing" : "read from the drawing" };
   }
   if (space !== "pdf_pt") return null;
+  // US / UK architectural scales: 1/4" = 1'-0" is 1:48, 1" = 40'-0" is 1:480 (Stoa's M-101A and AFCEC sheets). The 1:N
+  // patterns below must not read '1/4"' as 1:4 (that made every measurement on a US sheet 12× too small, 16:55).
+  const imp = imperialScale(typeof a.value === "string" && /^\s*[\d\s/.]+\s*(?:"|''|″)\s*=/.test(a.value) ? a.value : text);
+  if (imp) return { unitsPerM: PT_PER_M_AT_1 / imp.n, label: `1:${imp.n}`, source: `printed on the drawing (${imp.text})` };
   const v = typeof a.value === "string" ? a.value.match(/^\s*1\s*[:/]\s*(\d{1,5})\s*$/) : null;
-  const m = v ?? text.match(/\bscale:?\s*(?:of\s*|is\s*)?1\s*[:/]\s*(\d{1,5})\b/i) ?? text.match(/\b(?:Massstab|Maßstab|mittakaava|échelle|scala)\s*1\s*[:/]\s*(\d{1,5})\b/i);
+  const m = v ?? text.match(/\bscale:?\s*(?:of\s*|is\s*)?1\s*[:/]\s*(\d{1,5})\b(?!\s*(?:"|''|″|\/))/i) ?? text.match(/\b(?:Massstab|Maßstab|mittakaava|échelle|scala)\s*1\s*[:/]\s*(\d{1,5})\b/i);
   // plan_rooms / E1 when nothing is printed: 'no scale printed: 1:100 makes … (estimate)', 'scale: NOT printed … — 1:100
   // is an estimate', '… assumed 1:100'
   const est = m ? null : text.match(/\b(?:no scale printed|scale:?\s*NOT printed)[^\n|]*?\b1\s*:\s*(\d{1,5})\b/i) ?? text.match(/\bassumed 1\s*:\s*(\d{1,5})\b/i);
@@ -301,7 +318,7 @@ export class Measure {
   /** Trace the room around point p (drawing coordinates) and measure it at the current scale: area (m²) and the
    *  outline's extent along the drawing's axes (length ≥ width, m). Draws the outline; null when there is no scale or
    *  no closed room there. Used by a click in area mode and by the answer card (a room found by its printed label). */
-  async roomAt(p: [number, number], name = "", others: [number, number][] = []): Promise<{ m2: number; length: number; width: number; poly: [number, number][] } | null> {
+  async roomAt(p: [number, number], name = "", others: [number, number][] = []): Promise<{ m2: number; length: number; width: number; perimeter: number; poly: [number, number][] } | null> {
     const s = this.scale;
     if (!s) return null;
     const r = 1; // a point box around the click
@@ -319,9 +336,12 @@ export class Measure {
       const ys = sh.poly.map((q) => q[1]);
       const dx = (Math.max(...xs) - Math.min(...xs)) / s.unitsPerM;
       const dy = (Math.max(...ys) - Math.min(...ys)) / s.unitsPerM;
+      // the outline's length (baseboards / skirting = this minus the door openings, captain 16:59 convention)
+      const poly = sh.poly;
+      const perimeter = poly.reduce((n, q, i) => { const r = poly[(i + 1) % poly.length]; return n + Math.hypot(r[0] - q[0], r[1] - q[1]); }, 0) / s.unitsPerM;
       this.v2d.measurePoly(sh.poly, `${fmtM(m2)} m²`);
-      this.out(`${name ? `${esc(name)}: ` : "Room area: "}<b>${fmtM(m2)} m²</b> <small>traced outline at ${esc(s.label)} (${esc(s.source)}); inner faces of the walls, furniture lines may cut it</small>`);
-      return { m2, length: Math.max(dx, dy), width: Math.min(dx, dy), poly: sh.poly };
+      this.out(`${name ? `${esc(name)}: ` : "Room area: "}<b>${fmtM(m2)} m²</b> · perimeter <b>${fmtM(perimeter)} m</b> <small>traced outline at ${esc(s.label)} (${esc(s.source)}); inner faces of the walls, furniture lines may cut it; door openings not deducted from the perimeter</small>`);
+      return { m2, length: Math.max(dx, dy), width: Math.min(dx, dy), perimeter, poly: sh.poly };
     } catch (e) {
       this.out(`Could not trace the room: ${esc((e as Error).message)}`);
       return null;

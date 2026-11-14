@@ -105,37 +105,49 @@ measured by hand at the printed scale, each row saying which. The files are not 
 
 Each file is uploaded alone under a hashed name through the `upload` solver, with Gemini escalation off.
 
-| Commit (gate) | stoa-like dev | Areas | Lengths | Counts | stoa-like sealed |
+Until gate d17 the dev set had 55 scored questions; from d18 on it has 90 (16 questions our team lead wrote in Stoa's style,
+and USACE door counts and toilet skirting, were added), and the sealed set grew from 15 to 32.
+
+| Commit (gate) | stoa-like dev | stoa-like sealed |
+|---|---|---|
+| `504060a` (d16) | 43.6% (24 / 55; areas 3 / 16) | 40.0% (6 / 15) |
+| `4e0a4db` (d17) | 47.3% (26 / 55; 4 W / 2 L) | 40.0% (6 / 15) |
+| `517b67b` (d18) | 50.9% (28 / 55); **47.8% (43 / 90)** on the full set; mean latency 70 → 19 s per question | 31.3% (10 / 32) |
+| **`5a4b058` (d19)** | **65.6% (59 / 90; 16 W / 0 L)**; 0 wrong at confidence ≥ 0.8; cold cache: mean 7.1 s, p95 25.6 s, max 29.5 s | **46.9% (15 / 32; 7 W / 2 L)** |
+
+What d19 changed, all general readers rather than rules for these four sheets: printed area tables are read by their
+TOTAL row or summed by the asked type; piping parts are counted by their distinct tags; slab areas by type are traced
+around the slab callout; "how many linear metres of skirting" is a length, not a count. The gain carried over to the
+held-out sibling sheets (+5). Runs: `20261114-170611-upload-stoa_like_dev-9e13`, `-170632-upload-stoa_like_dev-e1b1`
+(all caches off), `-170611-upload-stoa_like_sealed-642e`.
+
+**Three systems on the same 90 dev questions** (same split and scorer): the app with the hosted escalation on (code
+`504060a`: Gemini 3.1 Pro for unsure answers, Nemotron verify), Gemini 3.1 Pro asked directly with the drawing, our local
+Qwen3-VL-8B asked directly, and our pipeline with no hosted model at d18 and d19.
+
+| Stoa kind (questions) | App, escalation on (`504060a`) | Gemini 3.1 Pro direct | Qwen3-VL-8B direct | Local only, d18 | Local only, d19 |
 |---|---|---|---|---|---|
-| `504060a` (d16) | 43.6% (24 / 55) | 3 / 16 | | | 40.0% (6 / 15) |
-| `4e0a4db` (d17) | **47.3%** (26 / 55; 4 W / 2 L) | 5 / 16 | 10 / 16 | 11 / 23 | **40.0%** (6 / 15) |
-| `517b67b` (d18) | **50.9%** (28 / 55; 2 W / 0 L; mean latency 70 → 19 s per question) | | | | |
+| **All (90)** | 55 (61%) | 55 (61%) | 23 (26%) | 43 (48%) | **59 (66%)** |
+| Areas by room (10) | 1 | 0 | 0 | 3 | 4 |
+| Areas by type, from a printed table (15) | 8 | 13 | 4 | 9 | 13 |
+| Baseboard lengths (3) | 1 | 0 | 0 | 0 | 1 |
+| Door counts (2) | 0 | 0 | 0 | 0 | 0 |
+| Slab area by type (7) | 2 | 3 | 0 | 0 | 2 |
+| Piping: tags and pipe sizes (20) | 18 | 17 | 13 | 12 | 19 |
+| Other: label counts, overall dimensions, slab data (33) | 25 | 22 | 6 | 19 | 20 |
+| Answers with evidence | 98% | none | none | 88% | 94% |
+| $ per question (first three columns: measured on the first 72 questions) | $0.018 | $0.010 | $0.0001 | $0.0011 | $0.0008 |
 
-**Three systems on the same 72 dev questions** (code `504060a`, same split and scorer): the app as it ships (Gemini 3.1
-Pro escalation and Nemotron verify on), Gemini 3.1 Pro asked directly with the drawing, and our local Qwen3-VL-8B asked
-directly.
+The first three columns were run once, at 17:00; the local-only columns are the gate runs. Between them the reference
+answers of two rows were corrected (a skirting length and a kitchen area), so a difference of one or two questions is
+within noise. Per-kind counts for the local-only columns are the eval's strict scoring (one more room area is right
+under a second accepted reading added later). The escalation column was not re-run on d19 code.
 
-| | App as shipped | Gemini 3.1 Pro direct | Qwen3-VL-8B direct |
-|---|---|---|---|
-| All (72) | **58.3%** | 59.7% | 25.0% |
-| Areas by room (8) | 1 | 0 | 0 |
-| Areas by type, from a printed table (12) | 5 | 10 | 4 |
-| Baseboard lengths (2) | 0 | 0 | 0 |
-| Slab area by type (6) | 1 | 2 | 0 |
-| Piping: tags and pipe sizes (16) | 15 | 14 | 10 |
-| Other: label counts, overall dimensions, slab data (28) | 20 | 17 | 4 |
-| Answers with evidence | 98.6% | none | none |
-| $ per question / mean latency | $0.018 / 62 s | $0.010 / 52 s | $0.0001 / 1.7 s |
-
-Runs: `20261114-163703-upload-stoa_like_dev-038f`, `-163704-vlm_direct-stoa_like_dev-526d`,
-`-163704-vlm_direct-stoa_like_dev-0c74`. 72% of the shipped app's answers on these sheets were in the expensive tier.
-The app's areas by type lose to Gemini because, on the vector PDF, they summed the area labels of the rooms instead of
-reading the sheet's printed total row. That is routing, not perception.
-
-Areas, Stoa's first priority, are our weakest kind on these sheets. Line-only CAD sheets have no room fills, so a
-room is found by its label and measured from the wall lines at the printed scale (to the middle of each drawn line).
-Areas by type, slab areas by slab type and baseboard lengths need the legend, the slab callouts or the door openings
-joined to the room geometry, which is where most misses are.
+Room areas, Stoa's first priority, are still our weakest kind on these sheets, and every other system does worse.
+Line-only CAD sheets have no room fills, so a room is found by its label and traced from the wall lines at the printed
+scale; door swings and door gaps break the outline (the DfE laundry comes out right, the kitchen leaks into the next
+room). Slab areas by slab type and baseboard lengths need the slab callouts or the door openings joined to the room
+geometry, which is where most of the remaining misses are.
 
 ## Real drawings from outside the dataset
 
@@ -167,6 +179,8 @@ bundled here.
 | `0b6f25d` (d14) | 64.9% (74 / 114, 10 W / 0 L, CI [+2.0, +13.8]) | 43.9% (1 W / 1 L) |
 | exam grown to 44 files: `fc0927a` (= d14 + docs) | 59.6% (81 / 136) | 48.6% (51 / 105) |
 | **`504060a` (d16)** | **64.0%** (87 / 136; areas 56, lengths 70, counts 62; 0 wrong at conf ≥ 0.8) | **49.1%** (55 / 112; areas 47, lengths 44, counts 58) |
+| exam grown again: `517b67b` (d18) | 70.2% (118 / 168; the 114 rows from d14 78.1%, the 54 rows added since 15:30 53.7%) | 49.2% (59 / 120) |
+| `5a4b058` (d19) | 69.6% (117 / 168; 0 W / 1 L) | 49.2% (59 / 120; 2 W / 2 L) |
 
 Gate d14 runs: `20261114-152311-upload-wild_dev-8df4` and `20261114-152311-upload-wild_sealed-dcd8`.
 
@@ -344,8 +358,9 @@ From the real-drawing exam (above) and from our red team. The red team wrote 992
 overnight, each family aimed at the weakness the last one found.
 
 - **Stoa's own kinds of question are the hardest.** On their example sheets we answer about half of the questions
-  (50.9% dev, 40.0% on held-out sibling sheets, local models only), and areas by room or by type are the weakest kind (see above).
-- **Real drawings are much harder than the dataset.** 43.9–49.1% on held-out real files with local models only (64.8% with the Gemini escalation), against 87.7% on the sealed
+  (65.6% dev, 46.9% on held-out sibling sheets, local models only), and room areas on line-only sheets (4 of 10),
+  slab areas by type (2 of 7) and door counts (0 of 2) are the weakest kinds (see above).
+- **Real drawings are much harder than the dataset.** 43.9–49.2% on held-out real files with local models only (64.8% with the Gemini escalation), against 87.7% on the sealed
   dataset test. The weakest kinds: rendered or photographed copies of plans, totals on IFC models, counts on images
   that are not CubiCasa-style, and dimension-only sheets (room sizes only as dimension chains).
 - **Confident misses on held-out real drawings** (4 of 7 confident answers wrong on wild-sealed). On the dataset,

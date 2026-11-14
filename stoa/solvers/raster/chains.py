@@ -375,7 +375,9 @@ def overall_answer(img_path: str, question: str, tl, solver: str = "raster") -> 
             return None  # both sides may be parts of a larger outline
         val = row.value * col.value
         unit = "ft2" if row.unit == "ft" else "m2"
-        trace = [f"overall dimensions: width {row.describe()}; depth {col.describe()}; product {val:.3f} {unit}"]
+        trace = [f"overall dimensions: width {row.describe()}; depth {col.describe()}; product {val:.3f} {unit}",
+                 "Convention: area of the overall dimensions = width × depth as printed (a rectangle; recesses not "
+                 "subtracted)" + (f"; = {val * 0.09290304:.2f} m²" if unit == "ft2" else "")]
         if unit == "ft2" and _SQM.search(question):
             val, unit = val * 0.09290304, "m2"
             trace.append(f"converted to {val:.3f} m² (1 ft² = 0.0929 m²)")
@@ -411,7 +413,12 @@ def overall_answer(img_path: str, question: str, tl, solver: str = "raster") -> 
         asm.append(f"integer dimension strings read as {p.int_unit} (segment sizes {'1000-6000' if p.int_unit == 'mm' else '100-600'} "
                    "for rooms)")
     sn = _scale_note(p)
+    metric = f" = {p.value * 0.3048:.3f} m" if p.unit == "ft" else ""
     trace = [f"overall dimension ({kind}, {p.axis}): {p.describe()}" + (f"; {sn}" if sn else ""),
-             f"verified chain totals found: {len(pairs)}"]
+             f"verified chain totals found: {len(pairs)}",
+             f"Convention: overall dimension = the outermost printed total along that side (as dimensioned on the "
+             f"drawing); units as printed: {p.value:g} {p.unit}{metric}"]
+    if metric:
+        asm.append(f"{p.value:g} ft{metric}")
     return Answer(value=round(p.value, 3), unit=p.unit, confidence=conf, solver=solver, trace=trace,
                   evidence=_ev(img_path, p), assumptions=asm, missing=miss)

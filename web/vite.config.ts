@@ -10,8 +10,11 @@ if (fs.existsSync(path.resolve(__dirname, "mobile.html"))) pages.mobile = path.r
 // `/api/*` → W4's API on :8100 when it is up, else the local mock (see mock/stoaApi.ts).
 export default defineConfig({
   plugins: [stoaApi()],
-  server: { host: "127.0.0.1", port: 5173 },
-  preview: { host: "127.0.0.1", port: 5173 },
+  // '.ts.net': the captain may open the demo from a phone through `tailscale serve` (Vite blocks unknown hosts, W6 16:28)
+  server: { host: "127.0.0.1", port: 5173, allowedHosts: [".ts.net"] },
+  preview: { host: "127.0.0.1", port: 5173, allowedHosts: [".ts.net"] },
+  // the landing page links to the phone page only when this build has it
+  define: { __HAS_MOBILE__: JSON.stringify(!!pages.mobile) },
   optimizeDeps: { exclude: ["web-ifc"] },
   build: { target: "es2022", chunkSizeWarningLimit: 4000, rollupOptions: { input: pages } },
 });

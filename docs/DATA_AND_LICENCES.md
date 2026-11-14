@@ -8,8 +8,9 @@ What this project uses, who made it, and under which licence. Short version:
 - **Our LoRA adapters and the optional CubiCasa5K weights are non-commercial** and are not in this repository.
 - **Copyleft dependencies are installed or called, not bundled:** PyMuPDF (AGPL-3.0), IfcOpenShell (LGPL-3.0), and
   LibreDWG (GPL-3.0, run as a separate program).
-- **Bundled here:** two small sample drawings (CC BY 4.0 and KIT "unrestricted use"), one screenshot that shows a
-  CC BY 4.0 drawing, and recorded answers for the web app's offline mode (see the table at the end).
+- **Bundled here:** three small sample drawings (CC BY 4.0, KIT "unrestricted use" and Open Government Licence v3.0),
+  one screenshot that shows the Open Government Licence drawing, and recorded answers for the web app's offline mode,
+  only about drawings whose licence allows commercial use (see the table at the end).
 
 This page summarises; it is not legal advice. The licence text and credit line of each dataset file are in
 `data/<source>/LICENSE.md` inside the dataset.
@@ -114,8 +115,21 @@ From `web/package.json`, installed by npm, not vendored.
 | `samples/swiss/plan.pdf`, `.dxf`, `.png` (dataset file `site117_bldg93_floor408`) | CC BY 4.0 | Swiss Dwellings v3.0.0 by Standfest et al. (Archilyse AG), doi:10.5281/zenodo.7788422, CC BY 4.0. Drawing rendered by Stoa from the dataset geometry (derived work; labels, language and numbering added). Archilyse AG does not endorse these drawings. From the Stoa Junction 2026 dataset |
 | `samples/fzk_house/fzk_house.ifc` (FZK-Haus) | KIT: "for unrestricted use" | Institute for Automation and Applied Informatics (IAI) / Karlsruhe Institute of Technology (KIT), KIT IFC Examples, https://www.ifcwiki.org/index.php?title=KIT_IFC_Examples. Unchanged, via IFC-Bench v2 and the Stoa Junction 2026 dataset |
 | `samples/dfe_school/plan.pdf` (Special School Plan Level 00, SEN-DFE-XX-00-D-X-0201 rev C01) | Open Government Licence v3.0 | UK Department for Education, GOV.UK "A new model design for a special school", unchanged. Contains public sector information licensed under the Open Government Licence v3.0 |
-| `docs/img/hero.png` (screenshot of our web app) | Our UI: MIT. The drawing shown: CC BY 4.0 | Floor plan `site1000_bldg2082_floor9385` from the Stoa Junction 2026 dataset, rendered by Stoa from Swiss Dwellings v3.0.0 (Archilyse AG), doi:10.5281/zenodo.7788422, CC BY 4.0 |
-| `web/fixtures/` (offline replay for the app) | Our answers: MIT. Dataset questions and data derived from a drawing keep that drawing's licence | Recorded questions and answers about dataset drawings, plus a little geometry derived from them (the 3D view of the Swiss floor in the screenshot, room regions of one CubiCasa5K plan). No drawing files. Some of these drawings are CC BY-NC-SA (CubiCasa5K) or CC BY-SA (OpeningDesign); credits as in the dataset |
+| `docs/img/hero.png` (screenshot of our web app) | Our UI: MIT. The drawing shown: Open Government Licence v3.0 | Special School Plan Level 00 (SEN-DFE-XX-00-D-X-0201), UK Department for Education, GOV.UK "A new model design for a special school". Contains public sector information licensed under the Open Government Licence v3.0 |
+| `web/fixtures/` (offline replay for the app) | Our answers: MIT. Dataset questions and data derived from a drawing keep that drawing's licence | Recorded questions and answers about the dataset drawings listed below, plus a little geometry derived from them (the 3D view of the Swiss floor). No drawing files. Entries about NonCommercial drawings (CubiCasa5K, CC BY-NC-SA 4.0) were removed from this repository, and the licence of every remaining file was checked against the dataset's `LICENSE.md` tables |
+
+**Drawings the offline replay (`web/fixtures/`) asks about.** The files themselves are not bundled; the app opens
+them from your copy of the dataset (`STOA_DATA`).
+
+| Dataset file(s) | Drawing | Licence | Credit |
+|---|---|---|---|
+| `ifc_models/bsc-esplanades_1807-ep-ar-v18.ifc` and its five plan sheets `…_plan-0N-N-korrus.pdf` | Maleva tänav 18 apartment building, Tallinn (Esplanades example model) | CC BY 4.0 | © Esplan (esplan.ee), via buildingSMART Community Sample-Test-Files. Plan sheets generated from the IFC by Stoa with IfcOpenShell IfcConvert 0.9.0 (rendered drawing; geometry unmodified) |
+| `swiss_dwellings/site1000_bldg2082_floor9385` (PDF, DXF, PNG) | Apartment floor | CC BY 4.0 | Swiss Dwellings v3.0.0 by Standfest et al. (Archilyse AG), doi:10.5281/zenodo.7788422. Rendered by Stoa from the dataset geometry; Archilyse AG does not endorse these drawings |
+| `ifc_models/bsc-duplex_duplex-a-20110907.ifc` | Duplex Apartment, architectural model | CC BY-ND 3.0 | BSI (2020) "Duplex Apartment Test Files", buildingSMART International. Only questions and our answers about the unchanged model; nothing derived from it is stored |
+| `ifc_bench/4351_arc.ifc` | Unidentified building, architectural model (IFC-Bench v2 project 4351) | GPL-3.0-or-later | © 2009–2017 BIMserver.org (opensourceBIM TestFiles), via IFC-Bench v2 (Hellin et al., TU Munich) |
+| `opening_design/Sports_Complex/Sheets - Current Set/A-801 - Door and Finish Schedules & Wall Types.pdf` | Xcel Sports Complex, door and finish schedules | CC BY-SA 4.0 | OpeningDesign, Sports_Complex (github.com/OpeningDesign/Sports_Complex), and the entire project team |
+| `habs/vi0026_sheet_00003.jpg` | Creque Marine Railway, Head House and Residence, North Elevation, Charlotte Amalie, St. Thomas, VI | Public domain | HAER, National Park Service; Library of Congress Prints and Photographs Division (loc.gov/pictures/item/vi0026.sheet.00003a) |
+| `finna/mfa.81125dbb-8b52-48e3-bc9d-1128e233ac93.jpg` | Olympiastadion, site plan, Helsinki, 3.7.1950 | CC BY 4.0 | Lindegren & Jäntti (architects); Arkkitehtuuri- ja designmuseo (Architecture & Design Museum, Helsinki), via Finna (finna.fi/Record/mfa.81125dbb-8b52-48e3-bc9d-1128e233ac93) |
 
 `samples/README.md` has the full credit lines and a few questions with expected answers (`samples/questions.jsonl`).
 

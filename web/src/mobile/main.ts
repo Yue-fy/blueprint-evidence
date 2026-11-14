@@ -35,6 +35,9 @@ const state = {
   question: "",
   /** the scale in evidence units (px or pt) per metre: the answer's, or the visitor's two taps */
   scale: null as Scale | null,
+  /** a scale an earlier answer READ from this photo / sheet (its scale bar, a printed 1:N): the tap-the-room flow uses
+   *  it before the door-swing guess (Stoa's DfE school sheet: scale bar 31.5 px/m, door swings 56 px/m) */
+  fileScale: null as Scale | null,
   tool: null as null | "scale" | "room",
   taps: [] as Pt[],
   /** outlines the visitor asked for (tap the room), in evidence units */
@@ -48,6 +51,7 @@ const view = new PhotoView($("photo"));
 /** test hook (playwright): the screen point of an image point */
 (window as unknown as { __w6at: (x: number, y: number) => number[] }).__w6at = (x, y) => view.toClient(x * state.k, y * state.k);
 const space = (): Space => (state.pdf ? "pdf_pt" : "image_px");
+const sheet = () => (state.pdf ? "drawing" : "photo");
 
 // ---------- the photo's scale from its door swings (best estimate; GET /api/m/doorscale, src/mobile/doorscale.py) ----------
 interface DoorEst { ok: boolean; px_per_m?: number; arcs?: number; leaf_m?: number; why?: string }
@@ -81,7 +85,7 @@ $("fit").addEventListener("click", () => view.fit());
 
 function reset() {
   state.busy?.abort();
-  Object.assign(state, { file: null, pdf: false, page: 0, k: 1, answer: null, question: "", scale: null, tool: null, taps: [], rooms: [] });
+  Object.assign(state, { file: null, pdf: false, page: 0, k: 1, answer: null, question: "", scale: null, fileScale: null, tool: null, taps: [], rooms: [] });
   view.clearMarks();
   document.body.dataset.step = "pick";
   $("result").innerHTML = "";
@@ -257,7 +261,7 @@ function thisRoom() {
   state.answer = { value: null, unit: "m2", confidence: 0.5, evidence: [], trace: ["tap-the-room: outlined on the photo by flood fill (W6 phone page)"], solver: "tap",
     intent: { task: "area", target: "room", scope: "room" }, cost: {} };
   state.rooms = [];
-  if (!state.scale?.user) state.scale = null;
+  if (!state.scale?.user) state.scale = state.fileScale;
   state.t.ask = 0;
   view.clearMarks();
   $("result").hidden = true;
@@ -290,6 +294,7 @@ async function askNow() {
     if (ctl.signal.aborted) return;
     state.answer = a;
     state.scale = scaleFromAnswer(a, space());
+    if (state.scale && !scaleGuessed(state.scale)) state.fileScale = state.scale;
     await showAnswer();
   } catch (e) {
     if (ctl.signal.aborted) return;
@@ -467,7 +472,7 @@ function renderResult() {
         : `<div class="m-value"><span class="m-big name">${size ? "Not measured yet" : "No answer"}</span></div>`}
       <div class="m-sentence">${esc(mine ? mine.how : guessNum && size ? `Not measured on ${state.pdf ? "the drawing" : "your photo"} yet: tap the room to outline it.` : sentence(a, q))}</div>
       <div class="hero-badges m-badges">
-        <span class="conf ${c.cls}" title="calibrated confidence ${Math.round((a.confidence ?? 0) * 100)} %">${esc(mine ? (scaleGuessed(state.scale) ? "Best estimate" : "Measured by you") : noNumber ? "No number yet" : c.word)}</span>
+        <span class="conf ${c.cls}" title="calibrated confidence ${Math.round((a.confidence ?? 0) * 100)} %">${esc(mine ? (scaleGuessed(state.scale) ? "Best estimate" : state.scale?.user ? "Measured by you" : state.pdf ? "Measured on the drawing" : "Measured on the photo") : noNumber ? "No number yet" : c.word)}</span>
         ${size && !scaleOk ? `<button type="button" class="scale-unknown" id="scalePill">Scale unknown — set it</button>` : ""}
         ${size && scaleOk ? `<span class="m-scale">Scale ${esc(state.scale!.label)} · ${esc(state.scale!.source)}</span>` : ""}
         <span class="m-tier t-${tier.tier}" title="${esc(tier.why)}"><span class="tier-dots">${[1, 2, 3].map((k) => `<i class="${k <= (tier.tier === "cheap" ? 1 : tier.tier === "mid" ? 2 : 3) ? "on" : ""}"></i>`).join("")}</span>${esc(tier.word)}</span>
@@ -501,14 +506,14 @@ function myMeasure(): { value: string; how: string } | null {
   const last = state.rooms[state.rooms.length - 1];
   if (last) {
     const m2 = polyArea(last.poly) / (s.unitsPerM * s.unitsPerM);
-    return length ? null : { value: fmtM(m2), how: `The room you tapped, outlined on the photo, at ${s.user ? "your scale" : `${s.label} (${s.source})`}. The outline is traced: check it.` };
+    return length ? null : { value: fmtM(m2), how: `The room you tapped, outlined on the ${sheet()}, at ${s.user ? "your scale" : `${s.label} (${s.source})`}. The outline is traced: check it.` };
   }
   if (!s.user) return null;
   const ev = (a.evidence ?? []).filter(onThis);
   const poly = ev.find((e) => e.polygon && e.polygon.length > 2)?.polygon as Pt[] | undefined;
   const line = ev.find((e) => e.polyline && e.polyline.length > 1)?.polyline as Pt[] | undefined;
-  if (!length && poly) return { value: fmtM(polyArea(poly) / (s.unitsPerM * s.unitsPerM)), how: `The outline on the photo at your scale (${s.label}).` };
-  if (length && line) return { value: fmtM(polyLength(line) / s.unitsPerM), how: `The line on the photo at your scale (${s.label}).` };
+  if (!length && poly) return { value: fmtM(polyArea(poly) / (s.unitsPerM * s.unitsPerM)), how: `The outline on the ${sheet()} at your scale (${s.label}).` };
+  if (length && line) return { value: fmtM(polyLength(line) / s.unitsPerM), how: `The line on the ${sheet()} at your scale (${s.label}).` };
   return null;
 }
 
@@ -523,7 +528,7 @@ function setTool(t: null | "scale" | "room") {
   const bar = $("toolBar");
   bar.hidden = !t;
   $("scaleSheet").hidden = true;
-  if (t === "scale") toolHint("Tap one end of a length you know, then the other end (pinch to zoom in first for precision). A printed dimension is best; a door is about 0.9 m.");
+  if (t === "scale") toolHint("Tap one end of a length you know, then the other end (pinch to zoom in first for precision). A printed dimension or the scale bar is best; a door is about 0.9 m.");
   if (t === "room") toolHint("Tap inside the room you mean. We outline it on the photo.");
   if (t) $("photo").scrollIntoView({ behavior: "smooth", block: "center" });
 }
@@ -603,23 +608,32 @@ async function traceRoom(ev: Pt) {
   view.addMark({ kind: "dot", pts: [toPx(ev)], tone: "user" });
   const r = Math.max(2, 4 / state.k);
   try {
-    const res = await roomShapes(state.file.path, state.page, space(), [{ i: 0, bbox: [ev[0] - r, ev[1] - r, ev[0] + r, ev[1] + r] }]);
+    const file = state.file;
+    const res = await roomShapes(file.path, state.page, space(), [{ i: 0, bbox: [ev[0] - r, ev[1] - r, ev[0] + r, ev[1] + r] }]);
+    if (state.file !== file) return; // a new photo was picked meanwhile
     const poly = res.shapes[0]?.poly as Pt[] | null | undefined;
     if (!poly || poly.length < 3) {
       toolHint("No closed room there (an open door or a faint wall?). Tap closer to the middle of the room.");
       return;
     }
     state.rooms.push({ poly });
-    setTool(null);
-    if (!state.scale) {
-      state.scale = await estimatedScale();
-      if (state.scale) setTool(null); // redraw the outline with its m² tag
+    if (!state.scale && !state.fileScale) {
+      // the door-swing estimate started at upload; on a big sheet it takes a second, sharper look (~10 s)
+      view.onTap = null;
+      view.addMark({ kind: "poly", pts: poly.map(toPx), tone: "user" });
+      toolHint("Room outlined. Working out the scale from the door swings…");
     }
+    if (!state.scale) {
+      const est = state.fileScale ?? (await estimatedScale());
+      if (state.file !== file) return;
+      state.scale = state.scale ?? est; // the visitor may have set one meanwhile
+    }
+    setTool(null); // the outline, with its m² tag once the scale is known
     if (state.answer?.solver === "tap") state.t.ask = performance.now() - t0;
     if (!state.scale) {
       renderResult();
       setTool("scale");
-      toolHint("Room outlined. Now set the scale: tap both ends of a length you know (a door is about 0.9 m).");
+      toolHint("Room outlined. Now set the scale: tap both ends of a length you know (the scale bar, a printed dimension; a door is about 0.9 m).");
       return;
     }
     renderResult();

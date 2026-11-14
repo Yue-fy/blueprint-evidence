@@ -33,9 +33,10 @@ server. One eval tool scores every solver the same way.
 | `pdf_vector` | same folder, `pdffloor.py` | Swiss-style vector PDF with no DXF | deterministic |
 | `schedule`, `pdf_text`, `pdf_textqa` | `stoa/solvers/vector/` | Schedule tables and text from the PDF text layer | deterministic (table code may use the LLM) |
 | `plan_rooms` | `stoa/solvers/plan_rooms.py` | Any vector plan PDF without its model or CAD file: room outlines (filled paths) + room labels + the printed or estimated 1:N scale | deterministic |
-| `line_rooms` | `stoa/solvers/line_rooms.py` | A named room on a line-only CAD sheet, traced around its printed label at the printed scale | deterministic |
+| `line_rooms` | `stoa/solvers/line_rooms.py` → `stoa/evidence/linework.py`, `lineplan.py` | Line-only CAD sheets (no fills, no CAD twin): the named room traced from the wall lines around its printed label at the printed 1:N (door gaps closed); also skirting / perimeter lengths | deterministic |
 | `area_tags` | `stoa/solvers/area_tags.py` | Room area tags printed on CAD/Revit sheets ('680 SF', '4.24 m²') | deterministic |
-| `label_count` | `stoa/solvers/label_count.py` | Counts of rooms of one type from their printed labels | deterministic |
+| `label_count` | `stoa/solvers/label_count.py` | Counts from the text layer: printed room labels of the asked type, distinct numbered tags of a piping or door family ('FP-1'..'FP-5' → 5) | deterministic |
+| area tables, slabs | `stoa/evidence/areatable.py`, `stoa/evidence/slabs.py` (hooks in the pipeline) | A printed area table ('TOTAL SECOND FLOOR = 26,562 SF': the TOTAL row, or the rows of the asked type summed); slab area by type = the region around the slab-type callout traced on the sheet's lines, joints and dimension lines left out | deterministic |
 | `svg_ifc` | `stoa/solvers/svg_ifc.py` | IfcConvert plan SVGs alone: one `<g class="IfcX" data-guid>` per element, room labels, scale | deterministic |
 | `raster` | `stoa/solvers/raster/` | Scans, PNGs and photos: scale bar or printed scale, flood fill, door arcs, window symbols, dimension strings, text layer | local |
 | `raster_cc5k` | `stoa/solvers/raster_cc5k/` | Pretrained CubiCasa5K network on CPU, one box per symbol (optional; weights not included) | local |

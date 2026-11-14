@@ -40,16 +40,13 @@ QUESTIONS = list(dict.fromkeys([(t["file"], t["q"]) for t in TOUR + TOUR_CUSTOME
 
 # On-demand second opinions (hosted NVIDIA Nemotron) the tour may click: (path, question).
 SECOND = [
-    ("data/cubicasa5k/colorful-4539.png", "Kuinka monta makuuhuonetta (MH) pohjapiirustuksessa on?"),
     ("data/habs/vi0026_sheet_00003.jpg",
      "What kind of drawing is this (floor plan, elevation, section, site plan)?"),
 ]
 SECOND_SOLVER = ("vlm_direct", {"backend": "nvidia"})
 # "Show where" on CubiCasa answers without evidence (web/src/card.ts locatorFor): room counts → the label reader
 # (raster), symbol counts → R1's pretrained CubiCasa5K detector (raster_cc5k, cached). (path, question, solver)
-LOCATE = [("data/cubicasa5k/colorful-4539.png", "Kuinka monta makuuhuonetta (MH) pohjapiirustuksessa on?", "raster"),
-          ("data/cubicasa5k/high_quality_architectural-14797.png", "How many saunas are on this floor plan?", "raster"),
-          ("data/cubicasa5k/high_quality_architectural-816.png", "How many doors are shown on this floor plan?", "raster_cc5k")]
+LOCATE: list[tuple[str, str, str]] = []  # this repository records no NonCommercial (CubiCasa5K) drawings
 
 
 def main() -> None:

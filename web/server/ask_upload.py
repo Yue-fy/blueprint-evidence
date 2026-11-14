@@ -164,7 +164,7 @@ def serve() -> None:
             continue
         try:
             out = {"answer": answer(json.loads(line))}
-        except Exception as e:  # noqa: BLE001  (one bad file must not end the worker)
+        except (Exception, SystemExit) as e:  # noqa: BLE001  (one bad file or a library's sys.exit must not end the worker)
             import traceback
 
             traceback.print_exc(file=sys.stderr)

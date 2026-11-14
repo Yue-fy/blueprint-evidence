@@ -340,6 +340,16 @@ def answer(path: str, question: str, image_path: str | None = None, backend: str
                 # H/Ziying x1-023: a type sheet prints ONE area for identical units drawn twice (studio 31.0 m² x 2)
                 missing.append("the number of DRAWN units is not checked: a type sheet may print one area label for "
                                "several identical units")
+    if (_AREA_Q.search(question) or _BIG_Q.search(question)) and not _AGG_Q.search(question) and not unit_q and \
+            isinstance(value, (int, float)) and cited and conf > 0.2 and \
+            any(_TOTAL_LINE.search(j.text) for i in cited for j in tl.items
+                if abs(j.cy - i.cy) < 4 * max(6.0, i.box[3] - i.box[1]) and
+                abs(j.cx - i.cx) < 12 * max(6.0, i.box[3] - i.box[1])):
+        # D1 16:59 (Stoa-style school PNG): 'floor area of the plant room?' -> 1248 m² @0.75 from the title block's
+        # 'Overall GIFA … Ground: 1248m²' (the cited 'Ground:' + '1248m²' sit under 'Overall GIFA'): a floor / building
+        # total is not one room's area
+        conf = min(conf, 0.15)
+        missing = [*missing, "the cited area is a floor or building total (GIFA / gross / overall), not the room's own"]
     if unit and _SIZE.search(question) and str(unit).strip().lower().rstrip(".") not in _UNITS_OK:
         # P1 14:45: 'How thick is the outer wall?' -> '87.5 BRH' @0.75 ('BRH' = Brüstungshöhe, a label, not a unit)
         missing = [*missing, f"'{unit}' is not a unit: the cited number belongs to a label ({unit}), not to the asked size"]
@@ -629,6 +639,8 @@ def _tag_count_answer(img_path: str, question: str, tl: T.TextLayer, solver: str
                   missing=["tags the text reading missed (small or overlapping text) are not counted"])
 
 
+_TOTAL_LINE = re.compile(r"\b(GIFA|GIA|NIA|GEA|gross|overall|total|sum|subtotal|BGF|NGF|BTA|NTA|HTA|"
+                         r"gesamt\w*|insgesamt|yhteens[äa]|kerrosala|bruttoala|totalt|summa)\b", re.I)
 _HOW_MANY = re.compile(r"\b(how many|number of|wie viele|anzahl|combien|quanti|quante|kuinka monta|hur många|cuántos|"
                        r"cuántas|hoeveel)\b", re.I)
 LABEL_COUNT_CONF = 0.7  # = G1's label_count on vector PDFs (a room may be unlabelled)

@@ -176,6 +176,12 @@ class Upload(Pipeline):
 
         try:
             png, zoom = render_png(prep.path)
+            try:
+                from stoa.formats.normalize import seed_text_layer
+
+                seeded = seed_text_layer(prep.path, png, zoom)  # the PDF's own words, not a 10-min OCR (S0 16:48)
+            except Exception:  # noqa: BLE001 — the image readers read the text themselves as before
+                seeded = 0
             ans = super().solve(png, question)
         except Exception as e:  # noqa: BLE001 — the PDF answer stands
             ans0.trace = [*ans0.trace, f"upload: page as image failed ({type(e).__name__}: {e})"]
@@ -190,7 +196,8 @@ class Upload(Pipeline):
         rec0 = [t for t in ans0.trace[:3] if str(t).startswith("recognised:")]
         chip0 = [a for a in ans0.assumptions if str(a).startswith("recognised as:")]
         ans.trace = [*rec0, f"upload: no PDF reader answered ({why[:160]}); page read as an image at {72 * zoom:.0f} "
-                            "dpi", *(t for t in ans.trace if not (rec0 and str(t).startswith("recognised:")))]
+                            "dpi" + (f" with the PDF's own text ({seeded} lines, no OCR)" if seeded else ""),
+                     *(t for t in ans.trace if not (rec0 and str(t).startswith("recognised:")))]
         if chip0:
             ans.assumptions = [*(a for a in ans.assumptions if not str(a).startswith("recognised as:")), *chip0]
         ans.cost = ans.cost.add(ans0.cost)  # both readings were paid for

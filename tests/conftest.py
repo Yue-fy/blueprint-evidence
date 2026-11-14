@@ -31,6 +31,18 @@ NEEDS_LOCAL_MODEL = {
     "tests/test_llm_parsing.py::test_local2_down_falls_back_to_local_at_once",
 }
 
+# test the local-backend code paths with a mocked client: STOA_MODE=api would reroute "local" to the hosted backend,
+# so these run with STOA_MODE unset (they make no network call either way)
+LOCAL_BACKEND_LOGIC = {
+    "tests/test_p1_portability.py::test_local_llm_never_seen_up_fails_fast",
+}
+
+
+@pytest.fixture(autouse=True)
+def _local_backend_logic(request, monkeypatch):
+    if request.node.nodeid in LOCAL_BACKEND_LOGIC:
+        monkeypatch.delenv("STOA_MODE", raising=False)
+
 
 def _has_dataset() -> bool:
     from stoa.data import data_root

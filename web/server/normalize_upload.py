@@ -95,7 +95,7 @@ def dxf(abs_path: str) -> dict:
     layer_note = _relayer(p)
     doc = ezdxf.readfile(str(p))
     msp = doc.modelspace()
-    unit = UNIT_M.get(int(doc.header.get("$INSUNITS", 6) or 6), 1.0)
+    unit, unit_note = _units(doc, msp)
     ext = bbox.extents(msp, fast=True)
     if not ext.has_data:
         raise ValueError("the CAD file has no drawable entities")
@@ -157,7 +157,31 @@ def dxf(abs_path: str) -> dict:
     page.insert_text((margin, H - margin / 2), f"Sheet drawn from {p.name} at 1:{n} on A3 (no original sheet uploaded)",
                      fontname="helv", fontsize=7, color=(0.45, 0.45, 0.45))
     out.save(dst)
-    return {"abs": str(dst), "note": f"sheet drawn from the CAD file at 1:{n}" + (f"; {layer_note}" if layer_note else "")}
+    return {"abs": str(dst), "note": f"sheet drawn from the CAD file at 1:{n}" + (f"; {unit_note}" if unit_note else "")
+            + (f"; {layer_note}" if layer_note else "")}
+
+
+def _units(doc, msp) -> tuple[float, str]:
+    """Metres per drawing unit. $INSUNITS can lie (E1 17:18: X1's wild DXF says mm but is drawn in metres, so its sheet
+    came out 1000x too small): E1's check by door-block size, else by the walls' span (stoa.evidence.dxfplan._unit),
+    and without it the same span test here. Returns (unit, a note when the declared unit was overruled)."""
+    declared = UNIT_M.get(int(doc.header.get("$INSUNITS", 0) or 0))
+    try:
+        from stoa.evidence.dxfplan import _unit  # night-E1 38086ce
+
+        u, why = _unit(doc, msp)
+    except Exception:  # noqa: BLE001 - older checkouts: the span test alone
+        from ezdxf import bbox
+
+        ext = bbox.extents(msp, fast=True)
+        span = max(ext.size.x, ext.size.y) if ext.has_data else 0.0
+        order = ([declared] if declared else []) + [k for k in (1.0, 0.001, 0.01, 0.0254, 0.3048) if k != declared]
+        u = next((k for k in order if 4 <= span * k <= 300), declared or 1.0)
+        why = f"the drawing spans {span * u:.1f} m"
+    names = {0.001: "millimetres", 0.01: "centimetres", 0.1: "decimetres", 1.0: "metres", 0.0254: "inches", 0.3048: "feet"}
+    if declared and abs(u / declared - 1) > 1e-6:
+        return u, f"read in {names.get(u, f'{u} m')} although the file says {names.get(declared, f'{declared} m')} ({why})"
+    return u, ""
 
 
 def _relayer(p: Path) -> str:

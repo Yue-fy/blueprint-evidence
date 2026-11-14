@@ -698,6 +698,258 @@ def _count_answer(path: str, pdf: str, page: int, q: str) -> Answer | None:
                   trace=[f"lineplan: {len(labs)} printed labels match {pat.pattern[:60]!r}: {names}"])
 
 
+_BASE_Q = re.compile(r"\b(base ?boards?|skirting(?:[\s-]*boards?)?|skirtings?|base (?:trim|moulding|molding|cove)s?|"
+                     r"cove base|wall base|kick ?boards?|sockelleiste\w*|fu(?:ß|ss)leiste\w*|scheuerleiste\w*|"
+                     r"plint(?:en|s)?|plinthes?|battiscop\w*|jalkalist\w*|golvlist\w*|sockellist\w*)\b", re.I)
+_BASE_WORDS = re.compile(r"\b(linear|lineal|running|metres?|meters?|lm|feet|foot|ft|needs?|needed|required|requires|"
+                         r"minus|less|doors?|openings?|perimeter|how|much|many|total|length|of|for|in|does|do|is|are|"
+                         r"would|will|we|install|installed|fit|fitted|fitting|along|around)\b", re.I)
+MIN_OPENING_M = 0.5  # a stretch of the room outline with no wall line along it, at least this long, is an opening
+
+
+def _px(ring, s_pt: float, ppt: float) -> tuple[float, float]:
+    q = ring.interpolate(float(s_pt))
+    return q.x * ppt, q.y * ppt
+
+
+def _face_ring(m: dict, m_per_pt: float):
+    """The traced outline moved out onto the wall faces: the polygon of pixel centres (simplified) runs ~0.5 pt inside
+    the room's pixels, so it is offset by (pixel area - polygon area) / perimeter (X1 sl-055 laundry: 47.9 x 27.7 pt
+    -> 48.9 x 28.7 = the wall faces 841.18-890.08 x 938.40-967.14)."""
+    from shapely.geometry import LineString, Polygon
+
+    try:
+        pg = Polygon([tuple(p) for p in m["polygon"]]).buffer(0)
+        if pg.geom_type != "Polygon" or pg.area <= 0:
+            return None
+        a_px_pt2 = float(m["area_m2"]) / (m_per_pt ** 2)
+        d = (a_px_pt2 - pg.area) / pg.length
+        if 0 < d <= 2.0:
+            g = pg.buffer(d, join_style=2, mitre_limit=2.0)
+            if g.geom_type == "Polygon":
+                pg = g
+        return LineString(list(pg.exterior.coords))
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _skirting(pdf: str, page: int, n: float, m: dict) -> dict | None:
+    """Skirting (baseboard) of a traced room = its outline minus the OPENINGS in its walls (captain 16:15, Stoa kind 2):
+    an opening is a stretch of the outline with no drawn line along it (door ways closed by the door-swing chord or by
+    the gap closing, open passages); the leaf of a door that rests against a wall keeps counting as wall. Opening
+    widths are measured jamb to jamb (X1 sl-055: laundry 10.957 m perimeter - 1.02 m opening = 9.93). Returns
+    {"perimeter_m", "value_m", "openings": [(a_pt, b_pt, len_m)], "runs": [[pt, ...], ...]} or None."""
+    import numpy as np
+    from shapely.geometry import LineString, Point
+    from shapely.ops import substring
+
+    from stoa.evidence import linework as L
+
+    pg = L._page(pdf, page)
+    if pg is None or not m.get("polygon"):
+        return None
+    ppt = pg["ppt"]
+    m_per_pt = n * L.PT_TO_M_AT_1
+    variant = str(m["variant"])
+    d_ink = L.ink_dist(pdf, page)  # the page as printed: walls, jambs, glazing (clip paths respected)
+    if d_ink is None:
+        return None
+    H, W = d_ink.shape
+
+    def at(d, x, y) -> float:
+        xi, yi = int(round(x)), int(round(y))
+        return float(d[yi, xi]) if 0 <= xi < W and 0 <= yi < H else 255.0
+
+    tol = max(2.5, 0.05 / m_per_pt * ppt)  # px: the outline sits on its lines' middles (simplified polygon: <= 2 px)
+    wtol = 0.15 / m_per_pt * ppt  # px: a door leaf resting against a wall lies within this of the wall's line
+    leaves, chords = [], []  # door radii: the door way's chord (an opening, drawn or not) / a leaf (counts as wall)
+    if "|doors@" in variant:
+        spokes, _ = L._door_arcs(pg, n)
+        for i in range(0, len(spokes) - 1, 2):
+            pair = []
+            for sp in spokes[i:i + 2]:
+                (cx, cy), (ex, ey) = sp.tolist()
+                mid = min(at(d_ink, cx + (ex - cx) * t, cy + (ey - cy) * t) for t in (0.25, 0.4, 0.5, 0.6, 0.75))
+                ext = max(at(d_ink, cx + (ex - cx) * t, cy + (ey - cy) * t) for t in (1.15, 1.3))  # wall line beyond
+                pair.append((LineString([(cx, cy), (ex, ey)]), mid, ext))
+            if len(pair) != 2:
+                continue
+            (s0, m0, e0), (s1, m1, e1) = pair
+            if (m0 > wtol) != (m1 > wtol):  # nothing drawn along one of them: that one spans the door way
+                c = 0 if m0 > wtol else 1
+            elif (e0 <= tol) != (e1 <= tol):  # both drawn (or both free): the chord runs on into the wall's line
+                c = 0 if e0 <= tol else 1
+            else:
+                leaves.extend(x[0] for x in pair if x[1] <= wtol)
+                continue
+            chords.append(pair[c][0])
+            if pair[1 - c][1] <= wtol:
+                leaves.append(pair[1 - c][0])
+
+    def on_chord(x, y) -> bool:
+        for c in chords:
+            (ax, ay), (bx, by) = c.coords
+            vx, vy = bx - ax, by - ay
+            ll = vx * vx + vy * vy
+            if ll <= 0:
+                continue
+            t = ((x - ax) * vx + (y - ay) * vy) / ll
+            if 0.02 <= t <= 0.98 and abs((x - ax) * vy - (y - ay) * vx) / ll ** 0.5 <= tol:
+                return True
+        return False
+
+    ring = _face_ring(m, m_per_pt)
+    if ring is None:
+        return None
+    total_pt = ring.length
+    step = 1.0 / ppt  # one raster px, in pt
+    k = max(8, int(total_pt / step))
+    ss = np.linspace(0.0, total_pt, k, endpoint=False)
+    d_arr, leaf_arr = np.zeros(k), np.zeros(k, dtype=bool)
+    for i, s_ in enumerate(ss):
+        x, y = _px(ring, s_, ppt)
+        d_arr[i] = at(d_ink, x, y)
+        if chords and on_chord(x, y):
+            d_arr[i] = 255.0  # a door way: drawn threshold / chord lines do not carry a skirting
+        elif d_arr[i] > tol and leaves:
+            leaf_arr[i] = any(c.distance(Point(x, y)) <= tol for c in leaves)
+    free = (d_arr > tol) & ~leaf_arr
+    if free.all() or not free.any():
+        return None
+    # runs of free samples, the ring rotated so it starts on a supported sample
+    r0 = int(np.argmin(free))
+    order = np.r_[r0:k, 0:r0]
+    opens, cur = [], None
+    for idx in order:
+        if free[idx]:
+            cur = [idx, idx] if cur is None else [cur[0], idx]
+        elif cur is not None:
+            opens.append(cur)
+            cur = None
+    if cur is not None:
+        opens.append(cur)
+    max_walk = int(np.ceil(2 * tol)) + 1
+    openings = []
+    for i0, i1 in opens:
+        # each end walked out to the first sample ON ink (the jamb's line), not along a door leaf
+        for _ in range(max_walk):
+            j = (i0 - 1) % k
+            if free[j] or leaf_arr[j] or d_arr[j] <= 0.5 or j == i1:
+                break
+            i0 = j
+        for _ in range(max_walk):
+            j = (i1 + 1) % k
+            if free[j] or leaf_arr[j] or d_arr[j] <= 0.5 or j == i0:
+                break
+            i1 = j
+        a_s, b_s = float(ss[i0]) - step / 2, float(ss[i1]) + step / 2
+        if b_s < a_s:  # wrapped past the ring's start
+            b_s += total_pt
+        if openings and a_s - openings[-1][1] <= 2 * tol / ppt:  # a double door: two leaves meet mid-opening
+            a_s = openings.pop()[0]
+        openings.append((a_s, b_s, (b_s - a_s) * m_per_pt))
+    if len(openings) > 1 and openings[0][0] + total_pt - openings[-1][1] <= 2 * tol / ppt:
+        last = openings.pop()
+        openings[0] = (last[0], openings[0][1] + total_pt, openings[0][1] + total_pt - last[0])
+        openings[0] = (openings[0][0], openings[0][1], openings[0][2] * m_per_pt)
+    openings = [o for o in openings if o[2] >= MIN_OPENING_M]
+    if not openings:
+        return {"perimeter_m": round(total_pt * m_per_pt, 3), "value_m": round(total_pt * m_per_pt, 3),
+                "openings": [], "runs": [[[round(x, 2), round(y, 2)] for x, y in ring.coords]]}
+
+    def piece(a, b):
+        a, b = a % total_pt, b % total_pt
+        if a <= b:
+            g = substring(ring, a, b)
+            return list(g.coords)
+        return list(substring(ring, a, total_pt).coords) + list(substring(ring, 0, b).coords)[1:]
+
+    runs, outs = [], []
+    for j, (a_s, b_s, ln_m) in enumerate(openings):
+        ca = piece(a_s, b_s)
+        outs.append(([round(c, 2) for c in ca[0]], [round(c, 2) for c in ca[-1]], round(ln_m, 3)))
+        nxt = openings[(j + 1) % len(openings)][0]
+        if nxt <= b_s:
+            nxt += total_pt
+        if nxt - b_s > step:
+            runs.append([[round(x, 2), round(y, 2)] for x, y in piece(b_s, nxt)])
+    per = total_pt * m_per_pt
+    val = per - sum(o[2] for o in outs)
+    return {"perimeter_m": round(per, 3), "value_m": round(val, 3), "openings": outs, "runs": runs}
+
+
+def _baseboard_answer(path: str, pdf: str, page: int, q: str, n: float, labs: list[dict]) -> Answer | None:
+    """'How many linear metres of skirting board does the laundry need?' — every named room (a plural takes every room
+    so labelled; 'the laundry and the kitchen' sums) traced, its outline minus the openings in its walls (_skirting).
+    Evidence per room: the skirting runs as polylines (outline with the openings cut out) + each opening's width."""
+    from stoa.evidence import linework as L
+
+    qn = _BASE_WORDS.sub(" ", _BASE_Q.sub(" ", re.sub(r"\(.*?\)", " ", q)))
+    parts = [p for p in _SPLIT.split(qn) if p and _words(p)] or [qn]
+    picked: list = []
+    for part in parts:
+        hits = _match_labels(labs, part)
+        if not hits:
+            if any(w not in _GENERIC and not _SUM_Q.fullmatch(w) for w in _words(part)) and len(parts) > 1:
+                return None  # a named part with no label on the sheet: the total would miss it
+            continue
+        if len(hits) > 1:
+            plural = _PLURAL_PART.search(re.sub(r"\b(rooms?|räume|zimmer)\b", "", part, flags=re.I)) or \
+                re.search(r"\b(all|every|each|both|total|alle\w*|jede\w*)\b", q, re.I)
+            if not plural:
+                pos = _position(q)
+                pick, _why = _pick([{**h} for h in hits], pos) if pos else (None, "")
+                if pick is None:
+                    return None  # 'the group room' with ten on the sheet
+                hits = [pick]
+        for h in hits:
+            if all(h is not p for p in picked):
+                picked.append(h)
+    if not picked or len(picked) > 16:
+        return None
+    d_med, n_doors = _door_check(pdf, page, n)
+    if d_med is not None and not 0.6 <= d_med <= 1.3:
+        return None
+    rows = []
+    for lab in picked:
+        m = L.measure_room(pdf, page, lab["pt"], n, tag_box=tuple(lab["bbox"]))
+        if m is None:
+            return None
+        sk = _skirting(pdf, page, n, m)
+        if sk is None:
+            return None
+        rows.append((lab, m, sk))
+    total = round(sum(sk["value_m"] for _, _, sk in rows), 2)
+    ev, terms = [], []
+    for lab, m, sk in rows:
+        name = lab["text"][:40]
+        ops = sk["openings"]
+        op_txt = ", ".join(f"{o[2]:.2f}" for o in ops) or "none"
+        terms.append(f"{name} {sk['perimeter_m']:.2f} - ({op_txt}) = {sk['value_m']:.2f} m")
+        for i, run in enumerate(sk["runs"]):
+            ev.append(Evidence(file=path, page=page, bbox=_poly_bbox(run), bbox_space="pdf_pt", exact=False,
+                               polyline=run, polygon=m["polygon"] if i == 0 else None,
+                               note=f"{name}: skirting {sk['value_m']:.2f} m = outline {sk['perimeter_m']:.2f} m "
+                                    f"minus {len(ops)} opening{'s' * (len(ops) != 1)} at 1:{n:g} (approximate)"
+                               if i == 0 else f"{name}: skirting run (approximate)"))
+        for a, b, ln in ops:
+            ev.append(Evidence(file=path, page=page, bbox=_poly_bbox([a, b]), bbox_space="pdf_pt", exact=False,
+                               polyline=[a, b], note=f"{name}: opening {ln:.2f} m (no skirting)"))
+    conf = 0.5 if all(m.get("support", 0) >= 3 for _, m, _ in rows) else 0.35
+    if len(rows) > 1:
+        conf = min(conf, 0.45)
+    assumptions = [f"scale: 1:{n:g} printed on the sheet; traced from the wall lines (approximate)",
+                   "skirting = the room's traced outline (wall faces) minus every opening in its walls, measured jamb "
+                   "to jamb (door ways and open passages); built-in units and fixed furniture not deducted",
+                   *([f"sum of {len(rows)} rooms: " + "; ".join(terms)] if len(rows) > 1 else [terms[0]])]
+    if d_med is not None:
+        assumptions.append(f"scale check: {n_doors} door swings measure a median {d_med:.2f} m at 1:{n:g} ✓")
+    return Answer(value=total, unit="m", confidence=conf, evidence=ev, solver=SOLVER, assumptions=assumptions,
+                  missing=["no skirting schedule or room dimensions printed: a finishes schedule or CAD twin would "
+                           "make it exact"],
+                  trace=[f"lineplan: skirting on a line-only sheet at printed 1:{n:g}: " + "; ".join(terms)])
+
+
 def answer(path: str, question: str, page: int = 0) -> Answer | None:
     try:
         return _answer(path, question, page)
@@ -710,6 +962,10 @@ def _answer(path: str, question: str, page: int) -> Answer | None:
     from stoa.evidence import linework as L
 
     q = question
+    if _BASE_Q.search(q):  # 'how many linear metres of skirting …' before the count words
+        pdf = str(abspath(path))
+        scales = L.sheet_scales(pdf, page) if pdf.lower().endswith(".pdf") else ()
+        return _baseboard_answer(path, pdf, page, q, scales[0], labels(pdf, page)) if scales else None
     if _COUNT_Q.search(q):
         pdf = str(abspath(path))
         return _count_answer(path, pdf, page, q) if pdf.lower().endswith(".pdf") else None
@@ -731,9 +987,13 @@ def _answer(path: str, question: str, page: int) -> Answer | None:
         return None  # no printed scale: a traced outline has no size (W5's 'Set the scale' takes over)
     n = scales[0]
     labs = labels(pdf, page)
-    if _SUM_Q.search(q):
-        return _sum_answer(path, pdf, page, q, n, labs, what)
     hits = _match_labels(labs, q)
+    if _SUM_Q.search(q):
+        r = _sum_answer(path, pdf, page, q, n, labs, what)
+        if r is not None or len(hits) != 1 or len(_SPLIT.split(q)) > 2:
+            return r
+        # ONE named room with a 'both / all / total' word ('the multi-purpose hall, both halves together (partition
+        # open)', X1 sl-059): that room, measured as one
     pos = _position(q)
     how = ""
     tag_box = None

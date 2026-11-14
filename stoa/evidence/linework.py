@@ -51,7 +51,9 @@ def _page(pdf_abs: str, page: int) -> dict | None:
         if page >= len(doc):
             return None
         pg = doc[page]
-        W, H = pg.rect.width, pg.rect.height
+        # paths and words come in UNROTATED page coordinates: a /Rotate 90 sheet (X1 stoa-like USACE S-100F, rect
+        # 2384 x 1684, paths up to y = 2384) needs the unrotated size, else its lower part falls off the raster
+        W, H = (pg.cropbox.width, pg.cropbox.height) if pg.rotation % 180 else (pg.rect.width, pg.rect.height)
         drawings = pg.get_drawings()
     if not drawings or len(drawings) > _MAX_PATHS:
         return None
@@ -242,6 +244,32 @@ def _door_arcs(pg: dict, scale_n: float) -> tuple[list, set]:
         if sid is not None:
             arc_ids.setdefault(sid, []).append((j0, j0 + len(pts) - 1))  # point index range of the arc's segments
     return out, arc_ids
+
+
+@functools.lru_cache(maxsize=2)
+def ink_dist(pdf_abs: str, page: int):
+    """Distance (px, clipped at 255) to the nearest INK of the page as rendered (same px grid as _page): clip paths,
+    white masks and fills behave as printed. CAD exports may draw a wall as one filled strip and cut its door openings
+    with a clip path (X1 stoa-like DfE school sheet); the path rasteriser (_dist) sees the strip unbroken."""
+    import cv2
+    import numpy as np
+    import pymupdf
+
+    pg = _page(pdf_abs, page)
+    if pg is None:
+        return None
+    H, W = pg["shape"]
+    with pymupdf.open(pdf_abs) as doc:
+        p = doc[page]
+        if p.rotation:
+            p.set_rotation(0)
+        pix = p.get_pixmap(matrix=pymupdf.Matrix(pg["ppt"], pg["ppt"]), colorspace=pymupdf.csGRAY, alpha=False)
+        img = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width)
+    ink = np.zeros((H, W), np.uint8)
+    h, w = min(H, img.shape[0]), min(W, img.shape[1])
+    ink[:h, :w] = img[:h, :w] < 200
+    d = cv2.distanceTransform((ink == 0).astype(np.uint8), cv2.DIST_L2, cv2.DIST_MASK_PRECISE)
+    return np.minimum(d, 255).astype(np.uint8)
 
 
 @functools.lru_cache(maxsize=6)

@@ -34,6 +34,9 @@ _AREA = re.compile(r"(m²|\bm2\b|ft²|\bft2\b|sq\.? ?ft|square (?:feet|foot|met)
                    r"\bquanto [eè] grande\b|\bqu[eé] tan grande\b)", re.I)
 _LENGTH = re.compile(r"(\blength\b|\blong\b|\blang\b|l[aä]nge|l[æe]ngde|pituus|lengte|longueur|lunghezza|"
                      r"longitud|pikkus|\bin met(?:re|er)s?\b|in metern|\bmeters?\b|\bmetres?\b|\bmeter\b|"
+                     # Stoa kind 2: 'what is the perimeter of the hall' was a text question
+                     r"\bperimeter\b|\bumfang\b|\bpiiri\b|p[ée]rim[eè]tre|\bperimetro\b|\bomtrek\b|\bomkrets\b|"
+                     r"\blinear (?:feet|foot|met(?:re|er)s?)\b|\blineal (?:feet|foot)\b|\brunning met(?:re|er)s?\b|"
                      # G1 cycle 3 (X1 wild 14:22, H 14:25): 'How wide is the platea…', 'How much higher is the stage floor…'
                      # were 'text' -> an unrelated text prior. Interrogative forms only: the dataset's 'what is the door
                      # width' questions are free-text schedule answers (dev: 0 rows change task with this list)
@@ -281,16 +284,16 @@ def _fold(s: str) -> str:
 # "how many square feet of ...", "wie viele Quadratmeter ...": a count cue followed by a UNIT is a quantity question
 _QTY_AFTER_COUNT = re.compile(
     r"\b(?:how many|how much|wie viele?|wieviel\w*|combien de|quant[ie]|hoeveel|hur m[aå]nga|kuinka (?:monta|paljon)|"
-    r"ile|hvor mange|cu[aá]nt[oa]s)\s+(?:of\s+)?(?P<u>cubic (?:metres|meters|feet|foot)|m³|m3\b|kubikmeter\w*|"
+    r"ile|hvor mange|cu[aá]nt[oa]s)\s+(?:of\s+)?(?:(?:linear|lineal|running|lin\.)\s+)?(?P<u>cubic (?:metres|meters|feet|foot)|m³|m3\b|kubikmeter\w*|"
     r"square (?:metres|meters|feet|foot)|sq\.? ?(?:ft|m)\b|m²|m2\b|ft²|ft2\b|quadratmeter\w*|qm\b|quadratfu(?:ß|ss)|"
     r"m[eè]tres? carr[ée]s|pieds? carr[ée]s|metri quadr\w*|piedi quadr\w*|vierkante (?:meter|voet)\w*|"
     r"kvadratmeter\w*|neli[öo]\w*|metres|meters|feet|foot|ft\b|meter\b|metern?\b|fu(?:ß|ss)\b|m[eè]tres?\b|pieds\b|"
-    r"metri\b|piedi\b|metri[äa]\b|metres? of)", re.I)
+    r"metri\b|piedi\b|metri[äa]\b|metres? of|lf\b|l\.f\.)", re.I)
 
 
 def _qty_unit(u: str) -> tuple[str, str]:
     u = u.lower()
-    feet = bool(re.search(r"feet|foot|ft|fu(?:ß|ss)|pied|piedi|voet", u))
+    feet = bool(re.search(r"feet|foot|ft|fu(?:ß|ss)|pied|piedi|voet|^l\.?f\.?$", u))
     if re.search(r"cubic|³|m3|kubik", u):
         return "volume", "ft3" if feet else "m3"
     if re.search(r"square|sq|²|m2|ft2|quadrat|qm|carr|quadr|vierkant|kvadrat|neli", u):
@@ -298,11 +301,19 @@ def _qty_unit(u: str) -> tuple[str, str]:
     return "length", "ft" if feet else "m"
 
 
+# Stoa kind 2 (captain 16:15, X1 16:38): skirting / baseboard = a LENGTH (room perimeter minus door openings), even
+# when asked 'how many (linear) metres / LF of …'; 'how many skirting boards' was a count ('64 count' from a VLM)
+_SKIRTING = re.compile(r"\b(?:skirting|base ?boards?|base (?:molding|moulding|trim)|jalkalist\w*|golvlist\w*|"
+                       r"sockelleiste\w*|fu(?:ß|ss)leiste\w*|plinthes?|battiscopa|zócalos?|rodapi[eé]s?)\b", re.I)
+
+
 def infer_task(q: str) -> tuple[str, str | None]:
     """-> (task, unit). Unit follows the question's own unit words (m² vs ft² etc.)."""
     mq = _QTY_AFTER_COUNT.search(q)
     if mq:
         return _qty_unit(mq.group("u"))
+    if _SKIRTING.search(q) and not re.search(r"m²|\bm2\b|ft²|\bft2\b|sq\.? ?ft|square|\barea\b", q, re.I):
+        return "length", ("ft" if re.search(r"\b(?:feet|foot|ft|LF|lin\.? ?ft)\b", q, re.I) else "m")
     if _VOLUME.search(q) and not _COUNT.search(q):
         return "volume", ("ft3" if re.search(r"ft³|ft3|cubic f", q, re.I) else "m3")
     if _COUNT.search(q):

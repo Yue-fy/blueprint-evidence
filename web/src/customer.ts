@@ -69,6 +69,7 @@ export function landingHtml(): string {
     <h2>Or explore a sample project.</h2>
     <div class="proj-grid">${PROJECTS.map(card).join("")}
     </div>
+    ${__HAS_MOBILE__ ? `<p class="landing-phone"><a href="./mobile.html">On a phone? Open the phone page</a></p>` : ""}
     <p class="landing-foot">Your files stay on the demo machine (a temporary folder) and are read by local models. Sample drawings and models are public (credits under each project). Every answer shows where it comes from, so anyone can check it in seconds.</p>
   </div>`;
 }
@@ -121,9 +122,21 @@ export function confidenceWords(c: number): { cls: string; word: string; hint: s
   if (c >= 0.7) return { cls: "fair", word: "Fairly sure", hint: "check the marked spots" };
   // a typical value, not something read off this drawing (the training prior, a guess without evidence)
   if (c < 0.25) return { cls: "est guess", word: "Rough guess", hint: "not found on the drawing" };
+  // Ziying (H 16:28): 'below a threshold it would be more honest to say: can't tell, please measure' — a 0.30 area shown
+  // as a plain number reads as a measurement. Under 0.4 the number is our guess and checking it is the main action.
+  if (c < LOW_CONF) return { cls: "est guess", word: "Our guess", hint: "we are unsure: please check it" };
   return { cls: "est", word: "Best estimate", hint: "" };
 }
 
+/** Below this confidence an answer is shown as a guess ('≈ 16 m²', 'Our guess'), with measuring / checking it as the
+ *  main action (Ziying 16:26; the expert workbench uses the same 0.4). */
+export const LOW_CONF = 0.4;
+/** a guess, shown as such: low confidence and no second method that agrees */
+export const isGuess = (a: Answer, agreeing = false) => (typeof a.value === "number" || (typeof a.value === "string" && /^\s*[\d][\d,.]*\s*[\p{L}²'"]{0,6}\s*$/u.test(a.value)))
+  && (a.confidence ?? 0) < LOW_CONF && !agreeing;
+
+/** 'how many linear metres / square feet / LF …': a length or an area asked as 'how many' */
+export const HOW_MANY_UNITS = /^\s*how many\s+(?:linear|running|lineal|square|sq\.?|cubic)?\s*(?:metres|meters|m|m2|m²|feet|foot|ft|sf|lf|yards?|millimetres|millimeters|mm|cm)\b/i;
 const SIZE_Q = /\b(how (big|large|wide|long|tall|high|deep|far|much (space|floor))|area|size|width|length|distance|perimeter|dimensions?|square (metres|meters|feet)|fläche|breite|länge|grösse|größe|pinta-ala|leveys|pituus|koko|superficie|surface|largeur|longueur)\b|m²|\bm2\b|\bsq ?m\b/i;
 
 /** An area or length question with nothing measured on this drawing: the answer is the dataset's typical value (the
@@ -134,8 +147,11 @@ const SIZE_Q = /\b(how (big|large|wide|long|tall|high|deep|far|much (space|floor
 export function needsMeasuring(a: Answer, question: string, file = ""): boolean {
   const task = a.intent?.task;
   if (a.value === null || a.value === undefined || typeof a.value === "boolean") return false;
-  if (task === "count" || a.unit === "count" || /^\s*how many\b/i.test(question)) return false;
-  if (!(task === "area" || task === "length" || SIZE_Q.test(question))) return false;
+  // 'How many linear metres of skirting …' / 'how many square feet …' ask for a quantity, not a count (the router said
+  // count for these until night-G1 8461ff7; the card then showed '≈ 6 m … on this drawing' with no way to measure)
+  const qty = HOW_MANY_UNITS.test(question);
+  if (!qty && (task === "count" || a.unit === "count" || /^\s*how many\b/i.test(question))) return false;
+  if (!(qty || task === "area" || task === "length" || SIZE_Q.test(question))) return false;
   const measured = (a.evidence ?? []).some((e) => e.bbox || e.polygon || e.polyline || e.ifc_guid);
   // a sentence with no number ('Not specified', 'The floor plan does not provide dimensions …': the image reader P1 runs
   // on a vector sheet no PDF reader could read, night 5fc4653) is no answer to 'how big': measure it on the drawing
@@ -239,7 +255,35 @@ export function routeInfo(a: Answer): { from: string; to: string; doors: string[
 /** How many evidence items get a number: 5, or 8 for a room's doors (each door IS one of the answer's rooms). */
 export const numberMax = (a: Answer) => (connectionInfo(a) ? 8 : 5);
 
-function headline(a: Answer, ctx: HeroCtx): { big: string; unit: string; sentence: string; text?: string; name?: boolean; next?: string[]; nextLabel?: string } {
+/** Nominal pipe size (inch) → its metric DN (ISO 6708 / EN 10255 pairs). */
+const DN: Record<string, number> = { "0.5": 15, "0.75": 20, "1": 25, "1.25": 32, "1.5": 40, "2": 50, "2.5": 65, "3": 80, "4": 100, "5": 125,
+  "6": 150, "8": 200, "10": 250, "12": 300, "14": 350, "16": 400, "18": 450, "20": 500, "24": 600, "30": 750, "36": 900 };
+const PIPE_Q = /\b(pipes?|piping|header|line|riser|main|diameter|dia|valve|DN|NPS|suction|discharge|supply|return|fuel|drain|sprinkler|duct)\b/i;
+
+/** A size in inches (piping plans, captain 16:15 / Stoa 16:10: '12" PUMP / DISCHARGE / HEADER', '16"', 16.0 'in'): the
+ *  size big, what the printed tag labels as the sentence, and the metric size under it (DN for a pipe, else mm). */
+function inchSize(a: Answer, q: string): { big: string; unit: string; sentence: string; metric: string } | null {
+  const v = a.value;
+  let n: number | null = null;
+  let rest = "";
+  if (typeof v === "number" && /^(in|inch|inches|"|″)$/i.test(String(a.unit ?? "").trim())) n = v;
+  else if (typeof v === "string") {
+    const m = v.replace(/\u2033/g, '"').match(/^\s*(?:(\d+)\s+)?(\d+(?:\.\d+)?|\d\/\d)\s*(?:"|''|-?\s*inch(?:es)?\b|in\b\.?)\s*[-–:]?\s*([\s\S]*)$/i);
+    if (!m) return null;
+    const frac = (x: string) => (x.includes("/") ? Number(x.split("/")[0]) / Number(x.split("/")[1]) : Number(x));
+    n = (m[1] ? Number(m[1]) : 0) + frac(m[2]);
+    rest = m[3].replace(/\s*\/\s*|\s*\n\s*/g, " ").replace(/\s+/g, " ").trim();
+  }
+  if (n === null || !Number.isFinite(n) || n <= 0 || n > 120) return null;
+  const pipe = PIPE_Q.test(q) || PIPE_Q.test(rest);
+  const dn = DN[String(n)];
+  const big = Number.isInteger(n) ? String(n) : n.toFixed(2).replace(/0+$/, "");
+  const what = rest ? `${calm(rest).toLowerCase()}, as printed on the drawing` : pipe ? "nominal pipe size, as printed on the drawing" : "as printed on the drawing";
+  return { big, unit: n === 1 ? "inch" : "inches", sentence: what,
+    metric: pipe && dn ? `DN ${dn} <small>(metric nominal pipe size)</small>` : `${Math.round(n * 25.4)} mm` };
+}
+
+function headline(a: Answer, ctx: HeroCtx): { big: string; unit: string; sentence: string; text?: string; name?: boolean; next?: string[]; nextLabel?: string; metric?: string } {
   const v = a.value;
   if (v === null || v === undefined) return { big: "No answer", unit: "", sentence: (a.missing ?? [])[0] ?? "We could not find this on the drawing." };
   if (typeof v === "boolean") return { big: v ? "Yes" : "No", unit: "", sentence: "" };
@@ -252,6 +296,8 @@ function headline(a: Answer, ctx: HeroCtx): { big: string; unit: string; sentenc
     return { big: String(rooms.length), unit: "", sentence: `${rooms.length === 1 ? "room has a door" : "rooms have a door"} to ${conn.room}${apt}${conn.rooms.includes("outside") ? " (and one door leads outside)" : ""}:`,
       next: rooms, nextLabel: "" };
   }
+  const inch = /\b(size|diameter|dia|how (big|large|wide|thick)|thick(ness)?|width|bore|DN|NPS)\b/i.test(ctx.question) || PIPE_Q.test(ctx.question) ? inchSize(a, ctx.question) : null;
+  if (inch) return inch;
   const route = routeInfo(a);
   if (route && typeof v === "number")
     return { big: String(v), unit: "", sentence: `${v === 1 ? "door" : "doors"} on the shortest way from ${route.from} to ${route.to}:`, next: route.doors, nextLabel: "" };
@@ -288,7 +334,7 @@ function headline(a: Answer, ctx: HeroCtx): { big: string; unit: string; sentenc
   // metric (its notes / assumptions / trace speak m or m²), else no unit rather than a guess
   const metric = /\d\s*(m²|m2|m)(?![\w²])/.test([...(a.trace ?? []), ...(a.assumptions ?? []), ...(a.evidence ?? []).map((e) => e.note ?? "")].join("\n"));
   // ('How wide is the corridor?' parses as a text question; the table reader's own code says unit = "m")
-  const lengthQ = a.intent?.task === "length" || /\b(how (wide|long|tall|high|deep|far)|width|length|distance|perimeter|breite|länge|leveys|pituus)\b/i.test(ctx.question);
+  const lengthQ = a.intent?.task === "length" || /\b(how (wide|long|tall|high|deep|far)|width|length|distance|perimeter|skirting|base ?boards?|linear (?:metres|meters|feet)|running (?:metres|meters)|LF|breite|länge|leveys|pituus)\b/i.test(ctx.question);
   const unit = unitLabel(a.unit) || (lengthQ && typeof v === "number" && (metric || /\bunit\s*=\s*["']m["']/.test((a.trace ?? []).join("\n"))) ? "m" : "");
   const t = a.intent?.target ?? "";
   const n = NOUN[t];
@@ -333,6 +379,8 @@ function costSentence(q: string) {
 /** Which kind of second source agreed, in words. */
 /** A cross-check in the answer's trace or notes, in words. ok → '2 independent methods agree' + which two (captain 15:12:
  *  a 0.22 next to two agreeing methods read as 'probably wrong' to Ziying, so the agreement is said plainly). */
+/** a second, independent method agrees with the answer (cross-check ✓, or the hybrid's 'two independent methods agree') */
+export const agrees = (a: Answer, file: string) => !!agreement(a, file)?.ok;
 function agreement(a: Answer, file: string): { ok: boolean; text: string; detail: string; which?: string } | null {
   const xs = crossChecks(a, agentAsks(a)).filter((x) => !/^skipped\b/i.test(x.text));
   if (!xs.length) {
@@ -470,7 +518,9 @@ export function heroHtml(a: Answer, ctx: HeroCtx): string {
   let c = a.value === null ? { cls: "none", word: "No answer", hint: "" } : confidenceWords(a.confidence ?? 0);
   // two methods that agree are not a 'rough guess … not found on the drawing', whatever the calibrated number says
   if (ag?.ok && c.cls.includes("guess")) c = { cls: "est", word: "Best estimate", hint: "" };
-  const assumption = c.cls.startsWith("est") ? (a.assumptions ?? [])[0] : "";
+  const conv = conventionOf(a, ctx.question);
+  // the convention line already says it: don't repeat a reader's 'Convention: …' as the assumption
+  const assumption = c.cls.startsWith("est") ? plainAssumption((a.assumptions ?? []).find((x) => !/^\s*convention\s*:/i.test(x)) ?? "") : "";
   const wall = a.cost?.wall_seconds && a.cost.wall_seconds > 0 ? a.cost.wall_seconds : ctx.roundTripMs / 1000;
   const mt = manualTime(a.intent?.task, a.intent?.scope, ctx.question);
   const set: { head: string; rows: SetRow[]; total?: string } | null = typeof a.value === "string" ? setAnswer(a, ctx.file) ?? (h.next?.length ? null : listAnswer(a, ctx.file)) : null; // a headline that already lists the items ('Floor 1: 50 · …') keeps its own form
@@ -516,16 +566,19 @@ export function heroHtml(a: Answer, ctx: HeroCtx): string {
   const shownRows = set ? Math.min(set.rows.length, 12) : 0;
   // an imperial answer (US / UK sheets: '26,562 SF', "12'-6\"", '45 LF') also in metric, under the number (captain 16:15)
   const iq = typeof a.value === "number" || typeof a.value === "string" ? quantityOf(`${a.value}${a.unit && !String(a.value).includes(a.unit) ? ` ${a.unit}` : ""}`, true) : null;
-  const imperial = iq?.metric && iq.label !== "mm" && iq.label !== "cm" && !set ? iq.metric.replace(/^(\d+)(\.\d)/, (_m, x: string, y: string) => `${Number(x).toLocaleString("en")}${y}`) : "";
+  const imperial = h.metric ? "" : iq?.metric && iq.label !== "mm" && iq.label !== "cm" && !set ? iq.metric.replace(/^(\d+)(\.\d)/, (_m, x: string, y: string) => `${Number(x).toLocaleString("en")}${y}`) : "";
   const imperialUnit = iq?.label === "SF" ? "square feet" : iq?.label === "LF" ? "linear feet" : "feet";
   const givenTotal = set?.total ? `<div class="hs-total"><span>Total</span><b>${esc(set.total)}${quantityOf(set.total)?.metric ? `<small> · ${esc(quantityOf(set.total)!.metric!)}</small>` : ""}</b></div>` : "";
   const setRows = set ? `<div class="hero-set">${set.head ? `<div class="hs-head">${esc(plainify(set.head))}</div>` : ""}${set.rows.slice(0, shownRows).map((r, k) =>
     `<button type="button" class="hs-row"${r.ev >= 0 ? ` data-ev="${r.ev}"` : ""}><span class="hs-name"><i class="hs-sw" style="background:${SWATCH[k % SWATCH.length]}"></i>${esc(r.name)}</span><b>${esc(r.detail)}${qty[k]?.metric ? `<small> · ${esc(qty[k]!.metric!)}</small>` : ""}</b></button>`).join("")}${set.rows.length > shownRows ? `<div class="hs-more">+ ${set.rows.length - shownRows} more</div>` : ""}${
     givenTotal ? givenTotal : total !== null ? `<div class="hs-total"><span>Total <small>(sum of the rows)</small></span><b>${esc(fmtQty(total, qty[0]!.label))}${qty[0]!.toMetric ? `<small> · ${esc(fmtQty(total * qty[0]!.toMetric, qty[0]!.kind === "area" ? "m²" : "m"))}</small>` : ""}</b></div>`
     : totalCount !== null ? `<div class="hs-total"><span>Total</span><b>${totalCount.toLocaleString("en")}</b></div>` : ""}</div>` : "";
+  // a guess (under 0.4, no second method agreeing): '≈ 16', in grey, so it does not read as a measurement (Ziying 16:26)
+  const guess = isGuess(a, !!ag?.ok) && !h.name && /^\d/.test(h.big);
   return `
-    ${h.big ? `<div class="hero-value"><span class="big${h.name ? " name" : ""}${!h.name && h.big.length > 8 ? " long" : ""}">${esc(h.big)}</span>${h.unit ? `<span class="unit">${esc(h.unit)}</span>` : ""}</div>` : ""}
+    ${h.big ? `<div class="hero-value"><span class="big${h.name ? " name" : ""}${!h.name && h.big.length > 8 ? " long" : ""}${guess ? " guess-val" : ""}"${guess ? ` title="Our guess: we are unsure of this number (confidence ${Math.round((a.confidence ?? 0) * 100)} %)"` : ""}>${guess ? "≈ " : ""}${esc(h.big)}</span>${h.unit ? `<span class="unit">${esc(h.unit)}</span>` : ""}</div>` : ""}
     ${imperial ? `<div class="hero-metric">= ${esc(imperial)} <small>(drawing in ${esc(imperialUnit)})</small></div>` : ""}
+    ${h.metric ? `<div class="hero-metric">= ${h.metric}</div>` : ""}
     ${h.sentence ? `<div class="hero-sentence">${esc(h.sentence)}</div>` : ""}
     ${h.next?.length ? `<div class="hero-next">${h.nextLabel === "" ? "" : "<span>Next:</span> "}${h.next.map(esc).join(" &nbsp;·&nbsp; ")}</div>` : ""}
     ${text}${setRows}
@@ -535,6 +588,7 @@ export function heroHtml(a: Answer, ctx: HeroCtx): string {
       ${tierHtml(a)}
       ${secondOpinions(a)}
     </div>
+    ${conv ? `<div class="hero-conv" title="How we measure or count this kind of question (our convention; the other value is in 'How we worked it out')"><b>Convention:</b> ${esc(conv.text)}${conv.alt ? ` <span class="hc-alt">· other way: ${esc(conv.alt)}</span>` : ""}</div>` : ""}
     ${assumption ? `<div class="hero-assume">Assumed: ${esc(assumption)}</div>` : ""}
     ${unnamedAlt(a)}
     <div class="hero-value-strip" title="Manual time is our rough estimate for this kind of question (${esc(mt.work)}), not a measurement">
@@ -552,13 +606,48 @@ export function heroHtml(a: Answer, ctx: HeroCtx): string {
         ? "in the 3D model" : "on the drawing"}${esc(stackNote)}</div>` : ""}</div>` : ""}`;
 }
 
+/** The measuring convention behind an answer (captain 16:59, KNOWLEDGE DECISION): the reader's own 'Convention: …' line
+ *  (assumptions / trace) first; else the team's convention for the question's kind, so every baseboard / door / window /
+ *  room-area / slab answer says how it was counted. alt = the other convention's value when the reader gives one. */
+export function conventionOf(a: Answer, q: string): { text: string; alt?: string } | null {
+  if (a.value === null || a.value === undefined || typeof a.value === "boolean") return null;
+  const lines = [...(a.assumptions ?? []), ...(a.trace ?? [])].map(String);
+  const own = lines.find((l) => /^\s*convention\s*:/i.test(l));
+  const altLine = lines.find((l) => /\balternative\b[^:\n]{0,80}:\s*\S/i.test(l) && !/^\s*convention\s*:/i.test(l));
+  const alt = altLine?.match(/\b(alternative\b[^:\n]{0,80}):\s*([^\n;]{1,80})/i);
+  const altText = alt ? `${alt[1].replace(/^alternative\s*/i, "").replace(/^\(|\)$/g, "").trim() || "other convention"}: ${alt[2].trim()}` : undefined;
+  if (own) return { text: own.replace(/^\s*convention\s*:\s*/i, "").replace(/\s+/g, " ").trim().slice(0, 220), alt: altText };
+  const task = a.intent?.task;
+  const t = (a.intent?.target ?? "").toLowerCase();
+  let text = "";
+  if (/\b(base ?boards?|skirting|skirtings|sockelleiste|jalkalista|plinth)\b/i.test(q))
+    text = "room perimeter at the inner wall face, minus the door openings (a double door deducts both leaves)";
+  else if ((task === "count" || (/^\s*how many\b/i.test(q) && !HOW_MANY_UNITS.test(q))) && (/door|window/.test(t) || /\b(doors?|windows?|türen|fenster|ovet|ikkunat)\b/i.test(q))) {
+    const d = /door/.test(t) || /\b(doors?|türen|ovet)\b/i.test(q), w = /window/.test(t) || /\b(windows?|fenster|ikkunat)\b/i.test(q);
+    text = [d ? "each door opening counts once (a double door = 1 door, 2 leaves)" : "", w ? "window units drawn in the walls" : ""].filter(Boolean).join("; ");
+  } else if (task === "area" || /\b(area|how (big|large)|square (metres|meters|feet)|m²|m2|sq ?ft|sf)\b/i.test(q)) {
+    if (/\b(slabs?|foundation|footing|bodenplatte|laatta)\b/i.test(q)) text = "plan area to the slab edge (thickened edges included); openings deducted only where drawn as voids";
+    else if (!/\b(total|whole|gross|building|storey|floor plate|gifa|gia)\b/i.test(q) && (/^(room|space)$/.test(t) || roomPhrases(q).length))
+      text = "net internal area, to the inner face of the walls";
+  }
+  return text ? { text, alt: altText } : null;
+}
+
+/** A reader's first assumption in a site engineer's words (the full text stays under 'How we worked it out'). */
+function plainAssumption(t: string): string {
+  if (/^read from \d+ printed text group/i.test(t)) return "read from the printed text on the drawing (the marked tag)";
+  if (/^recognised as:/i.test(t)) return "";
+  return t;
+}
+
 /** The hero when nothing was measured (needsMeasuring). Never an empty answer (captain 14:39): the reader's number as
  *  a rough guess ('a typical size, not measured on this drawing'), and main.ts measureFirst replaces it with the room
  *  traced at the drawing's scale, or at an estimated one (door swings, else the usual 1:100), with 'Scale unknown —
  *  set it' next to the number until the scale is known. */
 function measureFirstHtml(a: Answer, ctx: HeroCtx): string {
-  const length = a.intent?.task === "length" || (a.intent?.task !== "area" && /\b(how (wide|long|tall|high|deep|far)|width|length|distance|perimeter|breite|länge|leveys|pituus|largeur|longueur)\b/i.test(ctx.question));
+  const length = a.intent?.task === "length" || (a.intent?.task !== "area" && /\b(how (wide|long|tall|high|deep|far)|width|length|distance|perimeter|skirting|base ?boards?|linear (?:metres|meters|feet)|running (?:metres|meters)|LF|breite|länge|leveys|pituus|largeur|longueur)\b/i.test(ctx.question));
   const v = typeof a.value === "number" && a.value > 0 ? a.value : null;
+  const conv = conventionOf(a, ctx.question);
   const unit = unitLabel(a.unit) || (length ? "m" : "m²");
   const big = v !== null ? v.toLocaleString("en", { maximumFractionDigits: v >= 100 ? 0 : v >= 10 ? 1 : 2 }) : "";
   const sentence = big
@@ -568,7 +657,8 @@ function measureFirstHtml(a: Answer, ctx: HeroCtx): string {
   return `
     <div class="hero-value">${big ? `<span class="big guess-val">≈ ${esc(big)}</span><span class="unit">${esc(unit)}</span>` : `<span class="big name">${ctx.scaleKnown ? "Not found" : "Scale unknown"}</span>`}</div>
     <div class="hero-sentence">${esc(sentence)}</div>
-    <div class="hero-badges"><span class="conf est guess" title="Nothing on this drawing gave the ${length ? "length" : "area"} yet: the number is our usual guess (see 'How we worked it out')">Rough guess</span>${ctx.scaleKnown ? "" : SCALE_PILL}${tierHtml(a)}</div>`;
+    <div class="hero-badges"><span class="conf est guess" title="Nothing on this drawing gave the ${length ? "length" : "area"} yet: the number is our usual guess (see 'How we worked it out')">Rough guess</span>${ctx.scaleKnown ? "" : SCALE_PILL}${tierHtml(a)}</div>
+    ${conv ? `<div class="hero-conv"><b>Convention:</b> ${esc(conv.text)}</div>` : ""}`;
 }
 
 /** Next to an area / length number whose drawing scale is unknown or only estimated (captain 14:39): one tap opens the
@@ -736,11 +826,11 @@ export interface Recognition { kind: string; storey?: string; scale?: string; pa
 const KIND_WORDS: Record<string, string> = {
   // G1's kinds (stoa/router/recognize.py LABELS), in customer words (no dataset names)
   bim_elevation: "Elevation from a 3D model", bim_section: "Section from a 3D model", swiss_plan: "CAD floor plan",
-  cad_sheet: "Architectural drawing sheet", schedule_sheet: "Schedule sheet", cubicasa_plan: "Apartment floor plan (image)",
+  cad_sheet: "Architectural drawing sheet", schedule_sheet: "Schedule sheet", cubicasa_plan: "Floor plan image", // a raster plan in any style (Stoa's school sheet was called an apartment)
   plan_render: "Floor plan image", ifc_model: "3D building model (IFC)", dxf_plan: "CAD floor plan (DXF)",
   svg_bim: "Floor plan from a 3D model (SVG)", pdf_scan: "Scanned drawing (PDF)",
   bim_plan: "Floor plan from a 3D model", ifc_plan: "Floor plan from a 3D model", ifcconvert: "Floor plan from a 3D model",
-  cad_plan: "CAD floor plan", swiss: "CAD floor plan", raster_plan: "Floor plan image", cubicasa: "Apartment floor plan (image)",
+  cad_plan: "CAD floor plan", swiss: "CAD floor plan", raster_plan: "Floor plan image", cubicasa: "Floor plan image",
   schedule: "Schedule sheet", scan: "Scanned or historical drawing", historical: "Historical drawing (scan)", photo: "Photo of a printed drawing",
   model: "3D building model (IFC)", ifc: "3D building model (IFC)", other: "Drawing",
 };
@@ -748,7 +838,7 @@ const KIND_WORDS: Record<string, string> = {
 const KIND_BY_SOLVER: Record<string, string> = {
   plan_rooms: "Floor plan from a 3D model", ifcplan_pdf: "Floor plan from a 3D model", svg_ifc: "Floor plan from a 3D model (SVG)",
   pdf_vector: "CAD floor plan", dxf: "CAD floor plan with its DXF file", raster: "Floor plan image",
-  raster_cc5k: "Apartment floor plan (image)", vlm_lora: "Apartment floor plan (image)", schedule: "Schedule sheet",
+  raster_cc5k: "Floor plan image", vlm_lora: "Floor plan image", schedule: "Schedule sheet",
   pdf_text: "Drawing with readable text", vlm_direct: "Drawing read by an AI vision model",
   area_tags: "Floor plan with room area tags", // G1: Revit/CAD room tags 'U123 - 680 SF'
 };
