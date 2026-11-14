@@ -72,6 +72,15 @@ export function imperialScale(t: string): { n: number; text: string } | null {
   return { n: Number.isInteger(n) ? n : Math.round(n), text: m[0].replace(/\s+/g, " ").trim() };
 }
 
+/** A scale PRINTED on a vector PDF page (W6's GET /api/m/pdfscale: E1's linework.sheet_scales, else recognition):
+ *  {n: 200, text: '1:200'} or {n: 48, text: '1/4" = 1'-0"'} → a Scale; null when nothing is printed. */
+export function printedScaleOf(p: { ok?: boolean; n?: number; text?: string } | null): Scale | null {
+  const n = Number(p?.n ?? 0);
+  if (!p?.ok || !(n >= 1 && n <= 50000)) return null;
+  const t = String(p.text ?? "").trim();
+  return { unitsPerM: PT_PER_M_AT_1 / n, label: `1:${Math.round(n * 100) / 100}`, source: t && !/^1\s*:\s*[\d.]+$/.test(t) ? `printed on the drawing (${t})` : "printed on the drawing" };
+}
+
 export function scaleFromAnswer(a: Answer, space: "pdf_pt" | "image_px"): Scale | null {
   const text = [...(a.trace ?? []), ...(a.assumptions ?? []), ...(a.evidence ?? []).map((e) => e.note ?? "")].join("\n");
   const px = text.match(/([\d.]+)\s*px per m\b/i);
@@ -104,7 +113,7 @@ export function scaleFromAnswer(a: Answer, space: "pdf_pt" | "image_px"): Scale 
 }
 
 type Tool = "scale" | "length" | "area" | null;
-type Shapes = (path: string, page: number, space: string, items: { i: number; bbox: number[]; others?: [number, number][] }[]) => Promise<{ shapes: RoomShape[]; space: string }>;
+type Shapes = (path: string, page: number, space: string, items: { i: number; bbox: number[]; others?: [number, number][]; scale_n?: number }[]) => Promise<{ shapes: RoomShape[]; space: string }>;
 
 export class Measure {
   private el: HTMLElement;
@@ -324,7 +333,9 @@ export class Measure {
     const r = 1; // a point box around the click
     this.out(`Tracing ${name ? esc(name) : "the room"}…`);
     try {
-      const res = await this.shapes(this.file, 0, this.v2d.space, [{ i: ++this.n, bbox: [p[0] - r, p[1] - r, p[0] + r, p[1] + r], ...(others.length ? { others } : {}) }]);
+      // a vector PDF: its 1:N lets the wall-line tracer close door swings at the doorway (1 m = unitsPerM pt)
+      const scaleN = this.v2d.space === "pdf_pt" && /\.pdf$/i.test(this.file) ? Math.round(72 / 0.0254 / s.unitsPerM * 100) / 100 : 0;
+      const res = await this.shapes(this.file, 0, this.v2d.space, [{ i: ++this.n, bbox: [p[0] - r, p[1] - r, p[0] + r, p[1] + r], ...(others.length ? { others } : {}), ...(scaleN > 0 ? { scale_n: scaleN } : {}) }]);
       const sh = res.shapes[0];
       if (!sh?.poly || !sh.area) {
         this.out(others.length ? `${esc(name || "The room")} is open to the next rooms (doorways without a door line), so its outline does not close. Measure its length and width with two clicks each.`
@@ -340,7 +351,7 @@ export class Measure {
       const poly = sh.poly;
       const perimeter = poly.reduce((n, q, i) => { const r = poly[(i + 1) % poly.length]; return n + Math.hypot(r[0] - q[0], r[1] - q[1]); }, 0) / s.unitsPerM;
       this.v2d.measurePoly(sh.poly, `${fmtM(m2)} m²`);
-      this.out(`${name ? `${esc(name)}: ` : "Room area: "}<b>${fmtM(m2)} m²</b> · perimeter <b>${fmtM(perimeter)} m</b> <small>traced outline at ${esc(s.label)} (${esc(s.source)}); inner faces of the walls, furniture lines may cut it; door openings not deducted from the perimeter</small>`);
+      this.out(`${name ? `${esc(name)}: ` : "Room area: "}<b>${fmtM(m2)} m²</b> · perimeter <b>${fmtM(perimeter)} m</b> <small>traced ${sh.method === "wall lines" ? "from the wall lines (door swings closed at the doorway)" : "outline"} at ${esc(s.label)} (${esc(s.source)}); inner faces of the walls${sh.method === "wall lines" ? "" : ", furniture lines may cut it"}; door openings not deducted from the perimeter</small>`);
       return { m2, length: Math.max(dx, dy), width: Math.min(dx, dy), perimeter, poly: sh.poly };
     } catch (e) {
       this.out(`Could not trace the room: ${esc((e as Error).message)}`);

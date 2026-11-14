@@ -11,13 +11,19 @@ areas) and given to the model as facts; it states its assumptions (e.g. "no scal
 
 from __future__ import annotations
 
+import functools
 import json
+import os
 import re
+
+import numpy as np
 
 from stoa import llm
 from stoa.contract import Answer, Evidence
 from stoa.solvers.raster import apartment as A
 from stoa.solvers.raster import chains as CH
+from stoa.solvers.raster import callouts as CO
+from stoa.solvers.raster import notes as NO
 from stoa.solvers.raster import scalebar as SB
 from stoa.solvers.raster import textlayer as T
 
@@ -172,6 +178,12 @@ def answer(path: str, question: str, image_path: str | None = None, backend: str
     got = _tag_count_answer(img_path, question, tl, solver)  # 'How many pressure gauges (PG) are tagged?'
     if got is not None:
         return got
+    got = NO.listed_sum_answer(img_path, question, tl, solver)  # 'total length of the three trenches listed in the notes'
+    if got is not None:
+        return got
+    got = CO.thickness_answer(img_path, question, tl, solver)  # '150 SLAB-ON-GRADE W/ D13 @ 300': 150, not 300
+    if got is not None:
+        return got
     got = CH.overall_answer(img_path, question, tl, solver)  # overall dimension = a printed total its chain sums to
     if got is not None:
         return got
@@ -179,7 +191,7 @@ def answer(path: str, question: str, image_path: str | None = None, backend: str
     ub = SB.user_bar()  # W5 'set scale' (solver_args px_per_m): the visitor's scale replaces any detected bar
     if ub is not None and _SIZE.search(question):
         bars = [ub]
-    elif _SIZE.search(question):  # a size question: a graphic scale bar lets the PROGRAM measure (scalebar.py)
+    elif _SIZE.search(question) or _SKIRT.search(question):  # a size question: a graphic scale bar lets the PROGRAM measure (scalebar.py)
         try:
             bars = [b for b in SB.bars(img_path, backend=backend, layer=tl) if b.unit in SB.UNIT_M]
         except Exception:  # noqa: BLE001 - a bar is a bonus, never a reason to fail the question
@@ -190,6 +202,12 @@ def answer(path: str, question: str, image_path: str | None = None, backend: str
         if not bars:  # neither: the spacing of verified dimension chains (chains.py; >= 2 chains agreeing)
             cb = CH.chain_bar(tl)
             bars = [cb] if cb is not None else []
+        if bars:
+            _note_sheet(img_path, tl)
+    if bars and (_SKIRT.search(question) or _PERIM.search(question)):
+        got = _skirting_answer(img_path, question, tl, bars, solver)
+        if got is not None:
+            return got
     cmp = A.compared_units(question, tl)
     if cmp:
         got = _compare_units(img_path, question, tl, bars, cmp, solver)
@@ -359,12 +377,25 @@ def answer(path: str, question: str, image_path: str | None = None, backend: str
         # X1 wild exam: 'What is the floor area of the platea?' -> '1460 mm' @0.3 (one side's dimension string)
         conf = min(conf, 0.05)
         missing = [*missing, f"an area was asked but the reading is a length ({val} {unit}); the other side is needed"]
+    if (_AREA_Q.search(question) or _BIG_Q.search(question)) and isinstance(value, (int, float)) and cited and \
+            not _LEN_Q.search(question) and any(_MM_DIM.fullmatch(i.text.strip()) for i in cited) and \
+            not any(re.search(r"m²|m2|sq|ft²|SF\b", i.text, re.I) for i in cited):
+        # D1 17:22 PITFALL / O1 c6: 'How many square metres is the Food bay…?' -> 10.0 m² @0.75 citing the grid
+        # dimension '10,000' (mm); 'English 9' = 7200 m² from '7,200'. A bare mm dimension string is a length.
+        conf = min(conf, 0.05)
+        missing = [*missing, "the cited number is a dimension string (mm), not a printed area"]
     if bar_echo:
         conf = min(conf, 0.1)
         missing = [*missing, "the cited text is the graphic scale bar's own label, not a dimension of the asked element"]
     if _SIZE.search(question) and not isinstance(value, (int, float)) and conf > 0.3 and re.search(r"\d", val):
         conf = 0.3  # a size question answered with something that is not one number ('38.42.46')
         missing = [*missing, f"the answer '{val[:30]}' is not a single number"]
+    if _SIZE.search(question) and not isinstance(value, (int, float)) and not re.search(r"\d", val) and \
+            not _NAME_ASKED.search(question):
+        # O1 c6 (D1 line-only PNG): 'net floor area of the SEN resource?' -> 'A:' @0.75 (the room's area label with its
+        # number removed, cited literally). A size with no number in it is no reading of the size.
+        conf = min(conf, 0.05)
+        missing = [*missing, f"a size was asked but the reading '{val[:30]}' has no number"]
     if cmp:  # a unit comparison the boundaries could not settle: a VLM reading of sums it never did (3 misses at 0.75)
         conf = min(conf, 0.3)
         missing = [*missing, "could not measure every compared unit from its drawn boundary; the comparison is a "
@@ -413,6 +444,14 @@ def answer(path: str, question: str, image_path: str | None = None, backend: str
                  + (" (literal match)" if in_cited else ""))
     return Answer(value=value, unit=unit, confidence=conf, evidence=ev, solver=solver, trace=trace,
                   assumptions=assumptions, missing=missing)
+
+
+_SHORT_LABEL = re.compile(r"[^\W\d_]{1,3}(?: [^\W\d_]{1,3})? ?\d{1,2}|[^\W\d_]{1,2} [^\W\d_]{2,}")  # 'Yr 6', 'W St', 'N St'
+_MM_DIM = re.compile(r"\d{1,3}(?:[,  ]\d{3})+|\d{4,6}")  # '10,000' / '13 500' / '7200': a mm dimension string
+
+# questions whose answer is a NAME though they mention a size ('Which room has the largest area?', 'Where is …')
+_NAME_ASKED = re.compile(r"\b(which|where|what (?:room|space|type|kind|name|material)|name|is there|are there|does|do|"
+                         r"welche[rsn]?|wo|mikä huone|missä|quel(?:le)?s?|où|vilken|var)\b", re.I)
 
 
 _UNITS_OK = {"m", "mm", "cm", "dm", "km", "m2", "m²", "sqm", "sq m", "ft", "feet", "foot", "in", "inch", "inches", "ft2",
@@ -826,8 +865,9 @@ def _room_dims_answer(img_path: str, question: str, tl: T.TextLayer, bars: list,
     if loose:
         others += [i.box for i in tl.items if i is not lab and M._NAME.fullmatch(T.norm(i.text))
                    and T.norm(i.text) not in M._GENERIC]
-    r = M.room_area(img_path, lab.box, bar.px_per_m, **M.FILL, others=others, solid=True)
-    if r is None or r["wall_frac"] < 0.05 or r["m2"] > 120:
+    r = M.room_area(img_path, lab.box, bar.px_per_m, **M.FILL, others=others, solid=True,
+                    large=_LARGE.get(img_path, False))
+    if r is None or not _bounded(r, bar, img_path) or r["m2"] > _area_cap(bar, img_path):
         return None
     d = M.room_dims(r, bar.px_per_m)
     if d is None:
@@ -863,6 +903,141 @@ def _room_dims_answer(img_path: str, question: str, tl: T.TextLayer, bars: list,
                            "of lengths and 55% of widths"])
 
 
+_SKIRT = re.compile(r"\b(skirting|baseboards?|base ?boards?|base molding|base trim|sockel\w*|fu(?:ß|ss)leiste\w*|"
+                    r"jalkalist\w*|plinthes?|battiscopa|z[óo]calos?|golvlist\w*|sockellist\w*)\b", re.I)
+SKIRT_CONF = 0.4  # one traced room outline (DfE PNG laundry 10.01 vs 10.08 m); openings = rays finding no ink
+
+
+# images known to be whole large-format CAD sheets: a printed 1:N on a standard paper size (scalebar.printed_bar) AND a
+# clean digital render. Door gaps are bridged there at any resolution; Swiss renders / CubiCasa / scans print no 1:N on
+# a sheet size, so they keep the resolution rule. O1 c6 bench (experiments/o1/c5/lineonly_bench.py --dpi 300, D1's 15
+# line-only school sheets = the 300-dpi PNG twins of D1's probe, 59 / 29.5 px/m): see measure.BRIDGE_M notes.
+# Kill switch: STOA_O1_LARGE_SHEET=0.
+_LARGE: dict[str, bool] = {}
+LARGE_SHEET = os.environ.get("STOA_O1_LARGE_SHEET", "1") != "0"
+
+
+def _note_sheet(img_path: str, tl: T.TextLayer) -> None:
+    """Remember whether img_path is a whole large-format CAD sheet (see _LARGE)."""
+    if not LARGE_SHEET or img_path in _LARGE:
+        return
+    try:
+        _LARGE[img_path] = SB.printed_bar(img_path, tl) is not None and _clean(img_path)
+    except Exception:  # noqa: BLE001 - a hint, never a reason to fail
+        _LARGE[img_path] = False
+
+
+def _large(bar, img_path: str = "") -> bool:
+    """Door gaps bridged / big rooms allowed: a high-resolution image (>= M.BRIDGE_MIN_PX_M) or a known large sheet."""
+    from stoa.solvers.raster import measure as M
+
+    return M.BRIDGE_M > 0 and (bar.px_per_m >= M.BRIDGE_MIN_PX_M or _LARGE.get(img_path, False))
+
+
+def _area_cap(bar, img_path: str = "") -> float:
+    """Largest single room a fill may return: large-format sheets (door gaps bridged, _large) have halls and gyms (a
+    180 m² school hall measured within 1% on the line-only bench); residential plans keep 120 m² (a bigger region is a
+    leak there)."""
+    return 400.0 if _large(bar, img_path) else 120.0
+
+
+@functools.lru_cache(maxsize=32)
+def _clean(img_path: str) -> bool:
+    """A digital render, not a scan: windows.clean_render, OR >= DIGITAL_WHITE of the pixels pure white. Anti-aliased
+    thin CAD lines at 300 dpi spread over many grey levels (D1's line-only A3 PNGs: top-8 share 0.30-0.41 < 0.45, so
+    clean_render says 'scan'; P1 17:25: a LANCZOS downscale does the same), but their paper stays pure white (0.97-0.98);
+    160 sampled HABS / Finna / Europeana / Wikimedia scans: 1 at >= 0.95 (max 0.97, median 0.0-0.87)."""
+    from stoa.solvers.raster import windows as WN
+
+    try:
+        ok, pure, _ = WN.clean_render(str(T._abspath(img_path)))
+        return bool(ok) or pure >= DIGITAL_WHITE
+    except Exception:  # noqa: BLE001
+        return False
+
+
+DIGITAL_WHITE = 0.975
+
+
+def _bounded(r: dict, bar, img_path: str) -> bool:
+    """Is a filled region a room bounded by drawn walls? Its outline runs >= 5% along THICK walls (solid / poché), or
+    the sheet is a clean digital render at large-format resolution, where door gaps are bridged and walls may be
+    thin double lines (D1's line-only school sheets @600 dpi: median wall_frac 0.01 for fills within 2%; 125 / 176
+    rooms within 2% with the bridge). Scans keep the wall test (thin-line HABS plans leak: 'KITCHEN' ~100 m²)."""
+    from stoa.solvers.raster import measure as M
+
+    if r["wall_frac"] >= 0.05:
+        return True
+    return _large(bar, img_path) and _clean(img_path)
+
+
+_PERIM = re.compile(r"\b(perimeters?|umfang|piiri|ympärysmitta|périmètre|perimetro|perímetro|omkrets)\b", re.I)
+PERIM_CONF = 0.4  # gross perimeter of the traced outline (no openings deducted); LARGE_CONF on large sheets
+
+
+def _skirting_answer(img_path: str, question: str, tl: T.TextLayer, bars: list, solver: str):
+    """'How many linear metres of skirting does the laundry need?': the room's traced outline (the same fill as its
+    area) -> perimeter minus the door openings along it (captain 16:59 convention 1). None without a label / scale.
+    'What is the perimeter of the Hall?' (no skirting word): the outline's whole perimeter (O1 c6, D1 probe rows)."""
+    from stoa.solvers.raster import measure as M
+
+    lab = M.find_label(tl, question) or M.find_label(tl, question, loose=True)
+    bar = next((b for b in bars if b.px_per_m), None)
+    if lab is None or bar is None:
+        return None
+    others = [i.box for i in tl.items if i is not lab and (M._ROOM_ID.fullmatch(i.text.strip()) or (
+        M._NAME.fullmatch(T.norm(i.text)) and T.norm(i.text) not in M._GENERIC))]
+    ink = M._ink(img_path)
+    r = M.room_area(img_path, lab.box, bar.px_per_m, ink=ink, **M.FILL, others=others, solid=False,
+                    large=_LARGE.get(img_path, False))
+    if r is None or not _bounded(r, bar, img_path) or r["m2"] > _area_cap(bar, img_path):
+        return None
+    pr = M.room_perimeter(img_path, r, bar.px_per_m, ink=ink)
+    if pr is None or pr["net_m"] <= 0:
+        return None
+    ft = bool(re.search(r"\b(feet|foot|ft|lf|linear feet)\b", question, re.I))
+    if not _SKIRT.search(question):  # a plain perimeter: the whole outline
+        v = pr["perimeter_m"] / 0.3048 if ft else pr["perimeter_m"]
+        return Answer(value=round(v, 2), unit="ft" if ft else "m",
+                      confidence=LARGE_CONF if _LARGE.get(img_path, False) else PERIM_CONF, solver=solver,
+                      evidence=[Evidence(file=img_path, page=0, bbox=[round(x, 1) for x in lab.box],
+                                         bbox_space="image_px", note=f"room label '{lab.text}'"),
+                                Evidence(file=img_path, page=0, bbox=r["box"], bbox_space="image_px",
+                                         polygon=r.get("polygon"), exact=False,
+                                         note=f"room outline: perimeter {pr['perimeter_m']:.2f} m at 1 m = "
+                                              f"{bar.px_per_m:.1f} px from {SB.scale_source(bar)}")]
+                      + bar.evidence(img_path),
+                      trace=[f"room label '{lab.text}' at {[round(x) for x in lab.box]}", bar.describe(), *r["notes"],
+                             f"perimeter of the traced outline {pr['perimeter_m']:.2f} m (door openings along it "
+                             f"{pr['openings_m']:.2f} m are included)"],
+                      assumptions=[f"the room outline is the blank region around its label up to the drawn walls (inner "
+                                   f"wall faces), measured with {SB.scale_source(bar)}; doorways are closed straight"],
+                      missing=["printed room dimensions (the perimeter is measured on the drawing)"])
+    v = pr["net_m"] / 0.3048 if ft else pr["net_m"]
+    unit = "ft" if ft else "m"
+    alt = pr["perimeter_m"] / 0.3048 if ft else pr["perimeter_m"]
+    ev = [Evidence(file=img_path, page=0, bbox=[round(x, 1) for x in lab.box], bbox_space="image_px",
+                   note=f"room label '{lab.text}'"),
+          Evidence(file=img_path, page=0, bbox=r["box"], bbox_space="image_px", polygon=r.get("polygon"), exact=False,
+                   note=f"room outline: perimeter {pr['perimeter_m']:.2f} m at 1 m = {bar.px_per_m:.1f} px from "
+                        f"{SB.scale_source(bar)}")]
+    ev += [Evidence(file=img_path, page=0, bbox=[min(a[0], b[0]), min(a[1], b[1]), max(a[0], b[0]) + 1,
+                                                 max(a[1], b[1]) + 1], bbox_space="image_px", polyline=[a, b],
+                    exact=False, note=f"door opening {np.hypot(b[0] - a[0], b[1] - a[1]) / bar.px_per_m:.2f} m "
+                                      "(deducted)") for a, b in pr["segments"][:8]]
+    ev += bar.evidence(img_path)
+    trace = [f"room label '{lab.text}' at {[round(x) for x in lab.box]}", bar.describe(), *r["notes"],
+             f"perimeter {pr['perimeter_m']:.2f} m − {pr['n_openings']} opening(s) {pr['openings_m']:.2f} m = "
+             f"{pr['net_m']:.2f} m",
+             f"Convention: baseboard = room perimeter at the inner wall face minus door openings; without deduction "
+             f"{alt:.2f} {unit}" + (f" (= {pr['net_m']:.2f} m)" if ft else "")]
+    return Answer(value=round(v, 2), unit=unit, confidence=SKIRT_CONF, solver=solver, evidence=ev, trace=trace,
+                  assumptions=[f"the room outline is the blank region around its label up to the drawn walls, measured "
+                               f"with {SB.scale_source(bar)}; an opening is a stretch of the outline with no drawn line "
+                               f"within 0.3 m outside it (doorways), windows keep their wall"],
+                  missing=["door widths from the door schedule (openings are measured on the drawing)"])
+
+
 def _room_area_answer(img_path: str, question: str, tl: T.TextLayer, bars: list, solver: str):
     """'Area of room 2.32 / «Bagno»': the label in the text layer -> a printed area next to it (read), else the room's
     flood-filled outline x the scale bar (measure.py). No VLM call. None when the room or a metric bar is missing."""
@@ -877,8 +1052,10 @@ def _room_area_answer(img_path: str, question: str, tl: T.TextLayer, bars: list,
         return None
     h = lab.box[3] - lab.box[1]
     th = min(h, lab.box[2] - lab.box[0])  # text height, also for labels printed sideways
+    big = _LARGE.get(img_path, False)
     if loose and any(re.search(r"\d", i.text) and i is not lab and abs(i.cx - lab.cx) < 8 * th
-                     and abs(i.cy - lab.cy) < 8 * th for i in tl.items):
+                     and abs(i.cy - lab.cy) < 8 * th and not (big and _MM_DIM.fullmatch(i.text.strip()))
+                     for i in tl.items):
         # an unquoted name with numbers printed next to it (dimensions '12'-0" x 14'-6"', a printed area in a format
         # T.areas does not parse): the VLM reading of the print is the better source than a flood fill
         return None
@@ -900,17 +1077,24 @@ def _room_area_answer(img_path: str, question: str, tl: T.TextLayer, bars: list,
                       trace=[f"room label '{lab.text}' at {lab.box}; printed area next to it: '{a['line']}'"])
     others = [i.box for i in ids if i is not lab and M._ROOM_ID.fullmatch(i.text.strip())]
     if loose:  # other printed room NAMES split open regions / veto a merged solid-wall region too
-        others += [i.box for i in tl.items if i is not lab and M._NAME.fullmatch(T.norm(i.text))
+        others += [i.box for i in tl.items if i is not lab and (M._NAME.fullmatch(T.norm(i.text)) or
+                                                               _SHORT_LABEL.fullmatch(M._lkey(i.text)))
                    and T.norm(i.text) not in M._GENERIC]
-    r = M.room_area(img_path, lab.box, bar.px_per_m, **M.FILL, others=others, solid=True)
-    if r is None or r["wall_frac"] < 0.05 or r["m2"] > 120:
+    r = M.room_area(img_path, lab.box, bar.px_per_m, **M.FILL, others=others, solid=True,
+                    large=_LARGE.get(img_path, False))
+    if r is None or not _bounded(r, bar, img_path) or r["m2"] > _area_cap(bar, img_path):
         # not bounded by drawn walls (thin-line historical plans leak: HABS ut0011 'KITCHEN' filled ~100 m², 0% of its
         # outline on walls; Swiss rooms: min 0.01, 5/71 below 0.2) or larger than any single room: no measurement
         return None
     unit = "ft2" if re.search(r"\b(sq\.? ?ft|square feet|ft²|feet)\b", question, re.I) else "m2"
     v = r["m2"] / 0.3048 ** 2 if unit == "ft2" else r["m2"]
     W = M.WITHIN
-    return Answer(value=round(v, 2), unit=unit, confidence=M.CONF, solver=solver,
+    large = _LARGE.get(img_path, False)
+    how_good = (f"on D1's 15 line-only school sheets as 300-dpi PNGs (372 rooms, door gaps bridged) this measurement was "
+                f"within 2% for {100 * LARGE_WITHIN:.0f}%" if large else
+                f"on 23 held-out Swiss plan rooms this measurement was within 2% for {100 * W['2%']:.0f}%, within 5% for "
+                f"{100 * W['5%']:.0f}% and within 10% for {100 * W['10%']:.0f}%")
+    return Answer(value=round(v, 2), unit=unit, confidence=LARGE_AREA_CONF if large else M.CONF, solver=solver,
                   evidence=[lab_ev, Evidence(file=img_path, page=0, bbox=r["box"], bbox_space="image_px",
                                              polygon=r.get("polygon"), exact=False,
                                              note=f"room outline ({'solid walls' if r['notes'][0].startswith('walls-only') else 'flood fill'}): {r['m2']:.2f} m² at 1 m = "
@@ -920,9 +1104,18 @@ def _room_area_answer(img_path: str, question: str, tl: T.TextLayer, bars: list,
                   assumptions=[f"the room's outline is the blank region around its label up to the drawn walls "
                                f"(convex hull, so fixtures against walls count), measured with {SB.scale_source(bar)} "
                                f"({bar.px_per_m:.2f} px per m); no area is printed for this room"],
-                  missing=[f"a printed area or dimensions: on 23 held-out Swiss plan rooms this measurement was within 2% for "
-                           f"{100 * W['2%']:.0f}%, within 5% for {100 * W['5%']:.0f}% and within 10% for "
-                           f"{100 * W['10%']:.0f}%"])
+                  missing=[f"a printed area or dimensions: {how_good}"])
+
+
+# a room measured on a whole large-format CAD sheet (_LARGE: printed 1:N on a standard paper, door gaps bridged):
+# experiments/o1/c5/lineonly_bench.py --dpi 300 --bridge 2 (O1 c6, D1's 15 line-only school sheets, 372 rooms): within
+# 2% 199/372 hollow walls, 221/372 solid walls (median |err| 1.7 / 1.3%) -> P(within 2%) ~ 0.55
+LARGE_WITHIN = 0.55
+LARGE_CONF = 0.5
+# ... but a room AREA stays at 0.3 there: the upload solver traces an image whose reading is <= 0.3 into vector lines
+# (P1 vectorize + E1 lineplan), which measured D1's secondary PNG rooms closer (gate d22 + O1 at 0.5: Resistant
+# Materials 103.91 -> 100.71, Graphics 83.45 -> 81.06; 1 W / 2 L on D1's 129-row probe). This reading is the fallback.
+LARGE_AREA_CONF = 0.3
 
 
 # experiments/w3/apartment_eval.py (99 'net floor area of apartment X' Qs, 52 Swiss PNG plans: 37 dev + 15 train,
@@ -984,8 +1177,9 @@ def _rooms_sum_answer(img_path: str, question: str, tl: T.TextLayer, bars: list,
             got = None
             if bar is not None:
                 r = M.room_area(img_path, lab.box, bar.px_per_m, **M.FILL,
-                                others=[i.box for i in anchors if i is not lab], solid=True)
-                if r is not None and r["wall_frac"] >= 0.05 and r["m2"] <= 120:
+                                others=[i.box for i in anchors if i is not lab], solid=True,
+                                large=_LARGE.get(img_path, False))
+                if r is not None and _bounded(r, bar, img_path) and r["m2"] <= _area_cap(bar, img_path):
                     got = (round(r["m2"], 2), "m2")
                     ev += [lab_ev, Evidence(file=img_path, page=0, bbox=r["box"], bbox_space="image_px",
                                             polygon=r.get("polygon"), exact=False,
@@ -1031,7 +1225,7 @@ def _unit_area_answer(img_path: str, question: str, tl: T.TextLayer, bars: list,
     from stoa.solvers.raster import measure as M
 
     bar = next((b for b in bars if b.px_per_m), None)
-    r = A.room_set(img_path, tl, question, bar.px_per_m if bar else None)
+    r = A.room_set(img_path, tl, question, bar.px_per_m if bar else None, large=_LARGE.get(img_path, False))
     if r is None:
         return None
     ft = bool(re.search(r"\b(sq\.? ?ft|square feet|ft²|ft2)\b", question, re.I))
@@ -1095,13 +1289,30 @@ def _unit_area_answer(img_path: str, question: str, tl: T.TextLayer, bars: list,
                        + " (neither printed nor measurable): the sum is too small by their areas")
     if bar and bar.notes:
         assumptions.append("scale: " + bar.notes[-1])
+    unit_out = "ft2" if ft else "m2"
+    if r.get("unit") == "ft2":  # printed 'NNN SF': keep square feet unless the question asks for square metres
+        if re.search(r"m²|\bm2\b|square met|sq\.? ?m\b|neliö|quadratmeter", question, re.I):
+            k, unit_out = 0.3048 ** 2, "m2"
+        else:
+            k, unit_out = 1.0, "ft2"
+    if r.get("repeats"):
+        assumptions.append(f"{r['repeats']} room label(s) repeat a room number already counted (the same room in "
+                           "another view of the sheet, e.g. the reflected ceiling plan): counted once")
+    if r.get("sub_note"):
+        assumptions.append(r["sub_note"])
+    if r.get("repeats") or r.get("sub_note"):
+        conf = min(conf, 0.7)  # repeated views / a part by its room-number prefix: not yet calibrated
+    if r.get("sub_missed"):
+        conf = min(conf, 0.3)
+        missing.append(f"the question's scope '{r['sub_missed']}' was not applied: the sum covers every numbered room "
+                       "on the sheet")
     total = round(r["value"] * k, 2)
-    return Answer(value=total, unit="ft2" if ft else "m2", confidence=conf, solver=solver, evidence=ev[:14],
+    return Answer(value=total, unit=unit_out, confidence=conf, solver=solver, evidence=ev[:14],
                   trace=([f"apartment {r['letter']}: label '{lab.text}' at {[round(x) for x in lab.box]}; region "
                           f"inside the unit boundary {[round(x) for x in r['region_box']]} ({r['region_m2']} m² inside "
                           "the line)"] if lab is not None else [f"scope: {r['scope']}"
                                                                 + (f", rooms labelled '{r['name']}'" if r['name'] else "")])
-                  + ["rooms: " + " + ".join(parts) + f" = {r['value']:g} m²"],
+                  + ["rooms: " + " + ".join(parts) + f" = {r['value']:g} {'SF' if r.get('unit') == 'ft2' else 'm²'}"],
                   assumptions=assumptions, missing=missing)
 
 

@@ -99,10 +99,17 @@ def test_label_count_routed_for_upload_images_only():
     from stoa.pipeline import route
     from stoa.router.intent import parse
 
+    from pathlib import Path
+
+    import pytest
+
     q = "How many meeting rooms are on this level?"
+    if not Path(".stoa/neutral/x1/640f1a9d80/640f1a9d80.png").is_file():
+        pytest.skip("needs the wild upload copy (RL 17:38)")
     up = route(".stoa/neutral/x1/640f1a9d80/640f1a9d80.png", parse(q))
-    assert up[0] == "label_count" and "vlm_lora" in up
+    assert up[:2] == ["stated_count", "label_count"] and "vlm_lora" in up
     assert "label_count" not in route("data/cubicasa5k/high_quality/1/F1_original.png", parse(q))
+    assert "stated_count" not in route("data/cubicasa5k/high_quality/1/F1_original.png", parse(q))
 
 
 def test_stair_page_picks_the_noted_page(tmp_path):

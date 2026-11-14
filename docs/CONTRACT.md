@@ -118,9 +118,9 @@ wrong dimension (m for an area question) is wrong. Counts are rounded to the nea
 ## Eval CLI
 
 ```bash
-$JUNCTION_VENV/bin/python -m stoa.eval --solver <name> --split smoke|dev [--limit N] \
+.venv/bin/python -m stoa.eval --solver <name> --split smoke|dev [--limit N] \
     [--source S] [--type T] [--grep REGEX] [--workers N] [--solver-arg k=v] [--handled-only] [--note "..."]
-$JUNCTION_VENV/bin/python -m stoa.eval --list        # registered solvers + import errors
+.venv/bin/python -m stoa.eval --list        # registered solvers + import errors
 ```
 - Splits (v2) live in `$JUNCTION_SHARED/results/splits/{smoke,dev,test,train,unused,hard}.jsonl`. Grouped
   by drawing (`stoa.data.drawing_group`): sibling formats, floors of one Swiss site, plans and discipline

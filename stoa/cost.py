@@ -46,6 +46,10 @@ API_PRICES: dict[str, tuple[float, float]] = {
     "gemini-2.5-pro": (1.25, 10.00),
     "nvidia/nemotron-3.5-super-vl-120b-a12b": (0.40, 1.60),
     "google/gemma-3-12b-it": (0.10, 0.20),
+    # Verda Inference (V1 17:46, backend 'verda'): Verda publishes no per-token price we could find; ASSUMED vendor list
+    # prices (DeepSeek official for V4.1 Flash; Moonshot for Kimi K3.1 Pro, which bills ~97 reasoning tokens per call)
+    "deepseek-4-1-flash-1017": (0.30, 1.20),
+    "kimi-k3-1-pro": (2.00, 10.00),
 }
 DEFAULT_API_PRICE = (0.40, 1.60)  # unknown hosted model: the night's generic assumption
 try:

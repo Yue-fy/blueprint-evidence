@@ -62,9 +62,16 @@ class Upload(Pipeline):
                 if (rec := _recognition(prep.path, None)) is not None:
                     ans.trace = [trace_line(rec), *ans.trace]
                     ans.assumptions = [*ans.assumptions, chip(rec)]
+        q_read = question
+        if prep.kind.startswith("page") and prep.sheet:
+            from stoa.formats.normalize import without_sheet
+
+            q_read = without_sheet(question, prep.sheet)
+            if q_read != question:
+                prep.notes.append(f"sheet {prep.sheet} named in the question: its page was read as '{q_read}'")
         if ans is None:
             try:
-                ans = super().solve(prep.path, question)
+                ans = super().solve(prep.path, q_read)
             except Exception as e:  # noqa: BLE001 — never an error page: a plain answer that says what went wrong
                 ans = Answer.abstain("upload", f"the drawing could not be read: {type(e).__name__}: {e}")
                 ans.missing = [*ans.missing, "a readable copy of the drawing (PDF, PNG/JPG, IFC or DXF); this file "
@@ -72,10 +79,10 @@ class Upload(Pipeline):
         if Path(prep.path).suffix.lower() == ".pdf" and _no_reader(ans) and _recognised(ans) != "bim_plan":
             # not on IFC-exported sheets: their readers abstain because the question needs the model (up_lone: 98
             # such rows, whole-model counts / volumes), which a picture of one storey does not have either
-            ans = self._as_image(prep, question, ans)
+            ans = self._as_image(prep, q_read, ans)
         elif Path(prep.path).suffix.lower() in (".png", ".jpg", ".jpeg") and _weak(ans) and \
                 _intent(ans) in VECTOR_INTENTS:
-            ans = self._as_vector(prep, question, ans)
+            ans = self._as_vector(prep, q_read, ans)
         if Path(prep.path).suffix.lower() == ".dxf" and prep.missing and "dxf" in (ans.solver or "") and \
                 ans.value is not None:
             blocks_only = all("drawn as blocks" in m for m in prep.missing)
@@ -207,7 +214,7 @@ class Upload(Pipeline):
             # as mm, '1104.0 mm' for 11.04 m) -> in-between at most
             ans.confidence = 0.5
             ans.trace = [*ans.trace, "upload: confidence capped at 0.5 (a vector sheet read as a picture)"]
-        prep.path, prep.scan_zoom = png, zoom
+        prep.path, prep.scan_zoom = png, zoom * (prep.paper_f or 1.0)  # px per point of the UPLOADED page
         prep.kind = {"page": "page+render", "svg_pdf": "svg_pdf+render"}.get(prep.kind, "render")
         prep.notes.append(f"no PDF reader could read this sheet (e.g. its text is drawn as outlines): the page was "
                           f"read as an image at {72 * zoom:.0f} dpi")
@@ -222,7 +229,16 @@ class Upload(Pipeline):
         from stoa.formats import vectorize as V
         from stoa.formats.normalize import _cache_dir
 
-        hit = V.paper(prep.path)
+        hit, how = V.paper(prep.path), "from its metadata"
+        if hit is None:  # E1 17:29: Stoa's sheets carry no (or PyMuPDF's 96) dpi tag; their pixel size is the sheet
+            from stoa.formats.paper import paper_of_image
+            from stoa.solvers.raster import textlayer as T
+
+            try:  # the image readers ran first, so the text layer is cached
+                hit = paper_of_image(prep.path, [i.text for i in T.text_layer(prep.path).items])
+            except Exception:  # noqa: BLE001
+                hit = None
+            how = "from its pixel size and the sheet size it prints"
         if hit is None:
             return ans0
         dpi, sheet = hit
@@ -255,8 +271,8 @@ class Upload(Pipeline):
         rec0 = [t for t in ans0.trace[:3] if str(t).startswith("recognised:")]
         chip0 = [a for a in ans0.assumptions if str(a).startswith("recognised as:")]
         ans.trace = [*rec0, f"upload: the image readers gave no usable reading ({ans0.solver}: {str(ans0.value)[:60]!r} "
-                            f"@{ans0.confidence:.2f}); image traced as vector lines ({sheet} at {dpi:.0f} dpi from its "
-                            f"metadata, {out.name})", *(t for t in ans.trace if not (rec0 and str(t).startswith(
+                            f"@{ans0.confidence:.2f}); image traced as vector lines ({sheet} at {dpi:.0f} dpi {how}, "
+                            f"{out.name})", *(t for t in ans.trace if not (rec0 and str(t).startswith(
                                 "recognised:")))]
         if chip0:
             ans.assumptions = [*(a for a in ans.assumptions if not str(a).startswith("recognised as:")), *chip0]

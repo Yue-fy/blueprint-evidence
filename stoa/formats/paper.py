@@ -60,3 +60,58 @@ def paper_from_pixels(size: tuple[int, int], texts: list[str]) -> tuple[float, s
     sw, sl = PAPER_MM[hit[0]]
     a, b = sorted(size)
     return (a / (sw / 25.4) + b / (sl / 25.4)) / 2, hit[0]
+
+
+SRC_SIZE_KEY = "stoa_src_size"  # PNG text chunk written by normalize.shrink_image: the pixel size before the shrink
+
+
+def paper_of_image(path: str, texts: list[str]) -> tuple[float, str] | None:
+    """(dpi of THIS file, sheet) for an untagged sheet export: paper_from_pixels on the image's pixel size, or on its
+    size before normalize.shrink_image made this smaller copy (the UI reads 6000-px copies: 14000 px A2 @598.7 dpi ->
+    6000 px @256.6 dpi), the dpi scaled to this file. None when the sheet's text does not name exactly one candidate."""
+    from PIL import Image
+
+    Image.MAX_IMAGE_PIXELS = None
+    try:
+        with Image.open(path) as im:
+            size = im.size
+            raw = str(im.info.get(SRC_SIZE_KEY) or "")
+    except Exception:  # noqa: BLE001
+        return None
+    m = re.fullmatch(r"\s*(\d+)\s*x\s*(\d+)\s*", raw)
+    src = (int(m.group(1)), int(m.group(2))) if m else size
+    hit = paper_from_pixels(src, texts)
+    if hit is None:
+        return None
+    return hit[0] * size[0] / src[0], hit[1]
+
+
+# '1:200 @ A1', '1:200 at A1', 'SCALE 1:50@A1' (D1 16:50 / X1 17:41: UK EFA sheets print the scale for A1 on an A3 PDF)
+_SCALE_AT = re.compile(r"\b1\s*:\s*(\d{1,5})\s*(?:@|at|bei|auf)\s*(A[0-4])\b", re.I)
+
+
+def page_paper(width_pt: float, height_pt: float, tol: float = 0.03) -> str | None:
+    """The ISO A sheet a PDF page is (both sides within tol), or None."""
+    a, b = sorted((width_pt / 72 * 25.4, height_pt / 72 * 25.4))
+    for name in ("A0", "A1", "A2", "A3", "A4", "A5"):
+        w, h = PAPER_MM[name]
+        if abs(a - w) <= tol * w and abs(b - h) <= tol * h:
+            return name
+    return None
+
+
+def scale_for_other_paper(text: str, width_pt: float, height_pt: float) -> tuple[float, str, str, int] | None:
+    """(factor, printed-for paper, page paper, printed N) when the page prints its scale for ANOTHER paper size than
+    the page is: '1:200 @ A1' on an A3 page -> (2.0, 'A1', 'A3', 200): the drawing on this file is at 1:400, and the
+    page enlarged 2.0x is the sheet the 1:200 was written for. None when the papers agree, the page is not an ISO A
+    sheet, or the page names two different papers."""
+    hits = {(int(n), at.upper()) for n, at in _SCALE_AT.findall(text or "")}
+    papers = {at for _, at in hits}
+    if len(papers) != 1:
+        return None
+    named = papers.pop()
+    page = page_paper(width_pt, height_pt)
+    if page is None or page == named:
+        return None
+    f = PAPER_MM[named][1] / PAPER_MM[page][1]
+    return f, named, page, min(n for n, _ in hits)

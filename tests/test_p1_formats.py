@@ -767,3 +767,219 @@ def test_render_of_a_vector_page_reads_the_pdfs_own_words_not_ocr(tmp_path, monk
     doc2.save(tmp_path / "outlined.pdf")
     png2, z2 = normalize.render_png(str(tmp_path / "outlined.pdf"))
     assert normalize.seed_text_layer(str(tmp_path / "outlined.pdf"), png2, z2) == 0
+
+
+def test_shrink_image_keeps_a_clean_sheet_clean(tmp_path):
+    """P1 17:15: the web upload's 6000-px LANCZOS resize turned 2 of Stoa's 4 clean CAD sheets into 'scans' for the
+    clean-render gate (thin lines -> ramps of grey levels): text then went to CPU OCR, symbol readers switched off.
+    shrink_image keeps a clean original clean (flat grey levels), leaves a scan's grey levels alone, scales the DPI
+    with the pixels and does nothing to an image that is small enough."""
+    import numpy as np
+    from PIL import Image
+
+    from stoa.formats.normalize import shrink_image
+    from stoa.solvers.raster.windows import clean_render
+
+    from PIL import ImageDraw
+
+    rng = np.random.default_rng(1)
+    img = Image.new("L", (8000, 5000), 255)
+    d = ImageDraw.Draw(img)
+    for _ in range(900):  # 1-px CAD lines at any angle (walls, hatching, leaders)
+        x0, y0 = rng.integers(0, 8000), rng.integers(0, 5000)
+        d.line([(x0, y0), (x0 + rng.integers(-900, 900), y0 + rng.integers(-900, 900))], fill=int(rng.choice([0, 90])))
+    src = tmp_path / "sheet.png"
+    img.save(src, dpi=(300, 300))
+    assert clean_render(str(src))[0]
+    plain = tmp_path / "plain.png"
+    img.resize((6000, 3750), Image.LANCZOS).save(plain)
+    assert not clean_render(str(plain))[0]  # what the plain resize does to it
+    r = shrink_image(src, tmp_path / "sheet_small.png", 6000)
+    assert r["clean"] and r["flat"] and r["size"] == (6000, 3750) and abs(r["factor"] - 0.75) < 1e-9
+    assert clean_render(r["path"])[0]
+    with Image.open(r["path"]) as im:
+        assert abs(im.info["dpi"][0] - 225) < 0.5
+    rng = np.random.default_rng(0)
+    scan = rng.normal(200, 30, (5000, 8000)).clip(0, 255).astype(np.uint8)  # paper texture
+    s = tmp_path / "scan.png"
+    Image.fromarray(scan).save(s)
+    r2 = shrink_image(s, tmp_path / "scan_small.png", 6000)
+    assert r2["clean"] is False and not clean_render(r2["path"])[0]
+    assert shrink_image(r["path"], tmp_path / "again.png", 6000)["factor"] == 1.0
+    assert not (tmp_path / "again.png").exists()
+
+
+def test_big_image_upload_is_read_from_a_smaller_copy_and_points_back(tmp_path, monkeypatch):
+    """normalize.prepare reads an image above STOA_IMAGE_MAX_SIDE (default 6000 = the web upload's cap) from a cached
+    smaller copy, so CLI / API / evals read what the UI reads; evidence comes back in the upload's own pixels."""
+    from PIL import Image
+
+    big = tmp_path / "sheet.png"
+    Image.new("L", (9000, 3000), 255).save(big)
+    prep = normalize.prepare(str(big), "How big is the kitchen?")
+    assert prep.kind == "shrink" and abs(prep.img_scale - 6000 / 9000) < 1e-9
+    with Image.open(prep.path) as im:
+        assert im.size == (6000, 2000)
+    assert normalize.prepare(str(big), "again").path == prep.path  # cached copy reused
+    ans = Answer(value=12.0, unit="m2", confidence=0.5, solver="t",
+                 evidence=[Evidence(file=prep.path, bbox=[600, 300, 1200, 900], bbox_space="image_px",
+                                    polygon=[[600, 300], [1200, 300], [1200, 900]])])
+    ans = normalize.restore(ans, prep)
+    ev = ans.evidence[0]
+    assert ev.file.endswith("sheet.png") and ev.bbox == pytest.approx([900, 450, 1800, 1350])
+    assert ev.polygon[1] == pytest.approx([1800, 450])
+    assert ans.assumptions[0].startswith("large image (9000×3000 px) read at 6000×2000 px")
+    monkeypatch.setenv("STOA_IMAGE_MAX_SIDE", "0")
+    assert normalize.prepare(str(big), "off").kind == "as_is"
+
+
+def test_warm_reads_an_image_upload_before_the_first_question(tmp_path, monkeypatch):
+    """stoa.formats.warm: the text layer of an uploaded image is read when the file arrives (the first question's
+    37-81 s on Stoa's sheets), a big image via its smaller copy; it never raises."""
+    from PIL import Image
+
+    from stoa.formats import warm as W
+    from stoa.solvers.raster import textlayer as T
+
+    seen = []
+    monkeypatch.setattr(T, "text_layer", lambda p, **kw: seen.append(p) or T.TextLayer(path=p, size=(1, 1), items=[]))
+    monkeypatch.setattr(T, "is_clean", lambda p: True)
+    big = tmp_path / "sheet.png"
+    Image.new("L", (7000, 3000), 255).save(big)
+    out = W.warm(str(big))
+    assert out["error"] == "" and out["kind"] == "shrink" and seen == [out["solved_file"]]
+    assert seen[0].endswith("sheet.s6000.png") and "text layer (0 texts)" in out["done"]
+    bad = W.warm(str(tmp_path / "missing.png"))
+    assert isinstance(bad, dict) and "seconds" in bad
+
+
+def test_named_sheet_number_finds_its_sheet_in_a_set(tmp_path):
+    """P1 17:35: 'on sheet M-101A' in a 156-page USACE set went to the page with the most drawing: the sheet pattern
+    needed 2-4 digits and a word end ('M-101A', 'S-100F', 'A-2' never matched) and the set's index page lists every
+    number too. The sheet's OWN number is printed big in its title block."""
+    import pymupdf
+
+    from stoa.formats.pages import pick_page, sheet_id
+
+    d = pymupdf.open()
+    for i, (big, small) in enumerate([("G-001", "SHEET INDEX\nM-100A PIPING PLAN\nM-101A PIPING PLAN\nA-2 FLOOR PLAN"),
+                                      ("M-100A", "PIPING PLAN\nSEE SHEET M-101A\nCHECK VALVE"),
+                                      ("M-101A", "PIPING PLAN\nSEE SHEET M-504\nCHECK VALVE"),
+                                      ("A-2", "SECOND FLOOR PLAN\nCHECK VALVE")]):
+        pg = d.new_page(width=1224, height=792)
+        for j, line in enumerate(small.splitlines() + ["NOTES"] * 6):
+            pg.insert_text((60, 80 + 14 * j), line, fontsize=9)
+        pg.insert_text((1080, 740), big, fontsize=28)
+        pg.draw_rect(pymupdf.Rect(100, 300, 900 - 100 * i, 700))
+    f = tmp_path / "set.pdf"
+    d.save(f)
+    for q, want in [("How many check valves are there on sheet M-101A?", 2), ("On sheet M-100A: how many valves?", 1),
+                    ("What is the area of the second floor (sheet A-2)?", 3)]:
+        assert pick_page(f, q)[0] == want, q
+    assert sheet_id(f, 2) == "M-101A" and sheet_id(f, 0) == "G-001"
+    prep = normalize.prepare(str(f), "How many check valves are there on sheet M-101A?")
+    assert prep.page == 2 and "answered from page 3 (sheet M-101A)" in prep.notes[0]
+
+
+def test_scale_printed_for_another_paper_reads_the_page_enlarged(tmp_path):
+    """D1 16:50 / X1 17:41: UK EFA sheets print '1:200 @ A1' on an A3 PDF page (true 1:400 on the file); every reader
+    took the printed 1:200 (room areas x0.25). normalize.prepare reads such a page enlarged to the named paper, where
+    the printed 1:N holds, and maps evidence back; a page whose paper agrees is left alone."""
+    import pymupdf
+
+    from stoa.formats.paper import scale_for_other_paper
+
+    a3 = (420 / 25.4 * 72, 297 / 25.4 * 72)
+    assert scale_for_other_paper("SCALE 1:200 @ A1", *a3)[:3] == pytest.approx((841 / 420, "A1", "A3"))
+    assert scale_for_other_paper("1:100 at A3", *a3) is None and scale_for_other_paper("GRID A1  1:200", *a3) is None
+    assert scale_for_other_paper("1:200 @ A1  1:50 @ A3", *a3) is None  # two papers named: not sure
+    d = pymupdf.open()
+    pg = d.new_page(width=a3[0], height=a3[1])
+    pg.draw_rect(pymupdf.Rect(100, 100, 300, 200))
+    pg.insert_text((900, 800), "Scale 1:200 @ A1", fontsize=10)
+    f = tmp_path / "sheet.pdf"
+    d.save(f)
+    prep = normalize.prepare(str(f), "How big is the hall?")
+    assert prep.kind == "paper" and prep.paper_f == pytest.approx(2.0, rel=0.01)
+    with pymupdf.open(prep.path) as c:
+        assert c[0].rect.width == pytest.approx(a3[0] * prep.paper_f, rel=1e-3)
+        assert any(abs(r.rect.width - 200 * prep.paper_f) < 1 for r in [type("R", (), {"rect": dr["rect"]}) for dr in
+                                                                         c[0].get_drawings()])
+    assert "1:400 on this file" in prep.notes[0]
+    ans = Answer(value=1.0, unit="m2", confidence=0.5, solver="t",
+                 evidence=[Evidence(file=prep.path, page=0, bbox=[200, 200, 600, 400], bbox_space="pdf_pt")])
+    ev = normalize.restore(ans, prep).evidence[0]
+    assert ev.file.endswith("sheet.pdf") and ev.bbox == pytest.approx([v / prep.paper_f for v in (200, 200, 600, 400)])
+
+
+def test_paper_of_a_shrunk_sheet_export_and_sheet_reference_removal(tmp_path):
+    """E1 17:29: an untagged sheet export's pixel size gives its paper (paper_from_pixels) - also on the UI's 6000-px
+    copy, which carries its original size; and once a named sheet's page is picked from a set, the readers get the
+    question without 'sheet X' (it sent them to the sheet-table reader)."""
+    from PIL import Image
+
+    from stoa.formats.normalize import shrink_image, without_sheet
+    from stoa.formats.paper import paper_of_image
+
+    src = tmp_path / "a2.png"
+    Image.new("L", (14000, 9902), 255).save(src)  # A2 at 598.7 dpi, no tag (Stoa's DfE sheet)
+    r = shrink_image(src, tmp_path / "a2_small.png", 6000)
+    dpi, sheet = paper_of_image(r["path"], ["ISO A2"])
+    assert sheet == "A2" and dpi == pytest.approx(6000 / (594 / 25.4), rel=0.005)
+    assert paper_of_image(r["path"], ["GRID A1"]) is None
+    assert without_sheet("How many pumps? (sheet M-101A)", "M-101A") == "How many pumps?"
+    assert without_sheet("On sheet S-100F: how big is the pad?", "S-100F") == "How big is the pad?"
+    assert without_sheet("How many valves are on sheet M-101A?", "M-101A") == "How many valves are on the drawing?"
+    assert without_sheet("How many valves on sheet M-101B?", "M-101A") == "How many valves on sheet M-101B?"
+
+
+def test_shrunk_copy_is_made_once_under_concurrency_and_keeps_the_read_text(tmp_path, monkeypatch):
+    """S0 17:42 (gate d21): 4 eval workers asked about one big sheet at once; one read the .s6000.png while another was
+    still writing it ('cannot identify image file') and a right answer became the prior. The copy is made under a
+    cross-process lock and written atomically; a text layer already read on the full-size image is carried over."""
+    import concurrent.futures as cf
+    import json
+
+    from PIL import Image
+
+    from stoa.solvers.raster import textlayer as T
+
+    monkeypatch.setattr(T, "CACHE_DIR", tmp_path / "tl")
+    big = tmp_path / "sheet.png"
+    Image.new("L", (9000, 6000), 255).save(big)
+    f0 = T._disk_key(str(big), 1100, "local")
+    f0.parent.mkdir(parents=True)
+    f0.write_text(json.dumps({"path": str(big), "size": [9000, 6000], "items": [{"text": "KITCHEN",
+                                                                                   "box": [900, 600, 1800, 900]}]}))
+    with cf.ThreadPoolExecutor(8) as ex:
+        got = list(ex.map(lambda _: normalize.shrunk_copy(big, 6000), range(8)))
+    assert len({g[0] for g in got}) == 1
+    with Image.open(got[0][0]) as im:
+        im.load()
+        assert im.size == (6000, 4000)
+    d = json.loads(T._disk_key(got[0][0], 1100, "local").read_text())
+    assert d["size"] == [6000, 4000] and d["items"][0]["box"] == [600, 400, 1200, 600]
+    assert not list(tmp_path.glob(".*.tmp"))
+
+
+def test_big_set_note_lists_the_sheets_with_the_questions_rare_words(tmp_path):
+    """A question that names no sheet is ambiguous on a big standard-design set; the note lists the drawing sheets whose
+    text carries the question's RARE words (by their own sheet numbers), so the visitor can re-ask naming one."""
+    import pymupdf
+
+    from stoa.formats.pages import related
+
+    d = pymupdf.open()
+    for i in range(10):
+        pg = d.new_page(width=1224, height=792)
+        words = "PIPING PLAN CHECK VALVE" + (" SUCTION HEADER 16 IN" if i == 6 else "")
+        pg.insert_text((60, 80), words, fontsize=9)
+        pg.insert_text((60, 100), "NOTES " * 5, fontsize=9)
+        pg.insert_text((1080, 740), f"M-10{i}", fontsize=28)
+        for j in range(i + 1):  # more drawing on later pages
+            pg.draw_rect(pymupdf.Rect(100 + j, 300, 900, 700 - j))
+    f = tmp_path / "set.pdf"
+    d.save(f)
+    assert related(f, "What size is the suction header?", exclude=9) == [(6, "M-106")]
+    prep = normalize.prepare(str(f), "What size is the suction header?")
+    assert "other sheets with the question's words: M-106 (p. 7)" in prep.notes[0] or prep.page == 6

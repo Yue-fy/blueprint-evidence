@@ -43,10 +43,23 @@ def find_label(layer: T.TextLayer, question: str, loose: bool = False) -> T.Text
     if loose:
         rel = RELATIONAL.search(question)
         q = f" {T.norm(question[:rel.start()] if rel else question)} "  # a room named after 'next to' is a landmark
+        qk = re.sub(r"[^\w]+", " ", q)
         hits = [i for i in layer.items if _NAME.fullmatch(T.norm(i.text)) and T.norm(i.text) not in _GENERIC
-                and f" {T.norm(i.text)} " in re.sub(r"[^\w]+", " ", q)]
+                and f" {T.norm(i.text)} " in qk]
         if hits and len({T.norm(i.text) for i in hits}) == 1 and len(hits) == 1:
             return hits[0]
+        # O1 c6: names joined by '/' ('Food bay/practical resources', 'Head/Mtg' on D1's school sheets) fail _NAME;
+        # compare word keys on both sides, and of nested hits ('Hall' inside 'Main Hall') keep the longest
+        wide = [i for i in layer.items if _NAME_WIDE.fullmatch(_lkey(i.text)) and _lkey(i.text) not in _GENERIC
+                and f" {_lkey(i.text)} " in qk]
+        keys = {_lkey(i.text) for i in wide}
+        top = [k for k in keys if not any(k != o and f" {k} " in f" {o} " for o in keys)]
+        if len(top) == 1:
+            got = [i for i in wide if _lkey(i.text) == top[0]]
+            if len(got) == 1:
+                return got[0]
+        if hits:
+            return None
         if not hits:  # 'living room' on a plan printing WOHNZIMMER / OLOHUONE / SALON
             hits = concept_labels(layer, question[:rel.start()] if rel else question)
             if len(hits) == 1:
@@ -115,6 +128,13 @@ def concept_labels(layer: T.TextLayer, question: str, concept: str | None = None
 
 
 _NAME = re.compile(r"[^\W\d_]{3,}(?: [^\W\d_]{2,}){0,2}")
+_NAME_WIDE = re.compile(r"[^\W\d_]{2,}(?: [^\W\d_]{2,}){0,4}")
+
+
+def _lkey(text: str) -> str:
+    """A label's word key: normalised, every non-word run (/, -, .) a single space ('Head/Mtg' -> 'head mtg')."""
+    return re.sub(r"[^\w]+", " ", T.norm(text)).strip()
+
 _GENERIC = {"floor", "plan", "plans", "area", "areas", "room", "rooms", "total", "scale", "north", "level", "sheet",
             "drawing", "site", "the", "and", "with", "from", "planner", "page", "date", "title", "project", "unit",
             "apartment", "building", "house", "storey", "story", "wall", "walls", "door", "doors", "window", "windows"}
@@ -136,10 +156,34 @@ def _ink(path: str) -> np.ndarray:
 # within 2% 6/23, 5% 11/23, 10% 15/23, 20% 19/23, median 5.8% (untuned hull: 2/23, median 9.0%). WITHIN = held-out.
 # door-swing sectors kept inside a room's hull (0 = off). Swiss PNG bench (room_fill_eval.py --textqa, 242 rooms):
 # within 2% 90 -> 91, 5% 135 = 135; LEVEL_11 render comms room 16.32 -> 16.51 m² (gold 16.83)
+SEED_SKIP_LABELLED = os.environ.get("STOA_O1_SEED_SKIP", "1") != "0"
 DOOR_SECTOR_M2 = float(os.environ.get("STOA_O1_SECTOR", "1.2") or 0)
-FILL = {"door_m": 0.0, "hull": True, "clip": True, "clip_m2": 3.0, "fixture_retry": True, "grow": 1}
+GROW_PER_PX_M = float(os.environ.get("STOA_O1_GROW", "60") or 0)  # border px given back = px_per_m / this (min 1)
+OTHER_LABEL_CUT = os.environ.get("STOA_O1_LABEL_CUT", "1") != "0"  # blanks holding another room's label leave the hull
+# door gaps bridged along the wall lines (bridge()) on HIGH-RESOLUTION sheets only (>= BRIDGE_MIN_PX_M: large-format CAD
+# exported at 300-600 dpi, Stoa's DfE PNG = 118 px/m). D1's line-only school sheets rendered at 600 dpi (O1 c5,
+# experiments/o1/c5/lineonly_bench.py): within 2% 25 -> 33 of the first 54 rooms (0 losses), median 5.3 -> 1.0%;
+# Stoa's DfE PNG kitchen 40.07 -> 34.97 (alt gold 35.61), laundry 6.79 -> 6.89, fitness 26.46 -> 26.67 (with GROW).
+# The Swiss PNG bench (30-59 px/m, residential, open plans) LOSES with it (within 2% 91 -> 60 at 2.0 m): never there.
+BRIDGE_M = float(os.environ.get("STOA_O1_BRIDGE", "2.0") or 0)
+BRIDGE_MIN_PX_M = float(os.environ.get("STOA_O1_BRIDGE_MIN", "90") or 0)
+FILL = {"door_m": 0.0, "hull": True, "clip": True, "clip_m2": 3.0, "fixture_retry": True, "grow": 1,
+        "bridge_m": BRIDGE_M}
 WITHIN = {"2%": 6 / 23, "5%": 11 / 23, "10%": 15 / 23, "20%": 19 / 23}
 CONF = 0.3  # P(within 2%): held-out 6/23 rooms; end-to-end held-out 5/17 at the old 0.35
+
+
+def bridge(ink: np.ndarray, px_per_m: float, bridge_m: float, run_m: float = 0.4) -> np.ndarray:
+    """Close door openings along the WALL LINES only: vertical runs (>= run_m) are closed vertically and horizontal
+    runs horizontally, each up to bridge_m. Two collinear wall ends across a doorway join; two parallel walls of a
+    narrow room or corridor do not (a plain k x k closing fills every space narrower than k: WCs, stores)."""
+    L = max(3, int(round(run_m * px_per_m)))
+    k = max(3, int(round(bridge_m * px_per_m)))
+    v = cv2.morphologyEx(ink, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_RECT, (1, L)))
+    h = cv2.morphologyEx(ink, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_RECT, (L, 1)))
+    v = cv2.morphologyEx(v, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_RECT, (1, k)))
+    h = cv2.morphologyEx(h, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_RECT, (k, 1)))
+    return ink | v | h
 
 
 def _fill(ink: np.ndarray, label_box, px_per_m: float, door_m: float, hull: bool, clip: bool, clip_m2: float,
@@ -159,6 +203,15 @@ def _fill(ink: np.ndarray, label_box, px_per_m: float, door_m: float, hull: bool
     if not len(ids):
         return None
     cid = int(ids[np.argmax(counts)])
+    if others and len(ids) > 1 and SEED_SKIP_LABELLED:
+        # a long label printed across a wall ('Food bay/practical resources' reaching into Yr 6 on D1's school sheet):
+        # the ring's biggest blank is the neighbour. Skip blanks that hold ANOTHER label when one without does too.
+        held = {int(lab[min(H - 1, int((b[1] + b[3]) / 2)), min(W - 1, int((b[0] + b[2]) / 2))]) for b in others}
+        free_ids = [(c, int(i)) for i, c in zip(ids, counts) if int(i) not in held]
+        if cid in held and free_ids:
+            c, i = max(free_ids)
+            if c >= 0.15 * counts.sum():
+                cid = i
     comp = (lab == cid).astype(np.uint8)
     ys, xs = np.nonzero(comp)
     if ys.min() == 0 or xs.min() == 0 or ys.max() == H - 1 or xs.max() == W - 1:
@@ -195,6 +248,17 @@ def _fill(ink: np.ndarray, label_box, px_per_m: float, door_m: float, hull: bool
         big = sizes > clip_m2 * px_per_m ** 2
         big[0] = False
         big[cid] = False
+        if OTHER_LABEL_CUT and others:
+            # a small neighbouring room the hull reaches (a 2.6 m² store beside a kitchen, under clip_m2) is still
+            # another room when its own label sits in it (Stoa DfE PNG kitchen 36.9 -> store cut out)
+            for b in others:
+                bx0, by0, bx1, by1 = (int(round(v)) for v in b)
+                sub = lab[max(0, by0 - pad):min(H, by1 + pad), max(0, bx0 - pad):min(W, bx1 + pad)]
+                oi, oc = np.unique(sub[sub > 0], return_counts=True)
+                if len(oi):
+                    o = int(oi[np.argmax(oc)])
+                    if o != cid:
+                        big[o] = True
         cut = big[lab] & (filled > 0)
         if DOOR_SECTOR_M2 > 0 and cut.any():
             # a door swing drawn into the room: the sector between the leaf, the arc and the opening belongs to the
@@ -269,7 +333,12 @@ def room_area_walls(path: str, label_box: list[float], px_per_m: float, gap_m: f
 def room_area(path: str, label_box: list[float], px_per_m: float, door_m: float = 1.05,
               ink: np.ndarray | None = None, wall_m: float = 0.0, hull: bool = False, clip: bool = False,
               clip_m2: float = 3.0, others: list | None = None, fixture_retry: bool = False,
-              grow: int = 0, solid: bool = False) -> dict | None:
+              grow: int = 0, solid: bool = False, bridge_m: float = 0.0, large: bool = False) -> dict | None:
+    # large: the caller knows the image is a whole large-format CAD sheet (a printed 1:N on a standard paper size,
+    # clean render) -> door gaps are bridged at any resolution (textqa._large; O1 c6: D1's line-only school sheets as
+    # 300-dpi PNGs = 59 / 29.5 px/m, below BRIDGE_MIN_PX_M)
+    if bridge_m > 0 and (px_per_m >= BRIDGE_MIN_PX_M or large):
+        ink = bridge(_ink(path) if ink is None else ink, px_per_m, bridge_m)
     r = _room_area(path, label_box, px_per_m, door_m, ink, wall_m, hull, clip, clip_m2, others, fixture_retry, grow)
     if not solid:
         return r
@@ -335,6 +404,8 @@ def _room_area(path, label_box, px_per_m, door_m, ink, wall_m, hull, clip, clip_
         return None
     filled, xs, ys, notes, wall_frac, k = got
     if grow > 0:  # the ink threshold counts the walls' anti-aliased edge as wall: give the room its border back
+        if GROW_PER_PX_M > 0:  # high-resolution exports (600 dpi: 118 px/m at 1:200) lose 2-3 px per side
+            grow = max(grow, int(round(px_per_m / GROW_PER_PX_M)))
         filled = cv2.dilate(filled, np.ones((3, 3), np.uint8), iterations=grow)
     x0, y0, x1, y1 = label_box
     px = int(filled.sum())
@@ -346,3 +417,58 @@ def _room_area(path, label_box, px_per_m, door_m, ink, wall_m, hull, clip, clip_
                       + (f", door gaps closed at {k} px ({door_m:g} m)" if door_m > 0 else "")
                       + (", convex hull (fixtures against walls kept), walls and other rooms cut out" if hull else "")
                       + f": {px} px / {px_per_m:.2f}² px per m² = {m2:.2f} m²", *notes]}
+
+
+def room_perimeter(path: str, r: dict, px_per_m: float, ink: np.ndarray | None = None, reach_m: float = 0.3,
+                   step: float = 2.0) -> dict | None:
+    """Perimeter of a measured room (room_area result) and the door OPENINGS along it: a boundary stretch is an
+    opening when a ray cast outward finds no ink within reach_m (a doorway into the corridor; a window keeps its
+    glazing lines in the wall, a wall is ink). -> {"perimeter_m", "openings_m", "net_m", "openings": [[x, y], ...]
+    (opening sample points), "segments": [[[x, y], [x, y]], ...] (opening runs)}. Baseboard = net_m (captain 16:59)."""
+    poly = np.asarray(r.get("polygon") or [], np.float64)
+    if len(poly) < 3 or not px_per_m:
+        return None
+    ink = _ink(path) if ink is None else ink
+    H, W = ink.shape
+    x0, y0 = int(max(0, poly[:, 0].min() - 4)), int(max(0, poly[:, 1].min() - 4))
+    x1, y1 = int(min(W, poly[:, 0].max() + 5)), int(min(H, poly[:, 1].max() + 5))
+    mask = np.zeros((y1 - y0, x1 - x0), np.uint8)
+    cv2.fillPoly(mask, [np.round(poly - [x0, y0]).astype(np.int32)], 1)
+    reach = max(3, int(round(reach_m * px_per_m)))
+    perim, open_pts, runs, cur = 0.0, [], [], []
+    n = len(poly)
+    for k in range(n):
+        a, b = poly[k], poly[(k + 1) % n]
+        seg = float(np.hypot(*(b - a)))
+        if seg < 1:
+            continue
+        perim += seg
+        t = (b - a) / seg
+        nrm = np.array([t[1], -t[0]])
+        mid = (a + b) / 2
+        probe = np.round(mid + 3 * nrm - [x0, y0]).astype(int)
+        if 0 <= probe[1] < mask.shape[0] and 0 <= probe[0] < mask.shape[1] and mask[probe[1], probe[0]]:
+            nrm = -nrm  # make the normal point out of the room
+        for s in np.arange(0, seg, step):
+            p = a + t * s
+            hit = False
+            for d in range(2, reach + 1):
+                q = np.round(p + nrm * d).astype(int)
+                if not (0 <= q[0] < W and 0 <= q[1] < H) or ink[q[1], q[0]]:
+                    hit = True
+                    break
+            if not hit:
+                open_pts.append([float(p[0]), float(p[1])])
+                cur.append([float(p[0]), float(p[1])])
+            elif cur:
+                runs.append(cur)
+                cur = []
+        if cur:
+            runs.append(cur)
+            cur = []
+    # an opening narrower than 0.4 m is a gap in the drawing (a dashed line, an anti-aliasing break), not a doorway
+    runs = [c for c in runs if len(c) * step >= 0.4 * px_per_m]
+    op = sum(len(c) for c in runs) * step / px_per_m
+    pm = perim / px_per_m
+    return {"perimeter_m": round(pm, 3), "openings_m": round(op, 3), "net_m": round(pm - op, 3),
+            "segments": [[c[0], c[-1]] for c in runs], "n_openings": len(runs)}

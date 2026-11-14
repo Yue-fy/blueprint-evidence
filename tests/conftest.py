@@ -9,6 +9,7 @@ Run everything: set STOA_DATA to the dataset root (with questions.jsonl) and sta
 from __future__ import annotations
 
 import os
+from pathlib import Path
 
 import pytest
 
@@ -29,6 +30,11 @@ NEEDS_LOCAL_MODEL = {
     "tests/test_ifc_c9.py::test_bare_where_is_room[Wo ist Raum 103?]",
     "tests/test_ifc_c9.py::test_bare_where_is_room[Kus asub ruum 103?]",
     "tests/test_llm_parsing.py::test_local2_down_falls_back_to_local_at_once",
+}
+# read a file kept outside this repository (the team's anonymised upload copies; path relative to the repo root):
+# skipped when the file is not there
+NEEDS_FILE = {
+    "tests/test_g1_stated_count.py::test_pipe_runs_route_only_text_questions": ".stoa/neutral/x1sl/acf1f07a2d/acf1f07a2d.pdf",
 }
 
 # test the local-backend code paths with a mocked client: STOA_MODE=api would reroute "local" to the hosted backend,
@@ -56,5 +62,7 @@ def pytest_collection_modifyitems(config, items):
     for item in items:
         if not dataset and item.nodeid in NEEDS_DATASET:
             item.add_marker(pytest.mark.skip(reason="needs the Stoa dataset (STOA_DATA with questions.jsonl)"))
+        if item.nodeid in NEEDS_FILE and not (Path(config.rootpath) / NEEDS_FILE[item.nodeid]).is_file():
+            item.add_marker(pytest.mark.skip(reason=f"needs {NEEDS_FILE[item.nodeid]} (not in this repository)"))
         if api_mode and item.nodeid in NEEDS_LOCAL_MODEL:
             item.add_marker(pytest.mark.skip(reason="needs the local model server (STOA_MODE=api is set)"))

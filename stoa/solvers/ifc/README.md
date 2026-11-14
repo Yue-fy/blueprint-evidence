@@ -4,9 +4,9 @@ Answers questions about IFC building models, and about drawings rendered from th
 Evidence: one IFC GlobalId per counted or summed element, plus a `pdf_pt` box on the plan for the same GUID.
 
 ```bash
-$JUNCTION_VENV/bin/python -m stoa.eval --solver ifc --split dev --source ifc_models   # 354/354
-$JUNCTION_VENV/bin/python -m stoa.eval --solver ifc --split hard --source ifc_models  # 141/141
-$JUNCTION_VENV/bin/python -m pytest -q tests/test_ifc_solver.py tests/test_kg.py
+.venv/bin/python -m stoa.eval --solver ifc --split dev --source ifc_models   # 354/354
+.venv/bin/python -m stoa.eval --solver ifc --split hard --source ifc_models  # 141/141
+.venv/bin/python -m pytest -q tests/test_ifc_solver.py tests/test_kg.py
 ```
 
 | File | What |
@@ -250,7 +250,7 @@ compare runs) are in `stoa/router/README.md`; this section covers the IFC part o
 
 **1. Look at a question in 10 seconds.** Write the questions in a text file (a `PATH <file under data/ifc_models/>`
 line switches the model or sheet; `#` lines are comments), then run
-`PYTHONPATH=. $JUNCTION_VENV/bin/python experiments/w1/probe.py FILE` (ifc alone, 0.1 s per question) or
+`PYTHONPATH=. .venv/bin/python experiments/w1/probe.py FILE` (ifc alone, 0.1 s per question) or
 `SOLVER=pipeline … experiments/w1/probe_any.py FILE` (what the demo shows). Each line shows conf, value, the question,
 and the last 3 trace lines. Before you fix anything, write the gold next to each question in the file, taken from the
 model (the dataset-template wording on the same model is a reliable oracle: "What is the area of 'NAME (code)'?",
@@ -281,7 +281,7 @@ the wording, cap it: add a guard that sets confidence <= 0.3 with a `missing` no
 a wrong answer at >= 0.8 is what the judges see.
 
 **4. Check nothing else moved:** `experiments/w1/regress.sh [examples.jsonl]` (ifc train/dev/hard/hard2 + pipeline
-dev/hard on ifc_models, ~2 min, each diffed against the freeze baseline). Then `$JUNCTION_VENV/bin/python -m pytest -q`.
+dev/hard on ifc_models, ~2 min, each diffed against the freeze baseline). Then `.venv/bin/python -m pytest -q`.
 Tonight's rule for every commit: 0 unintended changes out of 2,051 + 495 rows.
 
 **Last answer-changing fix (daf7b4f, 11:06)**: `quote_room_refs` also quotes an unquoted room LongName that exactly

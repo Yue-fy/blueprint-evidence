@@ -6,6 +6,8 @@ Backends, all OpenAI-compatible ("local2" = a second local vLLM, $LLM2_BASE_URL,
   - "nvidia" : NVIDIA hosted API (https://integrate.api.nvidia.com/v1, key in $NVIDIA_API_KEY).
                Default model nvidia/nemotron-3.5-super-vl-120b-a12b. Rate-limited across *all* processes
                on this machine through a file lock (env NVIDIA_RPM, default 30 requests/minute).
+  - "verda"  : Verda Inference (https://inference.verda.com/v1, key in $VERDA_INFERENCE_API_KEY), EU-hosted, text only.
+               Default model $VERDA_MODEL or deepseek-4-1-flash-1017 (also kimi-k3-1-pro). STOA_TEXT_BACKEND=verda.
   - "gemini" : Google Gemini API, OpenAI-compatible endpoint (key in $GEMINI_API_KEY, from Sat 10:50). Default model
                $GEMINI_MODEL or gemini-3-flash-preview (gemini-3.1-pro-preview for hard cases). Google's rules: no
                abuse, so it is for visible, high-value steps only (demo, low-confidence escalation), NEVER in bulk eval
@@ -81,6 +83,16 @@ BACKENDS: dict[str, dict[str, Any]] = {
         "model": os.environ.get("GEMINI_MODEL", "gemini-3-flash-preview"),
         "coords": "yx1000",  # box_2d = [ymin, xmin, ymax, xmax], 0..1000
         "timeout": 300.0,
+    },
+    # V1: Verda Inference (EU-hosted, OpenAI-compatible, TEXT ONLY). Models on our key: deepseek-4-1-flash-1017 (default:
+    # ~0.3 s, no thinking) and kimi-k3-1-pro (thinks, 2-4 s). Accepts our guided_json + chat_template_kwargs. Use it for
+    # free-text steps: STOA_TEXT_BACKEND=verda (multi-part splits, IFC fact-card answers); see deploy/verda/SUMMARY.md.
+    "verda": {
+        "base_url": os.environ.get("VERDA_INFERENCE_BASE_URL", "https://inference.verda.com/v1"),
+        "api_key_env": "VERDA_INFERENCE_API_KEY",
+        "model": os.environ.get("VERDA_MODEL", "deepseek-4-1-flash-1017"),
+        "coords": None,  # text only: no images
+        "timeout": 120.0,
     },
 }
 
@@ -431,19 +443,31 @@ def text_backend(default: str = "local") -> str:
     return want if ok else default
 
 
+_SERVED_MODEL: dict[str, tuple[float, str]] = {}
+SERVED_MODEL_TTL = float(os.environ.get("LLM_SERVED_MODEL_TTL", 30))
+
+
 def served_model(backend: str = "local") -> str:
-    """The concrete model id behind the "default" alias (first id listed by /v1/models)."""
+    """The concrete model id behind the "default" alias (first id listed by /v1/models). Remembered for
+    SERVED_MODEL_TTL s (5 s when unreachable): chat() asks it for every cache key, and a cold 14k-px sheet's text layer
+    is 130 VLM calls = 130 /v1/models round trips (P1 17:10 profile: 5.9 s of one question)."""
     if api_mode() and is_local(backend):
         return api_route(backend, None)[1] or "unavailable (STOA_MODE=api)"
+    now = time.time()
+    hit = _SERVED_MODEL.get(backend)
+    if hit and now - hit[0] < (SERVED_MODEL_TTL if not hit[1].startswith("unavailable") else 5.0):
+        return hit[1]
     try:
         data = _client(backend).models.list().data
         ids = [m.id for m in data]
         # LoRA adapters are listed too (vLLM sets `parent` on them): the base model is the first without a parent
         base = [m.id for m in data if m.id != "default" and not (getattr(m, "model_extra", None) or {}).get("parent")
                 and not getattr(m, "parent", None)]
-        return base[0] if base else next((i for i in ids if i != "default"), ids[0] if ids else "")
+        out = base[0] if base else next((i for i in ids if i != "default"), ids[0] if ids else "")
     except Exception as e:  # noqa: BLE001
-        return f"unavailable ({type(e).__name__})"
+        out = f"unavailable ({type(e).__name__})"
+    _SERVED_MODEL[backend] = (now, out)
+    return out
 
 
 _SERVED: dict[str, tuple[float, frozenset]] = {}
@@ -583,6 +607,8 @@ def chat(
         # Gemini 3 thinks even at 'low' and max_tokens includes the thinking: a local 64-token budget would come back empty
         max_tokens = max(max_tokens, int(os.environ.get("STOA_API_MIN_TOKENS", 2048)))
     cfg = BACKENDS[backend]
+    if images and "coords" in cfg and cfg["coords"] is None:
+        raise ValueError(f"backend {backend!r} is text only (no images)")
     model = model or cfg["model"]
     msgs: list[dict] = [{"role": "user", "content": messages}] if isinstance(messages, str) else \
         [dict(m) for m in messages]

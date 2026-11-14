@@ -184,6 +184,7 @@ def test_local_llm_never_seen_up_fails_fast(monkeypatch):
 
     from stoa import llm
 
+    monkeypatch.delenv("STOA_MODE", raising=False)  # RL 17:28: API mode reroutes 'local' (release verify sets it)
     slept = []
     monkeypatch.setattr(llm.time, "sleep", lambda s: slept.append(s))
     calls = {"n": 0}
@@ -207,3 +208,29 @@ def test_local_llm_never_seen_up_fails_fast(monkeypatch):
     with pytest.raises(RuntimeError):
         llm.chat("hi again", backend="local", cache=False)
     assert sum(slept) <= 2  # held: fail at once
+
+
+def test_served_model_is_remembered_between_calls(monkeypatch):
+    """P1 17:10 profile: chat() asks served_model() for every cache key; a cold 14k-px sheet's text layer is 130 VLM
+    calls, and each asked the server's /v1/models again (5.9 s of one question). Remembered for SERVED_MODEL_TTL s."""
+    from types import SimpleNamespace
+
+    from stoa import llm
+
+    asked = {"n": 0}
+
+    class Up:
+        class models:  # noqa: N801
+            @staticmethod
+            def list():
+                asked["n"] += 1
+                return SimpleNamespace(data=[SimpleNamespace(id="default", model_extra={}),
+                                             SimpleNamespace(id="qwen-vl", model_extra={})])
+
+    monkeypatch.setattr(llm, "_client", lambda backend: Up())
+    monkeypatch.setattr(llm, "_SERVED_MODEL", {})
+    monkeypatch.setattr(llm, "api_mode", lambda: False)
+    assert [llm.served_model("local") for _ in range(50)] == ["qwen-vl"] * 50
+    assert asked["n"] == 1
+    llm._SERVED_MODEL["local"] = (llm._SERVED_MODEL["local"][0] - llm.SERVED_MODEL_TTL - 1, "qwen-vl")
+    assert llm.served_model("local") == "qwen-vl" and asked["n"] == 2  # re-asked after the TTL

@@ -287,23 +287,57 @@ export class Viewer2D {
   }
 
   /** Every text item of the shown PDF page: its centre (pdf_pt), text and compact form (lower-case letters and digits);
-   *  [] for images. */
+   *  [] for images. Centres follow each item's own text direction: on a page with /Rotate (5 of Stoa's 9 example
+   *  PDFs: USACE S-100F / M-101A, AFCEC A-2 / A-101) the words run vertically in PDF user space, and an upright-only
+   *  centre (x + width/2) was off by half the word along the wrong axis — outside a small room at 1" = 40'. */
   async labels(): Promise<{ at: [number, number]; text: string; compact: string }[]> {
     const page = this.pdfPage;
     if (!page) return [];
     const view = page.view as number[];
     const items = (await page.getTextContent()).items as { str?: string; transform?: number[]; width?: number; height?: number }[];
     const out: { at: [number, number]; text: string; compact: string }[] = [];
+    // user space → pdf_pt (PyMuPDF unrotated, y down)
+    const pt = (ux: number, uy: number): [number, number] => [ux - view[0], view[3] - uy];
+    type Word = { u: [number, number]; v: [number, number]; x: number; y: number; w: number; h: number; text: string; compact: string };
+    const words: Word[] = [];
     for (const it of items) {
       if (!it.str || !it.transform) continue;
       const compact = it.str.toLowerCase().normalize("NFKD").replace(/[^\p{L}\p{N}]/gu, "");
       if (!compact) continue;
-      const [, , , d, e, f] = it.transform;
+      const [a, b, c, d, e, f] = it.transform;
+      const na = Math.hypot(a, b) || 1, nc = Math.hypot(c, d) || 1;
+      // u = reading direction, v = glyph 'up', both unit vectors in user space
+      const u: [number, number] = [a / na, b / na];
+      const v: [number, number] = nc > 1e-9 ? [c / nc, d / nc] : [-u[1], u[0]];
       const w = it.width ?? 0;
-      const h = Math.abs(it.height ?? d ?? 0);
-      out.push({ at: [e + w / 2 - view[0], view[3] - f - h / 2], text: it.str.trim(), compact });
+      const h = Math.abs(it.height ?? nc);
+      out.push({ at: pt(e + u[0] * w / 2 + v[0] * h / 2, f + u[1] * w / 2 + v[1] * h / 2), text: it.str.trim(), compact });
+      // letters-only, short: a candidate line of a room name printed on two lines (coordinates in its own text frame)
+      if (h > 0 && w > 0 && it.str.trim().length <= 20 && /^[\p{L}][\p{L} '&/-]*$/u.test(it.str.trim()))
+        words.push({ u, v, x: e * u[0] + f * u[1], y: e * v[0] + f * v[1], w, h, text: it.str.trim(), compact });
+    }
+    // pdf.js gives a two-line room name as two items ('Secondary' over 'Classroom', DfE): each such stack is also one
+    // label 'Secondary Classroom' (centred between the lines), so a search for the whole name finds it. The single
+    // lines stay too. Stack = same direction, same text height (±25 %), the next baseline 0.6–1.7 heights lower in the
+    // text's own frame, left edges or centres within 30 % of the wider line; letters only (an area or room number
+    // below a name is not merged).
+    for (const top of words) {
+      const below = words.filter((o) => o !== top && o.u[0] * top.u[0] + o.u[1] * top.u[1] > 0.99 && o.v[0] * top.v[0] + o.v[1] * top.v[1] > 0.99
+        && Math.abs(o.h / top.h - 1) <= 0.25 && top.y - o.y >= 0.6 * top.h && top.y - o.y <= 1.7 * top.h
+        && (Math.abs(o.x - top.x) <= 0.3 * Math.max(o.w, top.w) || Math.abs(o.x + o.w / 2 - top.x - top.w / 2) <= 0.3 * Math.max(o.w, top.w)));
+      if (below.length !== 1) continue; // none, or ambiguous (a column of words)
+      const o = below[0];
+      const cx = (Math.min(top.x, o.x) + Math.max(top.x + top.w, o.x + o.w)) / 2; // along the reading direction
+      const cy = (top.y + top.h + o.y) / 2; // between the upper line's top and the lower line's baseline
+      // back to user space: (cx, cy) are coordinates along u and v (orthonormal) → cx·u + cy·v
+      out.push({ at: pt(cx * top.u[0] + cy * top.v[0], cx * top.u[1] + cy * top.v[1]), text: `${top.text} ${o.text}`, compact: top.compact + o.compact });
     }
     return out;
+  }
+
+  /** A pdf_pt point as shown on screen (content px: /Rotate applied), for 'up on the sheet' / 'left on the sheet'. */
+  shown(p: [number, number]): [number, number] {
+    return this.dToContent(p);
   }
 
   /** Outline one knowledge-graph item (a room's pdf_pt box) and zoom to it; `null` clears the mark. */
@@ -615,7 +649,7 @@ export class Viewer2D {
   }
 
   /** A measured line of an evidence item (D28 polyline, e.g. a wall's centre line), drawn on its group with end ticks. */
-  setEvidenceLine(index: number, pts: [number, number][], space: "pdf_pt" | "image_px" | "svg" = "pdf_pt") {
+  setEvidenceLine(index: number, pts: [number, number][], space: "pdf_pt" | "image_px" | "svg" = "pdf_pt", gap = false) {
     const g = this.evLayer.querySelector<SVGGElement>(`g.ev[data-index="${index}"]`);
     if (!g || pts.length < 2 || (space === "svg" && !this.svgVB)) return false;
     g.querySelector("polyline.eline")?.remove();
@@ -625,12 +659,19 @@ export class Viewer2D {
     pl.setAttribute("class", `eline${space === "image_px" ? "" : ""}`);
     g.insertBefore(pl, g.querySelector("rect, circle"));
     g.classList.add("on-shape", "on-line");
+    g.classList.toggle("gap", gap); // a deducted opening (no skirting there): drawn dashed in the warning colour
     // the tag goes at the middle of the line
     const mid = c[Math.floor((c.length - 1) / 2)];
     const nxt = c[Math.min(c.length - 1, Math.floor((c.length - 1) / 2) + 1)];
     g.dataset.cx = String((mid[0] + nxt[0]) / 2);
     g.dataset.cy = String((mid[1] + nxt[1]) / 2);
     return true;
+  }
+
+  /** The open PDF page's size in pt (w, h), or null (images, SVG) */
+  get sheetPt(): [number, number] | null {
+    const v = this.pdfPage?.view as number[] | undefined;
+    return v && v.length >= 4 ? [Math.abs(v[2] - v[0]), Math.abs(v[3] - v[1])] : null;
   }
 
   /** True when evidence item `index` already has an outline (exact from CAD, or traced). */

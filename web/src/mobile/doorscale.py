@@ -25,6 +25,15 @@ Measured (phone-like photos, truth from a scale bar or a dimensioned wall):
     (~5x too small) at 1.07x -> now rejected; high_quality-9970 (swings ~15-18 px, plausible 16.7 px/m) at 1.196x kept.
 Six data points chose the thresholds: a best estimate, and the page says so ('estimated from N door swings' +
 'Scale unknown — set it').
+LEAF CHECK (cycle 3): the radius steps of the detector put the median of ANY small quarter arcs at 15.4 px in the
+2,400 px look (1.28x the floor) -> 29.8 px/m. Stoa's USACE S-100F (1:50) and M-101A (1/4" = 1'-0") as phone photos
+(4,000 px; truth ~95 px/m) both came out 29.8 px/m (areas ~10x too large) from 48 / 40 arcs that are not doors. A door
+swing has a LEAF: a straight line from the hinge along one bounding radius. Share of the arcs used with a leaf:
+  DfE 2,400 px 93 % (29.8, truth 31.5) | Fraser 1,200 px 100 % | Pagenstr 1,200 px 80 %   -> kept
+  S-100F 2,400 px 12 % | M-101A 2,400 px 45 %                                              -> now rejected
+so >= 65 % of the arcs used must have one when their median is below 1.5x the floor. Not above it: CubiCasa plans
+often draw a swing as a bare arc (high_quality_architectural-3597 / -6369 at 3.0x / 2.7x, 20 % / 0 % leaf; colorful-10052
+4.5x, 0 %) and keep their old estimate; of 10 CubiCasa plans only colorful-10062 (1.20x, 25 % leaf) loses one.
 """
 
 from __future__ import annotations
@@ -41,10 +50,42 @@ sys.path.insert(0, str(ROOT))
 
 FLOOR = 12.0  # smallest arc radius (px in the shrunken copy) the detector looks for, as in doorarcs.scale_from_arcs
 PASSES = ((1200, 1.5), (2400, 1.15))  # (long side of the copy, median radius must be >= this x FLOOR)
+LEAF_SHARE = 0.65  # share of the arcs used that must have a door LEAF (ink along one bounding radius) ...
+LEAF_BELOW = 1.5  # ... when their median radius is below this x FLOOR (near the floor any small quarter stroke lands in
+#                   the same radius step; well above it, CubiCasa doors drawn as a bare arc without a leaf stay usable)
+LEAF_INK = 0.75  # a radius counts as a leaf when this share of it (0.15-0.9 r from the hinge) is ink
 
 
-def arcs_at(im, side: int) -> tuple[float | None, int, float]:
-    """(px per m in the ORIGINAL image, #arcs, median radius / FLOOR) on a copy shrunk to `side` px."""
+def leaf_share(small, dets: list[dict]) -> float:
+    """Share of `dets` with a straight radial line from the hinge (a door's leaf). Quarter arcs that are not door
+    swings have none: rounded corners of title-block / legend boxes run on TANGENTIALLY at both ends (W5 17:27),
+    pipe bends and symbol strokes have empty radii."""
+    import math
+
+    import numpy as np
+    from PIL import ImageFilter
+
+    from stoa.solvers.raster import doorarcs
+
+    ink = np.asarray(small.filter(ImageFilter.MinFilter(3))) < doorarcs.INK  # 1 px of slack around thin lines
+    h, w = ink.shape
+
+    def frac(cx: float, cy: float, th: float, r: float) -> float:
+        n = hit = 0
+        for t in np.linspace(0.15, 0.9, 16):
+            x, y = int(round(cx + math.cos(th) * t * r)), int(round(cy + math.sin(th) * t * r))
+            if 0 <= x < w and 0 <= y < h:
+                n, hit = n + 1, hit + int(ink[y, x])
+        return hit / max(1, n)
+
+    leaves = sum(max(frac(*d["c"], math.radians(d["q"] * 90), d["r_px"]), frac(*d["c"], math.radians(d["q"] * 90 + 90), d["r_px"])) >= LEAF_INK
+                 for d in dets)
+    return leaves / max(1, len(dets))
+
+
+def arcs_at(im, side: int) -> tuple[float | None, int, float, float]:
+    """(px per m in the ORIGINAL image, #arcs, median radius / FLOOR, share of the arcs used with a leaf) on a copy
+    shrunk to `side` px."""
     from PIL import Image
 
     from stoa.solvers.raster import doorarcs
@@ -57,10 +98,10 @@ def arcs_at(im, side: int) -> tuple[float | None, int, float]:
         ps = 46.0  # a pseudo-scale, so detect()'s 1:200 upscale rule does not fire (as scale_from_arcs)
         dets = doorarcs.detect(p, ps, r_m=(FLOOR / ps, max(40.0, max(small.size) / 25) / ps))
     if len(dets) < 3:
-        return None, len(dets), 0.0
+        return None, len(dets), 0.0, 0.0
     top = sorted(dets, key=lambda d: -d["score"])[: max(3, len(dets) // 2)]
     r = statistics.median(d["r_px"] for d in top)
-    return r / doorarcs.DOOR_LEAF_M / k, len(dets), r / FLOOR
+    return r / doorarcs.DOOR_LEAF_M / k, len(dets), r / FLOOR, leaf_share(small, top)
 
 
 def main() -> None:
@@ -76,9 +117,9 @@ def main() -> None:
         for side, need in PASSES:
             last = max(im.size) <= side  # a small image: this pass already sees it at full size, no second look
             need = PASSES[-1][1] if last else need
-            s, n, rel = arcs_at(im, side)
-            tried.append(f"{side} px: {n} arcs" + (f", {s:.1f} px/m at {rel:.2f}x the size floor" if s else ""))
-            if s and rel >= need:
+            s, n, rel, leaf = arcs_at(im, side)
+            tried.append(f"{side} px: {n} arcs" + (f", {s:.1f} px/m at {rel:.2f}x the size floor, {leaf:.0%} with a leaf" if s else ""))
+            if s and rel >= need and (rel >= LEAF_BELOW or leaf >= LEAF_SHARE):
                 out = {"ok": True, "px_per_m": round(s, 2), "arcs": n, "leaf_m": doorarcs.DOOR_LEAF_M, "side": side}
                 break
             if last:

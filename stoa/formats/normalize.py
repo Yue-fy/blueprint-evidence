@@ -44,7 +44,8 @@ _PX_PER = {"": 1.0, "px": 1.0, "pt": 96 / 72, "pc": 16.0, "mm": 96 / 25.4, "cm":
 class Prepared:
     original: str  # the uploaded file
     path: str  # the file to solve
-    kind: str = "as_is"  # as_is | dwg | dxf_roles | svg_pdf | heic | page | scan (an image-only PDF page, as PNG)
+    kind: str = "as_is"  # as_is | dwg | dxf_roles | svg_pdf | heic | page | scan (an image-only PDF page, as PNG) |
+    #                      shrink (an image above STOA_IMAGE_MAX_SIDE px, read from a smaller copy)
     page: int = 0  # page of the ORIGINAL the solved file shows (multi-page PDFs)
     pages: int = 1
     notes: list[str] = field(default_factory=list)  # assumptions to show with the answer
@@ -52,6 +53,9 @@ class Prepared:
     error: str = ""  # user-readable reason the file could not be converted ("" = fine)
     svg_frame: tuple[float, float, float] = (0.0, 0.0, 1.0)  # generic SVG: (x0, y0, user units per PDF pt)
     scan_zoom: float = 0.0  # scan: PNG pixels per PDF point of the original page (0 = not a scan)
+    img_scale: float = 0.0  # shrink: solved-image pixels per ORIGINAL image pixel (0 = not shrunk)
+    sheet: str = ""  # page: the picked page's own sheet number ('M-101A'), when its title block prints one
+    paper_f: float = 0.0  # paper: the solved PDF page is the original page enlarged this many times (0 = not)
 
 
 def _cache_dir(src: Path) -> Path:
@@ -210,6 +214,211 @@ def seed_text_layer(pdf: str, png: str, zoom: float, min_chars: int = 20) -> int
     return len(items)
 
 
+def shrink_image(src: str | Path, dst: str | Path, max_side: int = 6000) -> dict:
+    """Scale a large image down to `max_side` px (long side) so that it is still the same KIND of image to the readers.
+
+    P1 17:15: the web upload scales images above 6000 px down with LANCZOS (web/server/normalize_upload.py). On Stoa's
+    clean CAD sheets that blurs every 1-px line into a ramp of grey levels, and the clean-render gate
+    (raster.windows.clean_render: >= 70 % pure white AND the 8 commonest grey levels >= 45 % of the ink) then calls
+    2 of the 4 example sheets a SCAN (S-100F top-8 share 0.54 -> 0.22, M-101A 0.57 -> 0.24): their text goes to
+    PP-OCR on CPU instead of the VLM and the symbol readers switch off. So when the ORIGINAL passes the gate and the
+    plain resize does not, the copy gets near-white (>= 240) snapped to white and its other levels rounded to 8 steps
+    per channel (top-8 share 1.0); everything else (photos, scans, sheets that stay clean) is only resized. DPI (if tagged) is scaled with the pixels, so DPI x pixels still gives
+    the sheet size. -> {"path", "factor", "size", "clean", "note"}; factor 1.0 = nothing done (dst not written)."""
+    import numpy as np
+    from PIL import Image
+
+    Image.MAX_IMAGE_PIXELS = None  # Stoa's sheets are 70-140 MP; A0 at 400 dpi would hit PIL's 179 MP 'bomb' error
+    with Image.open(src) as im:
+        im.load()
+        W, H = im.size
+        dpi = im.info.get("dpi")
+        if max(W, H) <= max_side:
+            return {"path": str(src), "factor": 1.0, "size": (W, H), "clean": None, "note": ""}
+        f = max_side / max(W, H)
+        if im.mode in ("RGBA", "LA", "P"):  # transparent pixels -> white paper
+            rgba = im.convert("RGBA")
+            im2 = Image.new("RGBA", rgba.size, (255, 255, 255, 255))
+            im2.alpha_composite(rgba)
+            im2 = im2.convert("RGB")
+        else:
+            im2 = im.convert("RGB") if im.mode not in ("RGB", "L") else im.copy()
+    from stoa.solvers.raster.windows import CLEAN_TOP8, CLEAN_WHITE
+
+    def gate(img) -> bool:  # raster.windows.clean_render on every 4th pixel (same verdict, 4x cheaper)
+        g = np.asarray(img.convert("L"))[::2, ::2]
+        nw = g[g < 250]
+        top = float(np.sort(np.unique(nw, return_counts=True)[1])[::-1][:8].sum() / nw.size) if nw.size else 1.0
+        return float((g >= 250).mean()) >= CLEAN_WHITE and top >= CLEAN_TOP8
+
+    clean = gate(im2)
+    out = im2.resize((round(W * f), round(H * f)), Image.LANCZOS)
+    flat = clean and not gate(out)  # only where the plain resize changes the kind: flat levels also change routing
+    if flat:  # (P1 17:22: flattening the still-clean AFCEC copy made it a 0.97 'CubiCasa plan' -> room graph '0 m2')
+        a = np.asarray(out).astype(np.int16)
+        a = np.where(a >= 240, 255, (a // 32) * 32 + 16).clip(0, 255).astype(np.uint8)
+        out = Image.fromarray(a)
+    keep = {}
+    try:
+        if dpi and float(dpi[0]) > 0 and float(dpi[1]) > 0:
+            keep = {"dpi": (float(dpi[0]) * f, float(dpi[1]) * f)}
+    except (TypeError, ValueError, IndexError):
+        keep = {}
+    Path(dst).parent.mkdir(parents=True, exist_ok=True)
+    tmp = Path(dst).with_name(f".{Path(dst).name}.{os.getpid()}.tmp")  # S0 17:42: a reader saw a half-written copy
+    if Path(dst).suffix.lower() in (".jpg", ".jpeg"):
+        out.convert("RGB").save(tmp, format="JPEG", quality=94, **keep)
+    else:
+        from PIL import PngImagePlugin
+
+        from stoa.formats.paper import SRC_SIZE_KEY
+
+        info = PngImagePlugin.PngInfo()
+        info.add_text(SRC_SIZE_KEY, f"{W}x{H}")  # the export's pixel size = its paper at a usual dpi (paper_of_image)
+        out.save(tmp, format="PNG", pnginfo=info, **keep)
+    os.replace(tmp, dst)
+    note = f"large image ({W}×{H} px) read at {out.width}×{out.height} px"
+    if flat:
+        note += " (a clean drawing: kept to flat grey levels)"
+    return {"path": str(dst), "factor": f, "size": out.size, "clean": clean, "flat": flat, "note": note}
+
+
+def paper_copy(pdf: str) -> tuple[str, float, str] | None:
+    """(path, factor, note) of a one-page PDF enlarged to the paper its printed scale was written for ('1:200 @ A1' on an
+    A3 page -> the page drawn 2.0x on A1, cached as <stem>.paperA1.pdf), so every reader's printed 1:N is true on the
+    copy; None when the page's paper and its printed scale agree (P1 17:50; D1 16:50: EFA secondary sheets' filled
+    rooms match their printed areas 67/76 at 1:400 vs 0-1 at the printed 1:200)."""
+    import pymupdf
+
+    from stoa.formats.paper import scale_for_other_paper
+
+    try:
+        with pymupdf.open(pdf) as d:
+            if d.page_count != 1:
+                return None
+            pg = d[0]
+            hit = scale_for_other_paper(pg.get_text() or "", pg.rect.width, pg.rect.height)
+            if hit is None:
+                return None
+            f, named, page, n = hit
+            out = _cache_dir(Path(pdf)) / f"{Path(pdf).stem}.paper{named}.pdf"
+            if not out.exists() or out.stat().st_mtime < Path(pdf).stat().st_mtime:
+                nd = pymupdf.open()
+                np_ = nd.new_page(width=pg.rect.width * f, height=pg.rect.height * f)
+                np_.show_pdf_page(np_.rect, d, 0)
+                tmp = out.with_name(out.name + ".tmp")
+                nd.save(tmp, garbage=3, deflate=True)
+                nd.close()
+                os.replace(tmp, out)
+    except Exception:  # noqa: BLE001 — the page as it is
+        return None
+    return (str(out), f, f"the sheet prints its scale for {named} ('1:{n} @ {named}') but this PDF page is {page}: the "
+                         f"drawing is at 1:{round(n * f)} on this file; read on the page enlarged {f:.2f}x to {named}, "
+                         f"where 1:{n} holds")
+
+
+IMAGE_MAX_SIDE = 6000  # = the web upload's cap (web/server/normalize_upload.py), so CLI / API / evals read what the UI reads
+
+
+def shrunk_copy(src: Path, side: int) -> tuple[str, float, str] | None:
+    """(path, scale, note) of `src` shrunk to `side` px (cached next to it as <stem>.s<side>.png|.jpg with a .json
+    sidecar), or None when the image is small enough / unreadable."""
+    import json
+
+    from PIL import Image
+
+    Image.MAX_IMAGE_PIXELS = None
+    try:
+        with Image.open(src) as im:
+            W, H = im.size
+    except Exception:  # noqa: BLE001 — unreadable: the readers say so
+        return None
+    if max(W, H) <= side:
+        return None
+    ext = ".jpg" if src.suffix.lower() in (".jpg", ".jpeg") else ".png"
+    dst = _cache_dir(src) / f"{src.stem}.s{side}{ext}"
+    meta = dst.with_name(dst.name + ".json")
+
+    def cached():
+        try:
+            if dst.exists() and meta.exists() and dst.stat().st_mtime >= src.stat().st_mtime:
+                m = json.loads(meta.read_text())
+                if m.get("src_size") == [W, H]:
+                    return str(dst), float(m["factor"]), m["note"]
+        except (OSError, ValueError, KeyError):
+            pass
+        return None
+
+    if (hit := cached()) is not None:
+        return hit
+    import fcntl
+
+    # one writer per copy across threads AND processes (S0 17:42: 4 eval workers on one sheet; the API with 2 questions):
+    # the others wait here, then find the finished copy (written to a temp name + os.replace, meta last)
+    with open(dst.with_name(f".{dst.name}.lock"), "w") as lockf:
+        fcntl.flock(lockf, fcntl.LOCK_EX)
+        try:
+            if (hit := cached()) is not None:
+                return hit
+            r = shrink_image(src, dst, side)
+            if r["factor"] >= 1.0:
+                return None
+            try:
+                carry_text_layers(src, Path(r["path"]), r["factor"])
+            except Exception:  # noqa: BLE001 — the copy is then read like any new image
+                pass
+            try:
+                tmpm = meta.with_name(f".{meta.name}.tmp")
+                tmpm.write_text(json.dumps({"src_size": [W, H], "factor": r["factor"], "note": r["note"],
+                                            "clean": r["clean"], "flat": r.get("flat")}))
+                os.replace(tmpm, meta)
+            except OSError:
+                pass
+            return r["path"], r["factor"], r["note"]
+        finally:
+            fcntl.flock(lockf, fcntl.LOCK_UN)
+
+
+def carry_text_layers(src: Path, dst: Path, factor: float) -> list[str]:
+    """Text layers already read on the full-size image (raster VLM layer, OCR layer), boxes x factor, saved as the smaller
+    copy's own cached layers, so a sheet read before is not read again at 6000 px (S0 17:42: cold copies made S-100F
+    rows 0.5 -> 96 s and label_count skip 'a large image whose text has not been read yet'). -> layers carried."""
+    import json
+
+    from stoa.solvers.raster import textlayer as T
+
+    done = []
+    for backend in ("local",):
+        fs, fd = T._disk_key(str(src), 1100, backend), T._disk_key(str(dst), 1100, backend)
+        if fs.exists() and not fd.exists():
+            d = json.loads(fs.read_text())
+            d["path"] = str(dst)
+            d["size"] = [round(v * factor) for v in d.get("size", [0, 0])]
+            for it in d.get("items", []):
+                it["box"] = [round(v * factor, 1) for v in it["box"]]
+            d["notes"] = [*d.get("notes", []), f"carried over from the full-size image's reading (boxes x{factor:.4f})"]
+            tmp = fd.with_name(f".{fd.name}.tmp")
+            tmp.write_text(json.dumps(d))
+            os.replace(tmp, fd)
+            done.append(f"vlm:{backend}")
+    try:
+        from stoa import ocr
+
+        os_, od = ocr._key(str(src)), ocr._key(str(dst))
+        if os_.exists() and not od.exists():
+            d = json.loads(os_.read_text())
+            d["size"] = [round(v * factor) for v in d.get("size", [0, 0])]
+            for it in d.get("items", []):
+                it["box"] = [round(v * factor, 1) for v in it["box"]]
+            tmp = od.with_name(f".{od.name}.tmp")
+            tmp.write_text(json.dumps(d))
+            os.replace(tmp, od)
+            done.append("ocr")
+    except Exception:  # noqa: BLE001
+        pass
+    return done
+
+
 def _png_dpi(path: Path) -> float | None:
     try:
         from PIL import Image
@@ -276,6 +485,20 @@ def user_message(e: Exception, ext: str) -> str:
             f"{type(e).__name__}): please export it again, or upload the drawing as PDF or PNG")
 
 
+def without_sheet(question: str, sheet: str) -> str:
+    """The question minus its reference to `sheet` ('(sheet M-101A)', 'On sheet M-101A:', 'on sheet M-101A'): once that
+    sheet's page is picked from a set, the readers see a one-page drawing, and 'sheet M-101A' in the question sent
+    the intent router to the sheet-table reader (P1 17:46: 6 of 16 Stoa questions lost on the whole USACE sets)."""
+    if not sheet:
+        return question
+    s = re.escape(sheet)
+    q = re.sub(rf"\s*\(\s*(?:on\s+|see\s+)?sheet\s+{s}\s*\)", "", question, flags=re.I)
+    q = re.sub(rf"^\s*on\s+sheet\s+{s}\s*[:,\-–]\s*", "", q, flags=re.I)
+    q = re.sub(rf"\b(?:on|in|of|from)\s+sheet\s+{s}\b", "on the drawing", q, flags=re.I)
+    q = q.strip()
+    return (q[:1].upper() + q[1:]) if q else question
+
+
 def prepare(path: str, question: str = "") -> Prepared:
     """What to solve for this upload (never raises: a failed conversion keeps the original + error/missing)."""
     from stoa.data import abspath
@@ -322,6 +545,13 @@ def prepare(path: str, question: str = "") -> Prepared:
         elif ext in HEIC_EXT:
             prep.path, prep.kind = heic_to_jpg(src), "heic"
             prep.notes.append("HEIC photo converted to JPEG (turned upright) before reading")
+        elif ext in (".png", ".jpg", ".jpeg"):
+            side = int(os.environ.get("STOA_IMAGE_MAX_SIDE", str(IMAGE_MAX_SIDE)) or 0)
+            got = shrunk_copy(Path(src), side) if side > 0 else None
+            if got:
+                prep.path, prep.img_scale, note = got
+                prep.kind = "shrink"
+                prep.notes.append(note)
         elif ext == ".pdf":
             import pymupdf
 
@@ -338,8 +568,27 @@ def prepare(path: str, question: str = "") -> Prepared:
                     hit = None
                 k, why = hit or pick_page(src, question)
                 prep.path, prep.page, prep.kind = one_page_copy(src, k, _cache_dir(Path(src))), k, "page"
-                prep.notes.append(f"multi-page PDF ({prep.pages} pages): answered from page {k + 1} ({why}); "
-                                  "other pages were not read")
+                from stoa.formats.pages import sheet_id
+
+                sid = sheet_id(src, k) if prep.pages >= 4 else None  # big sets: say WHICH sheet, and how to pick another
+                prep.sheet = sid or ""
+                others = ""
+                if prep.pages >= 8 and not (sid and re.search(rf"(?<![\w-]){re.escape(sid)}(?!\w)", question or "")):
+                    from stoa.formats.pages import related
+
+                    try:  # the sheets whose text carries the question's rare words: one click / re-ask away
+                        rel = related(src, question, exclude=k)
+                    except Exception:  # noqa: BLE001
+                        rel = []
+                    if rel:
+                        others = "; other sheets with the question's words: " + ", ".join(
+                            f"{s_ or 'page'} (p. {i + 1})" for i, s_ in rel)
+                prep.notes.append(f"multi-page PDF ({prep.pages} pages): answered from page {k + 1}"
+                                  f"{f' (sheet {sid})' if sid else ''} ({why}); other pages were not read"
+                                  + others
+                                  + ("; to ask about another sheet, name its number in the question (e.g. "
+                                     f"'on sheet {(rel[0][1] if others and rel[0][1] else None) or ('S-101' if sid == 'A-101' else 'A-101')}')"
+                                     if prep.pages >= 4 else ""))
             try:
                 scan = scan_png(prep.path if prep.kind == "page" else str(src))
             except Exception:  # noqa: BLE001 — a failed scan check leaves the PDF to the PDF readers
@@ -349,6 +598,12 @@ def prepare(path: str, question: str = "") -> Prepared:
                 prep.kind = "scan" if prep.kind == "as_is" else "page+scan"
                 prep.notes.append(f"scanned PDF (the page is one image, no text layer): read as an image at "
                                   f"{72 * prep.scan_zoom:.0f} dpi")
+            else:
+                got = paper_copy(prep.path if prep.kind == "page" else str(src))
+                if got:
+                    prep.path, prep.paper_f, note = got
+                    prep.kind = "paper" if prep.kind == "as_is" else "page+paper"
+                    prep.notes.append(note)
     except Exception as e:  # noqa: BLE001 — never fail the question on a conversion
         prep.path, prep.kind = path, "as_is"
         prep.error = user_message(e, ext)
@@ -377,6 +632,24 @@ def restore(ans, prep: Prepared):
                     setattr(ev, attr, [[x * z, y * z] for x, y in pts])
             if not prep.kind.startswith("svg_pdf"):
                 continue
+        if prep.paper_f and ev.bbox_space == "pdf_pt":  # the enlarged page's points -> the uploaded page's points
+            z = 1 / prep.paper_f
+            ev.file, ev.page = orig, prep.page
+            ev.bbox = [v * z for v in ev.bbox] if ev.bbox else ev.bbox
+            for attr in ("polygon", "polyline"):
+                pts = getattr(ev, attr, None)
+                if pts:
+                    setattr(ev, attr, [[x * z, y * z] for x, y in pts])
+            continue
+        if prep.img_scale and ev.bbox_space == "image_px":  # smaller copy's pixels -> the uploaded image's pixels
+            z = 1 / prep.img_scale
+            ev.file = orig
+            ev.bbox = [v * z for v in ev.bbox] if ev.bbox else ev.bbox
+            for attr in ("polygon", "polyline"):
+                pts = getattr(ev, attr, None)
+                if pts:
+                    setattr(ev, attr, [[x * z, y * z] for x, y in pts])
+            continue
         if prep.kind == "page":  # same page size and coordinates, only the page index differs
             ev.file, ev.page = orig, prep.page
         elif prep.kind.startswith("svg_pdf") and ev.bbox_space == "pdf_pt":  # -> the SVG's user coordinates (D29)

@@ -39,25 +39,28 @@ and caveats: [docs/RESULTS.md](docs/RESULTS.md).
 
 | Test | Result | Commit |
 |---|---|---|
-| Stoa's own four example sheets (90 questions in Stoa's kinds: room and type areas, baseboards, slab areas, door counts, piping), local models only, no hosted model | **65.6%** (59/90), evidence on 94% of answers, 7 s per question on a new file | `5a4b058` |
+| Stoa's own four example sheets (90 questions in Stoa's kinds: room and type areas, baseboards, slab areas, door counts, piping), local models only, no hosted model | **81.1%** (73/90), evidence on 97% of answers, 8 s per question on a new file | `76f8f94` |
 | Same 90 questions: Gemini 3.1 Pro asked directly / Qwen3-VL-8B asked directly | 61%, no evidence / 26% | |
 | Same 90 questions, earlier code with the Gemini 3.1 Pro escalation on | 61%, evidence on 98% of answers | `504060a` |
-| Sibling sheets of the same drawing sets, held out (32 questions, never tuned on), local models only | **46.9%** (15/32; 31.3% one build earlier) | `5a4b058` |
+| Sibling sheets of the same drawing sets, held out (never tuned on), local models only | **50.0%** on the first 32 questions (31.3% at `517b67b`); **40.0%** (26/65) on the grown set with line-only school plans and image copies; 41.3% (59/143) on the final set | `1795365` |
 | Stoa dataset, sealed test split (2,199 held-out questions, run twice in total) | **87.7%** micro, **79.7%** weighted | `bb94fe4` |
-| Real drawings from outside the dataset, development set (168 questions), local models only | **69.6%** | `5a4b058` |
-| Real drawings, held-out set (120 questions on other files, never tuned on), local models only | **49.2%** | `5a4b058` |
+| Real drawings from outside the dataset, development set (168 questions), local models only | **72.0%** | `76f8f94` |
+| Real drawings, held-out set (120 questions on other files, never tuned on), local models only | **48.3%** | `68cec39` |
 | Real drawings, held-out set, as the API ships (Gemini 3.1 Pro escalation on) | **64.8%** (105 questions) | `fc0927a` |
 | For reference: Gemini 3.1 Pro asked directly, first version of the real-drawing set (125 questions) | 43.8%, no evidence | `9e1c725` |
 
 Our main metric is the first four rows: the four sheets Stoa sent as examples of their own test, and sibling sheets
 from the same public drawing sets, each uploaded alone under a meaningless name, as Stoa will test. These clean,
 large CAD sheets in metric and imperial units are far harder than the dataset. On them our local pipeline, with no
-hosted model at all, now answers more questions right than a frontier model asked directly (65.6% against 61%), at
-under a tenth of its cost per question, and it shows where each answer came from. The gain carries over to the held-out
-sibling sheets (31% to 47%). Room areas on line-only sheets (4 of 10), slab areas by type (2 of 7) and door counts
-(0 of 2) are still weak, for every system we tried. The real-drawing rows (public drawings from outside the dataset)
+hosted model at all, now answers more questions right than a frontier model asked directly (81.1% against 61%), and it shows where each
+answer came from. The first question on a new sheet costs about as much as asking Gemini ($0.010, mostly local GPU
+time to read the sheet's text once); each further question on the same sheet costs about $0.0006. The gain carries over to the held-out
+sibling sheets (31% to 50% on the first 32 questions), but the grown held-out set, with line-only school plans and image
+copies of the sheets, shows how far there is to go (40%, up from 32%), and so do 15 unseen line-only school plans like the DfE
+sheet (39%: 50 of 129 room-area, perimeter and label-count questions, up from 13% at `098d71e`). Room areas on
+line-only sheets (6 of 10), slab areas by type (3 of 7) and door counts (1 of 2) are still weak, for every system we tried. The real-drawing rows (public drawings from outside the dataset)
 add a warning: not every gain on the files we looked at transfers to held-out files (development rows we tuned on all afternoon: 78%;
-rows added later: 54%; held-out files: 49%), while the Gemini
+rows added later: 54%; held-out files: 48%), while the Gemini
 escalation does transfer (+15 points on held-out). Weak spots are listed in
 [docs/RESULTS.md](docs/RESULTS.md#known-weaknesses).
 
@@ -67,7 +70,8 @@ escalation does transfer (+15 points on held-out). Weak spots are listed in
 | In-between | A few calls to a small model (our local 8B) | 33% / 55% |
 | Expensive | A large hosted model, or a long chain of model calls | 0% / 11% |
 
-At `0b6f25d`, 1,000 questions cost an estimated $0.03 on the dataset's dev split and $0.28 on the real drawings. On the
+At `0b6f25d`, 1,000 questions cost an estimated $0.03 on the dataset's dev split and $0.28 on the real drawings, with
+the drawings' text layers already read (a first question on a new sheet costs more: about $0.01 on Stoa's sheets). On the
 sealed test, 56% of answers needed no model call at all. Gemini 3.1 Pro asked directly costs $7.59 per 1,000 questions.
 
 ## How it works
@@ -89,7 +93,7 @@ flowchart LR
    tables with code (IfcOpenShell, ezdxf, PyMuPDF). The answer is exact, and each counted object has its own box.
 3. **Ask a small model only when needed.** For scans and photos, our counting LoRA on Qwen3-VL-8B runs on our own GPU.
 4. **Escalate only when still unsure.** Gemini 3.1 Pro reads counts and lengths that no reader was sure of, and must
-   point at every object it counts. NVIDIA Nemotron checks unsure answers. Both were off for our scores above.
+   point at every object it counts. NVIDIA Nemotron checks unsure answers. Both were off for every result above marked "local models only".
 5. **Every answer carries its proof.** Each answer comes with evidence (boxes, outlines, measured lines or IFC
    GlobalIds), a calibrated confidence, its assumptions, what is missing, and its cost.
 
@@ -110,7 +114,8 @@ cp .env.example .env && set -a && . ./.env && set +a      # never commit .env
 ```
 
 Run everything from the repo root: local state (caches, eval splits) goes to `.stoa/` unless `JUNCTION_SHARED` says
-otherwise. The CLI reads relative paths against the dataset root, so pass your own files as absolute paths.
+otherwise. The CLI reads a relative path from the current folder, or from the dataset root (`STOA_DATA`) when it names
+a dataset file.
 
 **(a) API-only mode: no GPU.** The geometry readers run on your CPU. Steps meant for the local model go to a hosted
 model instead (Gemini 3 Flash by default) when `GEMINI_API_KEY` is set; `NVIDIA_API_KEY` is optional. With no key at
@@ -118,18 +123,20 @@ all, IFC, CAD and vector-PDF questions still work (the bundled samples need no k
 
 ```bash
 export STOA_MODE=api        # GEMINI_API_KEY=... for scans, photos and other drawings with nothing to parse
-.venv/bin/python -m stoa.cli ask "$PWD/samples/swiss/plan.pdf" "How many doors are drawn on this floor plan?" --api
-.venv/bin/python -m stoa.cli ask "$PWD/samples/fzk_house/fzk_house.ifc" "How many windows are in the building?" --api
-.venv/bin/python -m stoa.cli ask "$PWD/samples/dfe_school/plan.pdf" "What is the area of the laundry?" --api   # 7.03 m², traced at 1:200
+.venv/bin/python -m stoa.cli ask samples/swiss/plan.pdf "How many doors are drawn on this floor plan?" --api
+.venv/bin/python -m stoa.cli ask samples/fzk_house/fzk_house.ifc "How many windows are in the building?" --api
+.venv/bin/python -m stoa.cli ask samples/dfe_school/plan.pdf "What is the area of the laundry?" --api   # 7.03 m², traced at 1:200
 .venv/bin/python -m stoa.cli answer --in samples/questions.jsonl --out answers.jsonl --api   # a few with expected answers
 .venv/bin/python -m uvicorn stoa.api:app --port 8100                       # HTTP API: /health, POST /ask, ...
 cd web && npm install && npm run dev                                       # web app on http://localhost:5173
 ```
 
 **(b) Local GPU mode.** vLLM serves Qwen3-VL-8B as an OpenAI-compatible server on port 8001 (`LLM_BASE_URL`). Don't
-set `STOA_MODE`. If the server is down, each model step waits up to `LLM_RESTART_WAIT` seconds (default 300) for it
-to come back, so use API-only mode on machines without a GPU. We run it on one
-NVIDIA RTX PRO 6000 (96 GB) with 45% of its memory reserved for vLLM (about 42 GB).
+set `STOA_MODE`. If the server has not answered once since the process started, a model step waits about
+`LLM_NEVER_UP_WAIT` seconds (default 15; up to about 30 s with back-off), and further steps then skip the model for
+two minutes, so the readers still answer. If a server that was up goes down (a restart), each step waits up to
+`LLM_RESTART_WAIT` seconds (default 300) for it to come back. On machines without a GPU, use API-only mode. We run it
+on one NVIDIA RTX PRO 6000 (96 GB) with 45% of its memory reserved for vLLM (about 42 GB).
 
 ```bash
 VLLM_VENV=<venv with vllm> MODEL=<path or HF id of Qwen3-VL-8B-Instruct> serving/start.sh   # LORA=cc-v2=<dir> if you have it
@@ -149,8 +156,8 @@ Evaluate and test:
 .venv/bin/python -m pytest -q                                          # tests needing the dataset or a GPU are skipped
 ```
 
-The main environment variables are listed by name in `.env.example` and [docs/CONTRACT.md](docs/CONTRACT.md). API-only
-mode adds `STOA_MODE=api` and the optional `STOA_API_*` settings described at the top of `stoa/llm.py`.
+The main settings are in `.env.example`. Every environment variable the code reads, with its default, is listed in
+[docs/CONFIGURATION.md](docs/CONFIGURATION.md) (generated from the code).
 
 ## Repository layout
 
@@ -163,7 +170,7 @@ mode adds `STOA_MODE=api` and the optional `STOA_API_*` settings described at th
 | `deploy/` | Docker image, Google Cloud Run and Verda GPU scripts (no credentials) |
 | `tests/` | pytest suite |
 | `samples/` | Three small bundled examples: a Swiss Dwellings plan (PDF, DXF, PNG; CC BY 4.0), the FZK-Haus IFC model (KIT) and one of Stoa's example sheets, a UK DfE school plan at 1:200 (Open Government Licence) |
-| `docs/` | [RESULTS.md](docs/RESULTS.md), [ARCHITECTURE.md](docs/ARCHITECTURE.md), [DATA_AND_LICENCES.md](docs/DATA_AND_LICENCES.md), [CONTRACT.md](docs/CONTRACT.md) (API, data shapes, env var names) |
+| `docs/` | [RESULTS.md](docs/RESULTS.md), [ARCHITECTURE.md](docs/ARCHITECTURE.md), [DATA_AND_LICENCES.md](docs/DATA_AND_LICENCES.md), [CONTRACT.md](docs/CONTRACT.md) (API, data shapes), [CONFIGURATION.md](docs/CONFIGURATION.md) (every environment variable) |
 
 ## Tech challenge notes
 

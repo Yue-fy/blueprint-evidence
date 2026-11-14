@@ -768,6 +768,9 @@ def test_lineplan_skirting_is_the_outline_minus_the_door_way(tmp_path):
     b = answer(f, "How much baseboard do the conference room and the comms room need in total?")
     assert b is not None and abs(b.value / ((700 - 30 + 500 - 30) * k) - 1) <= 0.03, (b.value, b.trace)
     assert answer(f, "How many metres of skirting does the kitchen need?") is None  # no such room on the sheet
+    w = answer(f, "How many linear metres of skirting are needed for the whole floor?")
+    assert w is not None and abs(w.value / ((700 - 30 + 500 - 30) * k) - 1) <= 0.03 and w.confidence <= 0.3, w
+    assert answer(f, "How much skirting does the ballroom need on this floor?") is None  # named, not on the sheet
 
 
 def test_printed_area_table_answers_totals_types_and_wings(tmp_path):
@@ -845,3 +848,118 @@ def test_slab_area_by_type_ignores_joints_and_dimension_lines(tmp_path):
     b = answer(f, "How big is the 300 mm slab with D16 bars?")
     assert b is not None and abs(b.value / (194 * 200 * k * k) - 1) <= 0.04, b and b.value
     assert answer(f, "What is the area of the 200 mm slab?") is None  # no such callout
+    t = answer(f, "How thick is the slab reinforced with D13 bars?")
+    assert t is not None and (t.value, t.unit) == (0.15, "m") and t.evidence[0].exact
+    assert answer(f, "How many different slab types are called out on the plan?").value == 2
+    pn = answer(f, "Into how many panels do the control joints (CJ) divide the 150 mm D13 slab?")
+    assert pn is not None and (pn.value, pn.unit) == (2, "count") and len(pn.evidence) == 2
+
+
+def test_door_arcs_exploded_into_segments_count_and_grid_bubbles_do_not(tmp_path):
+    """USACE A-101F (1:50): door swings drawn as ~13 separate one-segment paths, and 0.4 m circles (grid bubbles /
+    section markers, 4 quarter arcs on one centre) — only the 0.9 m swing is a door (E1 cycle 7)."""
+    import math
+
+    import pymupdf
+
+    from stoa.evidence.linework import PT_TO_M_AT_1, door_radii_m
+
+    f = str(tmp_path / "doors.pdf")
+    doc = pymupdf.open()
+    pg = doc.new_page(width=600, height=400)
+    r = 0.9 / (50 * PT_TO_M_AT_1)  # 0.9 m at 1:50 in pt
+    cx, cy = 300.0, 250.0
+    pts = [(cx - r * math.sin(math.radians(a)), cy - r * math.cos(math.radians(a))) for a in range(0, 91, 7)]
+    for a, b in zip(pts, pts[1:]):  # one path per segment
+        sh = pg.new_shape()
+        sh.draw_line(a, b)
+        sh.finish(color=(0, 0, 0), width=0.5, closePath=False)
+        sh.commit()
+    sh = pg.new_shape()
+    for x in (80, 160, 460, 540):  # grid bubbles: full circles
+        sh.draw_circle((x, 60), 0.4 / (50 * PT_TO_M_AT_1))
+    sh.finish(color=(0, 0, 0), width=0.5)
+    sh.commit()
+    doc.save(f)
+    radii = door_radii_m(f, 0, 50)
+    assert len(radii) == 1 and abs(radii[0] - 0.9) <= 0.03, radii
+
+
+def test_room_nearest_a_named_landmark():
+    """Ziying's dfe-02 'the Secondary Classroom nearest the north stair': the northmost stair label (up on the sheet),
+    then the classroom label nearest to it; an unnamed subject ('the room next to the kitchen') is not guessed."""
+    from stoa.evidence.lineplan import _NEAR_Q, _nearest_to
+
+    def lab(t, x, y):
+        return {"text": t, "words": t.lower().split(), "pt": (x, y), "bbox": [x - 5, y - 2, x + 5, y + 2]}
+
+    labs = [lab("Stair", 332, 247), lab("Stair", 243, 841), lab("Secondary Classroom", 364, 303),
+            lab("Secondary Classroom", 205, 303), lab("Secondary Classroom", 368, 634)]
+    rooms = labs[2:]
+    q = "What is the floor area of the Secondary Classroom nearest the north stair?"
+    m = _NEAR_Q.search(q)
+    pick, why = _nearest_to(labs, rooms, m.group(2))
+    assert pick is labs[2] and "north taken as up" in why
+    pick, _ = _nearest_to(labs, rooms, "south stair")
+    assert pick is labs[4]
+    assert _nearest_to(labs, rooms, "stair")[0] is None  # two stairs, no word says which
+
+
+def test_printed_dimensions_pair_with_their_lines_and_span_a_rectangle(tmp_path):
+    """dimrect (E1 cycle 7): a number is a dimension when its own line (between arrow tips) measures it at 1:N; two of
+    them span the rectangle round a point (S-100F genset 4272 x 6200, A-101F toilet 1900 x 2054)."""
+    import pymupdf
+
+    from stoa.evidence import dimrect as D
+    from stoa.evidence.linework import PT_TO_M_AT_1
+
+    f = str(tmp_path / "dims.pdf")
+    k = 1000 * 50 * PT_TO_M_AT_1  # mm per pt at 1:50
+    w_pt, h_pt = 4272 / k, 6200 / k
+    x0, y0 = 150.0, 120.0
+    doc = pymupdf.open()
+    pg = doc.new_page(width=842, height=595)
+    sh = pg.new_shape()
+    sh.draw_rect(pymupdf.Rect(x0, y0, x0 + w_pt, y0 + h_pt))  # the slab / room outline
+    sh.finish(color=(0, 0, 0), width=1.0)
+    yd, xd = y0 + h_pt + 20, x0 + w_pt + 20
+    sh.draw_line((x0 + 6, yd), (x0 + w_pt - 6, yd))  # horizontal dimension line, stops at its arrow bases
+    sh.draw_line((xd, y0 + 6), (xd, y0 + h_pt - 6))
+    for a, b in (((x0, yd), (x0 + w_pt, yd)), ((xd, y0), (xd, y0 + h_pt))):
+        sh.draw_line(a, (a[0], a[1] - 25) if a[1] == b[1] else (a[0] - 25, a[1]))  # extension lines
+    sh.finish(color=(0, 0, 0), width=0.25, closePath=False)
+    for tri in ([(x0, yd), (x0 + 6, yd - 1.5), (x0 + 6, yd + 1.5)], [(x0 + w_pt, yd), (x0 + w_pt - 6, yd - 1.5),
+                (x0 + w_pt - 6, yd + 1.5)], [(xd, y0), (xd - 1.5, y0 + 6), (xd + 1.5, y0 + 6)],
+                [(xd, y0 + h_pt), (xd - 1.5, y0 + h_pt - 6), (xd + 1.5, y0 + h_pt - 6)]):
+        sh.draw_polyline(tri)
+        sh.finish(color=(0, 0, 0), fill=(0, 0, 0), width=0.1, closePath=True)
+    sh.commit()
+    pg.insert_text((x0 + w_pt / 2 - 10, yd - 3), "4272", fontsize=8)
+    pg.insert_text((xd - 3, y0 + h_pt / 2 + 10), "6200", fontsize=8, rotate=90)
+    pg.insert_text((x0 + 20, y0 + 20), "1234", fontsize=8)  # a number on no line: not a dimension
+    doc.save(f)
+    ds = D.dims(f, 0, 50.0)
+    assert sorted(d[0] for d in ds) == [4272, 6200] and all(abs(d[6] - d[0]) <= 0.01 * d[0] for d in ds), ds
+    r = D.rect_at(f, 0, 50.0, (x0 + 40, y0 + 60))
+    assert r is not None and r["area_m2"] == round(4272 * 6200 / 1e6, 3)
+    assert D.rect_spanning(f, 0, 50.0, (x0 + 1, y0 - 1, x0 + w_pt - 1, y0 + h_pt + 1)) is not None
+    assert D.rect_spanning(f, 0, 50.0, (x0 + 30, y0, x0 + w_pt, y0 + h_pt)) is None  # a smaller outline: not spanned
+
+
+def test_area_answered_with_a_printed_extent_string_becomes_its_product():
+    """D1 16:48 (AW 078-24-29 S-201): the raster reader returns the callout's extent '9'-0' x 9'-11'' for 'what is the
+    area of the 1'-9" slab'; imperial slab callouts parse as thickness + bars."""
+    from stoa.contract import Answer
+    from stoa.evidence.slabs import _BAR, _IMP_THK, _imp_mm, extent_product
+
+    a = extent_product("What is the area of the 1'-9\" thick slab-on-grade?", Answer(value="9'-0' x 9'-11'", unit=None,
+                                                                                    confidence=0.3))
+    assert a.value == 89.25 and a.unit == "ft2" and a.confidence == 0.3
+    b = extent_product("How big is the genset foundation in plan, in m²?", Answer(value="6200 x 4272", unit=None,
+                                                                                  confidence=0.3))
+    assert b.value == 26.486 and b.unit == "m2"
+    c = extent_product("How many pump pads?", Answer(value="7'-0\" x 7'-0\"", unit=None, confidence=0.3))
+    assert c.value == "7'-0\" x 7'-0\""
+    assert _imp_mm(_IMP_THK.search('1’-9" SLAB-ON-GRADE W/#5 @ 8" E.W.')) == 533
+    assert _imp_mm(_IMP_THK.search('12" SLAB-ON-GRADE U.N.O.')) == 305
+    assert _BAR.findall('W/#5 @ 12"') == ["#5"]

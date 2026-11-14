@@ -227,6 +227,42 @@ def _pick(items: list[dict], pos: dict) -> tuple[dict | None, str]:
     return ranked[0], f"the room nearest the {' '.join(x for x in (v, h) if x)} corner of the plan"
 
 
+_NEAR_Q = re.compile(r"\b(nearest|closest|next|adjacent|nächst\w*|naechst\w*|neben|dichtstbij\w*|lähin\w*|"
+                     r"le plus proche|près)\s+(?:to\s+|zu[mr]?\s+|de\s+la\s+|du\s+)?(?:the\s+|der\s+|dem\s+|de\s+)?"
+                     r"([^?.,;]{3,60})", re.I)
+_QWORDS = {"what", "which", "how", "is", "are", "the", "of", "in", "on", "this", "total", "floor", "area", "size",
+           "net", "gross", "combined", "all", "every", "each", "square", "metres", "meters", "m2", "much", "big"}
+
+
+def _nearest_to(labs: list[dict], hits: list[dict], ref: str) -> tuple[dict | None, str]:
+    """'the Secondary Classroom nearest the north stair' (Ziying's dfe-02): the reference label(s) named after
+    'nearest'; a compass / position word picks one of several ('north' = up on the sheet); then the asked room whose
+    label lies nearest to it."""
+    import math
+
+    refs = _match_labels(labs, ref)
+    refs = [r for r in refs if all(r is not h for h in hits)]
+    if not refs:
+        return None, "no label for the reference"
+    note = ""
+    if len(refs) > 1:
+        pos = _position(ref)
+        if pos is None:
+            return None, f"{len(refs)} labels read '{refs[0]['text']}'"
+        r, _w = _pick(refs, pos)
+        if r is None:
+            return None, "reference not picked"
+        side = " ".join(x for x in (pos["v"], pos["h"]) if x)
+        note = (f" (the {side}most of {len(refs)} '{refs[0]['text']}' labels"
+                f"{'; north taken as up on the sheet' if re.search(r'north|south|east|west', ref, re.I) else ''})")
+        refs = [r]
+    rp = refs[0]["pt"]
+    ranked = sorted(hits, key=lambda h: math.dist(h["pt"], rp))
+    if len(ranked) > 1 and math.dist(ranked[1]["pt"], rp) < 1.15 * math.dist(ranked[0]["pt"], rp):
+        return None, "two rooms about as near"
+    return ranked[0], f"the one of {len(hits)} nearest the '{refs[0]['text']}' label{note}"
+
+
 def rooms(pdf_abs: str, page: int, scale_n: float) -> list[dict]:
     """Closed rooms traced on the plan (no seed): free-space components of the linework at a few door-closing gaps,
     merged across readings; regions holding title-block words, running off the page or holding other regions are
@@ -378,10 +414,25 @@ def _sum_answer(path, pdf, page, q, n, labs, what) -> Answer | None:
     if what != "area":
         return None
     parts = [p for p in _SPLIT.split(q) if p and _words(p)]
-    if len(parts) < 2:
+    alt = ""
+    if len(parts) == 1 and re.search(r"\b(all|every|each|alle\w*|jede\w*)\b", q, re.I):
+        # ONE plural part: 'the total floor area of all Secondary Classrooms' (Stoa DfE sheet, Ziying's dfe-03) = every
+        # room whose label holds all the asked words ('Secondary Classroom (Severe …)' included; the exact-label-only
+        # total goes into the trace)
+        qw = [w for w in _words(_SUM_Q.sub(" ", q)) if w not in _GENERIC and w not in _QWORDS]
+        full = [lab for lab in labs if qw and all(any(_same(w, lw) for lw in lab["words"]) for w in qw)]
+        exact = _match_labels(labs, q)
+        if len(full) < 2 or len(full) > 16:
+            return None
+        if len(exact) != len(full):
+            alt = (f"; only the {len(exact)} labelled exactly '{exact[0]['text']}': see the trace" if exact else "")
+        parts, labs_full = [], full
+    else:
+        labs_full = None
+    if len(parts) < 2 and labs_full is None:
         return None
-    measured: list = []
-    seen: set = set()
+    measured: list = list(labs_full or [])
+    seen: set = {id(h) for h in measured}
     for part in parts:
         hits = _match_labels(labs, part)
         if not hits:
@@ -403,11 +454,18 @@ def _sum_answer(path, pdf, page, q, n, labs, what) -> Answer | None:
     ms = _measure_labels(pdf, page, measured, n)
     if not ms:
         return None
+    if labs_full is not None and len(ms) != len(measured):
+        return None  # 'all X': a room that could not be traced would be missing from the total
     total = round(sum(m["area_m2"] for _, m in ms), 2)
     terms = " + ".join(f"{m['area_m2']:g} ({lab['text'][:24]})" for lab, m in ms)
-    return _multi(path, page, n, ms, what, total, 0.45, f"sum of {len(ms)} rooms found by their labels: {terms} = "
-                  f"{total} m²", ["each outline traced from the drawn wall lines around its label (door openings "
-                                  "closed)"])
+    a = _multi(path, page, n, ms, what, total, 0.45, f"sum of {len(ms)} rooms found by their labels: {terms} = "
+               f"{total} m²{alt}", ["each outline traced from the drawn wall lines around its label (door openings "
+                                    "closed)"])
+    if alt:
+        ex = {id(x) for x in _match_labels(labs, q)}
+        sub = round(sum(m["area_m2"] for lab, m in ms if id(lab) in ex), 2)
+        a.trace.append(f"lineplan: alternative = only the rooms labelled exactly '{ms[0][0]['text'] if id(ms[0][0]) in ex else next(lab['text'] for lab, _ in ms if id(lab) in ex)}': {sub} m²")
+    return a
 
 
 _THICK_Q = re.compile(r"\b(thick\w*|dick\w*|stärke|staerke|wandstärke|dikte|épaisseur|epaisseur|spessore|paksu\w*|"
@@ -703,7 +761,10 @@ _BASE_Q = re.compile(r"\b(base ?boards?|skirting(?:[\s-]*boards?)?|skirtings?|ba
                      r"plint(?:en|s)?|plinthes?|battiscop\w*|jalkalist\w*|golvlist\w*|sockellist\w*)\b", re.I)
 _BASE_WORDS = re.compile(r"\b(linear|lineal|running|metres?|meters?|lm|feet|foot|ft|needs?|needed|required|requires|"
                          r"minus|less|doors?|openings?|perimeter|how|much|many|total|length|of|for|in|does|do|is|are|"
-                         r"would|will|we|install|installed|fit|fitted|fitting|along|around)\b", re.I)
+                         r"would|will|we|install|installed|fit|fitted|fitting|along|around|"
+                         # ', door opening excluded?' is a condition, not a second room (G1 17:22, sl-091)
+                         r"exclud\w*|includ\w*|deduct\w*|subtract\w*|without|not|counted|taken|off|net|gross|"
+                         r"ways?|widths?)\b", re.I)
 MIN_OPENING_M = 0.5  # a stretch of the room outline with no wall line along it, at least this long, is an opening
 
 
@@ -769,21 +830,26 @@ def _skirting(pdf: str, page: int, n: float, m: dict) -> dict | None:
             pair = []
             for sp in spokes[i:i + 2]:
                 (cx, cy), (ex, ey) = sp.tolist()
-                mid = min(at(d_ink, cx + (ex - cx) * t, cy + (ey - cy) * t) for t in (0.25, 0.4, 0.5, 0.6, 0.75))
+                # drawn = ink along MOST of the radius (median): a door tag ('102') or a leader crossing the door
+                # way touches one or two samples (USACE A-101F toilet), a leaf lying on its radius touches all
+                mid = float(np.median([at(d_ink, cx + (ex - cx) * t, cy + (ey - cy) * t)
+                                       for t in (0.15, 0.25, 0.35, 0.45, 0.5, 0.55, 0.65, 0.75, 0.85)]))
                 ext = max(at(d_ink, cx + (ex - cx) * t, cy + (ey - cy) * t) for t in (1.15, 1.3))  # wall line beyond
                 pair.append((LineString([(cx, cy), (ex, ey)]), mid, ext))
             if len(pair) != 2:
                 continue
             (s0, m0, e0), (s1, m1, e1) = pair
-            if (m0 > wtol) != (m1 > wtol):  # nothing drawn along one of them: that one spans the door way
-                c = 0 if m0 > wtol else 1
+            mtol = min(wtol, 2.5 * ppt)  # a leaf is drawn ON its radius: 0.15 m is 8.5 pt at 1:50 and took in the
+            #                              jamb / leaf ends of a 0.9 m door way (A-101F toilet); 1:200 unchanged
+            if (m0 > mtol) != (m1 > mtol):  # nothing drawn along one of them: that one spans the door way
+                c = 0 if m0 > mtol else 1
             elif (e0 <= tol) != (e1 <= tol):  # both drawn (or both free): the chord runs on into the wall's line
                 c = 0 if e0 <= tol else 1
             else:
-                leaves.extend(x[0] for x in pair if x[1] <= wtol)
+                leaves.extend(x[0] for x in pair if x[1] <= mtol)
                 continue
             chords.append(pair[c][0])
-            if pair[1 - c][1] <= wtol:
+            if pair[1 - c][1] <= mtol:
                 leaves.append(pair[1 - c][0])
 
     def on_chord(x, y) -> bool:
@@ -878,6 +944,28 @@ def _skirting(pdf: str, page: int, n: float, m: dict) -> dict | None:
     return {"perimeter_m": round(per, 3), "value_m": round(val, 3), "openings": outs, "runs": runs}
 
 
+_NO_DEDUCT = re.compile(r"\b(?:do(?:es)?\s*n[o’']t|not|without|no)\s+(?:subtract\w*|deduct\w*|minus\w*|remov\w*|"
+                        r"tak\w*\s+(?:off|out)|exclud\w*|leav\w*\s+out)\b|\bignor\w*\s+(?:the\s+|any\s+)?(?:doors?|openings?)|"
+                        r"\bincluding\s+(?:the\s+|any\s+)?(?:doors?|door\s*ways?|openings?)|\bacross\s+(?:the\s+)?(?:doors?|"
+                        r"openings?)|\bgross\b|\bfull\s+perimeter\b", re.I)
+_WHOLE_FLOOR_Q = re.compile(r"\b(?:whole|entire|complete|this|the)\s+(?:floor|level|storey|story|plan|building|school|"
+                            r"house|apartment|flat|ground floor|first floor)\b|\ball (?:the )?rooms\b|"
+                            r"\b(?:every|each) room\b", re.I)
+_NO_SKIRTING = re.compile(r"\b(stair\w*|lift\w*|elevator\w*|shaft\w*|riser\w*|void\w*|duct\w*|plant|walkway|"
+                          r"canopy|terrace\w*|balcon\w*|courtyard|external|open to below|disclaimer)\b", re.I)
+
+
+def _iou_poly(a: list, b: list) -> float:
+    try:
+        from shapely.geometry import Polygon
+
+        pa, pb = Polygon(a).buffer(0), Polygon(b).buffer(0)
+        u = pa.union(pb).area
+        return pa.intersection(pb).area / u if u > 0 else 0.0
+    except Exception:  # noqa: BLE001
+        return 0.0
+
+
 def _baseboard_answer(path: str, pdf: str, page: int, q: str, n: float, labs: list[dict]) -> Answer | None:
     """'How many linear metres of skirting board does the laundry need?' — every named room (a plural takes every room
     so labelled; 'the laundry and the kitchen' sums) traced, its outline minus the openings in its walls (_skirting).
@@ -905,27 +993,55 @@ def _baseboard_answer(path: str, pdf: str, page: int, q: str, n: float, labs: li
         for h in hits:
             if all(h is not p for p in picked):
                 picked.append(h)
-    if not picked or len(picked) > 16:
+    whole = False
+    rest = [w for w in _words(_WHOLE_FLOOR_Q.sub(" ", qn)) if w not in _GENERIC and not _SUM_Q.fullmatch(w) and
+            w not in {"order", "buy", "needed", "need", "required", "metres", "meters", "skirting", "baseboard"}]
+    if not picked and not rest and _WHOLE_FLOOR_Q.search(q):  # 'for the whole floor': every room label, each room once
+        picked = [lab for lab in labs if not _NO_SKIRTING.search(lab["text"]) and len(lab["text"]) <= 40]
+        whole = True
+    if not picked or len(picked) > (150 if whole else 16):
         return None
     d_med, n_doors = _door_check(pdf, page, n)
     if d_med is not None and not 0.6 <= d_med <= 1.3:
         return None
-    rows = []
+    rows, missed = [], []
     for lab in picked:
         m = L.measure_room(pdf, page, lab["pt"], n, tag_box=tuple(lab["bbox"]))
-        if m is None:
-            return None
-        sk = _skirting(pdf, page, n, m)
-        if sk is None:
-            return None
+        sk = _skirting(pdf, page, n, m) if m is not None else None
+        if sk is None or (whole and not 1.0 <= m["area_m2"] <= 1500):
+            if not whole:
+                return None
+            missed.append(lab["text"])
+            continue
+        if whole and any(_iou_poly(m["polygon"], r[1]["polygon"]) > 0.8 for r in rows):
+            continue  # two labels in one room ('Changing' over 'and Showers' read apart): counted once
+        if not whole:
+            try:  # printed dimensions spanning the traced room: its perimeter from the numbers (A-101F toilet:
+                #   2 x (1900 + 2054) = 7.908 m minus the 0.91 m door way = 6.998, X1 gold 6.993)
+                from stoa.evidence import dimrect as D
+
+                dr = D.rect_spanning(pdf, page, n, tuple(_poly_bbox(m["polygon"])),
+                                     tol_pt=0.15 / (n * L.PT_TO_M_AT_1))
+            except Exception:  # noqa: BLE001
+                dr = None
+            if dr is not None:
+                per = 2 * (dr["w_mm"] + dr["h_mm"]) / 1000
+                sk = {**sk, "perimeter_m": round(per, 3), "value_m": round(per - sum(o[2] for o in sk["openings"]), 3),
+                      "dims": (dr["w_mm"], dr["h_mm"])}
         rows.append((lab, m, sk))
-    total = round(sum(sk["value_m"] for _, _, sk in rows), 2)
+    if whole and (len(rows) < 2 or len(missed) > len(rows)):
+        return None
+    deducted = round(sum(sk["value_m"] for _, _, sk in rows), 2)
+    keep_doors = bool(_NO_DEDUCT.search(q))  # 'do not subtract the doors' / 'ignoring door openings' (D1 17:52)
+    total = round(sum(sk["perimeter_m"] for _, _, sk in rows), 2) if keep_doors else deducted
     ev, terms = [], []
     for lab, m, sk in rows:
         name = lab["text"][:40]
         ops = sk["openings"]
         op_txt = ", ".join(f"{o[2]:.2f}" for o in ops) or "none"
-        terms.append(f"{name} {sk['perimeter_m']:.2f} - ({op_txt}) = {sk['value_m']:.2f} m")
+        dm = sk.get("dims")
+        terms.append(f"{name} {sk['perimeter_m']:.2f}" + (f" (printed {dm[0]} x {dm[1]} mm)" if dm else "")
+                     + f" - ({op_txt}) = {sk['value_m']:.2f} m")
         for i, run in enumerate(sk["runs"]):
             ev.append(Evidence(file=path, page=page, bbox=_poly_bbox(run), bbox_space="pdf_pt", exact=False,
                                polyline=run, polygon=m["polygon"] if i == 0 else None,
@@ -938,10 +1054,18 @@ def _baseboard_answer(path: str, pdf: str, page: int, q: str, n: float, labs: li
     conf = 0.5 if all(m.get("support", 0) >= 3 for _, m, _ in rows) else 0.35
     if len(rows) > 1:
         conf = min(conf, 0.45)
+    if whole:
+        conf = min(conf, 0.3)
     assumptions = [f"scale: 1:{n:g} printed on the sheet; traced from the wall lines (approximate)",
+                   ("skirting = the room's whole traced outline (wall faces), door openings NOT deducted as asked; "
+                    f"with the openings deducted it would be {deducted:g} m") if keep_doors else
                    "skirting = the room's traced outline (wall faces) minus every opening in its walls, measured jamb "
                    "to jamb (door ways and open passages); built-in units and fixed furniture not deducted",
-                   *([f"sum of {len(rows)} rooms: " + "; ".join(terms)] if len(rows) > 1 else [terms[0]])]
+                   *([f"sum of {len(rows)} rooms: " + "; ".join(terms)] if len(rows) > 1 else [terms[0]]),
+                   *([f"whole floor = every labelled room on the sheet (stairs, lifts, shafts, plant and voids left "
+                      f"out); {len(missed)} label(s) not traced"
+                      + (f": {', '.join(x for x in missed if not re.search(r'[0-9]', x))[:200]}" if missed else "")]
+                     if whole else [])]
     if d_med is not None:
         assumptions.append(f"scale check: {n_doors} door swings measure a median {d_med:.2f} m at 1:{n:g} ✓")
     return Answer(value=total, unit="m", confidence=conf, evidence=ev, solver=SOLVER, assumptions=assumptions,
@@ -973,7 +1097,9 @@ def _answer(path: str, question: str, page: int) -> Answer | None:
         pdf = str(abspath(path))
         scales = L.sheet_scales(pdf, page) if pdf.lower().endswith(".pdf") else ()
         return _thickness_answer(path, pdf, page, q, scales[0], labels(pdf, page)) if scales else None
-    if _COUNT_Q.search(q) or _NOT_ROOM.search(q) or (_WALL_Q.search(q) and not _ROOM_Q.search(q)):
+    near_q = _NEAR_Q.search(q)  # 'the classroom nearest the north stair': the stair is a landmark, not the subject
+    q_subj = q[:near_q.start()] if near_q else q
+    if _COUNT_Q.search(q) or _NOT_ROOM.search(q_subj) or (_WALL_Q.search(q_subj) and not _ROOM_Q.search(q_subj)):
         return None  # 'wall to wall' / 'along the outer wall' still ask about a room; 'how long is the wall' does not
     what = ("perimeter" if _PERIM_Q.search(q) else "width" if _WID_Q.search(q) else "length" if _LEN_Q.search(q)
             else "area" if _AREA_Q.search(q) else None)
@@ -994,9 +1120,20 @@ def _answer(path: str, question: str, page: int) -> Answer | None:
             return r
         # ONE named room with a 'both / all / total' word ('the multi-purpose hall, both halves together (partition
         # open)', X1 sl-059): that room, measured as one
-    pos = _position(q)
+    near = _NEAR_Q.search(q)
+    if near and hits:
+        hits = _match_labels(labs, q[:near.start()])
+        if not hits:
+            return None  # 'the room next to the kitchen': the subject is unnamed, the kitchen only a landmark
+    pos = _position(q[:near.start()] if near else q)
     how = ""
     tag_box = None
+    why = ""
+    if near and len(hits) > 1:
+        pick, why = _nearest_to(labs, hits, near.group(2))
+        if pick is None:
+            return None
+        hits, pos = [pick], None
     if hits:
         if len(hits) > 1:
             if pos is None:  # 'one of the quiet rooms': equal rooms measured together; 'the meeting room' x4 differ
@@ -1007,7 +1144,7 @@ def _answer(path: str, question: str, page: int) -> Answer | None:
             how = f"{len(hits)} labels read '{hits[0]['text']}'; {why}"
         else:
             pick = hits[0]
-            how = f"the room labelled '{pick['text']}'"
+            how = f"the room labelled '{pick['text']}'" + (f", {why}" if why else "")
         seed, tag_box, name = pick["pt"], tuple(pick["bbox"]), pick["text"]
         conf = 0.55
     elif pos is not None:
@@ -1044,7 +1181,26 @@ def _answer(path: str, question: str, page: int) -> Answer | None:
                            "(a door leaf is ~0.7-1.0 m) ✓")
     sides = m.get("sides_m") or []
     ev_kw = dict(file=path, page=page, bbox=bbox, bbox_space="pdf_pt", exact=False)
+    dr = None
     if what == "area":
+        try:  # printed dimensions spanning exactly this room (each end within 0.15 m): the numbers win (A-101F toilet)
+            from stoa.evidence import dimrect as D
+
+            dr = D.rect_spanning(pdf, page, n, tuple(bbox), tol_pt=0.15 / (n * L.PT_TO_M_AT_1))
+        except Exception:  # noqa: BLE001
+            dr = None
+    if dr is not None:
+        (hv, *_h), (vv, *_v) = dr["dims"]
+        val, unit = dr["area_m2"], "m2"
+        ev = [Evidence(**ev_kw, polygon=poly, note=f"{name[:50]}: {hv} x {vv} mm = {val} m² (printed dimensions; "
+                                                     f"traced {m['area_m2']} m² at 1:{n:g})"),
+              *(Evidence(file=path, page=page, bbox=[round(t, 1) for t in d_[5]], bbox_space="pdf_pt", exact=True,
+                         note=f"dimension {d_[0]} mm (printed; measures {d_[6]} mm at 1:{n:g})") for d_ in dr["dims"])]
+        assumptions.append(f"area = the printed dimensions {hv} x {vv} mm that span this room (the traced outline "
+                           f"gives {m['area_m2']} m²); printed dimensions win over the drawing measured at 1:{n:g}")
+        missing = []
+        conf = max(conf, 0.6)
+    elif what == "area":
         val, unit = m["area_m2"], "m2"
         ev = [Evidence(**ev_kw, polygon=poly, note=f"{name[:50]}: {val} m² traced at 1:{n:g} (approximate)")]
     elif what == "perimeter":
@@ -1071,7 +1227,10 @@ def _answer(path: str, question: str, page: int) -> Answer | None:
                   assumptions=assumptions, missing=missing,
                   trace=[f"lineplan: line-only sheet at printed 1:{n:g}; {how}; measure_room -> area {m['area_m2']} m², "
                          f"sides {sides}, gap {m['gap_m']} m, variant {m['variant']}, support {m['support']}/"
-                         f"{m['n_readings']}"])
+                         f"{m['n_readings']}",
+                         *([f"lineplan: printed dimensions {dr['dims'][0][0]} x {dr['dims'][1][0]} mm span the traced "
+                            f"room (each measures its own line: {dr['dims'][0][6]} / {dr['dims'][1][6]} mm) -> "
+                            f"{dr['area_m2']} m²"] if dr is not None else [])])
 
 
 def add_traced_outlines(ans: Answer, max_items: int = 6) -> Answer:

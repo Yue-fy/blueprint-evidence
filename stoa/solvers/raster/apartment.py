@@ -172,8 +172,14 @@ def labelled_name(question: str) -> str | None:
     return m.group(1).strip() if m else unquoted_label(question)
 
 
+_SUBSCOPE_N = re.compile(r"\b(module|wing|zone|block|section|level|storey|floor|department|suite|pod|cluster|phase)"
+                         r"\s*(?:no\.?\s*|#\s*)?(\d{1,2})\b", re.I)
+_SUBSCOPE_NAMED = re.compile(r"\b(module|wing|zone|block|department|suite|pod|cluster)\b", re.I)
+_SQFT = re.compile(r"\b(sf|sq\.?\s*ft|square feet)\b|ft²|ft2", re.I)
+
+
 def room_set(path: str, layer: T.TextLayer, question: str, px_per_m: float | None,
-             grow_m: float = 0.15, mode: str = "hybrid") -> dict | None:
+             grow_m: float = 0.15, mode: str = "hybrid", large: bool = False) -> dict | None:
     """The rooms a summed-area question is about, with their areas: one unit's rooms ('apartment B': inside its drawn
     boundary), the rooms labelled X ('all rooms labelled «Bad»'), or every (numbered) indoor room of the floor. Outdoor
     rooms (and shafts/voids) are dropped when the question excludes them; rooms with a number but no printed area are
@@ -199,6 +205,13 @@ def room_set(path: str, layer: T.TextLayer, question: str, px_per_m: float | Non
     elif not (name or _FLOOR_SUM.search(question)):
         return None
     all_rooms = _rooms(layer)
+    if name and not any(r["name"] and (T.norm(r["name"]) == T.norm(name) or T.match_score(name, r["name"]) >= 0.9)
+                        for r in all_rooms):
+        # O1 c6 (D1 line-only school PNG: 'total floor area of all the rooms labelled Infants' -> the GIFA 2190):
+        # unnumbered rooms with no printed area -- each label printed exactly as the asked name IS a room, measured
+        # by flood fill ('Infants WC' is another room)
+        all_rooms += [{"id": None, "label": it, "name": it.text, "area": None, "cx": it.cx, "cy": it.cy,
+                       "named_only": True} for it in layer.items if T.norm(it.text) == T.norm(name)]
     if scope == "floor" and sum(r["label"] is not None for r in all_rooms) < 2:
         # a floor sum needs numbered rooms: on other sheets (scans, uploads) printed areas may be site or total areas
         return None
@@ -231,8 +244,12 @@ def room_set(path: str, layer: T.TextLayer, question: str, px_per_m: float | Non
             if px_per_m and r["label"] is not None and mode == "hybrid":
                 ink = M._ink(path) if ink is None else ink
                 ids = [i.box for i in layer.items if _ROOM_ID.match(i.text.strip()) and i is not r["label"]]
-                got = M.room_area(path, r["label"].box, px_per_m, ink=ink, others=ids, **M.FILL)
-                if got is not None and (got["wall_frac"] < 0.05 or got["m2"] > 60):
+                if r.get("named_only"):  # the other printed names are the other rooms
+                    ids += [i.box for i in layer.items if i is not r["label"] and M._NAME_WIDE.fullmatch(M._lkey(i.text))
+                            and M._lkey(i.text) not in M._GENERIC]
+                got = M.room_area(path, r["label"].box, px_per_m, ink=ink, others=ids, **M.FILL, large=large)
+                # whole large-format sheets (textqa._LARGE): thin double-line walls, door gaps bridged, school-size rooms
+                if got is not None and ((got["wall_frac"] < 0.05 and not large) or got["m2"] > (400 if large else 60)):
                     got = None
             if got is None:
                 unmeasured.append(r)
@@ -242,14 +259,51 @@ def room_set(path: str, layer: T.TextLayer, question: str, px_per_m: float | Non
         rooms.append(r)
     if not rooms:
         return None
-    total = sum(r["area"]["value"] if r["area"] else r["measured"]["m2"] for r in rooms)
+    # the same room drawn twice (floor plan + reflected ceiling plan / enlarged plan on one sheet): one room per number
+    # (X1 stoa-like AFCEE fitness PNG: every room summed twice, the lobby three times -> 7119 instead of 1388 SF)
+    seen: set = set()
+    uniq, repeats = [], 0
+    for r in rooms:
+        if r["id"] and r["id"] in seen:
+            repeats += 1
+            continue
+        if r["id"]:
+            seen.add(r["id"])
+        uniq.append(r)
+    rooms = uniq
+    # 'module 01' / 'wing 2' / 'level 3' with rooms numbered N.xx: that number's rooms (room numbers carry the part)
+    sub, sub_note, sub_missed = _SUBSCOPE_N.search(question), None, None
+    if sub is None and scope == "floor" and _SUBSCOPE_NAMED.search(question):
+        sub_missed = _SUBSCOPE_NAMED.search(question).group(0)  # 'the administration module': not applied
+    if sub and scope == "floor":
+        if sub.group(2):
+            n = str(int(sub.group(2)))
+            mine = [r for r in rooms if r["id"] and r["id"].split(".")[0].lstrip("0") in (n, n.lstrip("0") or "0")]
+            if mine and len(mine) < len(rooms):
+                keep = {id(r) for r in mine}
+                rooms = mine
+                measured = [r for r in measured if id(r) in keep or (r["id"] and r["id"].split(".")[0].lstrip("0") == n)]
+                unmeasured = [r for r in unmeasured if r["id"] and r["id"].split(".")[0].lstrip("0") == n]
+                sub_note = f"{sub.group(1).lower()} {sub.group(2)} = the rooms numbered {n}.xx"
+            elif not mine:
+                sub_missed = sub.group(0)
+        else:
+            sub_missed = sub.group(0)
+    # printed areas in square feet ('108 SF') stay square feet; measured rooms are converted to match
+    printed = [r["area"].get("text", "") for r in rooms if r["area"]]
+    sqft = bool(printed) and all(_SQFT.search(t or "") for t in printed)
+    total = sum(r["area"]["value"] if r["area"] else r["measured"]["m2"] / (0.3048 ** 2 if sqft else 1.0)
+                for r in rooms)
     gaps = numbering_gaps(layer)
     if scope == "unit":  # only gaps inside the unit's own number range (units are numbered in runs: 2.10-2.16)
         mine = [r["id"] for r in rooms + dropped + unmeasured if r["id"]]
         pref = {i.split(".")[0] for i in mine}
         lo, hi = (min(mine), max(mine)) if mine else ("", "")
         gaps = [g for g in gaps if g.split(".")[0] in pref and lo < g < hi]
+    if sub_note:
+        gaps = [g for g in gaps if g.split(".")[0].lstrip("0") == sub_note.split()[-1].split(".")[0]]
     out = {"scope": scope, "letter": letter, "name": name, "label": lab, "value": round(total, 2), "rooms": rooms,
+           "unit": "ft2" if sqft else "m2", "repeats": repeats, "sub_note": sub_note, "sub_missed": sub_missed,
            "gaps": gaps,
            "dropped": dropped, "unmeasured": unmeasured, "measured": measured, "region_box": None, "region_m2": None}
     if comp is not None:

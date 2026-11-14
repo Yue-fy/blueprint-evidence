@@ -82,8 +82,9 @@ export const uploadSet = (paths: string[]) =>
 export const benchmark = () => fetch("/api/bench").then((r) => (r.ok ? r.json() : Promise.reject(new Error(`${r.status}`))));
 
 /** Room outlines around evidence boxes (flood fill on the drawing, web/server/room_shape.py; estimates, CPU only). */
-export interface RoomShape { i: number; poly: [number, number][] | null; area?: number; closing_px?: number; fit?: number | null }
-export const roomShapes = (path: string, page: number, space: string, items: { i: number; bbox: number[]; others?: [number, number][] }[]) =>
+export interface RoomShape { i: number; poly: [number, number][] | null; area?: number; closing_px?: number; fit?: number | null; method?: string }
+/** items[].scale_n: the drawing's 1:N on a vector PDF: the wall-line tracer (door swings closed at the doorway) runs first */
+export const roomShapes = (path: string, page: number, space: string, items: { i: number; bbox: number[]; others?: [number, number][]; scale_n?: number }[]) =>
   call<{ shapes: RoomShape[]; space: "pdf_pt" | "image_px" }>("/api/shapes", {
     method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ path, page, space, items }),
   });
@@ -92,6 +93,13 @@ export const roomShapes = (path: string, page: number, space: string, items: { i
  *  door swings agree, boxes = where they are (pdf_pt). A best estimate when nothing is printed. */
 export interface DoorScale { ok: boolean; ratio?: number; raw?: number; doors?: number; radius_pt?: number; leaf_m?: number; boxes?: number[][]; why?: string }
 const doorMemo = new Map<string, Promise<DoorScale>>();
+/** The middleware's start-up check (S0 D42): can its Python load the solvers? null = no middleware / not known. */
+export const selfCheck = (): Promise<{ ok: boolean; py?: string; error?: string; checked_at?: string } | null> =>
+  fetch("/api/selfcheck").then((r) => (r.ok ? r.json() : null)).catch(() => null);
+/** The scale printed on a vector PDF page (W6's phone-page endpoint, served by the same Vite config; ~0.1–0.6 s,
+ *  no model call). null when the endpoint is missing (older trees) or fails. */
+export const printedScale = (path: string, page = 0): Promise<{ ok: boolean; n?: number; text?: string; source?: string } | null> =>
+  fetch(`/api/m/pdfscale?path=${encodeURIComponent(path)}&page=${page}`).then((r) => (r.ok ? r.json() : null)).catch(() => null);
 export const doorScale = (path: string, page = 0): Promise<DoorScale> => {
   const k = `${path}|${page}`;
   if (!doorMemo.has(k)) {

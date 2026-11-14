@@ -96,7 +96,8 @@ _QUOTED = re.compile(r"«([^»]{1,80})»|„([^“”\"]{1,80})[“”\"]|“([^
 _ROOM_NO = re.compile(r"\b(?:room|raum|pi[eè]ce|locale|huone|ruimte|rum)\s+([A-Z]{0,2}\d+(?:\.\d+)*)\b", re.I)
 _APT = re.compile(r"\b(?:apartment|wohnung|appartement|appartamento|dell'appartamento|de l'appartement|asunto|unit)\s+"
                   r"([A-Z0-9]{1,3})\b", re.I)
-_SHEET = re.compile(r"\bsheet\s+([A-Z]{1,3}-?\d{1,4}(?:\.\d+)?)", re.I)
+# P1 17:52: 'sheet M-101A' kept its suffix letter (was M-101, then the sheet-table reader took the question)
+_SHEET = re.compile(r"\bsheet\s+([A-Z]{1,3}-?\d{1,4}(?:[A-Z]\b)?(?:\.\d+)?)", re.I)
 _LABELLED = re.compile(r"labell?ed|bezeichnung|d[ée]signation|d[ée]sign[ée]e?s|denominazione|denominati|"
                        r"named|called|nimetty", re.I)
 _TOTAL = re.compile(r"\btotal\b|gesamt|totale?\b|samlede|totaal|zusammen|kokku|yhteens|alle\b|all\b|tous|toutes|tutti", re.I)
@@ -355,6 +356,9 @@ def parse(question: str) -> Intent:
                 continue
             target = t
             break
+    if task == "length" and _SKIRTING.search(q) and target in ("door", "opening", "window", "unknown"):
+        # D1 17:52: 'skirting … ignoring / minus the door openings' -> target 'door' (the EXCLUDED thing); it is the room's
+        target = "room"
     if target in ("wc", "wc_room", "unknown") and _ROOM_CODE_LIST.search(question) and _TARGETS_D["bathroom"].search(q_noquote):
         # R2 08:52 (F open set): "How many bathrooms or toilets (e.g. KH, KPH, PH, PESUH, SH)" -> wc seats; a
         # parenthesised list of Finnish wet-room CODES names rooms, so the question counts bathrooms (rooms)

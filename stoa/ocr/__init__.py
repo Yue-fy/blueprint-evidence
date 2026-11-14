@@ -53,22 +53,50 @@ def _abspath(path: str) -> Path:
     return Path(os.environ.get("STOA_DATA", ".")) / path
 
 
+def _tiled_tag(path: str) -> str:
+    """'|t2' for images the engine tiles (> 4000 px: engine.MAX_SIDE): their cached reads predate the clipped-read
+    dedupe (O1 c6), so they are read once more; smaller images keep their cache."""
+    try:
+        from PIL import Image
+
+        Image.MAX_IMAGE_PIXELS = None
+        with Image.open(_abspath(path)) as im:
+            return "|t2" if max(im.size) > 4000 else ""
+    except Exception:  # noqa: BLE001
+        return ""
+
+
 def _key(path: str) -> Path:
     from stoa.solvers.raster.textlayer import file_tag  # '' for dataset files, content hash for uploads
 
-    h = hashlib.sha1(f"{VERSION}|{Path(path).name}{file_tag(path)}".encode()).hexdigest()[:16]
+    h = hashlib.sha1(f"{VERSION}{_tiled_tag(path)}|{Path(path).name}{file_tag(path)}".encode()).hexdigest()[:16]
     return CACHE_DIR / f"{Path(path).stem[:60]}.{h}.json"
 
 
 def server_up(timeout: float = 0.5) -> bool:
-    global _server_ok
+    global _server_ok, _server_engine
     if _server_ok is None:
         try:
             with urllib.request.urlopen(OCR_URL, timeout=timeout) as r:
                 _server_ok = r.status == 200
+                try:
+                    _server_engine = str(json.loads(r.read()).get("engine", ""))
+                except Exception:  # noqa: BLE001
+                    _server_engine = ""
         except OSError:
             _server_ok = False
     return _server_ok
+
+
+_server_engine = ""
+TILE_FIX = "+t2"  # engine.ENGINE tag of the clipped-read tile dedupe
+
+
+def _server_for(path: str) -> bool:
+    """Use the OCR server for this image? Tiled images (> 4000 px) only when the server runs the clipped-read dedupe
+    (its engine string has TILE_FIX): an older server would cache the old reads under the new key. Otherwise the
+    subprocess runs this checkout's engine."""
+    return server_up() and (not _tiled_tag(path) or TILE_FIX in _server_engine)
 
 
 def available() -> bool:
@@ -80,7 +108,7 @@ def cached(path: str) -> bool:
 
 
 def _run(path: str) -> dict:
-    if server_up():
+    if _server_for(path):
         req = urllib.request.Request(OCR_URL, data=json.dumps({"path": path}).encode(),
                                      headers={"Content-Type": "application/json"})
         try:

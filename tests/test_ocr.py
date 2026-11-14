@@ -167,3 +167,23 @@ def test_area_labels_misread_as_m3_or_m_on_an_m2_sheet():
     assert n == 2 and out[3].text == "15.61 m²" and out[4].text == "10.16 m²" and out[6].text == "1450 m³"
     few, n2 = area_units([TextItem(t, [0, 0, 1, 1]) for t in ["12.05 m²", "10.16m"]])
     assert n2 == 0 and few[1].text == "10.16m"  # too few area labels: a length stays a length
+
+
+def test_dedupe_prefers_the_read_with_room_to_its_tile_edge():
+    """O1 c6: D1's 4961-px A3 PNG is read in two tiles (x 0-4000, 3800-4961). The left tile stops 'Scale:' 6 px before
+    its edge (word gap); the right tile reads the whole line 41 px from its own edge. The whole line must win."""
+    from stoa.ocr import engine as E
+
+    W, H = 4961, 3508
+    left, right = (0, 0, 4000, H), (3800, 0, W, H)
+    cut = {"text": "Scale:", "box": [3841, 3254, 3994, 3311], "score": 1.0}
+    whole = {"text": "Scale:1:200@A3", "box": [3841, 3255, 4243, 3313], "score": 0.997}
+    far = {"text": "Hall", "box": [100, 100, 160, 130], "score": 0.9}
+    cut["room"], whole["room"], far["room"] = (E._room(cut["box"], left, W, H), E._room(whole["box"], right, W, H),
+                                               E._room(far["box"], left, W, H))
+    assert cut["room"] < whole["room"] < E.EDGE_ROOM == far["room"]
+    out = E._dedupe([cut, whole, far])
+    assert [i["text"] for i in out] == ["Hall", "Scale:1:200@A3"]
+    assert all("room" not in i for i in out)
+    # one tile (images <= MAX_SIDE): no inner edges, every read has full room, the score decides as before
+    assert E._room([0, 0, 50, 20], (0, 0, 400, 300), 400, 300) == E.EDGE_ROOM

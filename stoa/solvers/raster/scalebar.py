@@ -18,6 +18,7 @@ Self-check (no gold needed): sheets with a FEET and a METERS bar must give px/m 
 from __future__ import annotations
 
 import contextlib
+import os
 import contextvars
 import re
 import statistics
@@ -144,14 +145,20 @@ class PrintedBar(Bar):
     paper: str = ""
     dpi: float = 0.0
     ratio: float = 0.0
+    dpi_from: str = "tag"  # 'tag' = the image's DPI tag; 'pixels' = pixel size + the sheet size the sheet prints
+
+    def _dpi_text(self) -> str:
+        if self.dpi_from == "pixels":
+            return f"{self.dpi:.0f} dpi from the image's pixel size on the {self.paper} sheet it names"
+        return f"{self.dpi:.0f} dpi image"
 
     def describe(self) -> str:
-        return (f"printed scale {self.unit_text} on a {self.paper} sheet ({self.dpi:.0f} dpi image): 1 m = "
+        return (f"printed scale {self.unit_text} on a {self.paper} sheet ({self._dpi_text()}): 1 m = "
                 f"{self.px_per_unit:.2f} px")
 
     def evidence(self, path: str) -> list[Evidence]:
         return [Evidence(file=path, page=0, bbox=[round(c, 1) for c in self.box], bbox_space="image_px",
-                         note=f"printed scale '{self.unit_text}' + image {self.dpi:.0f} dpi on {self.paper}: "
+                         note=f"printed scale '{self.unit_text}' + {self._dpi_text()} on {self.paper}: "
                               f"1 m = {self.px_per_unit:.2f} px")]
 
 
@@ -160,6 +167,7 @@ PAPER_MM = {"A0": (841, 1189), "A1": (594, 841), "A2": (420, 594), "A3": (297, 4
             "Letter": (216, 279), "Legal": (216, 356), "Tabloid": (279, 432), "ANSI C": (432, 559),
             "ANSI D": (559, 864), "ANSI E": (864, 1118), "ARCH A": (229, 305), "ARCH B": (305, 457),
             "ARCH C": (457, 610), "ARCH D": (610, 914), "ARCH E": (914, 1219), "ARCH E1": (762, 1067)}
+_AT_WORD = re.compile(r"\b(?:at|bei|auf|su|på|en)\s+(A[0-5])\b", re.I)
 _AT_PAPER = re.compile(r"@\s*(A[0-5])\b|\b(?:at|bei|auf|su|på|en)\s+(A[0-5])\b", re.I)
 
 
@@ -183,9 +191,12 @@ def printed_bar(img_path: str, tl) -> PrintedBar | None:
             size, dpi = im.size, (im.info.get("dpi") or (None,))[0]
     except Exception:  # noqa: BLE001
         return None
-    paper = paper_of(size, dpi)
-    if paper is None:
-        return None
+    paper, dpi_from = paper_of(size, dpi), "tag"
+    if paper is None:  # Stoa's exports: no DPI tag (or 96), but an exact sheet at an export dpi that the sheet names
+        hit = _paper_from_pixels(size, tl)
+        if hit is None:
+            return None
+        (dpi, paper), dpi_from = hit, "pixels"
     notes = [s for s in T.scales(tl) if 20 <= s["ratio"] <= 1000]
     if not notes:
         return None
@@ -204,7 +215,26 @@ def printed_bar(img_path: str, tl) -> PrintedBar | None:
     ppm = float(dpi) / 0.0254 / ratio
     box = list(s.get("box") or [0, 0, 0, 0])
     return PrintedBar(unit="m", px_per_unit=ppm, labels=[(0.0, 0.0, box), (1.0, ppm, box)], box=box, residual=0.0,
-                      source="printed", unit_text=s["text"], notes=extra, paper=paper, dpi=float(dpi), ratio=ratio)
+                      source="printed", unit_text=s["text"], notes=extra, paper=paper, dpi=float(dpi), ratio=ratio,
+                      dpi_from=dpi_from)
+
+
+def _paper_from_pixels(size: tuple[int, int], tl) -> tuple[float, str] | None:
+    """P1's stoa.formats.paper.paper_from_pixels (pixel size at a usual export dpi, confirmed by the sheet size the
+    sheet's text names: 'A2', 'ISO A1', 'ANSI D'); None while that module is absent or on any error.
+    Kill switch: STOA_O1_PIXEL_DPI=0."""
+    if os.environ.get("STOA_O1_PIXEL_DPI", "1") == "0":
+        return None
+    try:
+        from stoa.formats.paper import paper_from_pixels
+    except ImportError:
+        return None
+    try:
+        # '1:200 at A3' / 'M 1:100 auf A1' name the sheet like '1:200 @ A3' (D1 EFA line-only PNG)
+        texts = [_AT_WORD.sub(r"@ \1", i.text) for i in tl.items]
+        return paper_from_pixels(tuple(size), texts)
+    except Exception:  # noqa: BLE001
+        return None
 
 
 def scale_source(bar) -> str:
@@ -213,6 +243,9 @@ def scale_source(bar) -> str:
     if src == "user":
         return "the scale set by the user"
     if src == "printed":
+        if getattr(bar, "dpi_from", "tag") == "pixels":
+            return (f"the printed scale {bar.unit_text} at {bar.dpi:.0f} dpi (the image's pixel size on the "
+                    f"{bar.paper} sheet it names)")
         return f"the printed scale {bar.unit_text} at the image's {bar.dpi:.0f} dpi ({bar.paper} sheet)"
     if src == "chains":
         return f"the printed dimension chains' spacing ({len(getattr(bar, 'pairs', []))} chain(s) agreeing)"

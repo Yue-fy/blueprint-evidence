@@ -20,7 +20,9 @@ from pathlib import Path
 
 _AREA = re.compile(r"\d+(?:[.,]\d+)?\s*(?:m²|m2|sq\.?\s*ft|ft²|sf)\b", re.I)
 _ROOMNO = re.compile(r"\b\d{1,2}\.\d{2}\b|\b[A-Z]?\d{3}[A-Z]?\b")
-_SHEET = re.compile(r"\b[A-Z]{1,3}[-.]?\d{2,4}(?:\.\d+)?\b")
+# sheet numbers: 'A-101', 'M-101A', 'S-100F', 'A-2', 'A1.2', 'A101' (P1 17:35: the old pattern needed 2-4 digits and a
+# word end, so 'M-101A' / 'S-100F' / 'A-2' never counted as a named sheet)
+_SHEET = re.compile(r"\b[A-Z]{1,3}(?:[-.]\d{1,4}|\d{2,4}|\d(?=\.\d))(?:\.\d+)?[A-Z]?\b")
 _WORD = re.compile(r"[^\W\d_]{4,}", re.U)
 _COMMON = {"what", "which", "where", "many", "much", "total", "area", "areas", "floor", "plan", "plans", "drawing",
            "drawn", "shown", "sheet", "this", "that", "there", "with", "from", "have", "rooms", "room", "doors", "door",
@@ -67,16 +69,32 @@ def _stream_bytes(page) -> int:
         return 0
 
 
+_SCORES: dict[tuple, list[dict]] = {}
+
+
 def page_scores(path: str | Path) -> list[dict]:
+    """Per page: vector bytes, area labels, room numbers, chars, text. Remembered per file (path, mtime, size) for the
+    process: a 156-page set takes 3-7 s to read and every question on it asks again (P1 17:40)."""
     import fitz  # pymupdf
 
+    try:
+        st = Path(path).stat()
+        key = (str(Path(path).resolve()), st.st_mtime_ns, st.st_size)
+    except OSError:
+        key = None
+    if key is not None and key in _SCORES:
+        return [dict(pg) for pg in _SCORES[key]]
     out = []
     with fitz.open(path) as d:
         for i, p in enumerate(d):
             text = p.get_text("text") or ""
             out.append({"page": i, "vector_bytes": _stream_bytes(p), "areas": len(_AREA.findall(text)),
                         "room_numbers": len(_ROOMNO.findall(text)), "chars": len(text), "text": text})
-    return out
+    if key is not None:
+        if len(_SCORES) > 64:
+            _SCORES.clear()
+        _SCORES[key] = out
+    return [dict(pg) for pg in out]
 
 
 _HEIGHT_Q = re.compile(r"\b(?:how\s+(?:tall|high)|height|ridge|eaves|hoch|höhe|korkeus|hauteur|altezza)\b", re.I)
@@ -124,6 +142,87 @@ def floor_plan_pages(path: str | Path) -> list[tuple[int, str]]:
     return plan
 
 
+def _printed_big(path: str | Path, page: int, name: str, ratio: float = 2.0) -> bool:
+    """The sheet number `name` printed at least `ratio` x the page's median text size: the sheet's OWN number in its
+    title block (USACE AW 078-24-28: 'M-101A' 28.5 pt on its sheet vs 11.5 pt in the set's sheet index; S-100F 27.9 pt;
+    AFCEC 'A-2' 14.6 pt vs 8.4 pt on the cover), not a reference ('SEE SHEET M-504') or an index row."""
+    import statistics
+
+    import pymupdf
+
+    try:
+        with pymupdf.open(path) as d:
+            spans = [sp for b in d[page].get_text("dict").get("blocks", []) for ln in b.get("lines", [])
+                     for sp in ln.get("spans", []) if sp.get("text", "").strip()]
+    except Exception:  # noqa: BLE001
+        return False
+    if not spans:
+        return False
+    med = statistics.median(sp["size"] for sp in spans)
+    return any(sp["size"] >= ratio * med and len(sp["text"].strip()) <= len(name) + 12 and _token(name, sp["text"])
+               for sp in spans)
+
+
+def sheet_id(path: str | Path, page: int, ratio: float = 2.0) -> str | None:
+    """The page's own sheet number ('M-101A'): the largest span that is a sheet number printed >= `ratio` x the page's
+    median text size (title block); None when the page prints none."""
+    import statistics
+
+    import pymupdf
+
+    try:
+        with pymupdf.open(path) as d:
+            spans = [sp for b in d[page].get_text("dict").get("blocks", []) for ln in b.get("lines", [])
+                     for sp in ln.get("spans", []) if sp.get("text", "").strip()]
+    except Exception:  # noqa: BLE001
+        return None
+    if not spans:
+        return None
+    med = statistics.median(sp["size"] for sp in spans)
+    ids = [sp for sp in spans if sp["size"] >= ratio * med and _SHEET.fullmatch(sp["text"].strip())]
+    return max(ids, key=lambda sp: sp["size"])["text"].strip() if ids else None
+
+
+def related(path: str | Path, question: str, exclude: int = -1, n: int = 3) -> list[tuple[int, str | None]]:
+    """Up to n other pages whose text carries the question's RARE words (each word weighted by log(pages / pages that
+    have it): 'suction' on 5 of 156 pages counts, 'check' on 155 does not), with their own sheet numbers. For the note on
+    a big set when the question names no sheet (P1 17:58: Stoa's questions on their 156-page source set are ambiguous;
+    the right sheet is in this list of 3 for 9 of 17, so the visitor can re-ask naming it)."""
+    import math
+
+    pages = page_scores(path)
+    N = len(pages)
+    if N < 2:
+        return []
+    low = [pg["text"].lower() for pg in pages]
+    words = {w.lower() for w in _WORD.findall(question or "")} - _COMMON
+    rel = [0.0] * N
+    for w in words:
+        stems = [w] + ([w[:-2]] if w.endswith("es") and len(w) > 5 else []) + \
+                ([w[:-1]] if w.endswith("s") and len(w) > 4 else [])
+        has = [any(x in t for x in stems) for t in low]
+        df = sum(has)
+        if df:
+            idf = math.log(N / df)
+            for i in range(N):
+                if has[i]:
+                    rel[i] += idf
+    import statistics
+
+    vmed = statistics.median(pg["vector_bytes"] for pg in pages)
+    out = []
+    for i in sorted(range(N), key=lambda i: -rel[i]):
+        if len(out) >= n or rel[i] <= 0:
+            break
+        if i == exclude or pages[i]["vector_bytes"] < vmed:  # notes / index pages carry every word but little drawing
+            continue
+        sid = sheet_id(path, i)
+        if sid and re.match(r"G\d|G-", sid):  # US CAD standard 'G' sheets: general (cover, index, notes)
+            continue
+        out.append((i, sid))
+    return out
+
+
 def pick_page(path: str | Path, question: str = "") -> tuple[int, str]:
     """(0-based page, reason). One-page files -> (0, 'single page')."""
     pages = page_scores(path)
@@ -134,6 +233,8 @@ def pick_page(path: str | Path, question: str = "") -> tuple[int, str]:
     named = set(_SHEET.findall(q)) | set(re.findall(r"[\"'“„«‘]([^\"'”“»’]{1,60})[\"'”“»’]", q))
     inner = {m for n in named for m in re.findall(r"\(([^()]{1,20})\)", n)}  # 'Bathroom (1.5)' prints '1.5' alone
     words = {w.lower() for w in _WORD.findall(q)} - _COMMON
+    big = {n: {pg["page"] for pg in pages if _token(n, pg["text"]) and _printed_big(path, pg["page"], n)}
+           for n in named if _SHEET.fullmatch(n)}  # 'on sheet M-101A' -> the page whose title block prints it
     want = _HEIGHT_Q.search(q) and "elev" or "plan"  # the kind of sheet the question is about
     kinds = [_sheet_kind(pg["text"]) for pg in pages]
     has_kind = want in kinds
@@ -151,6 +252,8 @@ def pick_page(path: str | Path, question: str = "") -> tuple[int, str]:
         titles = [ln for ln in pg["text"].splitlines() if _TITLE.search(ln)]
         score = 0
         for n in named:
+            if pg["page"] in big.get(n, ()):  # its own sheet number, printed big in the title block
+                score += 8
             if any(_token(n, ln) for ln in titles):  # the sheet's title names it ('Floor plan: 0', '… 2. Level')
                 score += 6
             elif len(n) >= 4 and n.lower() in low:

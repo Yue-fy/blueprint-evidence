@@ -148,6 +148,32 @@ def _segments(drawings):
     return segs
 
 
+def _rounded_corner(r, ends, index, cell) -> bool:
+    """Both ends of the arc continue into a straight piece along the arc's tangent there (a box's rounded corner)."""
+    c = _centre(*ends)
+    if c is None:
+        return False
+    tol = max(0.08 * r, 0.6)
+
+    def goes_on(e) -> bool:
+        rx, ry = e[0] - c[0], e[1] - c[1]  # radial; the tangent is perpendicular to it
+        n = math.hypot(rx, ry) or 1.0
+        gx, gy = int(e[0] // cell), int(e[1] // cell)
+        for dx in (-1, 0, 1):
+            for dy in (-1, 0, 1):
+                for p, o in index.get((gx + dx, gy + dy), ()):
+                    if math.hypot(p[0] - e[0], p[1] - e[1]) > tol:
+                        continue
+                    vx, vy = o[0] - p[0], o[1] - p[1]
+                    m = math.hypot(vx, vy)
+                    # along the tangent (not radial), leaving the arc (pointing away from the centre's side of e)
+                    if m >= 0.3 * r and abs(vx * rx + vy * ry) / (m * n) <= 0.2:
+                        return True
+        return False
+
+    return goes_on(ends[0]) and goes_on(ends[-1])
+
+
 def _has_leaf(r, ends, index, cell):
     """A door swing's leaf: a straight piece from the hinge (the arc's centre) to one end of the arc (+-15 % of r)."""
     c = _centre(*ends)
@@ -192,6 +218,9 @@ def estimate(path: str, page: int = 0) -> dict:
     for sg in _segments(drawings):
         for p, o in (sg, sg[::-1]):
             index.setdefault((int(p[0] // cell), int(p[1] // cell)), []).append((p, o))
+    # a rounded corner (title-block and legend boxes: USACE S-100F / A-101F, 20 corners of 9.0 pt said 1:250 on a 1:50
+    # sheet) runs on into straight lines along its tangent at BOTH ends; a door swing does not (its leaf is radial)
+    q = [x for x in q if not _rounded_corner(x[0], x[2], index, cell)]
     leafed = [(r, b) for r, b, ends in q if _has_leaf(r, ends, index, cell)]
     if len(leafed) >= 3 or len(leafed) >= 0.2 * len(q):
         q = leafed

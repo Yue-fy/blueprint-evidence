@@ -212,3 +212,79 @@ def test_room_sized_by_margin_dimension_chains():
     b = Q._chain_room_answer("x.png", "Wie breit ist der Flur?", tl, "raster")
     assert b is not None and b.value == 3.0
     assert Q._chain_value("1934") is None and Q._chain_value("350") == 3.5 and Q._chain_value("3695") == 3.695
+
+
+def test_printed_scale_on_an_untagged_export(tmp_path, monkeypatch):
+    # Stoa's PNGs carry no DPI tag: the pixel size at an export dpi + the sheet size the sheet names give the dpi
+    import pytest
+    pytest.importorskip("stoa.formats.paper")
+    from PIL import Image as _Im
+    from stoa.solvers.raster import scalebar as _SB
+    from stoa.solvers.raster import textlayer as _T
+    p = tmp_path / "sheet.png"
+    _Im.new("L", (1169, 827), 255).save(p)  # A4 landscape at 100 dpi, no dpi tag
+    tl = _T.TextLayer(path=str(p), size=(1169, 827), items=[_T.TextItem("SCALE 1:100", [900.0, 780, 980, 790]),
+                                                             _T.TextItem("A4", [1000.0, 780, 1020, 790])])
+    b = _SB.printed_bar(str(p), tl)
+    assert b is not None and b.dpi_from == "pixels" and abs(b.px_per_unit - 100 / 0.0254 / 100) < 0.2
+    monkeypatch.setenv("STOA_O1_PIXEL_DPI", "0")
+    assert _SB.printed_bar(str(p), tl) is None
+
+
+def _door_room_png(tmp_path):
+    """A 3.88 x 2.88 m room (100 px/m, 12 px walls) with a 0.9 m door gap in its bottom wall, inside a closed hall."""
+    import numpy as _np
+    from PIL import Image as _Im
+    a = _np.full((800, 1000), 255, _np.uint8)
+    a[:20, :] = a[-20:, :] = 0
+    a[:, :20] = a[:, -20:] = 0  # the building's outer wall
+    a[100:112, 100:512] = 0
+    a[400:412, 100:250] = 0
+    a[400:412, 340:512] = 0  # bottom wall with the door gap x 250-340
+    a[100:412, 100:112] = 0
+    a[100:412, 500:512] = 0
+    p = tmp_path / "room.png"
+    _Im.fromarray(a).save(p)
+    return str(p)
+
+
+def test_bridge_closes_a_door_gap_on_large_format_sheets(tmp_path, monkeypatch):
+    from stoa.solvers.raster import measure as _M
+    p = _door_room_png(tmp_path)
+    r = _M.room_area(p, [280.0, 250, 320, 262], 100.0, **_M.FILL, solid=False)
+    assert r is not None and abs(r["m2"] - 3.88 * 2.88) / (3.88 * 2.88) < 0.05  # bridged: the room only
+    pr = _M.room_perimeter(p, r, 100.0)
+    assert pr is not None and pr["n_openings"] == 1 and abs(pr["openings_m"] - 0.9) < 0.1
+    assert abs(pr["perimeter_m"] - 2 * (3.88 + 2.88)) < 0.3
+    lo = _M.room_area(p, [280.0, 250, 320, 262], 100.0, **{**_M.FILL, "bridge_m": 0.0}, solid=False)
+    assert lo is None or lo["m2"] > 20  # unbridged: the fill runs through the doorway into the hall
+
+
+def test_skirting_reader(tmp_path):
+    from stoa.solvers.raster import scalebar as _SB
+    from stoa.solvers.raster import textlayer as _T
+    from stoa.solvers.raster import textqa as _Q
+    p = _door_room_png(tmp_path)
+    tl = _T.TextLayer(path=p, size=(1000, 800), items=[_T.TextItem("Laundry", [270.0, 250, 330, 262]),
+                                                       _T.TextItem("Corridor", [600.0, 600, 680, 612])])
+    bar = _SB.UserBar(unit="m", px_per_unit=100.0, labels=[], box=[0, 0, 0, 0], residual=0.0, source="user")
+    a = _Q._skirting_answer(p, "How many linear metres of skirting board does the laundry need?", tl, [bar], "raster")
+    assert a is not None and a.unit == "m" and abs(a.value - (2 * (3.88 + 2.88) - 0.9)) < 0.4
+    assert any("Convention: baseboard" in t for t in a.trace)
+
+
+def test_doorarcs_threads_identical(tmp_path, monkeypatch):
+    """O1 c6 (P1 18:01): the threaded ring filters return exactly the sequential detections."""
+    import cv2
+    from stoa.solvers.raster import doorarcs as D
+
+    img = np.full((600, 900), 255, np.uint8)
+    for i, (x, y) in enumerate([(100, 150), (400, 300), (700, 450)]):  # three door swings: leaf + quarter arc, r 50 px
+        cv2.line(img, (x, y), (x + 50, y), 0, 2)
+        cv2.ellipse(img, (x, y), (50, 50), 0, 0, 90 + 90 * (i % 2), 0, 2)
+    p = tmp_path / "doors.png"
+    Image.fromarray(img).save(p)
+    monkeypatch.setattr(D, "ARC_THREADS", 1)
+    seq = D.detect(str(p), 60.0)
+    monkeypatch.setattr(D, "ARC_THREADS", 4)
+    assert D.detect(str(p), 60.0) == seq

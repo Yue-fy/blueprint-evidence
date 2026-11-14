@@ -33,7 +33,7 @@ VISION_MODEL = os.environ.get("STOA_GEMINI_VISION", "gemini-3.1-pro-preview")
 VISION_CAP = float(os.environ.get("STOA_VISION_CAP", 0.45))
 AGREE_CONF, SAMPLES_CONF, DISAGREE_CONF = 0.8, 0.65, 0.3
 WEAK = 0.3
-STRUCTURED = ("ifc", "dxf", "svg_ifc", "schedule", "plan_rooms", "label_count", "area_tags", "pdf_vector", "line_rooms",
+STRUCTURED = ("ifc", "dxf", "svg_ifc", "schedule", "plan_rooms", "label_count", "stated_count", "area_tags", "pdf_vector", "line_rooms",
               "lengths")
 SECOND = os.environ.get("STOA_VISION_SECOND", "1") != "0"
 # areas (captain 15:43): our outline x our scale gives the value; Gemini says WHERE the room is and its own estimate is
@@ -234,7 +234,8 @@ def read(path: str, question: str, base: Answer | None = None, temperature: floa
     unit = _UNIT.get(unit_raw, unit_raw or None)
     v = _num(raw)
     value: object = raw
-    if v is not None and len(re.sub(r"[\d.,\s\-]", "", raw)) <= 3:
+    if v is not None and len(re.sub(r"[\d.,\s\-]", "", raw)) <= 3 and not re.search(r"\d\s*:\s*\d", raw):
+        # W6 17:51: a scale ratio (1:200) is not the number 1
         value = v / 100 if unit_raw == "cm" else (v / 1000 if unit_raw == "mm" else v)
         if unit == "count":
             value = int(round(v))

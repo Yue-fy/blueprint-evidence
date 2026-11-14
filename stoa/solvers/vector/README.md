@@ -4,7 +4,7 @@
 Answers swiss_dwellings questions (asked on .pdf, .png or .dxf) from the sibling DXF, no model, ~0.2 s/question.
 
 ```bash
-AGENT_ID=W2 $JUNCTION_VENV/bin/python -m stoa.eval --solver dxf --split dev --source swiss_dwellings
+.venv/bin/python -m stoa.eval --solver dxf --split dev --source swiss_dwellings
 ```
 
 | split (v2, f43c5369) | count | area | notes |
@@ -119,7 +119,7 @@ Use: PDF-only drawings, and as an independent second source to cross-check the D
 ## `schedule` (opening_design and other vector PDF sheets with tables)
 
 ```bash
-AGENT_ID=W2 $JUNCTION_VENV/bin/python -m stoa.eval --solver schedule --split dev --source opening_design
+.venv/bin/python -m stoa.eval --solver schedule --split dev --source opening_design
 # --solver-arg backend=nvidia  -> hosted Nemotron 120B instead of local Qwen3-VL-8B
 ```
 `pdftables.py` rebuilds tables from the text layer (PyMuPDF `find_tables` finds nothing on these rotated sheets

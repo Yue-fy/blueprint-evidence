@@ -63,6 +63,11 @@ TEXT_OFF = {"cubicasa5k", "swiss_dwellings", "ifc_models", "ifc_bench", "opening
 _LABELLED = re.compile(r"(?:labell?ed|called|named|marked|Bezeichnung|bezeichnet|beschriftet|désignation|intitulée?s?|"
                        r"denominazione|denominat[aeio]|etichettat[aeio]|nimellä|merkitty|märkt|benämn\w*)\s*"
                        r"[«'\"‘“„]\s*(.+)\s*[»'\"’”“]", re.I)
+# 'How many square metres is the Food bay?' is an AREA question, not a count (O1 c6: D1's line-only school PNG, style-
+# guessed as CubiCasa, went to the symbol counter: 'unknown object class')
+_UNIT_QTY = re.compile(r"\b(how many|wie viele|combien de|kuinka monta|montako)\s+(?:square|sq\.?|cubic|linear|lineal|running|"
+                       r"quadrat|neliö|mètres? carrés?)?\s*(?:met(?:er|re)s?|feet|foot|ft|m²|m2|m³|m3|mm|cm|inch(?:es)?|"
+                       r"yards?|metri[äa]?|neliömetri[äa]?|quadratmeter|m)\b", re.I)
 _COUNT_CUE = re.compile(r"how many|number of|wie viele|anzahl|combien|nombre de|quant[ie]|kuinka monta|montako|"
                         r"hur många|antal", re.I)
 
@@ -175,7 +180,7 @@ class RasterSolver(BaseSolver):
             # an unseen NON-count question on a CubiCasa plan ('area of the living room': many print 'OH 22.8'):
             # read it from the text layer. Count questions keep the counting LoRA / vlm_direct (0 dev/hard/hard2 Qs
             # reach this branch: all their CubiCasa questions are recognised counts)
-            return not _COUNT_Q.search(question)
+            return not _COUNT_Q.search(question) or bool(_UNIT_QTY.search(question))
         # a Swiss-style plan with NO vector twin (an unseen PNG/JPEG floor): dxf can't answer, so raster reads and
         # measures it (scale bar + room fill: Swiss PNG dev rooms median error 5-6.5%, vs VLM guesses ~50%)
         return src == "swiss_dwellings" and (not self.twins or not ({".pdf", ".dxf", ".ifc"} & set(_siblings(path))))

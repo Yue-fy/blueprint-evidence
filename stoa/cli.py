@@ -197,6 +197,9 @@ def main(argv=None) -> int:
     from stoa.data import abspath
     from stoa.solvers import get_solver
 
+    if not Path(a.path).is_absolute() and Path(a.path).is_file() and not abspath(a.path).is_file():
+        # RL 16:16: 'ask samples/x.pdf "…"' from a fresh clone: a path that exists relative to the CWD wins over $STOA_DATA
+        a.path = str(Path(a.path).resolve())
     if not abspath(a.path).is_file():
         print(f"no such file: {a.path}", file=sys.stderr)
         return 2

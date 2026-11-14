@@ -149,3 +149,27 @@ raster vs LoRA on all dev floors: `upload_set.py --what door|window` + `upload_c
   in the question text before a relational word ('the small room next to the living room' names a landmark).
 - `textqa._rooms_sum_answer`: 'combined area of the X and the Y' = each room's printed area / outline / chains, summed.
 - `textqa.two_lengths`: an area question read as 'A x B' becomes A × B (a rectangle, stated), not a string.
+
+## Whole large-format CAD sheets as PNG (O1, cycle 6)
+
+- **OCR tile seams** (`stoa/ocr/engine.py`): images > 4000 px are read in 4000-px tiles (200 px overlap). A line that
+  straddles a tile edge was read twice and `_dedupe` kept the higher score, often the CLIPPED read: D1's 4961-px A3 PNG
+  lost 'Scale:1:200@A3' to 'Scale:' (no scale -> no measurement on the whole sheet). Each read now carries its room to
+  its own tile's inner edges (text heights, capped at 2); among overlapping reads the one with more room wins. Engine
+  tag '+t2'; `stoa.ocr` re-reads tiled images once (cache key '|t2') and skips an OCR server without the tag for them.
+- **Large sheet** (`textqa._LARGE`, `_note_sheet`): a printed 1:N on a standard paper (`scalebar.printed_bar`) AND a
+  digital render (`_clean`: clean_render OR >= 97.5% pure white; 160 historical scans all below) -> door gaps bridged at
+  any resolution (`measure.room_area(large=True)`), big rooms allowed (400 m²), thin-wall fills count as bounded, room
+  areas / perimeters at `LARGE_CONF` 0.5. Bench (`experiments/o1/c5/lineonly_bench.py --dpi 300 [--solid] [--bridge 2]`,
+  D1's 15 line-only school sheets, 372 rooms) within 2%: hollow walls 119 -> 199, solid walls 145 -> 221 (median |err|
+  1.3%). Swiss PNG bench unchanged (90 / 139 / 168). Kill switch `STOA_O1_LARGE_SHEET=0`.
+- `_skirting_answer` also answers a plain 'perimeter of room X' (the traced outline, openings included).
+- Loose room names by word keys (`measure._lkey`: 'Food bay/practical resources', 'Head/Mtg'); nested hits keep the
+  longest. The flood seed skips a blank holding another label when the ring has one without (a label printed across a
+  wall; `STOA_O1_SEED_SKIP=0`). Short labels ('Yr 6', 'W. St') count as other rooms in loose mode.
+- Guards: a size answered with no number ('A:') -> 0.05; a bare mm dimension ('10,000') cited for an area -> 0.05;
+  'how many square metres …' is never a symbol count.
+- `doorarcs.detect` runs its ring filters in threads (identical output; `STOA_O1_ARC_THREADS`, default 6).
+- Known gaps: courts / furniture drawn thicker than hollow walls bound the fill (Sports Hall 20 of 504 m²); open bays
+  delimited by dashed lines (Food bay 15.75 vs 17); the style guesser calls line-only CAD PNGs 'cubicasa5k' (routing,
+  G1's pipeline) so the agent answers first.

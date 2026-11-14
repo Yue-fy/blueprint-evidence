@@ -38,7 +38,7 @@
           <label for="scaleM">Real length of the line you tapped</label>
           <div class="m-row">
             <input id="scaleM" type="text" inputmode="decimal" autocomplete="off" placeholder="e.g. 3.40" />
-            <span class="m-unit-in">m</span>
+            <button type="button" class="m-unit-in m-unit-btn" id="scaleUnit" title="Tap to switch between metres and feet">m</button>
             <button type="submit" class="m-btn primary small">Set</button>
           </div>
           <div class="m-row m-quick"><span>or</span><button type="button" class="m-chip" data-m="0.9">a door, 0.9 m</button><button type="button" class="m-chip" data-m="1">1 m</button><button type="button" class="m-chip" data-m="5">5 m</button></div>
@@ -47,6 +47,7 @@
       <div class="m-stagebar">
         <button type="button" class="m-btn small ghost" id="retake">New photo</button>
         <span id="stageNote" class="m-note"></span>
+        <span id="pager" class="m-pager" hidden><button type="button" class="m-btn small ghost" id="pgPrev" aria-label="Previous page">‹</button><button type="button" class="m-pgn" id="pgN" aria-label="Go to page"></button><button type="button" class="m-btn small ghost" id="pgNext" aria-label="Next page">›</button></span>
         <button type="button" class="m-btn small ghost" id="fit">Whole sheet</button>
       </div>
     </section>

@@ -9,8 +9,9 @@ What this project uses, who made it, and under which licence. Short version:
 - **Copyleft dependencies are installed or called, not bundled:** PyMuPDF (AGPL-3.0), IfcOpenShell (LGPL-3.0), and
   LibreDWG (GPL-3.0, run as a separate program).
 - **Bundled here:** three small sample drawings (CC BY 4.0, KIT "unrestricted use" and Open Government Licence v3.0),
-  one screenshot that shows the Open Government Licence drawing, and recorded answers for the web app's offline mode,
-  only about drawings whose licence allows commercial use (see the table at the end).
+  one screenshot that shows the Open Government Licence drawing, and recorded answers for the web app's offline mode.
+  A few of those answers are about CubiCasa5K plans, which are **non-commercial only**; they are labelled as such (see the
+  table at the end).
 
 This page summarises; it is not legal advice. The licence text and credit line of each dataset file are in
 `data/<source>/LICENSE.md` inside the dataset.
@@ -116,7 +117,7 @@ From `web/package.json`, installed by npm, not vendored.
 | `samples/fzk_house/fzk_house.ifc` (FZK-Haus) | KIT: "for unrestricted use" | Institute for Automation and Applied Informatics (IAI) / Karlsruhe Institute of Technology (KIT), KIT IFC Examples, https://www.ifcwiki.org/index.php?title=KIT_IFC_Examples. Unchanged, via IFC-Bench v2 and the Stoa Junction 2026 dataset |
 | `samples/dfe_school/plan.pdf` (Special School Plan Level 00, SEN-DFE-XX-00-D-X-0201 rev C01) | Open Government Licence v3.0 | UK Department for Education, GOV.UK "A new model design for a special school", unchanged. Contains public sector information licensed under the Open Government Licence v3.0 |
 | `docs/img/hero.png` (screenshot of our web app) | Our UI: MIT. The drawing shown: Open Government Licence v3.0 | Special School Plan Level 00 (SEN-DFE-XX-00-D-X-0201), UK Department for Education, GOV.UK "A new model design for a special school". Contains public sector information licensed under the Open Government Licence v3.0 |
-| `web/fixtures/` (offline replay for the app) | Our answers: MIT. Dataset questions and data derived from a drawing keep that drawing's licence | Recorded questions and answers about the dataset drawings listed below, plus a little geometry derived from them (the 3D view of the Swiss floor). No drawing files. Entries about NonCommercial drawings (CubiCasa5K, CC BY-NC-SA 4.0) were removed from this repository, and the licence of every remaining file was checked against the dataset's `LICENSE.md` tables |
+| `web/fixtures/` (offline replay for the app) | Our answers: MIT. Dataset questions and data derived from a drawing keep that drawing's licence | Recorded questions and answers about the dataset drawings listed below, plus a little geometry derived from them (the 3D view of the Swiss floor, room regions of one CubiCasa5K plan). No drawing files. **Entries about CubiCasa5K plans are CC BY-NC-SA 4.0, non-commercial use only**: each carries a `"licence"` field saying so, and `web/fixtures/LICENCES.md` lists every drawing with its licence and credit, generated from the dataset's `LICENSE.md` tables |
 
 **Drawings the offline replay (`web/fixtures/`) asks about.** The files themselves are not bundled; the app opens
 them from your copy of the dataset (`STOA_DATA`).
@@ -129,6 +130,7 @@ them from your copy of the dataset (`STOA_DATA`).
 | `ifc_bench/4351_arc.ifc` | Unidentified building, architectural model (IFC-Bench v2 project 4351) | GPL-3.0-or-later | © 2009–2017 BIMserver.org (opensourceBIM TestFiles), via IFC-Bench v2 (Hellin et al., TU Munich) |
 | `opening_design/Sports_Complex/Sheets - Current Set/A-801 - Door and Finish Schedules & Wall Types.pdf` | Xcel Sports Complex, door and finish schedules | CC BY-SA 4.0 | OpeningDesign, Sports_Complex (github.com/OpeningDesign/Sports_Complex), and the entire project team |
 | `habs/vi0026_sheet_00003.jpg` | Creque Marine Railway, Head House and Residence, North Elevation, Charlotte Amalie, St. Thomas, VI | Public domain | HAER, National Park Service; Library of Congress Prints and Photographs Division (loc.gov/pictures/item/vi0026.sheet.00003a) |
+| `cubicasa5k/colorful-4539.png`, `high_quality_architectural-816.png`, `high_quality_architectural-14797.png` | Finnish apartment floor plans (images) | **CC BY-NC-SA 4.0: non-commercial use only** (the CubiCasa5K repository states CC BY-NC 4.0; the dataset applies the stricter Zenodo licence). Kept for the non-commercial Junction challenge, cleared with Stoa | CubiCasa5K, © 2019 CubiCasa. Kalervo, Ylioinas, Häikiö, Karhu, Kannala, "CubiCasa5K: A Dataset and an Improved Multi-Task Model for Floorplan Image Analysis", SCIA 2019 |
 | `finna/mfa.81125dbb-8b52-48e3-bc9d-1128e233ac93.jpg` | Olympiastadion, site plan, Helsinki, 3.7.1950 | CC BY 4.0 | Lindegren & Jäntti (architects); Arkkitehtuuri- ja designmuseo (Architecture & Design Museum, Helsinki), via Finna (finna.fi/Record/mfa.81125dbb-8b52-48e3-bc9d-1128e233ac93) |
 
 `samples/README.md` has the full credit lines and a few questions with expected answers (`samples/questions.jsonl`).

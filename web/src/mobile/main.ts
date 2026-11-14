@@ -7,10 +7,10 @@
 import "@fontsource-variable/inter";
 import "../style.css";
 import "./mobile.css";
-import { fileUrl, listFiles, roomShapes, upload } from "../api";
+import { doorScale, fileUrl, listFiles, roomShapes, upload } from "../api";
 import { fmtValue, unitLabel } from "../card";
-import { approxEvidence, calm, confidenceWords, costTier, needsMeasuring, targetNoun } from "../customer";
-import { fmtM, scaleFromAnswer, scaleGuessed, scaleLabel, type Scale } from "../measure";
+import { approxEvidence, calm, confidenceWords, costTier, isGuess, needsMeasuring, targetNoun } from "../customer";
+import { doorScaleOf, fmtM, scaleFromAnswer, scaleGuessed, scaleLabel, type Scale } from "../measure";
 import type { Answer, Evidence, FileInfo } from "../types";
 import { prepImage } from "./prep";
 import { PhotoView, polyArea, polyLength, type Mark } from "./view";
@@ -29,8 +29,12 @@ const state = {
   file: null as FileInfo | null,
   pdf: false,
   page: 0,
+  /** pages in the PDF (1 for photos) */
+  pages: 1,
   /** image px per evidence unit (1 for images; the render scale for a PDF page) */
   k: 1,
+  /** a rotated PDF page (its /Rotate applied when drawn): evidence pt ↔ image px through pdf.js; null = px = pt × k */
+  map: null as null | { toPx: (p: Pt) => Pt; toPt: (p: Pt) => Pt },
   answer: null as Answer | null,
   question: "",
   /** the scale in evidence units (px or pt) per metre: the answer's, or the visitor's two taps */
@@ -41,7 +45,7 @@ const state = {
   tool: null as null | "scale" | "room",
   taps: [] as Pt[],
   /** outlines the visitor asked for (tap the room), in evidence units */
-  rooms: [] as { poly: Pt[] }[],
+  rooms: [] as { poly: Pt[]; method?: string }[],
   busy: null as AbortController | null,
   t: { upload: 0, ask: 0 },
 };
@@ -49,7 +53,7 @@ const state = {
 
 const view = new PhotoView($("photo"));
 /** test hook (playwright): the screen point of an image point */
-(window as unknown as { __w6at: (x: number, y: number) => number[] }).__w6at = (x, y) => view.toClient(x * state.k, y * state.k);
+(window as unknown as { __w6at: (x: number, y: number) => number[] }).__w6at = (x, y) => view.toClient(...toPx([x, y]));
 const space = (): Space => (state.pdf ? "pdf_pt" : "image_px");
 const sheet = () => (state.pdf ? "drawing" : "photo");
 
@@ -63,13 +67,43 @@ function doorEstimate(path: string): Promise<DoorEst> {
   }
   return doorMemo.get(path)!;
 }
-/** A scale for measuring a tapped room when nothing better is known: the door swings on the photo (images only). */
+const PT_PER_M_AT_1 = (72 / 25.4) * 1000; // PDF points per real metre at 1:1
+/** The scale printed on a vector PDF page (GET /api/m/pdfscale, src/mobile/pdfscale.py, ~0.1 s), or null. */
+const printedMemo = new Map<string, Promise<Scale | null>>();
+function pdfPrinted(path: string, page: number): Promise<Scale | null> {
+  const k = `${path}|${page}`;
+  if (!printedMemo.has(k)) {
+    printedMemo.set(k, fetch(`/api/m/pdfscale?path=${encodeURIComponent(path)}&page=${page}`).then((r) => (r.ok ? r.json() : { ok: false }))
+      .then((d: { ok: boolean; n?: number; all?: number[]; text?: string }) => {
+        if (!d.ok || !d.n || !(d.n > 0)) return null;
+        const more = (d.all ?? []).length > 1 ? `; the sheet also prints ${d.all!.slice(1, 3).map((n) => `1:${n}`).join(", ")}` : "";
+        const as = d.text && d.text.replace(/\s+/g, "") !== `1:${d.n}` ? ` as ${d.text}` : "";
+        return { unitsPerM: PT_PER_M_AT_1 / d.n, label: `1:${d.n}`, source: `printed on the drawing${as}${more}` } as Scale;
+      })
+      .catch(() => null));
+  }
+  return printedMemo.get(k)!;
+}
+/** A scale for measuring a tapped room when nothing better is known: the door swings on the photo (GET /api/m/doorscale)
+ *  or, on a vector PDF, W5's door-swing reader (GET /api/doorscale, quarter arcs in the vector paths, rounded box corners
+ *  left out; ~0.1-0.5 s). No estimate → null (the visitor sets the scale with two taps). */
 async function estimatedScale(): Promise<Scale | null> {
-  if (!state.file || state.pdf) return null;
+  if (!state.file) return null;
+  if (state.pdf) {
+    // the scale printed on the sheet first (title block; rounded box corners fooled the door swings: USACE A-101F,
+    // printed 1:50, read '1:250 from 20 door swings'); a 404 where the phone plugin is not loaded → door swings
+    const printed = await pdfPrinted(state.file.path, state.page);
+    if (printed) return printed;
+    const p = await doorScale(state.file.path, state.page);
+    return p.ok && p.ratio ? doorScaleOf(p) : null;
+  }
   const d = await doorEstimate(state.file.path);
   if (!d.ok || !d.px_per_m) return null;
   return { unitsPerM: d.px_per_m, label: scaleLabel(d.px_per_m, "image_px"), source: `estimated from ${d.arcs} door swings, a door being about ${d.leaf_m ?? 0.85} m wide` };
 }
+
+/** The drawing's 1:N on a vector PDF at scale s (pdf_pt per m), for the wall-line tracer; 0 on photos / no scale. */
+const scaleN = (s: Scale | null | undefined): number => (state.pdf && s && s.unitsPerM > 0 ? Math.round((PT_PER_M_AT_1 / s.unitsPerM) * 100) / 100 : 0);
 
 // ---------- 1. pick / take a photo ----------
 for (const id of ["cam", "pickf"]) {
@@ -85,20 +119,60 @@ $("fit").addEventListener("click", () => view.fit());
 
 function reset() {
   state.busy?.abort();
-  Object.assign(state, { file: null, pdf: false, page: 0, k: 1, answer: null, question: "", scale: null, fileScale: null, tool: null, taps: [], rooms: [] });
+  Object.assign(state, { file: null, pdf: false, page: 0, pages: 1, k: 1, map: null, answer: null, question: "", scale: null, fileScale: null, tool: null, taps: [], rooms: [] });
   view.clearMarks();
   document.body.dataset.step = "pick";
   $("result").innerHTML = "";
   $("result").hidden = true;
   $("stageNote").textContent = "";
   setTool(null);
+  pager();
   window.scrollTo({ top: 0, behavior: "smooth" });
 }
+
+// ---------- pages of a drawing set (PDF): ‹ 3 / 121 › ----------
+function pager() {
+  const many = state.pdf && state.pages > 1;
+  $("pager").hidden = !many;
+  if (!many) return;
+  $("pgN").textContent = `${state.page + 1} / ${state.pages}`;
+  $<HTMLButtonElement>("pgPrev").disabled = state.page <= 0;
+  $<HTMLButtonElement>("pgNext").disabled = state.page >= state.pages - 1;
+}
+/** Another page: its own scale and rooms (an answer on the page before is put away; asking again goes on from here). */
+async function goPage(p: number) {
+  if (!state.file || !state.pdf || p < 0 || p >= state.pages || p === state.page) return;
+  state.busy?.abort();
+  Object.assign(state, { answer: null, scale: null, fileScale: null, taps: [], rooms: [] });
+  setTool(null);
+  view.clearMarks();
+  try {
+    await showDrawing(p);
+  } catch (e) {
+    return fail(`We could not show page ${p + 1}: ${(e as Error).message}`, () => void goPage(p));
+  }
+  ready();
+}
+$("pgPrev").addEventListener("click", () => void goPage(state.page - 1));
+$("pgNext").addEventListener("click", () => void goPage(state.page + 1));
+$("pgN").addEventListener("click", () => {
+  const v = window.prompt(`Go to page (1–${state.pages})`, String(state.page + 1));
+  const n = v ? parseInt(v, 10) : NaN;
+  if (Number.isFinite(n)) void goPage(Math.max(1, Math.min(state.pages, n)) - 1);
+});
 
 async function takeFile(f: File) {
   reset();
   document.body.dataset.step = "photo";
   const pdf = /\.pdf$/i.test(f.name) || f.type === "application/pdf";
+  // Android's file browser can hand over any file: CAD models and other formats belong on the full page
+  // (by name first: browsers call a .dxf 'image/vnd.dxf' and a .dwg 'image/vnd.dwg')
+  const photoExt = /\.(jpe?g|png|heic|heif|webp|gif|bmp|tiff?)$/i.test(f.name);
+  const otherExt = /\.[a-z0-9]{1,5}$/i.test(f.name) && !photoExt;
+  if (!pdf && (otherExt || (!photoExt && (!f.type.startsWith("image/") || /vnd\.(dxf|dwg)/i.test(f.type))))) {
+    const ext = (f.name.match(/\.([a-z0-9]{1,5})$/i)?.[1] ?? "").toUpperCase();
+    return fail(`This page reads photos and PDFs${ext ? `, not ${ext} files` : ""}. Open the full view (top right) for IFC models and DXF drawings, or print the plan to PDF.`, () => reset(), "Choose another file");
+  }
   // the photo at once (a local preview), so the screen is never blank while it uploads
   if (!pdf) {
     try {
@@ -161,11 +235,17 @@ async function showDrawing(page = 0) {
     const { renderPage } = await import("./pdfpage");
     const r = await renderPage(fileUrl(f.path), page);
     state.k = r.scale;
+    state.map = r.rotation % 360 ? { toPx: r.toPx, toPt: r.toPt } : null;
     state.page = page;
+    state.pages = r.pages;
     await view.show(r.url);
+    pager();
   } else {
     await view.show(fileUrl(f.path));
     state.k = 1;
+    state.map = null;
+    state.pages = 1;
+    pager();
   }
 }
 
@@ -258,7 +338,7 @@ function thisRoom() {
   state.busy?.abort();
   const q = "How big is this room?";
   state.question = q;
-  state.answer = { value: null, unit: "m2", confidence: 0.5, evidence: [], trace: ["tap-the-room: outlined on the photo by flood fill (W6 phone page)"], solver: "tap",
+  state.answer = { value: null, unit: "m2", confidence: 0.5, evidence: [], trace: ["tap-the-room: outlined on the photo (flood fill) or, on a vector PDF at a known scale, along its wall lines"], solver: "tap",
     intent: { task: "area", target: "room", scope: "room" }, cost: {} };
   state.rooms = [];
   if (!state.scale?.user) state.scale = state.fileScale;
@@ -368,7 +448,9 @@ const isArea = (a: Answer, q: string) => a.intent?.task === "area" || /\b(area|h
 const isLength = (a: Answer, q: string) => a.intent?.task === "length" || (!isArea(a, q) && /\b(how (wide|long|tall|high|deep|far)|width|length|distance|perimeter|breite|länge|leveys|pituus)\b/i.test(q));
 const onThis = (e: Evidence) => !!state.file && (e.file === state.file.path || e.file?.split("/").pop() === state.file.path.split("/").pop())
   && (e.page ?? 0) === state.page && (!e.bbox_space || e.bbox_space === space());
-const toPx = (p: number[]): Pt => [p[0] * state.k, p[1] * state.k];
+const toPx = (p: number[]): Pt => (state.map ? state.map.toPx([p[0], p[1]]) : [p[0] * state.k, p[1] * state.k]);
+/** a point on the shown image → evidence units (px on a photo, unrotated pdf_pt on a PDF) */
+const toEv = (x: number, y: number): Pt => (state.map ? state.map.toPt([x, y]) : [x / state.k, y / state.k]);
 
 async function showAnswer() {
   const a = state.answer!;
@@ -402,7 +484,11 @@ function drawEvidence(a: Answer) {
       const b = e.bbox as number[];
       marks.push({ kind: "box", pts: [toPx([b[0], b[1]]), toPx([b[2], b[3]])], label: n < 30 ? String(++n) : undefined, approx: ap });
     }
-    if (e.bbox && e.bbox.length === 4) boxes.push((e.bbox as number[]).map((v) => v * state.k));
+    if (e.bbox && e.bbox.length === 4) {
+      const b = e.bbox as number[];
+      const [p, q] = [toPx([b[0], b[1]]), toPx([b[2], b[3]])];
+      boxes.push([Math.min(p[0], q[0]), Math.min(p[1], q[1]), Math.max(p[0], q[0]), Math.max(p[1], q[1])]);
+    }
   });
   view.setMarks(marks);
   // zoom to the evidence when it is one place (a room); the whole sheet when the marks are spread out
@@ -415,8 +501,9 @@ function drawEvidence(a: Answer) {
 
 async function outlineBoxes(a: Answer) {
   const ev = a.evidence ?? [];
+  const n = scaleN(state.scale);
   const items = ev.map((e, i) => ({ e, i })).filter(({ e }) => onThis(e) && e.bbox && !e.polygon).slice(0, 4)
-    .map(({ e, i }) => ({ i, bbox: e.bbox as number[] }));
+    .map(({ e, i }) => ({ i, bbox: e.bbox as number[], ...(n > 0 ? { scale_n: n } : {}) }));
   if (!items.length || !state.file) return;
   try {
     const r = await roomShapes(state.file.path, state.page, space(), items);
@@ -432,8 +519,9 @@ function sentence(a: Answer, q: string): string {
   const t = a.intent?.target && !/^(unknown|drawing|floor|area|room)$/i.test(a.intent.target) ? a.intent.target.replace(/_/g, " ") : "";
   const ev = (a.evidence ?? []).filter(onThis);
   const on = state.pdf ? "the drawing" : "your photo";
+  const polys = ev.filter((e) => e.polygon && e.polygon.length > 2).length; // the scale bar's box is not an outline
   const how = ev.length
-    ? ev.some((e) => e.polygon) ? `measured from the outline${ev.length > 1 ? "s" : ""} drawn on ${on}` : ev.length > 1 ? `marked in ${ev.length} places on ${on}` : `marked on ${on}`
+    ? polys ? `measured from the outline${polys > 1 ? "s" : ""} drawn on ${on}` : ev.length > 1 ? `marked in ${ev.length} places on ${on}` : `marked on ${on}`
     : `nothing marked on ${on}`;
   if (a.intent?.task === "count" || a.unit === "count") {
     const n = typeof a.value === "number" ? a.value : NaN;
@@ -454,14 +542,23 @@ function renderResult() {
   const unit = unitLabel(a.unit) || (isArea(a, q) ? "m²" : isLength(a, q) ? "m" : "");
   let big = a.value === null || a.value === undefined ? "" : fmtValue(a);
   const words = typeof a.value === "string" && !/\d/.test(a.value);
-  let c = a.value === null ? { cls: "none", word: "No answer", hint: "" } : confidenceWords(a.confidence ?? 0);
-  if (c.cls.includes("guess")) c = { cls: "est", word: "Best estimate", hint: "not found on the drawing" };
+  // the desktop's words (Very sure / Fairly sure / Best estimate / Our guess / Rough guess, same 0.4 as the expert
+  // workbench): a 0.05 answer must not read like a measurement
+  const c = a.value === null ? { cls: "none", word: "No answer", hint: "" } : confidenceWords(a.confidence ?? 0);
   const scaleOk = !!state.scale && !scaleGuessed(state.scale);
   const tier = costTier(a);
   // the visitor's own measurement (tap the room) at the scale: replaces a missing / unmeasured number
   const mine = myMeasure();
   if ((measure || words || !big) && mine) big = mine.value;
-  const guessNum = (measure || words) && !mine;
+  // a low-confidence number is shown as one: '≈ 3,770' (3 significant digits), not '3,766.88' (DfE photo, @0.05)
+  const lowConf = !mine && !measure && !words && isGuess(a);
+  if (!mine && size && typeof a.value === "number" && Math.abs(a.value) >= 100) {
+    const v = lowConf ? Number(a.value.toPrecision(3)) : a.value;
+    big = Math.abs(v) >= 1000 ? v.toLocaleString("en", { maximumFractionDigits: 2 }) : fmtValue({ ...a, value: v }); // areas: 2,500 m²
+  }
+  const guessNum = ((measure || words) && !mine) || lowConf;
+  // 'Total floor area?' is about the whole drawing: tapping one room does not answer it
+  const whole = !!a.intent?.scope && !/^room$/i.test(a.intent.scope) && !/\b(this|the) room\b/i.test(q);
   const noNumber = !big || (guessNum && words);
   // what a site engineer can act on: not our plumbing ('recognised as …', 'LLM budget reached (20000 tokens …)')
   const assume = (a.assumptions ?? []).filter((x) => !/^recognised as|LLM budget|tokens or \d+ calls|\bsolver\b|cascade/i.test(x))[0];
@@ -470,7 +567,7 @@ function renderResult() {
       <div class="m-q">${esc(q)}</div>
       ${big && !(guessNum && words) ? `<div class="m-value"><span class="m-big${big.length > 9 ? " long" : ""}">${guessNum ? "≈ " : ""}${esc(big)}</span>${unit && (!words || mine) ? `<span class="m-unit">${esc(unit)}</span>` : ""}</div>`
         : `<div class="m-value"><span class="m-big name">${size ? "Not measured yet" : "No answer"}</span></div>`}
-      <div class="m-sentence">${esc(mine ? mine.how : guessNum && size ? `Not measured on ${state.pdf ? "the drawing" : "your photo"} yet: tap the room to outline it.` : sentence(a, q))}</div>
+      <div class="m-sentence">${esc(mine ? mine.how : a.solver === "tap" && state.rooms.length ? `The room you tapped is outlined on the ${sheet()}. Set the scale to measure it: tap both ends of the scale bar or of a printed dimension.` : guessNum && size && measure ? (whole ? `An estimate for the whole ${sheet()}, not measured on it. To measure one room, tap it.` : `Not measured on ${state.pdf ? "the drawing" : "your photo"} yet: tap the room to outline it.`) : sentence(a, q))}</div>
       <div class="hero-badges m-badges">
         <span class="conf ${c.cls}" title="calibrated confidence ${Math.round((a.confidence ?? 0) * 100)} %">${esc(mine ? (scaleGuessed(state.scale) ? "Best estimate" : state.scale?.user ? "Measured by you" : state.pdf ? "Measured on the drawing" : "Measured on the photo") : noNumber ? "No number yet" : c.word)}</span>
         ${size && !scaleOk ? `<button type="button" class="scale-unknown" id="scalePill">Scale unknown — set it</button>` : ""}
@@ -506,14 +603,17 @@ function myMeasure(): { value: string; how: string } | null {
   const last = state.rooms[state.rooms.length - 1];
   if (last) {
     const m2 = polyArea(last.poly) / (s.unitsPerM * s.unitsPerM);
-    return length ? null : { value: fmtM(m2), how: `The room you tapped, outlined on the ${sheet()}, at ${s.user ? "your scale" : `${s.label} (${s.source})`}. The outline is traced: check it.` };
+    const traced = last.method === "wall lines" ? "traced along its walls (doorways closed)" : "outlined";
+    return length ? null : { value: fmtM(m2), how: `The room you tapped, ${traced} on the ${sheet()}, at ${s.user ? "your scale" : `${s.label} (${s.source})`}.${imperial(s) ? ` That is ${sqft(m2)} sq ft.` : ""} The outline is traced: check it.` };
   }
   if (!s.user) return null;
   const ev = (a.evidence ?? []).filter(onThis);
   const poly = ev.find((e) => e.polygon && e.polygon.length > 2)?.polygon as Pt[] | undefined;
   const line = ev.find((e) => e.polyline && e.polyline.length > 1)?.polyline as Pt[] | undefined;
-  if (!length && poly) return { value: fmtM(polyArea(poly) / (s.unitsPerM * s.unitsPerM)), how: `The outline on the ${sheet()} at your scale (${s.label}).` };
-  if (length && line) return { value: fmtM(polyLength(line) / s.unitsPerM), how: `The line on the ${sheet()} at your scale (${s.label}).` };
+  const m2 = poly ? polyArea(poly) / (s.unitsPerM * s.unitsPerM) : 0;
+  const m = line ? polyLength(line) / s.unitsPerM : 0;
+  if (!length && poly) return { value: fmtM(m2), how: `The outline on the ${sheet()} at your scale (${s.label}).${imperial(s) ? ` That is ${sqft(m2)} sq ft.` : ""}` };
+  if (length && line) return { value: fmtM(m), how: `The line on the ${sheet()} at your scale (${s.label}).${imperial(s) ? ` That is ${feet(m)} ft.` : ""}` };
   return null;
 }
 
@@ -539,11 +639,18 @@ $("toolDone").addEventListener("click", () => setTool(null));
 
 function roomTag(poly: Pt[]): string | undefined {
   const s = state.scale;
-  return s ? `${fmtM(polyArea(poly) / (s.unitsPerM * s.unitsPerM))} m²` : undefined;
+  if (!s) return undefined;
+  const m2 = polyArea(poly) / (s.unitsPerM * s.unitsPerM);
+  return `${fmtM(m2)} m²${imperial(s) ? ` · ${sqft(m2)} sq ft` : ""}`;
 }
+/** A scale in feet: typed by the visitor in feet (80', 12'-6", 80 ft) or printed in feet-inches (1/4" = 1'-0", 1" = 40').
+ *  US sheets answer in square feet (Stoa's AFCEC dorm tables), so the measured value gets its sq ft / ft too. */
+const imperial = (s: Scale | null): boolean => !!s && /\d\s*(?:'|’|′|ft\b|feet|foot)|\d\s*(?:"|″|”)/.test(`${s.label} ${s.source}`);
+const sqft = (m2: number): string => Math.round(m2 / 0.09290304).toLocaleString("en-US");
+const feet = (m: number): string => (m / 0.3048).toLocaleString("en-US", { maximumFractionDigits: 1 });
 
 function onTap(x: number, y: number) {
-  const ev: Pt = [x / state.k, y / state.k];
+  const ev: Pt = toEv(x, y);
   if (state.tool === "scale") {
     state.taps.push(ev);
     view.addMark({ kind: "dot", pts: [[x, y]], tone: "user" });
@@ -571,20 +678,41 @@ function openScaleSheet() {
 }
 $("scaleForm").addEventListener("submit", (e) => {
   e.preventDefault();
-  setScaleFrom(Number($<HTMLInputElement>("scaleM").value.replace(",", ".")));
+  const typed = $<HTMLInputElement>("scaleM").value;
+  const m = lengthM(typed, $("scaleUnit").textContent === "ft" ? "ft" : "m");
+  if (m) setScaleFrom(m, /ft|'|’|′|feet|foot/i.test(typed) || $("scaleUnit").textContent === "ft" ? typed.trim() : "");
 });
+// US sheets print feet (Stoa's AFCEC / USACE examples: a 0-80' scale bar): the unit next to the box switches m <-> ft
+$("scaleUnit").addEventListener("click", () => {
+  const u = $("scaleUnit");
+  u.textContent = u.textContent === "ft" ? "m" : "ft";
+  $<HTMLInputElement>("scaleM").placeholder = u.textContent === "ft" ? "e.g. 80 or 12'-6\"" : "e.g. 3.40";
+});
+
+/** A typed real length in metres: '3.40', '3,40' (in `unit`), or with its own unit: 80', 80 ft, 12'-6", 12' 6", 150",
+ *  2400 mm, 340 cm, 3.4 m. null when it cannot be read. */
+export function lengthM(text: string, unit: "m" | "ft"): number | null {
+  const t = text.trim().toLowerCase().replace(/(\d),(\d)/g, "$1.$2").replace(/[’′]/g, "'").replace(/[”″]|''/g, '"');
+  const fi = t.match(/^(\d+(?:\.\d+)?)\s*(?:'|ft|feet|foot)\s*-?\s*(?:(\d+(?:\.\d+)?)\s*(?:"|in|inch|inches)?)?$/);
+  if (fi) return (Number(fi[1]) + Number(fi[2] ?? 0) / 12) * 0.3048;
+  const m = t.match(/^(\d+(?:\.\d+)?)\s*(mm|cm|m|"|in|inch|inches)?$/);
+  if (!m) return null;
+  const v = Number(m[1]);
+  const k = m[2] === "mm" ? 0.001 : m[2] === "cm" ? 0.01 : m[2] === "m" ? 1 : m[2] ? 0.0254 : unit === "ft" ? 0.3048 : 1;
+  return v > 0 ? v * k : null;
+}
 $("scaleSheet").addEventListener("click", (e) => {
   const b = (e.target as HTMLElement).closest<HTMLElement>("[data-m]");
   if (b) setScaleFrom(Number(b.dataset.m));
 });
 
-function setScaleFrom(m: number) {
+function setScaleFrom(m: number, asTyped = "") {
   if (!(m > 0) || state.taps.length < 2) return;
   const [p, q] = state.taps;
   const d = Math.hypot(q[0] - p[0], q[1] - p[1]);
   if (d < 3) return;
   const u = d / m;
-  state.scale = { unitsPerM: u, label: scaleLabel(u, space()), source: `set by you: the line you tapped is ${m} m`, user: true };
+  state.scale = { unitsPerM: u, label: scaleLabel(u, space()), source: `set by you: the line you tapped is ${asTyped ? `${/^[\d.,]+$/.test(asTyped) ? `${asTyped} ft` : asTyped} = ` : ""}${+m.toFixed(asTyped ? 2 : 3)} m`, user: true };
   $("scaleSheet").hidden = true;
   setTool(null);
   // redraw the visitor's rooms with their m², and the answer with its numbers at the new scale
@@ -609,14 +737,22 @@ async function traceRoom(ev: Pt) {
   const r = Math.max(2, 4 / state.k);
   try {
     const file = state.file;
-    const res = await roomShapes(file.path, state.page, space(), [{ i: 0, bbox: [ev[0] - r, ev[1] - r, ev[0] + r, ev[1] + r] }]);
+    // a vector PDF: its scale first (the visitor's, one read from the sheet, else its door swings, ~0.3 s), so E1's
+    // wall-line tracer closes door swings at the doorway (DfE laundry 7.03 m² vs 5.68 by flood fill, gold 7.0)
+    if (state.pdf && !state.scale) {
+      const est = state.fileScale ?? (await estimatedScale());
+      if (state.file !== file) return;
+      state.scale = state.scale ?? est;
+    }
+    const n = scaleN(state.scale);
+    const res = await roomShapes(file.path, state.page, space(), [{ i: 0, bbox: [ev[0] - r, ev[1] - r, ev[0] + r, ev[1] + r], ...(n > 0 ? { scale_n: n } : {}) }]);
     if (state.file !== file) return; // a new photo was picked meanwhile
     const poly = res.shapes[0]?.poly as Pt[] | null | undefined;
     if (!poly || poly.length < 3) {
       toolHint("No closed room there (an open door or a faint wall?). Tap closer to the middle of the room.");
       return;
     }
-    state.rooms.push({ poly });
+    state.rooms.push({ poly, method: res.shapes[0]?.method });
     if (!state.scale && !state.fileScale) {
       // the door-swing estimate started at upload; on a big sheet it takes a second, sharper look (~10 s)
       view.onTap = null;

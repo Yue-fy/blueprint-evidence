@@ -180,7 +180,31 @@ function kgFromDisk(rel: string) {
  * has stoa/kg); if that fails too, the directory-based links above. Cached per path.
  */
 const KG_REPO = process.env.STOA_KG_REPO ?? path.resolve(__dirname, "../..");
-const PY = process.env.JUNCTION_VENV ? `${process.env.JUNCTION_VENV}/bin/python` : "python3";
+/** The Python that runs stoa (S0 D42, 17:36): a preview started without JUNCTION_VENV in its env fell back to the
+ * system python3 (no pydantic, no stoa) and every upload answered 500. Order: $JUNCTION_VENV, the team venv on this
+ * machine, then python3 — and the self-check below says loudly when that Python cannot import stoa. */
+const TEAM_VENV = ".venv";
+const PY = (() => {
+  for (const venv of [process.env.JUNCTION_VENV, TEAM_VENV]) {
+    const py = venv ? `${venv}/bin/python` : "";
+    if (py && fs.existsSync(py)) return py;
+  }
+  return "python3";
+})();
+/** Environment for every Python child: the dataset path and the venv, whatever the server was started with. */
+const pyEnv = (extra: Record<string, string> = {}) => ({
+  ...process.env, STOA_DATA: DATA, JUNCTION_VENV: process.env.JUNCTION_VENV ?? (PY.startsWith(TEAM_VENV) ? TEAM_VENV : ""), ...extra });
+/** Start-up check: can PY import stoa + pydantic from KG_REPO? Uploads need it; the page shows a banner when not. */
+let selfCheck: { ok: boolean; py: string; error?: string; checked_at?: string } = { ok: true, py: PY };
+function runSelfCheck() {
+  execFile(PY, ["-c", "import stoa, pydantic, stoa.contract; print('ok')"], { cwd: KG_REPO, timeout: 60_000, env: pyEnv() }, (err, stdout, stderr) => {
+    const ok = !err && stdout.trim().endsWith("ok");
+    const error = ok ? undefined : (String(stderr || err?.message || "").trim().split("\n").filter(Boolean).slice(-1)[0] ?? "unknown error");
+    selfCheck = { ok, py: PY, error, checked_at: new Date().toISOString() };
+    if (ok) console.log(`[stoa-api] uploads: ${PY} imports stoa + pydantic (cwd ${KG_REPO})`);
+    else console.error(`[stoa-api] FATAL: uploads will fail: ${PY} cannot import stoa/pydantic from ${KG_REPO}: ${error}. Start the server with JUNCTION_VENV=${TEAM_VENV}.`);
+  });
+}
 const kgCache = new Map<string, Promise<{ body: Record<string, unknown>; backend: string }>>();
 /**
  * Room graph of a CubiCasa plan (R1, experiments/r1/room_graph/graph.py): rooms (class, printed label, ~m² with an
@@ -193,7 +217,7 @@ const ROOMS_REC = path.resolve(__dirname, "../fixtures/rooms.json"); // {path: g
 function roomGraph(rel: string) {
   if (!roomsCache.has(rel)) {
     roomsCache.set(rel, new Promise((resolve) => {
-      execFile(PY, ["-c", ROOMS_PY, rel], { cwd: KG_REPO, timeout: 60_000, maxBuffer: 16 << 20, env: { ...process.env, STOA_DATA: DATA } },
+      execFile(PY, ["-c", ROOMS_PY, rel], { cwd: KG_REPO, timeout: 60_000, maxBuffer: 16 << 20, env: pyEnv() },
         (err, stdout) => {
           let g: Record<string, unknown> | null = null;
           try {
@@ -219,7 +243,7 @@ const PLAN3D_REC = path.resolve(__dirname, "../fixtures/plan3d.json");
 function plan3d(rel: string) {
   if (!plan3dCache.has(rel)) {
     plan3dCache.set(rel, new Promise((resolve) => {
-      execFile(PY, ["-m", "stoa.geometry.plan3d", rel], { cwd: KG_REPO, timeout: 60_000, maxBuffer: 32 << 20, env: { ...process.env, STOA_DATA: DATA } },
+      execFile(PY, ["-m", "stoa.geometry.plan3d", rel], { cwd: KG_REPO, timeout: 60_000, maxBuffer: 32 << 20, env: pyEnv() },
         (err, stdout) => {
           let g: Record<string, unknown> | null = null;
           try {
@@ -239,7 +263,7 @@ const KG_PY = "import json,sys\nfrom stoa.kg import links\nprint(json.dumps(link
 function kg(rel: string) {
   if (!kgCache.has(rel)) {
     kgCache.set(rel, new Promise((resolve) => {
-      execFile(PY, ["-c", KG_PY, rel], { cwd: KG_REPO, timeout: 120_000, maxBuffer: 64 << 20, env: { ...process.env, STOA_DATA: DATA } },
+      execFile(PY, ["-c", KG_PY, rel], { cwd: KG_REPO, timeout: 120_000, maxBuffer: 64 << 20, env: pyEnv() },
         (err, stdout) => {
           const disk = { ...kgFromDisk(rel), kg_error: "" };
           if (err) {
@@ -420,10 +444,11 @@ const UPLOAD_EXT = new Set([".pdf", ".png", ".jpg", ".jpeg", ".ifc", ".dxf", ".s
 const CONVERT_EXT = new Set([".webp", ".tif", ".tiff", ".bmp", ".gif", ".heic", ".heif"]);
 const IMAGE_EXT = new Set([".png", ".jpg", ".jpeg", ...CONVERT_EXT]);
 const NORMALIZE = path.resolve(__dirname, "../server/normalize_upload.py");
+const IMAGE_NORM_V = "|norm-2"; // bump when normalize_upload.image() changes what it writes
 /** Phone photos upright (EXIF), WebP/TIFF/BMP/GIF → PNG, a lone DXF → a PDF sheet drawn from it (same stem). */
 function normalizeUpload(kind: "image" | "dxf" | "dwg", abs: string): Promise<{ abs: string; note: string; error?: string }> {
   return new Promise((resolve) => {
-    execFile(PY, [NORMALIZE, kind, abs], { cwd: KG_REPO, timeout: 120_000, maxBuffer: 8 << 20 }, (err, stdout) => {
+    execFile(PY, [NORMALIZE, kind, abs], { cwd: KG_REPO, timeout: 120_000, maxBuffer: 8 << 20, env: pyEnv() }, (err, stdout) => {
       try {
         if (err) throw err;
         resolve(JSON.parse(stdout.trim().split("\n").pop()!));
@@ -488,7 +513,7 @@ const STYLE_MIN_P = 0.8;
 function guessStyle(abs: string): Promise<{ style: string; p: number } | null> {
   const code = "import json,sys; sys.path.insert(0,'experiments/r2/style'); import style; s,p=style.guess_style(sys.argv[1]); print(json.dumps({'style':s,'p':round(float(p),3)}))";
   return new Promise((resolve) => {
-    execFile(PY, ["-c", code, abs], { cwd: KG_REPO, timeout: 30_000 }, (err, stdout) => {
+    execFile(PY, ["-c", code, abs], { cwd: KG_REPO, timeout: 30_000, env: pyEnv() }, (err, stdout) => {
       try {
         resolve(err ? null : JSON.parse(stdout.trim().split("\n").pop()!));
       } catch {
@@ -496,6 +521,17 @@ function guessStyle(abs: string): Promise<{ style: string; p: number } | null> {
       }
     });
   });
+}
+/** P1 17:24: read an image upload's text layer + drawing kind right when it arrives (`python -m stoa.formats.warm`,
+ * one JSON line, never raises; disk caches are keyed by content, so the ask workers find it). Detached, not awaited;
+ * a question asked before it ends just reads the file itself. Only on trees that have it (night-P1 cb0fc1d). */
+const WARM_PY = path.join(KG_REPO, "stoa/formats/warm.py");
+const warming = new Set<string>();
+function warmUpload(abs: string) {
+  if (!selfCheck.ok || warming.has(abs) || warming.size >= 2 || !fs.existsSync(WARM_PY)) return;
+  warming.add(abs);
+  execFile(PY, ["-m", "stoa.formats.warm", abs], { cwd: KG_REPO, timeout: 300_000, maxBuffer: 4 << 20, env: askEnv() },
+    () => warming.delete(abs));
 }
 async function saveUpload(name: string, body: Buffer, style = "", raw = false) {
   const safe = path.basename(name).replace(/[^\w.\- ()]+/g, "_").replace(/^\.+/, "").slice(-120) || "upload";
@@ -505,7 +541,9 @@ async function saveUpload(name: string, body: Buffer, style = "", raw = false) {
   if (body.length > UPLOAD_MAX) throw Object.assign(new Error(`${path.basename(name)} is ${(body.length / 1e6).toFixed(0)} MB; the limit is ${UPLOAD_MAX >> 20} MB. Split the set or export one sheet.`), { status: 413 });
   const image = IMAGE_EXT.has(ext);
   // 1. the file as uploaded, in a folder named by its content; made readable (photo upright, PNG, DXF → sheet)
-  const plainId = createHash("sha256").update(body).digest("hex").slice(0, 12);
+  // images: the folder id also names the normalize rule (18:20: a sheet stored before the clean-preserving shrink kept
+  // its grey copy, because an existing upload is not normalized again); PDFs and models keep their plain content id
+  const plainId = createHash("sha256").update(body).update(image ? IMAGE_NORM_V : "").digest("hex").slice(0, 12);
   let abs = path.join(UPLOADS, plainId, safe);
   fs.mkdirSync(path.dirname(abs), { recursive: true });
   if (!fs.existsSync(abs)) fs.writeFileSync(abs, body);
@@ -529,6 +567,7 @@ async function saveUpload(name: string, body: Buffer, style = "", raw = false) {
     abs = r.abs;
     extra.upload_note = r.note;
   }
+  if (image) warmUpload(abs);
   const stored = path.basename(abs);
   // 2. the drawing style (images): declared, or guessed from the image (no model call)
   let guess: { style: string; p: number } | null = null;
@@ -573,7 +612,7 @@ function linkUploads(paths: unknown) {
 }
 const ASK_UPLOAD = path.resolve(__dirname, "../server/ask_upload.py");
 const uploadAnswers = new Map<string, Promise<Record<string, unknown>>>();
-const askEnv = () => ({ ...process.env, STOA_DATA: DATA, STOA_TEXT_BACKEND: process.env.STOA_TEXT_BACKEND ?? "local2", STOA_AGENT: process.env.STOA_AGENT ?? "W5" });
+const askEnv = () => ({ ...pyEnv(), STOA_TEXT_BACKEND: process.env.STOA_TEXT_BACKEND ?? "local2", STOA_AGENT: process.env.STOA_AGENT ?? "W5" });
 
 /** Long-lived answer workers (`ask_upload.py --serve`, P1 15:12): a new Python process per question rebuilt every
  * cache (pipeline, recognise step, the prior's 127k-question table, raster text layers) = ~2.5 s per ask; a warm one
@@ -662,6 +701,8 @@ function askUpload(b: { path: string; question?: string; solver?: string; solver
   const key = JSON.stringify([b.path, (b.question ?? "").trim(), b.solver ?? "pipeline", b.solver_args ?? {}]);
   const hit = uploadAnswers.get(key);
   if (hit) return hit.then((a) => ({ ...a, cached: true }));
+  if (!selfCheck.ok) // D42: say what is wrong instead of a Python traceback line ('No module named pydantic')
+    return Promise.reject(new Error(`uploads are off on this server: its Python (${PY}) cannot load the solvers (${selfCheck.error}). The sample projects still work; restart the server with JUNCTION_VENV set`));
   const req = { abs, virtual: b.path, question: b.question ?? "", solver: b.solver, solver_args: b.solver_args };
   const p = MAX_WORKERS > 0 ? askViaWorker(req) : new Promise<Record<string, unknown>>((resolve, reject) => {
     const child = execFile(PY, [ASK_UPLOAD], { cwd: KG_REPO, timeout: 600_000, maxBuffer: 64 << 20, env: askEnv() },
@@ -690,7 +731,7 @@ function uploadKg(virtual: string, abs: string) {
     const rename = (x: unknown): unknown => typeof x === "string" ? (x.startsWith(folder) ? vdir + x.slice(folder.length) : x)
       : Array.isArray(x) ? x.map(rename) : x && typeof x === "object" ? Object.fromEntries(Object.entries(x).map(([k, v]) => [k, rename(v)])) : x;
     uploadKgCache.set(virtual, new Promise((resolve) => {
-      execFile(PY, ["-c", KG_PY, abs], { cwd: KG_REPO, timeout: 120_000, maxBuffer: 64 << 20, env: { ...process.env, STOA_DATA: DATA } },
+      execFile(PY, ["-c", KG_PY, abs], { cwd: KG_REPO, timeout: 120_000, maxBuffer: 64 << 20, env: pyEnv() },
         (err, stdout) => {
           try {
             if (err) throw err;
@@ -717,7 +758,7 @@ function thumb(abs: string): Promise<string | null> {
   if (!thumbJobs.has(dst)) {
     fs.mkdirSync(THUMBS, { recursive: true });
     thumbJobs.set(dst, new Promise((resolve) => {
-      execFile(PY, ["-c", THUMB_PY, abs, dst], { timeout: 60_000 }, (err) => {
+      execFile(PY, ["-c", THUMB_PY, abs, dst], { timeout: 60_000, env: pyEnv() }, (err) => {
         thumbJobs.delete(dst);
         resolve(!err && fs.existsSync(dst) ? dst : null);
       });
@@ -764,7 +805,7 @@ function roomShapes(abs: string, b: { page?: number; space?: string; items?: unk
   const key = JSON.stringify([abs, b.page ?? 0, b.items ?? []]);
   if (!shapeCache.has(key)) {
     const p = new Promise<Record<string, unknown>>((resolve, reject) => {
-      const child = execFile(PY, [ROOM_SHAPE], { cwd: KG_REPO, timeout: 60_000, maxBuffer: 16 << 20 }, (err, stdout, stderr) => {
+      const child = execFile(PY, [ROOM_SHAPE], { cwd: KG_REPO, timeout: 60_000, maxBuffer: 16 << 20, env: pyEnv() }, (err, stdout, stderr) => {
         if (err) return reject(new Error(String(stderr || err.message).trim().split("\n").slice(-1)[0]));
         try {
           resolve(JSON.parse(stdout));
@@ -806,7 +847,7 @@ async function handleDoorScale(res: http.ServerResponse, rel: string, page: numb
   const key = `${abs}|${page}`;
   if (!doorCache.has(key)) {
     doorCache.set(key, new Promise((resolve) => {
-      execFile(PY, [DOOR_SCALE, abs, String(page)], { cwd: KG_REPO, timeout: 30_000, maxBuffer: 4 << 20 }, (err, stdout) => {
+      execFile(PY, [DOOR_SCALE, abs, String(page)], { cwd: KG_REPO, timeout: 30_000, maxBuffer: 4 << 20, env: pyEnv() }, (err, stdout) => {
         try {
           resolve(err ? { ok: false, why: "could not read the drawing" } : JSON.parse(stdout));
         } catch {
@@ -930,6 +971,7 @@ async function handle(req: Connect.IncomingMessage, res: http.ServerResponse, ne
   const url = new URL(req.url, "http://x");
   const route = url.pathname.replace(/^\/api/, "");
   try {
+    if (route === "/selfcheck" && req.method === "GET") return send(res, 200, selfCheck, "disk");
     if (route === "/shapes" && req.method === "POST") return void (await handleShapes(req, res));
     if (route === "/doorscale" && req.method === "GET") return void (await handleDoorScale(res, url.searchParams.get("path") ?? "", Number(url.searchParams.get("page") ?? 0) || 0));
     if (route === "/thumb" && req.method === "GET") return void (await handleThumb(res, url.searchParams.get("path") ?? ""));
@@ -1072,10 +1114,12 @@ export function stoaApi(): Plugin {
     name: "stoa-api",
     configureServer(server) {
       server.middlewares.use(handle);
+      runSelfCheck();
       setTimeout(warmPlan3d, 1500);
     },
     configurePreviewServer(server) {
       server.middlewares.use(handle);
+      runSelfCheck();
       setTimeout(warmPlan3d, 1500);
     },
   };

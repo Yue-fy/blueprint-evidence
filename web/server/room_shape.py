@@ -12,6 +12,9 @@ photos with shading work), small marks (text, symbols) are dropped so the room l
 region around the box centre is flood-filled. Door openings would let the fill leak into the next room, so walls are
 thickened step by step (0, then ~0.3 %, ~0.6 %, ~1 % of the page) until the region is closed (not touching the page
 edge, not most of the plan); the region is then grown back by the same amount. A region that still leaks is dropped.
+An item may carry "scale_n" (the drawing's 1:N, vector PDFs only): then E1's wall-line tracer runs first
+(stoa.evidence.linework.measure_room: door swings closed at the doorway line, outline at the lines' middle, other rooms'
+printed names kept out; DfE laundry 7.03 m² vs 5.68 here, gold 7.0) and this flood fill is the fallback.
 An item may list "others": [[x, y], ...], the label points of OTHER rooms (same space): a region holding one of them
 leaked through a door into that room, so the walls are thickened further (none closed → no outline).
 Output, per item: {"i", "poly": [[x, y], ...] in the evidence's own space, "area": in that space's units squared,
@@ -29,6 +32,27 @@ import sys
 import numpy as np
 
 LONG_SIDE = 2400
+REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+
+def wall_lines(abs_path: str, page: int, pt: tuple[float, float], scale_n: float):
+    """E1's tracer on a vector PDF at 1:scale_n around pt (pdf_pt): (poly pdf_pt, area pt², how) or None.
+    ROOM_E1=0 turns it off (bench)."""
+    if not abs_path.lower().endswith(".pdf") or not scale_n or scale_n <= 0 or os.environ.get("ROOM_E1", "1") == "0":
+        return None
+    try:
+        if REPO not in sys.path:
+            sys.path.insert(0, REPO)
+        from stoa.evidence.linework import PT_TO_M_AT_1, measure_room
+
+        r = measure_room(abs_path, page, (float(pt[0]), float(pt[1])), float(scale_n))
+    except Exception as e:  # noqa: BLE001
+        print(f"room_shape: wall-line tracer: {e}", file=sys.stderr)
+        return None
+    if not r or not r.get("polygon") or not r.get("area_m2"):
+        return None
+    m_per_pt = float(scale_n) * PT_TO_M_AT_1
+    return r["polygon"], float(r["area_m2"]) / (m_per_pt * m_per_pt), "wall lines"
 
 
 def load(abs_path: str, page: int):
@@ -252,7 +276,15 @@ def main() -> None:
             print(f"room_shape: {e}", file=sys.stderr)
             return None
 
-    todo = list(range(len(items)))
+    # vector PDF at a known scale: the wall-line tracer first (items it outlines skip the flood fill)
+    lined: dict[int, tuple] = {}
+    for k, it in enumerate(items):
+        if it.get("scale_n"):
+            bb = it["bbox"][:4]
+            hit = wall_lines(req["abs"], int(req.get("page") or 0), ((bb[0] + bb[2]) / 2, (bb[1] + bb[3]) / 2), float(it["scale_n"]))
+            if hit:
+                lined[k] = hit
+    todo = [k for k in range(len(items)) if k not in lined]
     for _ in range(len(CLOSING)):
         for k in todo:
             res[k] = run(k)
@@ -271,6 +303,11 @@ def main() -> None:
         todo = [k for k in todo if start[k] < len(CLOSING)]
     out = []
     for k, it in enumerate(items):
+        if k in lined:
+            poly, area, how = lined[k]
+            out.append({"i": it.get("i"), "poly": [[round(float(x), 2), round(float(y), 2)] for x, y in poly], "area": round(area, 2),
+                        "closing_px": 0, "fit": None, "method": how})
+            continue
         r = res.get(k)
         if r is None:
             out.append({"i": it.get("i"), "poly": None})

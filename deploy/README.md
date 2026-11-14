@@ -49,9 +49,11 @@ the exact demo lines (`api`, `web`) started on spare ports answer like :8100 / :
 for an API whose /health was 200 but /ask failed.
 
 `gate.py` (a shared-password reverse proxy for a public Tailscale Funnel link) is kept but no longer needed. If a
-public link is ever wanted: `STOA_GATE_PASSWORD=… python deploy/gate.py --upstream http://127.0.0.1:5180 --port 8140`,
-then `tailscale funnel --bg --https=10000 http://127.0.0.1:8140` (443 / 8443 on this box are used by another project;
-never `tailscale funnel reset`). Tested through it: browser sign-in, uploads, a 12 MB IFC byte-exact, /api.
+public link is ever wanted: `STOA_GATE_PASSWORD=… python deploy/gate.py --upstream http://127.0.0.1:5180 --port 8190`,
+then CHECK that the gate (not something else) owns the port: `curl -s http://127.0.0.1:8190/__gate/health` must print
+`{"gate": "ok", ...}`, and only then `tailscale funnel --bg --https=10000 http://127.0.0.1:8190` (443 / 8443 on this box
+are used by another project; never `tailscale funnel reset`). The gate used :8140 until 18:10 on 14 Nov; V1's door
+detector (no password) listens there now, so an old command would have published it. Tested through it: browser sign-in, uploads, a 12 MB IFC byte-exact, /api.
 
 ## 1. Batch answers (what Stoa can run on their hidden set)
 
@@ -61,11 +63,11 @@ else `$STOA_DATA`); absolute paths work too.
 
 ```bash
 # on our GPU box (local models)
-$JUNCTION_VENV/bin/python -m stoa.cli answer --in questions.jsonl --out answers.jsonl --workers 4
+.venv/bin/python -m stoa.cli answer --in questions.jsonl --out answers.jsonl --workers 4
 # anywhere without a GPU (API-only mode; needs GEMINI_API_KEY)
-$JUNCTION_VENV/bin/python -m stoa.cli answer --in questions.jsonl --out answers.jsonl --api
+.venv/bin/python -m stoa.cli answer --in questions.jsonl --out answers.jsonl --api
 # one question
-$JUNCTION_VENV/bin/python -m stoa.cli ask data/swiss_dwellings/site1000_bldg2082_floor9385.pdf "How many doors?" [--api]
+.venv/bin/python -m stoa.cli ask data/swiss_dwellings/site1000_bldg2082_floor9385.pdf "How many doors?" [--api]
 ```
 
 Each output line = the input row + `value`, `unit`, `confidence`, `evidence` (file, page, bbox + bbox_space, or IFC
@@ -76,7 +78,7 @@ would overwrite (e.g. the reference `unit`) is kept as `input_unit`. Re-running 
 With Docker (CPU image, API-only mode):
 
 ```bash
-$JUNCTION_VENV/bin/python deploy/pack_state.py      # once: runtime state the image needs (gitignored deploy/state/)
+.venv/bin/python deploy/pack_state.py      # once: runtime state the image needs (gitignored deploy/state/)
 docker build -f deploy/Dockerfile --target api -t stoa:api .
 docker run --rm -e GEMINI_API_KEY -v /path/to/dataset:/data/stoa:ro -v "$PWD/out":/out stoa:api \
   python -m stoa.cli answer --in /data/stoa/questions.jsonl --out /out/answers.jsonl --workers 2
@@ -152,8 +154,8 @@ plans, not on vector / IFC / schedule questions.
 
 ```bash
 # 1. the drawings the demo shows (~25 files, 30 MB, + their questions) -> a folder outside git; runtime state
-$JUNCTION_VENV/bin/python deploy/subset.py --out /path/to/stoa-demo-data
-$JUNCTION_VENV/bin/python deploy/pack_state.py
+.venv/bin/python deploy/subset.py --out /path/to/stoa-demo-data
+.venv/bin/python deploy/pack_state.py
 # 2a. Google Cloud Run (the temporary Google account includes it): prompts for the two secrets once
 PROJECT=<gcp-project-id> DATA_DIR=/path/to/stoa-demo-data deploy/cloudrun.sh
 # 2b. or a VM with Docker (Vultr...): keys in ~/stoa.env (GEMINI_API_KEY=..., DEMO_PASSWORD=...), chmod 600

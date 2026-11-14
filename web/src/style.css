@@ -1075,6 +1075,7 @@ body[data-view="customer"] .credit { grid-row: 3; }
 body[data-view="customer"] #tourNote { grid-row: 1; }
 /* D28 measured lines (length answers): a bold accent line with round caps */
 .v2d-overlay .ev polyline.eline { fill: none; stroke: var(--accent); stroke-width: 4px; stroke-linecap: round; stroke-linejoin: round; vector-effect: non-scaling-stroke; pointer-events: none; filter: drop-shadow(0 0 3px rgba(0, 113, 227, .45)); }
+.v2d-overlay .ev.gap polyline.eline { stroke: var(--warn-dot); stroke-dasharray: 2 7; stroke-width: 5px; filter: none; }
 body[data-view="customer"] .v2d-overlay .ev.on-line:not(.hot):not(.sel) > rect { stroke: transparent; fill: transparent; }
 body[data-view="customer"] #ask textarea, body[data-view="customer"].answered #ask textarea { height: 56px; min-height: 56px; }
 
@@ -1379,3 +1380,4 @@ body[data-view="customer"] .hero-value .big.xlong { font-size: 40px; letter-spac
 .hero-scale .hs-second { flex-basis: 100%; margin-top: 6px; font-size: 14px; line-height: 1.45; color: var(--ink); }
 .hero-scale .hs-second .ok { color: var(--ok); font-weight: 600; }
 .hero-scale .hs-second .warn { color: var(--warn); font-weight: 600; }
+.dz-op { font-size: 12px; color: var(--muted, #6e6e73); margin: 6px 0 0; }

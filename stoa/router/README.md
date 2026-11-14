@@ -10,12 +10,12 @@ noon reveal. The overnight agents stop at 11:45.
 
 ```bash
 # Stoa's examples as rows {"path": "data/...", "question": "...", "answer": "..."}; "answer" is optional (unscored)
-$JUNCTION_VENV/bin/python -m stoa.eval --solver pipeline --split /path/to/stoa_examples.jsonl --no-leaderboard
+.venv/bin/python -m stoa.eval --solver pipeline --split /path/to/stoa_examples.jsonl --no-leaderboard
 # one question with its full trace, evidence and cost
-$JUNCTION_VENV/bin/python experiments/w4/ask.py data/ifc_models/<sheet>.pdf "How big is room 119?" [k=v ...]
+.venv/bin/python experiments/w4/ask.py data/ifc_models/<sheet>.pdf "How big is room 119?" [k=v ...]
 # where the points go / two runs side by side
-$JUNCTION_VENV/bin/python -m stoa.eval.analyze <run_id> --baseline <run_id>
-$JUNCTION_VENV/bin/python experiments/r2/compare_runs.py <run_a> <run_b> --show
+.venv/bin/python -m stoa.eval.analyze <run_id> --baseline <run_id>
+.venv/bin/python experiments/r2/compare_runs.py <run_a> <run_b> --show
 ```
 
 The team's noon tools (all on night 277fe9f) wrap these steps; use them instead of writing new scripts:

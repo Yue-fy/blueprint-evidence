@@ -1,7 +1,7 @@
 // Inter (OFL), bundled so Windows / offline machines get the designed type (captain 13:06; installed 14:01)
 import "@fontsource-variable/inter";
 import "./style.css";
-import { ask, benchmark, doorScale, exampleQuestions, fileUrl, knowledgeGraph, listFiles, onBackend, roomGraph, roomShapes, secondOpinion, upload, uploadSet } from "./api";
+import { ask, benchmark, doorScale, exampleQuestions, fileUrl, knowledgeGraph, listFiles, onBackend, roomGraph, printedScale, roomShapes, secondOpinion, selfCheck, upload, uploadSet } from "./api";
 import { renderBench } from "./bench";
 import { agentAsks, crossChecks, renderCard, roomKindsIn } from "./card";
 import { markAnswerCheck, renderKg } from "./kg";
@@ -13,7 +13,7 @@ import tourCustomer from "../fixtures/tour-customer.json";
 import { agrees, diffQuestion, diffsHtml, heroHtml, isGuess, needsMeasuring, readerGuess, SCALE_PILL, roomPhrases, calm, heroLoadingHtml, initialView, landingHtml, numbered, numberMax, connectionInfo, projectDifferences, spreadOf, approxEvidence, projectOf, PROJECTS, saveView, kindChoices, rankOf, recognitionHtml, recognitionMenuHtml, recognitionOf, type Difference, type FloorGroup, type Recognition, type View } from "./customer";
 import { floorName, type Project } from "./projects";
 import { dxfToPdf, matchEvidence, planGeo, type PlanGeo } from "./plangeo";
-import { Measure, doorScaleOf, fmtM, scaleFromAnswer, scaleGuessed, scaleLabel, type Scale } from "./measure";
+import { Measure, doorScaleOf, fmtM, printedScaleOf, scaleFromAnswer, scaleGuessed, scaleLabel, type Scale } from "./measure";
 
 const $ = <T extends HTMLElement = HTMLElement>(id: string) => document.getElementById(id) as T;
 
@@ -90,11 +90,14 @@ function drawGeometry(a: Answer) {
     if (e.file !== f.path || (e.bbox_space && !["pdf_pt", "image_px", "svg"].includes(e.bbox_space))) return;
     const sp = (e.bbox_space ?? "pdf_pt") as "pdf_pt" | "image_px" | "svg";
     if (e.polygon && e.polygon.length >= 3) v2d.setEvidenceShape(i, e.polygon as [number, number][], "room", undefined, sp, e.exact === false);
-    if (e.polyline && e.polyline.length >= 2 && v2d.setEvidenceLine(i, e.polyline as [number, number][], sp) && isCustomer()) {
+    // an opening deducted from a skirting run (E1: 'Laundry: opening 0.82 m (no skirting)') is a gap, not a measured run
+    const gap = /\bopening\b[^;]*\bno skirting\b|\(no skirting\)/i.test(e.note ?? "");
+    if (e.polyline && e.polyline.length >= 2 && v2d.setEvidenceLine(i, e.polyline as [number, number][], sp, gap) && isCustomer()) {
       const own = (e.note ?? "").split(/;\s*cross-?check:/i)[0];
       const m = own.match(LEN_IN_NOTE);
       const single = a.evidence.filter((x) => x.polyline).length === 1 && typeof a.value === "number";
-      v2d.setValueTag(i, m ? `${m[1].replace(",", ".")} ${m[2]}` : single ? `${a.value} ${a.unit ?? "m"}` : "");
+      // a gap gets no tag (it would cover the short line it marks; the evidence list says 'opening 0.82 m (no skirting)')
+      v2d.setValueTag(i, gap ? "" : m ? `${m[1].replace(",", ".")} ${m[2]}` : single ? `${a.value} ${a.unit ?? "m"}` : "");
     }
   });
 }
@@ -137,6 +140,7 @@ function applyPlan3D(a: Answer) {
 }
 
 const v2d = new Viewer2D($("v2d"));
+(window as unknown as { __v2d: Viewer2D }).__v2d = v2d; // dev hook: __v2d.labels() (label search checks)
 // measure on the drawing: set the scale with two clicks, then lengths and room areas (src/measure.ts)
 const measure = new Measure(v2d, $("pane2d"), roomShapes);
 measure.onScale = () => state.answer && renderHero(state.answer, hero.roundTripMs);
@@ -1415,6 +1419,14 @@ function showLanding(on: boolean) {
   el.hidden = !on;
   if (!on) return;
   el.innerHTML = landingHtml();
+  void selfCheck().then((c) => { // D42: a server whose Python cannot load the solvers says so before anyone uploads
+    const ls = document.getElementById("landStatus");
+    if (!c || c.ok || !ls || !ls.hidden) return;
+    ls.hidden = false;
+    ls.className = "dz-status err";
+    ls.innerHTML = `<p class="dz-err">Uploads are not working on this server right now: it cannot load the drawing readers. The sample projects below still work.</p>
+      <p class="dz-op">For the operator: restart the server with JUNCTION_VENV set (${esc(c.error ?? "")}).</p>`;
+  });
   el.querySelector<HTMLButtonElement>("[data-act=tour]")?.addEventListener("click", () => {
     showLanding(false);
     $("tourBtn").click();
@@ -1566,6 +1578,16 @@ async function prereadScale(f: FileInfo) {
   };
   line(`<span class="spinner-sm"></span> Reading the drawing's scale and text…${/\.(png|jpe?g)$/i.test(f.path) ? " (a photo or scan takes 1–2 minutes the first time; ask away meanwhile)" : ""}`);
   try {
+    // a vector PDF: the printed scale straight from its text layer (no model call: the pipeline's answer to this
+    // question cost a Gemini call per upload and read '1:200' as 1, W6 18:02); photos and scans still ask, which
+    // also reads their text for the visitor's first question
+    const printed = /\.pdf$/i.test(f.path) ? printedScaleOf(await printedScale(f.path, 0)) : null;
+    if (printed) {
+      if (state.file?.path === f.path) measure.setAutoScale(printed);
+      line(`Scale <b>${esc(printed.label)}</b> ${esc(printed.source)} · <button type="button" class="link intro-measure">check it or measure</button>`);
+      intro()?.querySelector(".intro-measure")?.addEventListener("click", () => measure.open(true, "area"));
+      return;
+    }
     const a = await ask(f.path, "What is the scale of this drawing?");
     let s = scaleFromAnswer(a, /\.pdf$/i.test(f.path) ? "pdf_pt" : "image_px");
     // nothing printed on a PDF: its door swings give a best estimate (else the usual 1:100), marked as one
@@ -1589,7 +1611,7 @@ async function prereadScale(f: FileInfo) {
 function heroScale(el: HTMLElement, a: Answer) {
   const f = state.file;
   const task = a.intent?.task;
-  if (isCustomer() && f && needsMeasuring(a, $<HTMLTextAreaElement>("question").value, f.path)) return measureFirst(el, a, f.path);
+  if (isCustomer() && f && needsMeasuring(a, $<HTMLTextAreaElement>("question").value, f.path, sheetAtScale())) return measureFirst(el, a, f.path);
   if (!isCustomer() || !f || !/\.(pdf|png|jpe?g)$/i.test(f.path) || (task !== "area" && task !== "length")) return;
   // measured in the 3D model or the CAD file (real-world units): the drawing's scale plays no part
   const solver = String(a.solver ?? "");
@@ -1711,7 +1733,10 @@ function measureFirst(el: HTMLElement, a: Answer, path: string) {
   const div = document.createElement("div");
   div.className = "hero-scale cta";
   const canMeasure = /\.(pdf|png|jpe?g)$/i.test(path) && !!v2d.openFile;
-  const what = length ? "click the two ends of what you want to measure" : "click inside the room";
+  // a slab / footing / roof is not a room: its callout sits inside one cell of control joints and dimension lines, so a
+  // room trace around it measures a cell (S-100F '300 SLAB-ON-GRADE' → 11.8 m², the slab is ~214 m²): no auto-trace
+  const notRoom = /\b(slabs?|footings?|foundations?|roofs?|decks?|pads?|paving|plinths?)\b/i.test(q) && !/\b(rooms?|office|kitchen|hall|toilet|store)\b/i.test(q);
+  const what = length ? "click the two ends of what you want to measure" : notRoom ? "click inside the area (a closed outline)" : "click inside the room";
   // no scale at all on a PDF: estimate one (door swings → 1:N, else 1:100); setAutoScale re-renders the hero with it
   if (!s && canMeasure && v2d.space === "pdf_pt") {
     void doorScale(path, 0).then((d) => {
@@ -1722,7 +1747,7 @@ function measureFirst(el: HTMLElement, a: Answer, path: string) {
     ? `<div class="hs-txt">Open the drawing as a PDF or image to measure it yourself: set the scale with two clicks on a length you know, then ${what}.</div>`
     : known
     ? `<div class="hs-txt"><b>Measure it in one step.</b> Scale <b>${esc(s!.label)}</b>${s!.user ? " (yours)" : ` ${esc(s!.source)}`}: ${what}.</div>
-      <button type="button" class="hs-btn primary">${length ? "Measure a length" : "Measure the room"}</button>`
+      <button type="button" class="hs-btn primary">${length ? "Measure a length" : notRoom ? "Measure the area" : "Measure the room"}</button>`
     : s
     ? `<div class="hs-txt"><b>Scale unknown.</b> No scale is printed, so we measure at about <b>${esc(s.label)}</b> (${esc(scaleWhy(s))}). Set the scale for an exact answer: two clicks on a length you know.</div>
       <button type="button" class="hs-btn primary">Set the scale</button>`
@@ -1736,7 +1761,9 @@ function measureFirst(el: HTMLElement, a: Answer, path: string) {
   el.append(div);
   // with a scale (known or estimated): the room the question names, found by its printed label on the sheet, is
   // traced and measured at once ('LOUNGE' → 23.4 m², or its length × width), the outline drawn; the visitor checks it
-  if (s && canMeasure) void measureNamedRoom(div, a, q, length, s, !known);
+  // 'total floor area of all Secondary Classrooms' (Stoa kind 1): every room with that printed name traced and summed;
+  // one room otherwise
+  if (s && canMeasure && !notRoom) void measureAllNamed(div, q, length, s, !known).then((done) => { if (!done) void measureNamedRoom(div, a, q, length, s, !known); });
   if (known && !s!.user && canMeasure && /\.pdf$/i.test(path)) void doorCheck(div, s!, path);
 }
 
@@ -1750,7 +1777,31 @@ const scaleWhy = (s: Scale) => s.source.replace(/\s*\(unsure\)\s*$/, "").replace
 const NOT_A_ROOM = /^\s*(whg|wohnung|apt|apartment|appartement|unit|flat|lgh|lägenhet|bostad|asunto|huoneisto|as\.|block|level|floor|storey|geschoss|kerros|plan|scale|massstab|maßstab|mittakaava|sheet|drawing|dwg|north|nord|rev|date|datum|project|projekt|client|bauherr)\b/i;
 
 /** last automatic measurement per file + question + scale (renderHero runs again on every scale change) */
-const roomMemo = new Map<string, { name: string; at: [number, number]; m: { m2: number; length: number; width: number; perimeter: number; poly: [number, number][] } | null }>();
+const roomMemo = new Map<string, { name: string; at: [number, number]; which?: string; m: { m2: number; length: number; width: number; perimeter: number; poly: [number, number][] } | null }>();
+
+/** '… nearest the north stair' / 'closest to the lift' / 'next to the kitchen': which of several equal room labels (DfE:
+ *  8 'Secondary Classroom'); dir picks one of several targets (north = up on the sheet) */
+const NEAR_Q = /\b(?:nearest|closest|next)\s+(?:to\s+)?(?:the\s+)?(?:(north|south|east|west|top|bottom|upper|lower|left|right)(?:ern|most)?\s+)?([\p{L}][\p{L} -]{1,30}?)\s*(?:[?,.]|$|\b(?:on|in|of)\b)/iu;
+async function nearestLabel(q: string, phrases: string[], lab: { at: [number, number]; text: string }) {
+  const m = q.match(NEAR_Q);
+  if (!m) return { lab, which: "" };
+  const all = await v2d.labels();
+  const ph = phrases.find((p) => all.some((l) => l.compact.includes(p) && l.text === lab.text));
+  const cands = ph ? all.filter((l) => l.compact.includes(ph)) : [];
+  const tw = roomPhrases(m[2]).filter((t) => t.length >= 3);
+  let targets = all.filter((l) => tw.some((t) => l.compact.includes(t)) && !(ph && l.compact.includes(ph)));
+  if (cands.length < 2 || !targets.length) return { lab, which: "" };
+  const dir = (m[1] ?? "").toLowerCase();
+  // up / left as SHOWN (a sheet with /Rotate 90 is turned on screen; pdf_pt is the unrotated page)
+  const key = (l: { at: [number, number] }) => {
+    const [x, y] = v2d.shown(l.at);
+    return /north|top|upper/.test(dir) ? y : /south|bottom|lower/.test(dir) ? -y : /west|left/.test(dir) ? x : /east|right/.test(dir) ? -x : 0;
+  };
+  if (dir) targets = [targets.reduce((b, l) => (key(l) < key(b) ? l : b))];
+  const d = (l: { at: [number, number] }) => Math.min(...targets.map((t) => Math.hypot(t.at[0] - l.at[0], t.at[1] - l.at[1])));
+  const pick = cands.reduce((b, l) => (d(l) < d(b) ? l : b));
+  return { lab: { at: pick.at, text: pick.text }, which: `the one nearest the ${dir ? `${dir} ` : ""}${m[2].trim().toLowerCase()}${/north|south|east|west/.test(dir) ? " (north taken as up on the sheet)" : ""}` };
+}
 
 /** The room the question names, found by its printed label and traced at scale s (memo per file + question + scale);
  *  null when no label matches. Draws the outline and zooms to it. */
@@ -1759,9 +1810,12 @@ async function traceNamedRoom(q: string, s: Scale) {
   const key = `${file}|${q}|${s.unitsPerM.toFixed(4)}`;
   let hit = roomMemo.get(key);
   if (!hit) {
-    const phrases = roomPhrases(q);
-    const lab = await v2d.findLabel(phrases);
-    if (!lab || v2d.openFile !== file) return null;
+    // the room is named before 'nearest …'; the rest picks which one
+    const nq = q.match(NEAR_Q);
+    const phrases = roomPhrases(nq ? q.slice(0, nq.index) : q);
+    const lab0 = await v2d.findLabel(phrases);
+    if (!lab0 || v2d.openFile !== file) return null;
+    const { lab, which } = await nearestLabel(q, phrases, lab0);
     // the other rooms' names on the sheet: the outline must not swallow them. Not: apartment / unit markers printed
     // inside a room ('Whg. A' cut the Swiss living room 16.3 → 9.8 m²), notes and title-block lines, parts of this
     // label ('Living' / 'Room' on two lines) or anything within 1 m of it
@@ -1772,7 +1826,19 @@ async function traceNamedRoom(q: string, s: Scale) {
     if (state.mode !== "2d" && state.mode !== "split") setMode("2d");
     measure.open(true, "area");
     const m = await measure.roomAt(lab.at, calm(lab.text), others);
-    hit = { name: calm(lab.text), at: lab.at, m };
+    // pdf.js gives a two-word label as two items ('Secondary' / 'Classroom'): the question's words complete the name
+    const esc2 = lab.text.trim().replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const fuller = esc2 ? q.match(new RegExp(`\\b${esc2}(?:\\s+[\\p{L}][\\p{L}-]*){1,2}`, "iu"))?.[0] : undefined;
+    // … only when that next word is printed as its own item just below the label (a split label, not 'Laundry need').
+    // The next word is the one after ALL the label's words: a stacked label is already merged by v2d.labels()
+    // ('Secondary Classroom' → next = 'nearest', not 'Classroom' again)
+    const nw = lab.text.trim().split(/\s+/).length;
+    const nextWord = fuller?.trim().split(/\s+/)[nw];
+    const next = nextWord?.toLowerCase().replace(/[^\p{L}\p{N}]/gu, "");
+    const split = !!next && !lab.text.toLowerCase().includes(next)
+      && (await v2d.labels()).some((l) => l.compact === next && Math.abs(l.at[0] - lab.at[0]) < 40 && l.at[1] > lab.at[1] && l.at[1] - lab.at[1] < 16);
+    const fullName = split ? `${lab.text.trim()} ${nextWord}` : lab.text;
+    hit = { name: calm(fullName), at: lab.at, which, m };
     roomMemo.set(key, hit);
     if (m && v2d.openFile === file) v2d.zoomToDrawing(m.poly); // the traced room, like an answer's evidence
   }
@@ -1804,13 +1870,83 @@ function offerCompare(div: HTMLElement, a: Answer, q: string, length: boolean, s
     } else {
       const ours = PERIM_Q.test(q) ? hit.m.perimeter : length ? hit.m.length : hit.m.m2;
       const k = Math.abs(ours / (a.value as number) - 1);
-      out.innerHTML = `On the drawing at ${scaleGuessed(s) ? "about " : ""}${esc(s.label)}: <b>${esc(fmtM(ours))} ${length ? "m" : "m²"}</b> (${esc(hit.name.toLowerCase())}, outline traced). ${k <= 0.1
+      const guessedScale = scaleGuessed(s);
+      out.innerHTML = `On the drawing at ${guessedScale ? "about " : ""}${esc(s.label)}: <b>${esc(fmtM(ours))} ${length ? "m" : "m²"}</b> (${esc(hit.name.toLowerCase())}${hit.which ? `, ${esc(hit.which)}` : ""}, outline traced). ${k <= 0.1
         ? `<span class="ok">Close to the answer above: two independent methods agree.</span>`
-        : `<span class="warn">${Math.round(k * 100)} % off the answer above: set the scale to settle it.</span>`}`;
+        : guessedScale ? `<span class="warn">${Math.round(k * 100)} % off the answer above: set the scale to settle it.</span>`
+        // the scale is printed / set: the traced outline is the better number when it follows the room's walls
+        : `<span class="warn">Very different from the answer above (${ours > (a.value as number) ? `${Math.round(ours / (a.value as number))}×` : `${Math.round(k * 100)} % less`}). The scale is ${s.user ? "yours" : "known"}, so if the outline follows the room's walls, this is the better number.</span>`}`;
     }
     b.remove();
     div.append(out);
   });
+}
+
+/** 'all / total / every <rooms>' + a room name printed on ≥ 2 labels of the PDF: each traced (the wall-line tracer at
+ *  the scale), outlines found twice (two labels in one room) counted once, summed. Draws every outline with its m² and
+ *  makes the sum the hero. false = not such a question / fewer than 2 rooms traced (the one-room path runs then). */
+const ALL_Q = /\b(all|total|every|combined|sum|together|altogether)\b/i;
+async function measureAllNamed(div: HTMLElement, q: string, length: boolean, s: Scale, guessed: boolean): Promise<boolean> {
+  const file = v2d.openFile;
+  if (length || PERIM_Q.test(q) || !ALL_Q.test(q) || v2d.space !== "pdf_pt" || !file || !/\.pdf$/i.test(file)) return false;
+  // plural nouns to singular ('classrooms' → 'classroom', 'offices' → 'office'); quantity words dropped
+  const sing = q.replace(/\b([a-zà-ÿ]{3,}?[^s\W])s\b/gi, "$1").replace(new RegExp(ALL_Q.source, "gi"), " ");
+  const phrases = roomPhrases(sing).filter((ph) => ph.length >= 4);
+  const labs = (await v2d.labels()).filter((l) => !NOT_A_ROOM.test(l.text) && l.text.length <= 40);
+  let hits: typeof labs = [], phrase = "";
+  for (const ph of phrases) { // the longest phrase printed on at least two labels
+    const h = labs.filter((l) => l.compact.includes(ph));
+    if (h.length >= 2) { hits = h; phrase = ph; break; }
+  }
+  if (hits.length < 2 || v2d.openFile !== file) return false;
+  // one label per room: labels within 1 m of an earlier one are its second line
+  const near = Math.max(1, s.unitsPerM);
+  const one = hits.filter((l, i) => !hits.slice(0, i).some((m) => Math.hypot(m.at[0] - l.at[0], m.at[1] - l.at[1]) < near)).slice(0, 40);
+  const scaleN = Math.round(72 / 0.0254 / s.unitsPerM * 100) / 100;
+  const txt = div.querySelector(".hs-txt");
+  if (txt) txt.innerHTML = `Tracing the ${one.length} rooms labelled <b>${esc(calm(one[0].text))}</b>…`;
+  let res;
+  try {
+    res = await roomShapes(file, 0, "pdf_pt", one.map((l, i) => ({ i, bbox: [l.at[0] - 1, l.at[1] - 1, l.at[0] + 1, l.at[1] + 1], scale_n: scaleN })));
+  } catch {
+    return false;
+  }
+  if (v2d.openFile !== file || !div.isConnected) return true;
+  const rooms: { text: string; m2: number; poly: [number, number][] }[] = [];
+  for (const sh of res.shapes) {
+    if (!sh.poly || !sh.area) continue;
+    const m2 = sh.area / (s.unitsPerM * s.unitsPerM);
+    const c = sh.poly.reduce((o, p) => [o[0] + p[0] / sh.poly!.length, o[1] + p[1] / sh.poly!.length], [0, 0]);
+    // the same outline from two labels (one room, two names on it) counts once
+    if (rooms.some((r) => Math.abs(r.m2 / m2 - 1) < 0.02 && Math.hypot(...(r.poly.reduce((o, p) => [o[0] + p[0] / r.poly.length, o[1] + p[1] / r.poly.length], [0, 0]).map((v, k) => v - c[k]) as [number, number])) < near)) continue;
+    rooms.push({ text: calm(one[sh.i].text), m2, poly: sh.poly });
+  }
+  if (rooms.length < 2) return false;
+  const sum = rooms.reduce((t, r) => t + r.m2, 0);
+  if (state.mode !== "2d" && state.mode !== "split") setMode("2d");
+  v2d.measureClear();
+  rooms.forEach((r) => v2d.measurePoly(r.poly, `${fmtM(r.m2)} m²`));
+  v2d.zoomToDrawing(rooms.flatMap((r) => r.poly), 1.3);
+  const hero = div.closest("#hero");
+  const big = hero?.querySelector(".hero-value");
+  const approx = guessed ? "≈ " : "";
+  if (big) big.innerHTML = `<span class="big">${approx}${esc(fmtM(sum))}</span><span class="unit">m²</span>`;
+  // the rooms as the question names them ('all Secondary Classrooms' → 'Secondary Classrooms'; pdf.js splits labels into
+  // words), else the label as printed
+  const asked = q.match(/\b(?:all|every)\s+(?:the\s+|of\s+the\s+)?(.{3,40}?)\s*(?:\b(?:on|in|at|of)\b.*)?\??\s*$/i)?.[1]?.trim();
+  const name = asked ? `the ${rooms.length} ${asked}` : `the ${rooms.length} rooms labelled ‘${rooms[0].text.replace(/\s*\(.*$/, "")}’`;
+  const sen = hero?.querySelector(".hero-sentence");
+  if (sen) sen.textContent = `floor area of ${name} together, measured on the drawing ${s.user ? `at your scale ${s.label}` : guessed ? `at an estimated ${s.label}` : `at ${s.label}`}`;
+  const pill = hero?.querySelector(".hero-badges .conf");
+  if (pill) {
+    pill.className = guessed ? "conf est" : "conf fair";
+    pill.textContent = guessed ? "Best estimate" : "Measured · check the outlines";
+  }
+  const missed = one.length - rooms.length;
+  const variants = [...new Set(rooms.map((r) => r.text))];
+  if (txt) txt.innerHTML = `${rooms.length} rooms traced from the wall lines${missed > 0 ? ` (${missed} more label${missed > 1 ? "s" : ""} found but not closed or the same room)` : ""}: ${rooms.map((r) => esc(fmtM(r.m2))).join(" + ")} m².${variants.length > 1 ? ` <small>Names included: ${variants.map((v) => `‘${esc(v)}’`).join(", ")}.</small>` : ""} <small>Check each outline on the plan${guessed ? "; set the scale for an exact answer" : ""}.</small>`;
+  void phrase;
+  return true;
 }
 
 async function measureNamedRoom(div: HTMLElement, a: Answer, q: string, length: boolean, s: Scale, guessed = false) {
@@ -1851,7 +1987,7 @@ async function measureNamedRoom(div: HTMLElement, a: Answer, q: string, length: 
     ? `<span class="big long${(approx + fmtM(hit.m.length) + fmtM(hit.m.width)).length > 9 ? " xlong" : ""}">${approx}${esc(fmtM(hit.m.length))} × ${esc(fmtM(hit.m.width))}</span><span class="unit">m</span>`
     : `<span class="big">${approx}${esc(fmtM(hit.m.m2))}</span><span class="unit">m²</span>`;
   const sen = hero?.querySelector(".hero-sentence");
-  if (sen) sen.textContent = `${perim ? "perimeter at the inner wall face (door openings not deducted yet)" : length ? "length × width" : "floor area inside the walls"} of ${/^\d/.test(hit.name) ? "room " : "the "}${hit.name.toLowerCase()}, measured on the drawing ${s.user ? `at your scale ${s.label}` : guessed ? `at an estimated ${s.label}` : `at ${s.label}`}`;
+  if (sen) sen.textContent = `${perim ? "perimeter at the inner wall face (door openings not deducted yet)" : length ? "length × width" : "floor area inside the walls"} of ${/^\d/.test(hit.name) ? "room " : "the "}${hit.name.toLowerCase()}${hit.which ? ` (${hit.which})` : ""}, measured on the drawing ${s.user ? `at your scale ${s.label}` : guessed ? `at an estimated ${s.label}` : `at ${s.label}`}`;
   const pill = hero?.querySelector(".hero-badges .conf");
   if (pill) {
     pill.className = guessed ? "conf est" : "conf fair";
@@ -1893,7 +2029,10 @@ function recognitionChip(el: HTMLElement, a: Answer, sheet?: string) {
   if (r && (a.intent?.scope === "model" || /\b(whole|entire) (building|model)\b/i.test($<HTMLTextAreaElement>("question").value))) r = { ...r, storey: undefined };
   // a general reader (text, vision model) says less about the file than a plan reader that answered before
   const known = kindMemo.get(f.path);
-  if (r && !mine && GENERIC_KIND.test(r.kind) && known && !GENERIC_KIND.test(known)) r = { ...r, kind: known };
+  // a vector PDF once read as a drawing sheet stays one when a later question went down the picture path (S-100F
+  // 'total slab area' via the image readers said 'Scanned or historical drawing' after 'Architectural drawing sheet')
+  const pictureKind = (k: string) => /scan|image|photo|historical/i.test(k);
+  if (r && !mine && known && ((GENERIC_KIND.test(r.kind) && !GENERIC_KIND.test(known)) || (/\.pdf$/i.test(f.path) && pictureKind(r.kind) && !pictureKind(known) && !GENERIC_KIND.test(known)))) r = { ...r, kind: known };
   else if (r && !mine) kindMemo.set(f.path, r.kind);
   if (!r) {
     const base = recognitionOf({ ...a, solver: "pdf_vector" }, f.path, { sheet, scale }); // its floor / scale / page
@@ -1960,6 +2099,14 @@ document.addEventListener("click", (e) => {
   if (!(e.target as HTMLElement).closest?.(".recog-wrap")) document.querySelectorAll(".rg-menu").forEach((m) => m.remove());
 });
 
+/** The open PDF page at its known (not guessed) scale: {m2, diag} in metres, for the hero's plausibility check. */
+function sheetAtScale(): { m2: number; diag: number } | undefined {
+  const s = measure.scale, pt = v2d.sheetPt;
+  if (!s || scaleGuessed(s) || !pt || v2d.space !== "pdf_pt" || !(s.unitsPerM > 0)) return undefined;
+  const w = pt[0] / s.unitsPerM, h = pt[1] / s.unitsPerM;
+  return { m2: w * h, diag: Math.hypot(w, h) };
+}
+
 function renderHero(a: Answer, roundTripMs: number) {
   const el = $("hero");
   el.hidden = false;
@@ -1972,6 +2119,7 @@ function renderHero(a: Answer, roundTripMs: number) {
     labelOf: (i) => humanLabel(a, i),
     rank: rankOf(a, $<HTMLTextAreaElement>("question").value),
     scaleKnown: !!measure.scale && !scaleGuessed(measure.scale),
+    sheet: sheetAtScale(),
   });
   const sheet = p?.sheets.find((s) => s.path === state.file?.path)?.label;
   recognitionChip(el, a, sheet && !/^(plan|plan sheet|sheet)$/i.test(sheet) ? sheet : undefined);

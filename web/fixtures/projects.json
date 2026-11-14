@@ -121,6 +121,30 @@
     "kind": "schedule"
   },
   {
+    "id": "flat",
+    "name": "Apartment floor plan",
+    "place": "Finland",
+    "facts": [
+      "scanned plan",
+      "Finnish room codes"
+    ],
+    "contents": "1 plan image",
+    "sheets": [
+      {
+        "label": "Plan",
+        "path": "data/cubicasa5k/colorful-4539.png"
+      }
+    ],
+    "chips": [
+      "How many bedrooms are there?",
+      "Is there a sauna?",
+      "Kuinka monta makuuhuonetta (MH) pohjapiirustuksessa on?"
+    ],
+    "credit": "Plan: CubiCasa5K, CC BY-NC-SA 4.0, non-commercial use only",
+    "kind": "plan",
+    "licence": "CC BY-NC-SA 4.0: non-commercial use only"
+  },
+  {
     "id": "habs",
     "name": "Creque Marine Railway, head house",
     "place": "Charlotte Amalie, St. Thomas (US Virgin Islands)",

@@ -37,7 +37,9 @@ MAX_SIDE = 4000  # det input cap; bigger images are tiled at this size
 TILE_OVERLAP = 200
 VERTICAL = 2.5  # a box this many times taller than wide is a vertical line
 UPSCALE = float(os.environ.get("STOA_OCR_UPSCALE", "0") or 0)  # >1: enlarge images below MAX_SIDE first (small print)
-ENGINE = f"PP-OCRv6_{SIZE}+rot" + (f"+up{UPSCALE:g}" if UPSCALE > 1 else "")
+# '+t2' = tiled images (> MAX_SIDE) are deduped by each read's room to its tile's inner edges (O1 c6); stoa.ocr uses a
+# server for tiled images only when its engine string carries it (an older server still runs the old dedupe)
+ENGINE = f"PP-OCRv6_{SIZE}+rot+t2" + (f"+up{UPSCALE:g}" if UPSCALE > 1 else "")
 _lock = threading.Lock()
 _ocr = None
 
@@ -85,13 +87,31 @@ def _iou(a, b) -> float:
 
 
 def _dedupe(items: list[dict]) -> list[dict]:
-    """Tile overlaps read some lines twice: keep the higher-scoring of two boxes that overlap >= 60%."""
-    items = sorted(items, key=lambda i: -i["score"])
+    """Tile overlaps read some lines twice: keep the higher-scoring of two boxes that overlap >= 60%. A read CLIPPED by
+    an inner tile edge loses to the overlapping read with more room to its own tile's inner edges ('room', set by _pass,
+    in text heights, capped at EDGE_ROOM), whatever the scores (O1 c6: on D1's
+    4961-px A3 PNG the left tile's 'Scale:' (cut at x = 4000) beat the right tile's 'Scale: 1:200@A3', so the sheet
+    had no scale; 'Dwg. N' likewise)."""
+    items = sorted(items, key=lambda i: (-i.get("room", EDGE_ROOM), -i["score"]))
     kept: list[dict] = []
     for it in items:
         if all(_iou(it["box"], k["box"]) < 0.6 for k in kept):
             kept.append(it)
+    for k in kept:
+        k.pop("room", None)
     return sorted(kept, key=lambda i: (round(i["box"][1] / 20), i["box"][0]))
+
+
+EDGE_ROOM = 2.0  # text heights; a box this far from every INNER tile edge is whole (the score decides)
+
+
+def _room(b: list[float], tile: tuple[int, int, int, int], W: int, H: int) -> float:
+    """Distance from a box to the nearest INNER edge of the tile it was read in, in text heights (capped): near an
+    edge the line may continue past it (a word gap: 'Scale:' ended 6 px before the edge, '1:200@A3' began after it)."""
+    x0, y0, x1, y1 = tile
+    d = [b[0] - x0 if x0 > 0 else 1e9, x1 - b[2] if x1 < W else 1e9,
+         b[1] - y0 if y0 > 0 else 1e9, y1 - b[3] if y1 < H else 1e9]
+    return min(EDGE_ROOM, max(0.0, min(d)) / max(1.0, min(b[3] - b[1], b[2] - b[0])))
 
 
 _SCALEISH = re.compile(r"SCALE|[S58]C[A4][LI1][E3]|=|\d\s*/\s*\d|['’]\s*-", re.I)
@@ -141,6 +161,7 @@ def _pass(img: Image.Image) -> list[dict]:
         for it in _predict(arr, MAX_SIDE):
             b = it["box"]
             it["box"] = [round(b[0] + x0, 1), round(b[1] + y0, 1), round(b[2] + x0, 1), round(b[3] + y0, 1)]
+            it["room"] = _room(it["box"], (x0, y0, x1, y1), W, H)
             items.append(it)
     return _dedupe(items)
 

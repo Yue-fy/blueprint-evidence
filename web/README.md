@@ -40,14 +40,14 @@ API cache (`DEMO_WARM=0` skips that; `fixtures/recorded.json` is not changed). T
 - `STOA_DATA` must point at the dataset root (default: the team path in `AGENTS.md`).
 - `STOA_TEXT_BACKEND=local2` (D21): free-text IFC answers use the 35B on :8002 (judged 62 vs 54 % on ifc_bench, p95
   6.6 vs 18.2 s; falls back to :8001 by itself). `demo.sh` sets it for the API and Vite it starts; uploads' questions
-  get it by default. Starting the API by hand: `STOA_TEXT_BACKEND=local2 $JUNCTION_VENV/bin/python -m uvicorn stoa.api:app --port 8100`.
+  get it by default. Starting the API by hand: `STOA_TEXT_BACKEND=local2 .venv/bin/python -m uvicorn stoa.api:app --port 8100`.
 - `/api/*` goes to W4's API (`STOA_API_URL`, default `http://127.0.0.1:8100`, see `docs/CONTRACT.md`;
-  start it with `$JUNCTION_VENV/bin/python -m uvicorn stoa.api:app --port 8100` from the repo root).
+  start it with `.venv/bin/python -m uvicorn stoa.api:app --port 8100` from the repo root).
   If that server is down, the dev server answers from a **mock** (`mock/stoaApi.ts`): files and example
   questions come from the dataset, `/ask` replays `fixtures/recorded.json` (live answers recorded with
   `fixtures/record.py`) and then `fixtures/answers.json`. The badge in the top-left says `API live` or `API mock`.
 - `/api/kg` (knowledge graph): the API's `GET /kg` if it has one; otherwise the dev server runs W1's
-  `stoa.kg.links(path)` itself with `$JUNCTION_VENV/bin/python` from the repo root (`STOA_KG_REPO=<checkout>`
+  `stoa.kg.links(path)` itself with `.venv/bin/python` from the repo root (`STOA_KG_REPO=<checkout>`
   to use another checkout); if that fails too, it links files by name only (the panel title says "files only").
 - Hosted second opinions (NVIDIA Nemotron) are rate-limited and can hang for minutes: the dev server waits
   `STOA_HOSTED_TIMEOUT_S` (default 45) seconds, then shows that model's answer from `fixtures/recorded.json`, marked
@@ -231,7 +231,7 @@ the IfcConvert `.svg` sibling's GUID groups, IfcOpenShell, DXF layers). It never
 five match the dataset answers. Regenerate:
 
 ```bash
-$JUNCTION_VENV/bin/python web/fixtures/make_fixtures.py
+.venv/bin/python web/fixtures/make_fixtures.py
 ```
 
 **Tour and recorded answers.** The demo tour's steps are in `fixtures/tour.json` (`{file, q, note, bench?,
@@ -240,7 +240,7 @@ tour question (plus a few extras, the Nemotron second opinions and the "Show whe
 `fixtures/recorded.json`, which the mock replays when the API is down:
 
 ```bash
-$JUNCTION_VENV/bin/python web/fixtures/record.py --api http://127.0.0.1:8100
+.venv/bin/python web/fixtures/record.py --api http://127.0.0.1:8100
 ```
 
 An entry with `"pinned": true` in `recorded.json` is kept instead of the fresh recording (use it to hold a

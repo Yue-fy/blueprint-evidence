@@ -5,7 +5,7 @@ and this gate in front of it. One shared password; a login page sets a cookie (b
 user name (curl / scripts). Everything else is passed through unchanged and streamed both ways (uploads, PDFs, IFC
 models, slow answers up to 15 min). It never touches the upstream process.
 
-    STOA_GATE_PASSWORD='...' python deploy/gate.py --upstream http://127.0.0.1:5180 --port 8140
+    STOA_GATE_PASSWORD='...' python deploy/gate.py --upstream http://127.0.0.1:5180 --port 8190
     # or: --password-file ~/.stoa_gate (one line, chmod 600). Never pass the password on the command line.
 
 Open without a password: GET /__gate/health (gate + upstream status, for the watchdog and Funnel checks).
@@ -269,7 +269,7 @@ def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--upstream", default="http://127.0.0.1:5180", help="the demo web server (default :5180)")
     ap.add_argument("--host", default="127.0.0.1", help="listen address (Funnel connects locally)")
-    ap.add_argument("--port", type=int, default=8140)
+    ap.add_argument("--port", type=int, default=8190)
     ap.add_argument("--password-file", help="file with the password on its first line (else $STOA_GATE_PASSWORD)")
     ap.add_argument("--timeout", type=float, default=900, help="seconds to wait for the demo (slow answers)")
     ap.add_argument("--max-fails", type=int, default=20, help="failed logins per client per 10 min before a 429 (if the "
@@ -281,7 +281,12 @@ def main(argv=None) -> int:
         print("set a password of at least 8 characters: $STOA_GATE_PASSWORD or --password-file", file=sys.stderr)
         return 2
     g = Gate(a.upstream, pw, a.timeout, a.max_fails)
-    srv = ThreadingHTTPServer((a.host, a.port), make_handler(g))
+    try:
+        srv = ThreadingHTTPServer((a.host, a.port), make_handler(g))
+    except OSError as e:  # never let a Funnel point at whatever else owns the port
+        print(f"cannot listen on {a.host}:{a.port} ({e}); pick a free --port and point the Funnel at it only after "
+              f"/__gate/health answers {{\"gate\": \"ok\"}}", file=sys.stderr)
+        return 3
     srv.daemon_threads = True
     print(f"gate on http://{a.host}:{a.port} -> {a.upstream} (health: /__gate/health)", file=sys.stderr)
     try:

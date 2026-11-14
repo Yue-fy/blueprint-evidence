@@ -31,6 +31,7 @@ SPACING_BAD_CONF = 0.5  # the sum holds but the strings' spacing does not fit th
 SPREAD_BAD = 0.12  # max residual / chain span above which a chain's spacing contradicts its values
 SCALE_AGREE = 0.015  # verified chains must agree on px per m within this to give the drawing a scale (hand-lettered HABS chains spread 2.4-2.8%: not a measuring scale)
 AREA_CONF = 0.6  # 'the area the two overall dimensions enclose' = their product (asked literally)
+PART_OFF_CONF = 0.4  # the side-named chain lies outside the part the question names ('… of the left part')
 FOOTPRINT_CONF = 0.4  # 'footprint' = width x depth assumes a rectangular outline
 
 _FTIN = re.compile(r"^(\d{1,3})\s*['’′]\s*-?\s*(?:(\d{1,2})(?:[\s·•\-]+(\d)/(\d{1,2}))?\s*[\"”″]?)?$")
@@ -288,6 +289,61 @@ _EW = re.compile(r"\b(east(?:\s*(?:to|-|–)\s*|\s+and\s+)west|west(?:\s*(?:to|-
 _NS = re.compile(r"\b(north(?:\s*(?:to|-|–)\s*|\s+and\s+)south|south(?:\s*(?:to|-|–)\s*|\s+and\s+)north|"
                  r"top to bottom|vertical\w*|nord-süd|pohjois-etelä|nord-sud)\b", re.I)
 _PAREN = re.compile(r"\([^()]*\)")
+# the side a dimension LINE is on ('along the bottom dimension line', 'dimensioned on the left side', 'the top chain'):
+# the side word followed within two words by a line noun. Another side word is then a PART qualifier ('… of the left
+# part'), not the axis (X1 stoa-like S-100F sl-081: 'bottom dimension line of the left part' read as the left chain).
+_SIDE_WORDS = (r"left|right|top|bottom|upper|lower|links|rechts|oben|unten|oberen?|unteren?|linken?|rechten?|gauche|"
+               r"droite|haut|bas|vasem\w*|oike\w*|ylä\w*|ala\w*")
+_LINE_SIDE = re.compile(rf"\b({_SIDE_WORDS})\s+(?:\w+\s+){{0,2}}?(dimension\w*|chain\w*|side|edge|string\w*|line|"
+                        rf"ma(?:ß|ss)kett\w*|bema(?:ß|ss)ung\w*|seite|rand|côté|cote\w*|lato|reuna\w*|mittaketju\w*)\b",
+                        re.I)
+_ROW_WORD = re.compile(r"^(top|bottom|upper|lower|oben|unten|oberen?|unteren?|haut|bas|ylä\w*|ala\w*)$", re.I)
+_LOW_END = re.compile(r"^(top|upper|oben|oberen?|haut|ylä\w*|left|links|linken?|gauche|vasem\w*)$", re.I)
+_PART = re.compile(rf"\b({_SIDE_WORDS})\s+(part|wing|half|section|portion|block|end|teil|flügel|hälfte|osa|siipi|"
+                   rf"partie|aile|parte|ala)\b|\b(part|wing|half|section|portion|block|teil|flügel|osa)\s*\(\s*"
+                   rf"({_SIDE_WORDS})\s*\)", re.I)
+
+
+def line_side(question: str) -> tuple[str, bool] | None:
+    """(axis, low_end) when the question names the side its dimension line is on: ('row', False) = the bottom chain,
+    ('col', True) = the left chain. None when no side word is attached to a line noun."""
+    hits = {m.group(1).lower() for m in _LINE_SIDE.finditer(question)}
+    if len(hits) != 1:
+        return None
+    w = hits.pop()
+    return ("row" if _ROW_WORD.match(w) else "col"), bool(_LOW_END.match(w))
+
+
+def part_side(question: str) -> tuple[str, bool] | None:
+    """(axis across which the part lies, low_end) for '… of the left part' / 'the pump room part (left)': ('row', True)
+    = the left part (a part to the left lies at low x, i.e. along the row axis)."""
+    m = _PART.search(question)
+    if not m:
+        return None
+    w = (m.group(1) or m.group(4) or "").lower()
+    return ("col" if _ROW_WORD.match(w) else "row"), bool(_LOW_END.match(w))
+
+
+def _cross(p: Pair) -> float:
+    """Where the chain lies across its own axis: a row chain's y, a col chain's x (image px)."""
+    bs = [d.item.box for d in p.run]
+    return sum((b[1] + b[3]) / 2 if p.axis == "row" else (b[0] + b[2]) / 2 for b in bs) / len(bs)
+
+
+def _along(p: Pair) -> tuple[float, float]:
+    bs = [d.item.box for d in p.run]
+    return (min(b[0] for b in bs), max(b[2] for b in bs)) if p.axis == "row" else \
+        (min(b[1] for b in bs), max(b[3] for b in bs))
+
+
+def on_side(pairs: list[Pair], axis: str, low: bool, band: float) -> list[Pair]:
+    """The chains on one side of the plan: the outermost chain on that axis and every chain within band px of it
+    across the axis (a chain of segments + the chain of totals next to it)."""
+    c = [p for p in pairs if p.axis == axis]
+    if not c:
+        return []
+    edge = min(map(_cross, c)) if low else max(map(_cross, c))
+    return [p for p in c if abs(_cross(p) - edge) <= band]
 _NEG = re.compile(r"\b(without|excluding|except|not counting|ohne|ilman|sans|senza|sin|utan)\b[^,.;?]*", re.I)
 _SQM = re.compile(r"square met|m²|m2\b|quadratmeter|neliö", re.I)
 
@@ -302,8 +358,9 @@ def question_kind(question: str) -> tuple[str, str | None] | None:
     building = bool(_BUILDING.search(q) or _PLAN_SUBJECT.search(q))
     if not (overall or building):
         return None
-    axis = "row" if _EW.search(q) else "col" if _NS.search(q) else \
-        "col" if _COL_SIDE.search(q) else "row" if _ROW_SIDE.search(q) else None
+    ls, qs = line_side(q), _PART.sub(" ", q)  # a part qualifier ('of the left part') does not name the axis
+    axis = "row" if _EW.search(q) else "col" if _NS.search(q) else ls[0] if ls else \
+        "col" if _COL_SIDE.search(qs) else "row" if _ROW_SIDE.search(qs) else None
     if _AREA.search(q):
         literal = bool(_DIMWORD.search(q) and re.search(r"\benclose|\bspan|\bwithin|\bmultipl|\btimes\b|×", q, re.I))
         foot = bool(re.search(r"footprint|grundfläche|bebaute|emprise|impronta|pohja-ala", q, re.I))
@@ -317,9 +374,10 @@ def question_kind(question: str) -> tuple[str, str | None] | None:
     return None
 
 
-def _larger_unverified(tl, p: Pair, any_axis: bool = False) -> Dim | None:
+def _larger_unverified(tl, p: Pair, any_axis: bool = False, near: tuple | None = None) -> Dim | None:
     """A printed dimension of the same unit system 2% to 3x larger than the chosen total (then the total may be a part).
-    any_axis: 'how long is the building' = its LONGEST extent, so a larger string in either direction is a rival."""
+    any_axis: 'how long is the building' = its LONGEST extent, so a larger string in either direction is a rival.
+    near (axis, cross, band): only strings on that side of the plan count (the question named the dimension line)."""
     lo, hi = p.value * 1.02, p.value * 3
     for d in dims_of(tl.items):
         if d.family != ("ft" if p.unit == "ft" else "metric") or d is p.total:
@@ -327,6 +385,10 @@ def _larger_unverified(tl, p: Pair, any_axis: bool = False) -> Dim | None:
         w, h = d.item.box[2] - d.item.box[0], d.item.box[3] - d.item.box[1]
         if not any_axis and not (w > 1.5 * h if p.axis == "row" else h > 1.5 * w):
             continue  # only strings written along the same axis (a building's length is not a rival to its depth)
+        if near is not None:
+            c = (d.item.box[1] + d.item.box[3]) / 2 if near[0] == "row" else (d.item.box[0] + d.item.box[2]) / 2
+            if abs(c - near[1]) > near[2]:
+                continue
         v = d.value if d.family == "ft" else _metres(d, p.int_unit or _int_unit([d]))
         if lo < v <= hi:
             return d
@@ -364,6 +426,8 @@ def overall_answer(img_path: str, question: str, tl, solver: str = "raster") -> 
     if qk is None:
         return None
     kind, axis = qk
+    if part_side(question) and not line_side(question):
+        return None  # 'how wide is the pump room part (left)': a part of the plan, not its overall dimension
     pairs = verified(tl)
     if not pairs:
         return None
@@ -399,14 +463,33 @@ def overall_answer(img_path: str, question: str, tl, solver: str = "raster") -> 
         p = row if axis == "row" else col
         side = ("the horizontal overall dimension (top/bottom chain)" if axis == "row" else
                 "the vertical overall dimension (left/right chain)")
+    ls = line_side(question)
+    band = 0.08 * max(tl.size)
+    side_pairs = on_side(pairs, ls[0], ls[1], band) if ls else []
+    if side_pairs:
+        p = best(side_pairs, ls[0])
+        word = {("row", True): "top", ("row", False): "bottom", ("col", True): "left", ("col", False): "right"}[ls]
+        side = f"the overall dimension on the {word} dimension line (as the question asks)"
     if p is None:
         return None
-    big = _larger_unverified(tl, p, any_axis=kind == "length" and axis is None)
+    if side_pairs:  # a rival larger string only counts on the same side of the plan (the 27 m top chain is not one)
+        big = _larger_unverified(tl, p, near=(p.axis, _cross(p), band))
+    else:
+        big = _larger_unverified(tl, p, any_axis=kind == "length" and axis is None)
     if big is not None:
         # X1 Stoa-like AFCEC plan: the largest VERIFIED total (286') was a wing, the overall 323'-4" did not verify:
         # 286 ft @0.70. A larger printed dimension of the same unit system means this total may not be the overall
         return None
     conf, miss = _conf(p, VERIFIED_CONF)
+    ps = part_side(question)
+    if side_pairs and ps and ps[0] == p.axis:  # '… of the left part': the chosen chain should lie in that part
+        lo_all = min(_along(q)[0] for q in pairs if q.axis == p.axis)
+        hi_all = max(_along(q)[1] for q in pairs if q.axis == p.axis)
+        mid, c = (lo_all + hi_all) / 2, sum(_along(p)) / 2
+        if (c > mid) if ps[1] else (c < mid):
+            conf = min(conf, PART_OFF_CONF)
+            miss = miss + ["which chain belongs to the part the question names (the chosen chain lies in the other "
+                           "half of the plan)"]
     asm = [f"{kind} = {side}: the printed total {p.describe()}", "the overall dimension is the largest printed total "
            "that equals the sum of the chain beside it"]
     if p.int_unit:

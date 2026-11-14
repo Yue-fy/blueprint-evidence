@@ -1,4 +1,5 @@
 {"path": "swiss/plan.pdf", "question": "How many doors (interior doors and entrance doors together) are drawn on this floor plan?", "answer": 8, "unit": "count", "type": "count"}
+{"path": "swiss/plan.pdf", "question": "How many doors are drawn on this floor plan?", "answer": 8, "unit": "count", "type": "count"}
 {"path": "swiss/plan.pdf", "question": "How many windows are drawn on this floor plan?", "answer": 7, "unit": "count", "type": "count"}
 {"path": "swiss/plan.pdf", "question": "What is the net floor area of room 6.02 ('Bad') in m²?", "answer": 1.76, "unit": "m2", "type": "area"}
 {"path": "swiss/plan.pdf", "question": "What is the net floor area of room 6.04 ('Reduit') in m²?", "answer": 4.24, "unit": "m2", "type": "area"}

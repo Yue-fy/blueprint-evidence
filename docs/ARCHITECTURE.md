@@ -36,7 +36,11 @@ server. One eval tool scores every solver the same way.
 | `line_rooms` | `stoa/solvers/line_rooms.py` → `stoa/evidence/linework.py`, `lineplan.py` | Line-only CAD sheets (no fills, no CAD twin): the named room traced from the wall lines around its printed label at the printed 1:N (door gaps closed); also skirting / perimeter lengths | deterministic |
 | `area_tags` | `stoa/solvers/area_tags.py` | Room area tags printed on CAD/Revit sheets ('680 SF', '4.24 m²') | deterministic |
 | `label_count` | `stoa/solvers/label_count.py` | Counts from the text layer: printed room labels of the asked type, distinct numbered tags of a piping or door family ('FP-1'..'FP-5' → 5) | deterministic |
+| `stated_count` | `stoa/solvers/label_count.py` | Counts the sheet states itself: 'SECOND FLOOR = 48 DORMS', printed type quantities ('25 KPL', pcs, EA); the sheet's own floor row when the question names one | deterministic |
+| `pipe_runs` | `stoa/solvers/pipe_runs.py` | Piping sheets: 'Where does the 16" line go?' = the printed run callouts of that pipe size (TO / FROM / run name, stacked lines joined), each boxed; the drawn line itself is not traced (said in `missing`) | deterministic |
 | area tables, slabs | `stoa/evidence/areatable.py`, `stoa/evidence/slabs.py` (hooks in the pipeline) | A printed area table ('TOTAL SECOND FLOOR = 26,562 SF': the TOTAL row, or the rows of the asked type summed); slab area by type = the region around the slab-type callout traced on the sheet's lines, joints and dimension lines left out | deterministic |
+| dimension strings | `stoa/evidence/dimrect.py` (used by `lineplan.py`, `slabs.py`) | Printed dimension strings on vector sheets, each number paired with its own dimension line (it must measure that line at the printed 1:N within 10%); the printed value wins over a measured one | deterministic |
+| paper-size copy | `stoa/formats/normalize.py` (`paper_copy`) | A sheet printed '1:200 @ A1' but stored as an A3 page is read on a copy enlarged to A1, so every reader's printed scale is true | deterministic |
 | `svg_ifc` | `stoa/solvers/svg_ifc.py` | IfcConvert plan SVGs alone: one `<g class="IfcX" data-guid>` per element, room labels, scale | deterministic |
 | `raster` | `stoa/solvers/raster/` | Scans, PNGs and photos: scale bar or printed scale, flood fill, door arcs, window symbols, dimension strings, text layer | local |
 | `raster_cc5k` | `stoa/solvers/raster_cc5k/` | Pretrained CubiCasa5K network on CPU, one box per symbol (optional; weights not included) | local |
@@ -165,8 +169,8 @@ cd web && npm run dev                                    # http://localhost:5173
 .venv/bin/python -m pytest -q
 ```
 
-Env var names (values live in `.env`, never in git) are listed in `.env.example` and `docs/CONTRACT.md`: among
-them `STOA_DATA`, `JUNCTION_SHARED`, `LLM_BASE_URL`, `LLM2_BASE_URL`, `GEMINI_API_KEY`, `NVIDIA_API_KEY`,
+Env var names (values live in `.env`, never in git) are listed in `.env.example`, and every variable the code reads, with
+its default, in [CONFIGURATION.md](CONFIGURATION.md). Among them `STOA_DATA`, `JUNCTION_SHARED`, `LLM_BASE_URL`, `LLM2_BASE_URL`, `GEMINI_API_KEY`, `NVIDIA_API_KEY`,
 `STOA_GEMINI_ESCALATE`, `STOA_VERIFY` and `CC5K_WEIGHTS`. API-only mode (`STOA_MODE`, `STOA_API_*`) is described at
 the top of `stoa/llm.py`, and the cost rates (`STOA_GPU_USD_PER_HOUR`, `STOA_API_PRICES`, …) in `stoa/cost.py`. Each eval run appends one line to
 `$JUNCTION_SHARED/results/leaderboard.jsonl` and writes per-question predictions to `$JUNCTION_SHARED/artifacts/eval/`.

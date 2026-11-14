@@ -100,6 +100,8 @@ export interface HeroCtx {
   rank?: number[] | null;
   /** the drawing's scale is known (printed, from the CAD file, or set by the visitor), not only guessed */
   scaleKnown?: boolean;
+  /** the whole sheet at its known scale (area m², diagonal m): an answer larger than that cannot be right */
+  sheet?: { m2: number; diag: number };
 }
 
 export interface FloorGroup {
@@ -144,7 +146,28 @@ const SIZE_Q = /\b(how (big|large|wide|long|tall|high|deep|far|much (space|floor
  *  only and no scale, X1's wild exam 14:22) or a 'Not determined …' / unrelated stock sentence. A site engineer
  *  reads such a number as a wrong answer, so the customer view shows no number and offers the measure tool instead;
  *  the guess itself stays under "How we worked it out". Counts keep their rough guess. */
-export function needsMeasuring(a: Answer, question: string, file = ""): boolean {
+/** The answer cannot be a measurement of what was asked (an area / length question):
+ *  'echo' = a bare number copied from the question ('What is the area of the 300 SLAB-ON-GRADE …?' → '300', no unit);
+ *  'too big' = more than the whole sheet covers at its known scale (S-100F 'total slab area' → 108,000 m² @0.03 on an
+ *  A1 sheet at 1:50 ≈ 1,250 m²), or a length longer than the sheet's diagonal. sheet = {m2, diag} at the known scale. */
+export function implausible(a: Answer, question: string, sheet?: { m2: number; diag: number }): "" | "echo" | "too big" {
+  const v = typeof a.value === "number" ? a.value : typeof a.value === "string" && /^\s*[\d.,]+\s*$/.test(a.value) ? Number(a.value.replace(/,/g, "")) : NaN;
+  if (!Number.isFinite(v)) return "";
+  const u = String(a.unit ?? "").trim();
+  const raw = String(a.value).trim().replace(/\.0+$/, "");
+  if (!u && new RegExp(`(?<![\\d.,])${raw.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}(?![\\d.,]*\\d)`).test(question)) return "echo";
+  // a whole-building / several-floor question can exceed one sheet; so can a confident answer from a model or schedule
+  if (!sheet || !(sheet.m2 > 0) || (a.confidence ?? 0) >= 0.5 || a.intent?.scope === "model"
+    || /\b(building|buildings|floors|storeys|levels|model|site|project|gebäude|rakennu\w*)\b/i.test(question)
+    || (a.evidence ?? []).some((e) => e.ifc_guid)) return "";
+  const m2 = /^(m2|m²|sq ?m)$/i.test(u) ? v : /^(ft2|ft²|sf|sq ?ft)$/i.test(u) ? v * 0.09290304 : NaN;
+  const m = /^m$/i.test(u) ? v : /^mm$/i.test(u) ? v / 1000 : /^(ft|feet)$/i.test(u) ? v * 0.3048 : NaN;
+  if (m2 > 1.05 * sheet.m2) return "too big";
+  if (m > 1.05 * sheet.diag && !/\b(skirting|base ?boards?|total|all|sum|whole)\b/i.test(question)) return "too big";
+  return "";
+}
+
+export function needsMeasuring(a: Answer, question: string, file = "", sheet?: { m2: number; diag: number }): boolean {
   const task = a.intent?.task;
   if (a.value === null || a.value === undefined || typeof a.value === "boolean") return false;
   // 'How many linear metres of skirting …' / 'how many square feet …' ask for a quantity, not a count (the router said
@@ -152,6 +175,7 @@ export function needsMeasuring(a: Answer, question: string, file = ""): boolean 
   const qty = HOW_MANY_UNITS.test(question);
   if (!qty && (task === "count" || a.unit === "count" || /^\s*how many\b/i.test(question))) return false;
   if (!(qty || task === "area" || task === "length" || SIZE_Q.test(question))) return false;
+  if (implausible(a, question, sheet) && (a.confidence ?? 0) < 0.9) return true;
   const measured = (a.evidence ?? []).some((e) => e.bbox || e.polygon || e.polyline || e.ifc_guid);
   // a sentence with no number ('Not specified', 'The floor plan does not provide dimensions …': the image reader P1 runs
   // on a vector sheet no PDF reader could read, night 5fc4653) is no answer to 'how big': measure it on the drawing
@@ -362,13 +386,56 @@ function headline(a: Answer, ctx: HeroCtx): { big: string; unit: string; sentenc
   // one room named in every note ('Comms Room: 16.68 m² traced at 1:100', E1's line-plan reader; "'OFFICE SPACE' outline
   // traced …") that the question also names: 'floor area of the comms room', not '… on this drawing'
   const ev0 = (a.evidence ?? [])[0]?.note ?? "";
-  const noteRoom = ev0.match(/^'?([\p{L}][\p{L}\d .\/-]{1,40}?)'?(?::\s*(?:long side |short side |width |length )?[\d.,]+\s*m|\s+outline\b)/u)?.[1]?.trim();
+  const noteRoom = ev0.match(/^'?([\p{L}][\p{L}\d .\/-]{1,40}?)'?(?::\s*(?:long side |short side |width |length |skirting |perimeter )?[\d.,]+\s*m|\s+outline\b)/u)?.[1]?.trim();
   const named2 = !room && !apt && !several && noteRoom && roomPhrases(ctx.question).some((ph) => noteRoom.toLowerCase().replace(/[^\p{L}\p{N}]/gu, "").includes(ph))
     ? `the ${noteRoom.toLowerCase()}` : "";
+  // a room's printed label read as text ('Text: Ncoic Office / 2.05 / 81 SF (view …)', 'Text: Conference/ / Classroom /
+  // 2.01 / 536 SF'): the name = the parts before the first number, in the question's own casing ('NCOIC Office')
+  const printedRoom = (() => {
+    if (room || apt || several || named2 || a.intent?.task !== "area") return "";
+    const tm = ev0.match(/^text:\s*(.+)$/i);
+    if (!tm) return "";
+    const parts: string[] = [];
+    for (const t of tm[1].split(/\s+\/\s+/)) {
+      if (/^\d/.test(t.trim())) break;
+      parts.push(t.trim());
+    }
+    const nm = parts.join(" ").replace(/\/\s+/g, "/").replace(/\/$/, "").trim();
+    const key = nm.toLowerCase().replace(/[^\p{L}\p{N}]/gu, "");
+    if (nm.length < 3 || !roomPhrases(ctx.question).some((ph) => ph.length >= 4 && key.includes(ph))) return "";
+    const inQ = ctx.question.match(new RegExp(nm.replace(/[.*+?^${}()|[\]\\]/g, "\\$&").replace(/\//g, "\\s*/?\\s*").replace(/\s+/g, "\\s*/?\\s*"), "i"))?.[0];
+    return inQ ?? nm.toLowerCase();
+  })();
+  if (printedRoom && /^(m2|m²|ft2|sf|sq ?ft)$/i.test(String(a.unit ?? "")))
+    return { big: fmtValue(a), unit, sentence: `floor area of the ${printedRoom}, as printed on the drawing` };
+  // skirting / baseboard (Stoa kind 2, E1's lineplan): 'Laundry: skirting 10.13 m = outline 10.95 m minus 1 opening'
+  // → 'skirting for the laundry: its outline 10.95 m minus 1 opening in its walls'; several rooms → 'N rooms together'
+  if (SKIRT_Q.test(ctx.question) && a.intent?.task !== "count") {
+    const runs = (a.evidence ?? []).map((e) => (e.note ?? "").match(/^'?(.+?)'?:\s*skirting\s+[\d.,]+\s*m\s*=\s*outline\s+([\d.,]+)\s*m\s+minus\s+(\d+)\s+openings?/i)).filter(Boolean) as RegExpMatchArray[];
+    if (runs.length === 1) {
+      const [, nm, outl, k] = runs[0];
+      const who = named2 || `the ${nm.toLowerCase()}`;
+      return { big: fmtValue(a), unit, sentence: `of skirting for ${who}: its outline ${outl} m minus ${k} opening${k === "1" ? "" : "s"} in its walls` };
+    }
+    if (runs.length > 1) return { big: fmtValue(a), unit, sentence: `of skirting for ${runs.length} rooms together (each outline minus its openings)` };
+    return { big: fmtValue(a), unit, sentence: [named2 ? `of skirting for ${named2}` : "of skirting", where].filter(Boolean).join(" ") };
+  }
+  // a slab type's area (Stoa kind 4, E1's slab_area): the callout it was asked by, as printed ('300 SLAB-ON-GRADE W/ D16
+  // @ 300 TOP FACE. BOTTOM: 212.45 m² traced at 1:50') → 'area of the slab "300 slab-on-grade w/ D16 @ 300", to its edge'
+  if (/\bslabs?\b/i.test(ctx.question) && /^(m2|m²|ft2|sf)$/i.test(String(a.unit ?? ""))) {
+    const slabs = (a.evidence ?? []).map((e) => (e.note ?? "").match(/^(.*?\bSLAB\b.*?):\s*[\d.,]+\s*(?:m²|m2|SF|ft²)/i)?.[1]).filter(Boolean) as string[];
+    if (slabs.length === 1) {
+      const callout = slabs[0].replace(/\s+(TOP|BOTT?OM|T\.?O\.?S)\b.*$/i, "").replace(/\bSLAB-ON-GRADE\b/gi, "slab on grade").replace(/\bW\/\s*/g, "with ").trim();
+      return { big: fmtValue(a), unit, sentence: `area of the slab ‘${callout}’, traced to its edge` };
+    }
+    if (/\btotal\b/i.test(ctx.question)) return { big: fmtValue(a), unit, sentence: "total slab area, to the slab edges" };
+  }
   const what = a.intent?.task === "area" ? (room ? `floor area of ${room}` : apt ? `floor area of ${apt}` : several ? `floor area of ${several}` : named2 ? `floor area of ${named2}` : "floor area")
     : a.intent?.task === "length" ? (named2 ? `length of ${named2}` : "length") : a.intent?.task === "volume" ? "volume" : "";
   return { big: fmtValue(a), unit, sentence: [what, where].filter(Boolean).join(" ") };
 }
+/** skirting / baseboard questions (Stoa kind 2): a length of wall face minus openings */
+const SKIRT_Q = /\b(skirting|base ?boards?|sockelleiste\w*|jalkalista\w*|plinth)\b/i;
 const plainify = (s: string) => swissRooms(s).replace(/'?(\d+)\.korrus'?/g, (_, n) => `floor ${n}`).replace(/\bstorey\b/g, "floor").replace(/\bIFC model\b/g, "3D model").replace(/\bplan draws\b/g, "the drawing shows")
   .replace(/\bthe plan's\b/g, "the drawing's").trim();
 function costSentence(q: string) {
@@ -512,7 +579,7 @@ export function listAnswer(a: Answer, currentFile = ""): { head: string; rows: S
 }
 
 export function heroHtml(a: Answer, ctx: HeroCtx): string {
-  if (needsMeasuring(a, ctx.question, ctx.file)) return measureFirstHtml(a, ctx);
+  if (needsMeasuring(a, ctx.question, ctx.file, ctx.sheet)) return measureFirstHtml(a, ctx);
   const h = headline(a, ctx);
   const ag = agreement(a, ctx.file);
   let c = a.value === null ? { cls: "none", word: "No answer", hint: "" } : confidenceWords(a.confidence ?? 0);
@@ -646,18 +713,21 @@ function plainAssumption(t: string): string {
  *  set it' next to the number until the scale is known. */
 function measureFirstHtml(a: Answer, ctx: HeroCtx): string {
   const length = a.intent?.task === "length" || (a.intent?.task !== "area" && /\b(how (wide|long|tall|high|deep|far)|width|length|distance|perimeter|skirting|base ?boards?|linear (?:metres|meters|feet)|running (?:metres|meters)|LF|breite|länge|leveys|pituus|largeur|longueur)\b/i.test(ctx.question));
-  const v = typeof a.value === "number" && a.value > 0 ? a.value : null;
+  const bad = implausible(a, ctx.question, ctx.sheet);
+  const v = typeof a.value === "number" && a.value > 0 && !bad ? a.value : null;
   const conv = conventionOf(a, ctx.question);
   const unit = unitLabel(a.unit) || (length ? "m" : "m²");
   const big = v !== null ? v.toLocaleString("en", { maximumFractionDigits: v >= 100 ? 0 : v >= 10 ? 1 : 2 }) : "";
   const sentence = big
     ? readerGuess(a) === "typical" ? `a typical ${length ? "length" : "size"} for this — not measured on this drawing yet`
       : `read off a picture of the drawing without marking where — not measured yet`
+    : bad === "echo" ? `The reading found only ‘${String(a.value).trim()}’, the number in your question, not the ${length ? "length" : "area"}.`
+    : bad === "too big" ? `The reading gave ${typeof a.value === "number" ? a.value.toLocaleString("en", { maximumFractionDigits: 0 }) : String(a.value)} ${unitLabel(a.unit) || ""}, more than the whole sheet covers at its scale (about ${Math.round(length ? ctx.sheet!.diag : ctx.sheet!.m2).toLocaleString("en")} ${length ? "m" : "m²"}), so it is not shown as the answer.`
     : `We could not measure this on the drawing yet.`;
   return `
     <div class="hero-value">${big ? `<span class="big guess-val">≈ ${esc(big)}</span><span class="unit">${esc(unit)}</span>` : `<span class="big name">${ctx.scaleKnown ? "Not found" : "Scale unknown"}</span>`}</div>
     <div class="hero-sentence">${esc(sentence)}</div>
-    <div class="hero-badges"><span class="conf est guess" title="Nothing on this drawing gave the ${length ? "length" : "area"} yet: the number is our usual guess (see 'How we worked it out')">Rough guess</span>${ctx.scaleKnown ? "" : SCALE_PILL}${tierHtml(a)}</div>
+    <div class="hero-badges"><span class="conf est guess" title="Nothing on this drawing gave the ${length ? "length" : "area"} yet${big ? ": the number is our usual guess (see 'How we worked it out')" : ""}">${big ? "Rough guess" : "No number yet"}</span>${ctx.scaleKnown ? "" : SCALE_PILL}${tierHtml(a)}</div>
     ${conv ? `<div class="hero-conv"><b>Convention:</b> ${esc(conv.text)}</div>` : ""}`;
 }
 

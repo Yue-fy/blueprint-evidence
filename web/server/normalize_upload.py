@@ -28,9 +28,29 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 MAX_SIDE = 6000
 
 
+def _clean(img) -> bool | None:
+    """raster.windows.clean_render's verdict on a PIL image (every 2nd pixel): a clean digital render? None when the
+    gate is not on this tree."""
+    try:
+        import numpy as np
+
+        from stoa.solvers.raster.windows import CLEAN_TOP8, CLEAN_WHITE
+    except ImportError:
+        return None
+    g = np.asarray(img.convert("L"))[::2, ::2]
+    nw = g[g < 250]
+    top = float(np.sort(np.unique(nw, return_counts=True)[1])[::-1][:8].sum() / nw.size) if nw.size else 1.0
+    return float((g >= 250).mean()) >= CLEAN_WHITE and top >= CLEAN_TOP8
+
+
 def image(abs_path: str) -> dict:
     from PIL import Image, ImageOps
 
+    Image.MAX_IMAGE_PIXELS = None  # P1 17:18: an A0 sheet at 400 dpi (> 179 MP) is a drawing, not a decompression bomb
+    try:  # P1 17:24 (night-P1 cb0fc1d): a shrink that keeps a clean CAD export clean (flat greys), else a plain resize
+        from stoa.formats.normalize import shrink_image
+    except ImportError:
+        shrink_image = None
     p = Path(abs_path)
     if p.suffix.lower() in (".heic", ".heif"):  # iPhone photos: readable once pillow-heif (BSD-3) is installed
         import pillow_heif  # noqa: F401  (ImportError -> the browser explains how to share the photo as JPG)
@@ -45,11 +65,26 @@ def image(abs_path: str) -> dict:
         out = ImageOps.exif_transpose(im) if orient not in (None, 1) else im
         if orient not in (None, 1):
             notes.append("turned upright (the photo's rotation tag)")
+        if shrink_image and orient in (None, 1) and p.suffix.lower() in (".png", ".jpg", ".jpeg") and max(out.size) > MAX_SIDE:
+            im.close()  # P1: in place is safe (it reads the image fully before writing)
+            r = shrink_image(str(p), str(p), MAX_SIDE)
+            return {"abs": str(r.get("path") or p), "note": str(r.get("note") or "")}
         if max(out.size) > MAX_SIDE:
             f = MAX_SIDE / max(out.size)
             k = f
+            was_clean = _clean(out)
             out = out.resize((round(out.width * f), round(out.height * f)), Image.LANCZOS)
             notes.append(f"scaled to {out.width}×{out.height} px")
+            # P1 17:18: LANCZOS turns a clean CAD export's 1-px lines into grey ramps, the readers then take it for a
+            # SCAN (CPU OCR, minutes per question: Stoa's S-100F / M-101A). When the original was a clean render and
+            # the copy is not, snap near-white to white and round the other levels to 8 steps (P1's shrink_image
+            # rule; used until that function is on this tree).
+            if was_clean and _clean(out) is False:
+                import numpy as np
+
+                a = np.asarray(out.convert("RGB")).astype(np.int16)
+                out = Image.fromarray(np.where(a >= 240, 255, (a // 32) * 32 + 16).clip(0, 255).astype(np.uint8))
+                notes.append("kept as a clean drawing (grey levels flattened after scaling)")
         ext = p.suffix.lower()
         if ext in (".png", ".jpg", ".jpeg") and not notes:
             return {"abs": str(p), "note": ""}

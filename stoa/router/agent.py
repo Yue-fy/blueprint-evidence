@@ -586,6 +586,7 @@ class Agent:
                 evidence += [e.model_copy(update={"note": (f"{w[5:60]} — {e.note}" if e.note else w[5:60])}) for e in ev[:EV_PER_STEP]]
         else:
             missing.append("the agent's answer is not backed by a tool result")
+        trace[:] = _honest_words(trace, len(asked))
         cost.wall_seconds = round(time.perf_counter() - t0, 3)
         trace.insert(0, f"agent: general tool-using path ({len(trace)} steps, {cost.llm_calls} LLM calls)")
         return Answer(value=final, unit=None, confidence=round(min(conf, 0.95), 3), evidence=evidence[:EV_TOTAL], trace=trace,
@@ -673,11 +674,28 @@ class Agent:
                 evidence.append(e.model_copy(update={"note": (f"{w[5:60]} — {e.note}" if e.note else w[5:60])}))
         if value is None:
             missing.append("the agent did not reach an answer")
+        trace = _honest_words(trace, len({w for _, _, _, w in used}))
         cost.wall_seconds = round(time.perf_counter() - t0, 3)
         trace.insert(0, f"agent: general tool-using path ({len(trace)} steps, {cost.llm_calls} LLM calls)")
         return Answer(value=value, unit=unit if unit not in ("", "none") else None, confidence=round(min(conf, 0.95), 3),
                       evidence=evidence[:EV_TOTAL], trace=trace, solver="agent", assumptions=assumptions, missing=missing,
                       cost=cost)
+
+
+def _honest_words(trace: list, sources: int) -> list:
+    """H 16:28 (Ziying, x1-026): the agent wrote 'the floor area of the Salón is confirmed as 16 m²' after relaying ONE
+    raster reading @0.30; an expert trusts 'confirmed' more than she should. Fewer than two independent tool results ->
+    'confirmed / verified' become 'unconfirmed (one reading only)' in the agent's own lines."""
+    if sources >= 2:
+        return trace
+    out = []
+    for t in trace:
+        if isinstance(t, str) and re.search(r"(?i)\b(confirm|verif)", t):
+            t = re.sub(r"(?i)\b(is|was|are)\s+(?:confirmed|verified)\b", r"\1 read (unconfirmed: one reading only)", t)
+            t = re.sub(r"(?i)\b(?:confirmed|verified)\b", "unconfirmed (one reading only)", t)
+            t = re.sub(r"(?i)\b(?:confirms|verifies)\b", "suggests", t)
+        out.append(t)
+    return out
 
 
 __all__ = ["Agent", "calc", "KNOWN"]

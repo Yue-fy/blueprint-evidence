@@ -156,6 +156,7 @@ def _variants(pg: dict) -> list[str]:
 
 DOOR_R_M = (0.45, 1.45)  # door leaf radius (one leaf), metres
 LINE_GROW_PT = 1.0  # a room grows into its bounding lines up to their middle, at most this deep (pt)
+FILL_GROW_M = float(__import__("os").environ.get("E1_FILL_GROW_M", "0.08"))  # into a solid wall fill: at most this (m)
 
 
 def _door_spokes(pg: dict, scale_n: float) -> list:
@@ -200,6 +201,7 @@ def _door_arcs(pg: dict, scale_n: float) -> tuple[list, set]:
     px_per_m = pg["ppt"] / (scale_n * PT_TO_M_AT_1)
     rmin, rmax = DOOR_R_M[0] * px_per_m, DOOR_R_M[1] * px_per_m
     out: list = []
+    found: list = []
     arc_ids: dict = {}
     items = [(None, 0, np.asarray(arr, dtype=float)) for arr, _w in pg["curves"]]
     for i, (arr, _w, _d) in enumerate(pg["strokes"]):
@@ -221,6 +223,7 @@ def _door_arcs(pg: dict, scale_n: float) -> tuple[list, set]:
             if k - j >= 4:
                 items.append((i, j, P[j:k + 1]))
             j = k
+    items += _chained_arcs(pg["strokes"], px_per_m)
     for sid, j0, pts in items:
         if len(pts) < 5:
             continue
@@ -238,12 +241,83 @@ def _door_arcs(pg: dict, scale_n: float) -> tuple[list, set]:
         sweep = abs((math.degrees(a1 - a0) + 180) % 360 - 180)
         if not 30 <= sweep <= 100:
             continue
-        c = (int(round(ux)), int(round(uy)))
-        out.append(np.array([c, (int(ax), int(ay))], dtype=np.int32))
-        out.append(np.array([c, (int(cx), int(cy))], dtype=np.int32))
-        if sid is not None:
-            arc_ids.setdefault(sid, []).append((j0, j0 + len(pts) - 1))  # point index range of the arc's segments
+        found.append(((ux, uy), r, (int(ax), int(ay)), (int(cx), int(cy)), sid, j0, len(pts)))
+    for k, (u, r, a, b, sid, j0, n_pts) in enumerate(found):
+        # a CIRCLE drawn as 3-4 quarter arcs round one centre (grid bubbles, section / detail markers: USACE A-101F
+        # has 13 of them, 0.4 m at 1:50, and they made its door-scale check abstain) is not a door swing; a door has
+        # one arc per hinge (two for a double-swing leaf)
+        same = sum(1 for v, s_, *_ in found if abs(v[0] - u[0]) <= 2 + 0.03 * r and abs(v[1] - u[1]) <= 2 + 0.03 * r
+                   and abs(s_ - r) <= 0.05 * r)
+        if same >= 3:
+            continue
+        c = (int(round(u[0])), int(round(u[1])))
+        out.append(np.array([c, a], dtype=np.int32))
+        out.append(np.array([c, b], dtype=np.int32))
+        if isinstance(sid, tuple):  # an arc exploded into one-segment paths: each of them is part of the swing
+            for s_i in sid:
+                arc_ids.setdefault(s_i, []).append((0, 1))
+        elif sid is not None:
+            arc_ids.setdefault(sid, []).append((j0, j0 + n_pts - 1))  # point index range of the arc's segments
     return out, arc_ids
+
+
+def _chained_arcs(strokes: list, px_per_m: float, max_seg_m: float = 0.35) -> list:
+    """Arcs EXPLODED into one-segment paths (USACE A-101F draws its door swings as ~13 separate 2-point lines):
+    short single segments chained end to end through points shared by exactly two of them -> (stroke ids, 0, points)
+    for _door_arcs' circle fit, which then keeps only round 30-100 degree runs."""
+    import numpy as np
+
+    lim = max_seg_m * px_per_m
+    segs = {}
+    for i, (arr, _w, _d) in enumerate(strokes):
+        if len(arr) != 2:
+            continue
+        a, b = (int(arr[0][0]), int(arr[0][1])), (int(arr[1][0]), int(arr[1][1]))
+        if a != b and float(np.hypot(a[0] - b[0], a[1] - b[1])) <= lim:
+            segs[i] = (a, b)
+    if len(segs) < 5:
+        return []
+    at: dict = {}
+    for i, (a, b) in segs.items():
+        at.setdefault(a, []).append(i)
+        at.setdefault(b, []).append(i)
+
+    def near(p):  # segments ending at p or within one pixel of it (rounding of the same PDF point)
+        out = []
+        for dx in (-1, 0, 1):
+            for dy in (-1, 0, 1):
+                out += at.get((p[0] + dx, p[1] + dy), [])
+        return out
+
+    used: set = set()
+    chains = []
+    for i0 in segs:
+        if i0 in used:
+            continue
+        used.add(i0)
+        chain = [i0]
+        a, b = segs[i0]
+        pts = [a, b]
+        for forward in (True, False):  # walk from both ends while the joint is shared by exactly two segments
+            end = pts[-1] if forward else pts[0]
+            while True:
+                nb = [j for j in set(near(end)) if j != (chain[-1] if forward else chain[0])]
+                if len(nb) != 1 or nb[0] in used:
+                    break
+                j = nb[0]
+                used.add(j)
+                p, q = segs[j]
+                nxt = q if abs(p[0] - end[0]) <= 1 and abs(p[1] - end[1]) <= 1 else p
+                if forward:
+                    chain.append(j)
+                    pts.append(nxt)
+                else:
+                    chain.insert(0, j)
+                    pts.insert(0, nxt)
+                end = nxt
+        if len(chain) >= 5:
+            chains.append((tuple(chain), 0, np.asarray(pts, dtype=float)))
+    return chains
 
 
 @functools.lru_cache(maxsize=2)
@@ -501,15 +575,47 @@ def sheet_scales(pdf_abs: str, page: int = 0) -> tuple[float, ...]:
     with pymupdf.open(pdf_abs) as doc:
         if page >= len(doc):
             return ()
-        blocks = doc[page].get_text("dict").get("blocks", [])
+        p = doc[page]
+        blocks = p.get_text("dict").get("blocks", [])
+        r = p.mediabox if p.rotation in (90, 270) else p.rect
+        page_mm = sorted((r.width * 25.4 / 72, r.height * 25.4 / 72))
+    on_paper = _paper_named(page_mm)
     c: Counter = Counter()
     for b in blocks:
-        for ln in b.get("lines", []):
-            text = "".join(s.get("text", "") for s in ln.get("spans", []))
+        lines = ["".join(s.get("text", "") for s in ln.get("spans", [])) for ln in b.get("lines", [])]
+        for i, text in enumerate(lines):
             for s in parse_scales(text):
                 if 10 <= s["ratio"] <= 2000:
-                    c[float(s["ratio"])] += 1
+                    c[float(s["ratio"]) * _at_paper_factor(text, lines[i + 1] if i + 1 < len(lines) else "",
+                                                           on_paper)] += 1
     return tuple(n for n, _ in c.most_common())
+
+
+def _paper_named(page_mm) -> str | None:
+    from stoa.solvers.raster.scalebar import PAPER_MM
+
+    a, b = page_mm
+    for name, (sw, sl) in PAPER_MM.items():
+        if abs(a - sw) <= 0.02 * sw and abs(b - sl) <= 0.02 * sl:
+            return name
+    return None
+
+
+def _at_paper_factor(text: str, next_line: str, on_paper: str | None) -> float:
+    """'1:200 @ A1' / '1:200 at A1' printed on a page that IS another standard sheet (D1's EFA school sets: A1 drawings
+    published as A3 PDFs, the page size exact): the drawing on the file is at 1:200 x (A1 / A3) = 1:400 (the drawn
+    0-10 m bar agrees). Same rule as the raster reader's printed_bar (_AT_PAPER)."""
+    from stoa.solvers.raster.scalebar import _AT_PAPER, PAPER_MM
+
+    m = _AT_PAPER.search(text) or (_AT_PAPER.match(next_line.strip()) if next_line else None)
+    if not m or on_paper is None:
+        return 1.0
+    at = (m.group(1) or m.group(2)).upper()
+    if at not in PAPER_MM or at == on_paper:
+        return 1.0
+    if re.fullmatch(r"A\d", at) and re.fullmatch(r"A\d", on_paper):  # ISO A sizes: exactly sqrt(2) per step
+        return 2 ** ((int(on_paper[1]) - int(at[1])) / 2)
+    return PAPER_MM[at][1] / PAPER_MM[on_paper][1]
 
 
 _LABEL_WORD = re.compile(r"[^\W\d_]{3,}")
@@ -611,10 +717,20 @@ def measure_room(pdf_abs: str, page: int, pt: tuple[float, float], scale_n: floa
     room[Y0 - y0p:Y0 - y0p + filled.shape[0], X0 - x0p:X0 - x0p + filled.shape[1]] = filled
     dcrop = dist_full[y0p:y1p, x0p:x1p]
     line = dcrop == 0
+    fm = None
+    if pg["fills"]:
+        # a SOLID wall strip (poché fill): the room grows into it by at most FILL_GROW_M in real units (D1 17:46: at
+        # 1:400 the 1 pt line growth is 0.14 m and EFA solid-wall rooms came out +1-6 %; Stoa's DfE fills at 1:200 sit
+        # ~0.03-0.07 m inside the faces X1 measured)
+        fm = np.zeros(dcrop.shape, np.uint8)
+        cv2.fillPoly(fm, [f - np.array([x0p, y0p]) for f in pg["fills"]], 1)
     other = (dcrop > 0) & (room == 0)
     d_room = cv2.distanceTransform((room == 0).astype(np.uint8), cv2.DIST_L2, 3)
     d_other = cv2.distanceTransform((~other).astype(np.uint8), cv2.DIST_L2, 3)
-    grown = (room > 0) | (line & (d_room <= d_other + 0.5) & (d_room <= e))
+    lim = np.full(dcrop.shape, float(e), np.float32)
+    if fm is not None:
+        lim[fm > 0] = min(float(e), FILL_GROW_M / (scale_n * PT_TO_M_AT_1) * ppt)
+    grown = (room > 0) | (line & (d_room <= d_other + 0.5) & (d_room <= lim))
     filled = cv2.copyMakeBorder(grown.astype(np.uint8), 1, 1, 1, 1, cv2.BORDER_CONSTANT, value=0)
     X0, Y0, e = x0p, y0p, 1
     cs, _ = cv2.findContours(filled, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)

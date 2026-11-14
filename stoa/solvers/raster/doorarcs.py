@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import functools
 import math
+import os
 
 import numpy as np
 from PIL import Image
@@ -57,6 +58,26 @@ def legend_cut(ink: np.ndarray) -> int:
     return int(H // 2 + ys[0]) if len(ys) else H
 
 
+ARC_THREADS = max(1, int(os.environ.get("STOA_O1_ARC_THREADS", "6") or 1))  # 1 = the sequential loop; Stoa DfE 6000-px
+# copy (128 arcs, identical): 36.8 s sequential, 14.9 s with 4 threads, 9.9 s with 8 (box load ~250)
+
+
+def _arc_chunk(work: np.ndarray, pairs: list) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Best ring score / radius / quadrant per pixel over (r, q) pairs, in order (strict '>': earlier pairs win ties)."""
+    import cv2
+
+    best = np.full(work.shape, -1.0, np.float32)
+    best_r = np.zeros(work.shape, np.float32)
+    best_q = np.zeros(work.shape, np.int8)
+    for r, q in pairs:
+        on, off = ring_kernel(float(r), q)
+        kern = on / on.sum() - off / off.sum()  # filter2D correlates (no flip needed)
+        s = cv2.filter2D(work, cv2.CV_32F, kern, borderType=cv2.BORDER_CONSTANT)
+        m = s > best
+        best[m], best_r[m], best_q[m] = s[m], r, q
+    return best, best_r, best_q
+
+
 def detect(png: str, px_per_m: float, r_m: tuple[float, float] = R_M, thr: float = THR, ink_lvl: int = INK,
            max_side: int = 3600) -> list[dict]:
     import cv2
@@ -78,16 +99,28 @@ def detect(png: str, px_per_m: float, r_m: tuple[float, float] = R_M, thr: float
     while r <= r_m[1] * ppm + 0.01:  # step <= 2 px: the +-1 px ring still covers an arc between two radii
         radii.append(r)
         r += max(1.0, min(2.0, 0.04 * r))
-    best = np.full(work.shape, -1.0, np.float32)
-    best_r = np.zeros(work.shape, np.float32)
-    best_q = np.zeros(work.shape, np.int8)
-    for r in radii:
-        for q in range(4):
-            on, off = ring_kernel(float(r), q)
-            kern = on / on.sum() - off / off.sum()  # filter2D correlates (no flip needed)
-            s = cv2.filter2D(work, cv2.CV_32F, kern, borderType=cv2.BORDER_CONSTANT)
-            m = s > best
-            best[m], best_r[m], best_q[m] = s[m], r, q
+    pairs = [(r, q) for r in radii for q in range(4)]
+    if ARC_THREADS > 1 and len(pairs) > 8:
+        # P1 18:01: 124 sequential filter2D on Stoa's DfE sheet (7009 x 4957 after the upscale) = 27 of 35 s on the
+        # upload's critical path. cv2 releases the GIL: chunks run in threads, each folds its own best in (r, q)
+        # order, and the chunks are folded here in order with the same strict '>' -> identical results (ties keep the
+        # earlier (r, q)). Waves of ARC_THREADS chunks bound memory (~3 work-sized arrays per running chunk).
+        from concurrent.futures import ThreadPoolExecutor
+
+        size = max(4, -(-len(pairs) // (3 * ARC_THREADS)))
+        chunks = [pairs[i:i + size] for i in range(0, len(pairs), size)]
+        best = best_r = best_q = None
+        with ThreadPoolExecutor(ARC_THREADS) as ex:
+            for i in range(0, len(chunks), ARC_THREADS):
+                for f in [ex.submit(_arc_chunk, work, c) for c in chunks[i:i + ARC_THREADS]]:
+                    b, br, bq = f.result()
+                    if best is None:
+                        best, best_r, best_q = b, br, bq
+                        continue
+                    m = b > best
+                    best[m], best_r[m], best_q[m] = b[m], br[m], bq[m]
+    else:
+        best, best_r, best_q = _arc_chunk(work, pairs)
     sz = int(max(5, 0.35 * ppm)) | 1
     peaks = (best >= cv2.dilate(best, np.ones((sz, sz), np.uint8))) & (best >= thr)
     ys, xs = np.nonzero(peaks)

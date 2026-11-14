@@ -184,3 +184,28 @@ def test_total_words_near_cited_area():
 
     assert _TOTAL_LINE.search("Overall GIFA") and _TOTAL_LINE.search("Kerrosala yhteensä")
     assert not _TOTAL_LINE.search("PLANT ROOM 29 m²")
+
+
+def test_line_side_and_part_qualifiers():
+    # X1 stoa-like S-100F sl-081: the side word attached to 'dimension line' names the chain; 'left part' is a part
+    q = "What is the overall length of the foundation along the bottom dimension line of the left part?"
+    assert CH.line_side(q) == ("row", False)
+    assert CH.part_side(q) == ("row", True)
+    assert CH.question_kind(q) == ("length", "row")
+    assert CH.line_side("What overall depth is dimensioned on the left side of that floor plan?") == ("col", True)
+    assert CH.line_side("How long is the building east to west, overall?") is None
+    assert CH.part_side("How wide is the pump room part (left) overall, according to the dimensions?") == ("row", True)
+
+
+def test_bottom_chain_chosen_over_larger_top_chain():
+    k = 0.02  # px per mm
+    top = _row(100, [("6000", 6000), ("6000", 6000), ("6000", 6000), ("9000", 9000)], 100, k)
+    bot = _row(800, [("4000", 4000), ("5000", 5000), ("4000", 4000)], 100, k)
+    items = top + [("27000", [610 - 40, 70, 610 + 40, 86])] + bot + [("13000", [230 - 40, 830, 230 + 40, 846])]
+    tl = _tl(items)
+    q = "What is the overall length of the foundation along the bottom dimension line of the left part?"
+    a = CH.overall_answer("x.png", q, tl)
+    assert a is not None and abs(a.value - 13.0) < 1e-6 and a.unit == "m"
+    # a part named without a dimension line is not the overall dimension: no answer from the chains
+    assert CH.overall_answer("x.png", "How wide is the pump room part (left) overall, according to the dimensions?",
+                             tl) is None

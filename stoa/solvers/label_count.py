@@ -74,6 +74,13 @@ def asked_types(question: str) -> list[str]:
     if not m:
         return []
     phrase = m.group(1)
+    lab = re.search(r"\b(?:rooms?|spaces?|areas?)\s+(?:labell?ed|named|called|marked|tagged)\s+['\"‘’“”]?(.+?)['\"‘’“”]?\s*$",
+                    phrase, re.I)
+    if lab:  # D1 17:22: 'How many rooms labelled Infants' -> the label is the type ('Infants'), not 'roomsinfants'
+        phrase = lab.group(1)
+        f = _fold(phrase)
+        if f and re.search(r"(?:labell?ed|named|called|marked|tagged)\s+['\"‘’“”]", m.group(1), re.I):
+            return [f]  # a QUOTED label is counted as written ('Bad' is not every bathroom)
     parts = [phrase] + re.findall(r"\(([^)]{1,30})\)", phrase)
     stems: list[str] = []
     for p in parts:
@@ -184,7 +191,8 @@ _TAG_ABBR_Q = re.compile(r"\(([A-Z]{1,5})(?:-[.…]*)?\)")
 _TAG_WORDS = {"fuel pump": ("FP",), "fueling pump": ("FP",), "fuelling pump": ("FP",), "check valve": ("CV",),
               "filter separator": ("FSI", "FSR"), "pressure gauge": ("PG",), "pipe support": ("PS",),
               "insulating flange": ("IF",), "control valve": ("FSCV",), "pressure switch": ("PSW",),
-              "air vent": ("MAV",), "manual air vent": ("MAV",), "flow switch": ("FS",), "pump": ("P",)}
+              "air vent": ("MAV",), "manual air vent": ("MAV",), "flow switch": ("FS",),
+              "pump": ("P", "FP")}  # H 17:26: 'How many pumps are there?' on M-101A = the 5 FP-n fueling pumps
 _LEGEND = re.compile(r"([A-Z][A-Z /&-]{3,60}?)\s*\(([A-Z]{1,5})\)")
 _STOPW = {"the", "a", "an", "of", "on", "in", "are", "is", "how", "many", "shown", "there", "this", "sheet", "plan",
           "piping", "tagged", "called", "out", "with", "total", "and", "different", "types", "type", "w"}
@@ -195,9 +203,18 @@ def _words(s: str) -> set[str]:
 
 
 def _tag_prefixes(question: str, lines) -> tuple[list[str], str]:
-    ab = _TAG_ABBR_Q.findall(question)
+    # the tag family must name the COUNTED thing: 'Into how many panels do the control joints (CJ) divide the slab?'
+    # counts panels, not CJ tags (stoa-like sl-017: 7 CJ tags @0.6, gold 6 panels)
+    hm = _HOWMANY.search(question)
+    if not hm:
+        return [], ""
+    phrase = question[hm.start(1):hm.end(1)]
+    ab = [m.group(1) for m in _TAG_ABBR_Q.finditer(question) if m.start() <= hm.end(1)]
     if ab:
         return ab, "abbreviation in the question"
+    if _TAG_ABBR_Q.search(question):
+        return [], ""
+    question = phrase
     qw = _words(question)
     best, src = [], ""
     for t, _ in lines:  # the sheet's own legend: 'NON-SURGE CHECK VALVE (CV) W/ RATE OF FLOW CONTROLLER'
@@ -230,6 +247,8 @@ def _tag_answer(lines, question: str, path: str, space: str) -> Answer | None:
     for t, bb in lines:
         for p in pre:
             for m in re.finditer(r"(?<![A-Z0-9])" + p + r"-(\d{1,3}[A-Z]?)\b", t):
+                if re.fullmatch(r"0+[A-Z]?", m.group(1)):
+                    continue  # S0 17:42: OCR read 'PS 0' on a 6000-px copy; tag numbers start at 1
                 nums[p].setdefault(m.group(1), (t, bb))
             if re.fullmatch(r"\W*" + p + r"\W*", t):
                 bare[p].append((t, bb))
@@ -250,8 +269,8 @@ def _tag_answer(lines, question: str, path: str, space: str) -> Answer | None:
           for t, bb in used[:60]]
     return Answer(value=n, unit="count", confidence=conf, evidence=ev, solver="label_count",
                   trace=[f"label_count: component tags {'/'.join(pre)} ({src}): {how} -> {n}"],
-                  assumptions=[f"each distinct tag of the {'/'.join(pre)} family is one component (tag family from "
-                               f"{src})"],
+                  assumptions=[f"Convention: each distinct tag of the {'/'.join(pre)} family = one component, a tag "
+                               f"printed twice counts once (tag family from {src})"],
                   missing=[] if n_num else ["numbered tags (an un-numbered tag may repeat one component)"])
 
 
@@ -317,6 +336,86 @@ def _image_lines(img_abs: str):
 _IMG = (".png", ".jpg", ".jpeg", ".webp", ".tif", ".tiff", ".bmp")
 
 
+_DOORS_Q = re.compile(r"\bhow many\s+(?:\w+\s+){0,2}doors?\b|\bnumber of doors\b", re.I)
+_ROOM_NO = re.compile(r"^\s*(\d{2,4})\s*$")
+_DOOR_TAG = re.compile(r"^\s*(\d{2,4})([A-Z])?\s*$")
+
+
+def door_tags(lines) -> tuple[list, list] | None:
+    """US door numbering (S0 17:13, X1 17:01: USACE A-101F 'How many doors does the filter building have?' -> 6 = tags
+    101A, 101B, 102, 103, 104A, 104B): a door is tagged with its room's number (+ a letter when the room has several
+    doors). Room numbers are the bare numbers printed right under a room name; door tags are the same numbers (or number
+    + letter) printed ELSEWHERE. -> (distinct tags [(tag, box)], room numbers) or None when the sheet shows no such
+    convention (< 2 room numbers, or no lettered tag)."""
+    named = [(t, bb) for t, bb in lines if re.search(r"[A-Za-z]{3,}", t) and len(t.split()) <= 4]
+    rooms, room_boxes = set(), set()
+    for t, bb in lines:
+        m = _ROOM_NO.match(t)
+        if not m:
+            continue
+        h = max(1.0, bb[3] - bb[1])
+        for t2, b2 in named:
+            if 0 <= bb[1] - b2[3] <= 1.2 * h and min(bb[2], b2[2]) - max(bb[0], b2[0]) > 0:
+                rooms.add(m.group(1))
+                room_boxes.add(tuple(bb))
+                break
+    if len(rooms) < 2:
+        return None
+    tags: dict[str, tuple] = {}
+    for t, bb in lines:
+        m = _DOOR_TAG.match(t)
+        if m and m.group(1) in rooms and tuple(bb) not in room_boxes:
+            tags.setdefault(m.group(1) + (m.group(2) or ""), tuple(bb))
+    if not any(k[-1].isalpha() for k in tags):
+        return None
+    return sorted(tags.items()), sorted(rooms)
+
+
+def _door_answer(lines, question: str, path: str, space: str) -> Answer | None:
+    if not _DOORS_Q.search(question) or re.search(r"\b(double|single|pairs?|leaves|leafs?|fire|exterior|interior|"
+                                                  r"glazed|sliding|swing)\b", question, re.I):
+        return None  # a door TYPE needs the schedule / symbols, not the tag count
+    if len(lines) > 4000:
+        return None  # pairwise label search; a sheet this dense is a schedule set, not one plan
+    got = door_tags(lines)
+    if got is None:
+        return None
+    tags, rooms = got
+    n = len(tags)
+    ev = [Evidence(file=path, page=0, bbox=list(bb), bbox_space=space, exact=True, note=f"door tag {k}")
+          for k, bb in tags[:60]]
+    return Answer(value=n, unit="count", confidence=0.6 if space == "pdf_pt" else 0.5, evidence=ev, solver="label_count",
+                  trace=[f"label_count: {n} distinct door tags (room number + letter) next to rooms "
+                         f"{', '.join(rooms[:8])}: {', '.join(k for k, _ in tags[:20])}"],
+                  assumptions=["Convention: one door tag = one door (US numbering: the room's number, plus a letter when "
+                               "a room has several doors); a pair of leaves under one tag counts as one door",
+                               "doors drawn without a tag are not counted"],
+                  missing=["a door schedule to confirm the tags"])
+
+
+def _stacked_pairs(lines) -> list:
+    """(upper, lower) pairs of lines printed as ONE label on two lines: similar text height, the lower one starts within
+    0.8 heights below, x-centres within half the wider line. Each upper line pairs with its nearest lower line."""
+    out = []
+    boxes = [(t, bb) for t, bb in lines if len(t.split()) <= 3 and bb[3] > bb[1]]
+    for t, bb in boxes:
+        h = bb[3] - bb[1]
+        xc = (bb[0] + bb[2]) / 2
+        best = None
+        for t2, b2 in boxes:
+            if b2 is bb:
+                continue
+            h2 = b2[3] - b2[1]
+            gap = b2[1] - bb[3]
+            if 0.6 < h2 / h < 1.6 and -0.3 * h <= gap <= 0.8 * h and \
+                    abs((b2[0] + b2[2]) / 2 - xc) < 0.5 * max(bb[2] - bb[0], b2[2] - b2[0]):
+                if best is None or gap < best[0]:
+                    best = (gap, (t2, b2))
+        if best is not None:
+            out.append(((t, bb), best[1]))
+    return out
+
+
 @register("label_count")
 class LabelCount(BaseSolver):
     sources = ()
@@ -330,10 +429,11 @@ class LabelCount(BaseSolver):
         from stoa.data import abspath
 
         stems = asked_types(question)
+        doors = bool(_DOORS_Q.search(question))
         stairs = bool(_STEPS_Q.search(question))
         tags = bool(_TAG_ABBR_Q.search(question) or any(re.search(r"\b" + k + r"(?:s|es)?\b", question.lower())
                                                          for k in _TAG_WORDS if k != "pump"))
-        if not stems and not stairs and not tags:
+        if not stems and not stairs and not tags and not doors:
             return self.abstain("not a 'how many <room type>' question")
         if _SCOPED.search(question) and not stairs:
             return self.abstain("scoped to an apartment / the whole building: labels carry no membership")
@@ -347,6 +447,12 @@ class LabelCount(BaseSolver):
         if lines is None:
             return self.abstain("a large image whose text has not been read yet (a cold reading costs minutes; the "
                                 "image readers read it)")
+        if doors:
+            a = _door_answer(lines, question, path, space)
+            if a is not None:
+                return a
+            return self.abstain("no door tags (room number + letter) on the sheet: the door symbols are counted by "
+                                "the drawing readers")
         if tags or stems:
             a = _tag_answer(lines, question, path, space)
             if a is not None:
@@ -372,6 +478,15 @@ class LabelCount(BaseSolver):
             if s and key not in seen:
                 seen.add(key)
                 hits.append((t, bb))
+        stacked = 0
+        for (t1, b1), (t2, b2) in _stacked_pairs(lines):
+            # 'Secondary' over 'Classroom' (DfE PNG: OCR reads a two-line label as two lines; stoa-like sl-035)
+            k1, k2 = (round(b1[0]), round(b1[1])), (round(b2[0]), round(b2[1]))
+            if k1 in seen or k2 in seen or not _matches(f"{t1} {t2}", stems):
+                continue
+            seen |= {k1, k2}
+            hits.append((f"{t1} / {t2}", (min(b1[0], b2[0]), b1[1], max(b1[2], b2[2]), b2[3])))
+            stacked += 1
         if not hits:
             return self.abstain(f"no label of the asked type ({', '.join(stems[:4])}) in the text layer "
                                 f"({len(lines)} lines)")
@@ -383,8 +498,10 @@ class LabelCount(BaseSolver):
         n = len(hits)
         ev = [Evidence(file=path, page=0, bbox=list(bb), bbox_space=space, exact=True, note=f"label '{t}'")
               for t, bb in hits[:60]]
-        assumptions = ["each printed room label of this type is one room (rooms drawn without a label are not "
-                       "counted)"]
+        assumptions = ["Convention: one printed room label of the asked type = one room (rooms drawn without a "
+                       "label are not counted)"]
+        if stacked:
+            assumptions.append(f"{stacked} label(s) printed on two lines were read as one")
         if rel:
             assumptions.append(f"not counted (a related type, not the one asked): {', '.join(sorted(set(rel))[:5])}")
         # an image's labels come from OCR / a VLM reading (a label can be missed or misread): one step less sure
@@ -394,3 +511,239 @@ class LabelCount(BaseSolver):
                              + "; ".join(t for t, _ in hits[:12])],
                       assumptions=assumptions,
                       missing=[] if n else ["room labels of this type"])
+
+
+# ---------------------------------------------------------------------------------------------------------------------
+# stated_count (G1 cycle 5; E1 16:59, X1 16:41): a sheet that PRINTS the count of the asked room kind ('48 DORMS',
+# 'SECOND FLOOR = 48 DORMS', 'TOTAL = 144 DORMS', '3 BEDROOMS', 'UNITS: 12') answers 'how many …' from that line, not
+# from its polygons (plan_rooms counted 2 labelled fills on Stoa's AFCEC dorm sheet: gold 48 / 144). The row label to
+# the left of the number ('SECOND FLOOR =', 'TOTAL =') picks the row the question's scope asks for.
+_STATED = re.compile(r"(?<![\w.,/'\"-])(\d{1,4})\s*(x\s*|×\s*)?([A-Za-zÄÖÜäöüß][A-Za-zÄÖÜäöüß .'-]{1,30}?)\s*$")
+_STATED_EQ = re.compile(r"^\s*([A-Za-zÄÖÜäöüß][A-Za-zÄÖÜäöüß .'-]{1,30}?)\s*[:=]\s*(\d{1,4})\s*$")
+_FLOOR_WORDS = {
+    "basement": ("basement", "cellar", "keller", "kellari"), "ground": ("ground", "erdgeschoss", "eg", "1st floor"),
+    "1": ("first", "1st", "level 1", "floor 1"), "2": ("second", "2nd", "level 2", "floor 2"),
+    "3": ("third", "3rd", "level 3", "floor 3"), "4": ("fourth", "4th", "level 4", "floor 4"),
+    "5": ("fifth", "5th", "level 5", "floor 5"),
+}
+_TOTAL_ROW = re.compile(r"\b(total|totals|overall|building|all floors|gesamt|summe|yhteens[aä])\b", re.I)
+_TOTAL_Q = re.compile(r"\b(whole|entire|in total|altogether|all (?:the )?(?:floors|storeys|levels)|does the building|"
+                      r"building (?:have|has|contain)|in the building|insgesamt|ganze\w*|yhteens[aä])\b", re.I)
+_THIS_Q = re.compile(r"\b(this|the drawn|the shown|on the plan|on this|drawn on)\b", re.I)
+
+
+def _floor_of(text: str) -> str | None:
+    t = " " + re.sub(r"\s+", " ", text.lower()) + " "
+    for k, words in _FLOOR_WORDS.items():
+        if any(re.search(r"(?<![a-z0-9])" + re.escape(w) + r"(?![a-z0-9])", t) for w in words):
+            if k == "ground" and "1st floor" in t and not re.search(r"\bground\b", t):
+                return "1"
+            return k
+    return None
+
+
+def _noun_matches(noun: str, stems: list[str]) -> bool:
+    f = _fold(noun)
+    if not f or len(noun.split()) > 3:
+        return False
+    sing = {f, _PLURAL.sub("", f), f[:-1] if f.endswith("s") else f, f[:-3] + "y" if f.endswith("ies") else f}
+    for s in stems:
+        core = re.sub(r"rooms?$", "", s) if len(s) > 6 else s
+        if s in sing or (len(core) >= 3 and (core in sing or any(x.startswith(core) and len(x) - len(core) <= 6
+                                                                  for x in sing))):
+            return True
+        if any(len(x) >= 4 and s.startswith(x) and len(s) - len(x) <= 6 for x in sing):  # 'DORMS' for 'dormitories'
+            return True
+    return False
+
+
+def _display_lines(p: str, img: bool):
+    """((text, box in the evidence space, box in DISPLAY orientation), ...): a /Rotate 90 sheet's lines are rotated back
+    so one printed row ('SECOND FLOOR =' … '48 DORMS') shares a y."""
+    import os
+
+    if img:
+        lines = _image_lines(p)
+        return None if lines is None else tuple((t, bb, bb) for t, bb in lines)
+    import pymupdf
+
+    lines = text_lines(p, os.stat(p).st_mtime)
+    with pymupdf.open(p) as doc:
+        m = doc[0].rotation_matrix
+    out = []
+    for t, bb in lines:
+        r = pymupdf.Rect(bb) * m
+        r.normalize()
+        out.append((t, bb, (r.x0, r.y0, r.x1, r.y1)))
+    return tuple(out)
+
+
+def stated_rows(lines, stems: list[str]) -> list[dict]:
+    """Printed count statements of the asked kind: [{'n', 'noun', 'row' (label to its left), 'box', 'text'}]."""
+    rows = []
+    for t, bb, d in lines:
+        m = _STATED.search(t)
+        n = noun = None
+        # '101 OFFICE' is a room number + name, '48 DORMS' / '2 x WC' a count: a count > 1 needs a plural or an 'x'
+        if m and _noun_matches(m.group(3), stems) and (m.group(2) or int(m.group(1)) == 1 or
+                                                       re.search(r"(?:s|S)\s*$", m.group(3))):
+            n, noun = int(m.group(1)), m.group(3)
+            left = t[:m.start()].strip(" =:")
+        else:
+            m2 = _STATED_EQ.match(t)
+            if m2 and _noun_matches(m2.group(1), stems):
+                n, noun, left = int(m2.group(2)), m2.group(1), ""
+        if n is None or n == 0:
+            continue
+        label = " ".join([*_row_left(lines, t, d), left]).strip(" =:")
+        rows.append({"n": n, "noun": noun.strip(), "row": label, "box": list(bb), "text": t})
+    return rows
+
+
+def _row_left(lines, t: str, d) -> list[str]:
+    """The row label: short lines on the same display row, chained leftwards with gaps under ~8 text heights."""
+    h = max(1.0, d[3] - d[1])
+    yc = (d[1] + d[3]) / 2
+    cands = sorted(((d2[0], d2[2], t2) for t2, _, d2 in lines if t2 != t and abs((d2[1] + d2[3]) / 2 - yc) < 0.5 * h
+                    and d2[2] <= d[0] + 0.5 * h and len(t2.split()) <= 5), key=lambda x: -x[1])
+    same, edge = [], d[0]
+    for x0, x1, t2 in cands:
+        if edge - x1 > 8 * h:
+            break
+        same.insert(0, t2)
+        edge = x0
+    return same
+
+
+# X1 17:20 (Tapiola 1963 kitchen type sheet): 'TÄTÄ TYYPPIÄ 25 KPL' + 'PEILIKUVA KEITTIÖTÄ 25 KPL' (KPL = pieces): 'How
+# many kitchens of this type are built in total, including the mirror-image ones?' = 25 + 25
+_TYPE_Q = re.compile(r"\b(of this type|this type|are (?:to be )?built|built in total|mirror(?:ed)?[- ]?image|mirrored|"
+                     r"peilikuv\w*|t[äa]t[äa] tyyppi\w*|dieses typs|dieser art|spiegelbildlich\w*)", re.I)
+_QTY = re.compile(r"(?<![\w.,])(\d{1,4})\s*(?:KPL|kpl|Kpl|pcs|PCS|pc\.|st\.|ST\b|Stk\.?|STK|EA\b|NOS?\b\.?)")
+_MIRROR = re.compile(r"PEILI|MIRROR|SPIEGEL|SPEGEL|INVERS|PEILIK", re.I)
+_TYPE_ROW = re.compile(r"TYYP|TYPE|\bTYP\b|TYPPI|THIS|T[ÄA]T[ÄA]", re.I)
+
+
+def type_quantities(lines, question: str) -> tuple[list[dict], str] | None:
+    """Printed quantities of the drawn type ('25 KPL'), split into this type / its mirror image -> (rows used, why)."""
+    if not _TYPE_Q.search(question):
+        return None
+    rows = []
+    for t, bb, d in lines:
+        m = _QTY.search(t)
+        if not m:
+            continue
+        label = " ".join([*_row_left(lines, t, d), t[:m.start()]]).strip()
+        kind = "mirror" if _MIRROR.search(label) else "type" if _TYPE_ROW.search(label) else None
+        if kind:
+            rows.append({"n": int(m.group(1)), "kind": kind, "row": label, "box": list(bb), "text": t})
+    if not rows:
+        return None
+    ty = [r for r in rows if r["kind"] == "type"][:1]
+    mi = [r for r in rows if r["kind"] == "mirror"][:1]
+    if re.search(r"\b(including|incl\.?|with|and|plus|together)\b.{0,30}mirror|mirror.{0,30}\b(included|too|as well)\b|"
+                 r"peilikuv\w*\s+mukaan", question, re.I):
+        used = ty + mi
+        why = "this type + its mirror image, both printed"
+    elif re.search(r"mirror|peilikuv", question, re.I):
+        used, why = mi, "the mirror-image quantity printed"
+    else:
+        used, why = ty, "the quantity printed for this type"
+    return (used, why) if used else None
+
+
+def _sheet_floor(lines) -> str | None:
+    fl = {_floor_of(t) for t, *_ in lines if re.search(r"\b(floor|level|storey|geschoss)\s+plan\b|\bplan\b.*\b(floor|level)\b",
+                                                         t, re.I)}
+    fl.discard(None)
+    return next(iter(fl)) if len(fl) == 1 else None
+
+
+def pick_stated(rows: list[dict], question: str, lines) -> tuple[dict | None, str, float]:
+    """-> (row, why, confidence) for the question's scope, or (None, why, 0)."""
+    if not rows:
+        return None, "no printed count of the asked kind", 0.0
+    totals = [r for r in rows if _TOTAL_ROW.search(r["row"])]
+    floors = {}
+    for r in rows:
+        f = _floor_of(r["row"])
+        if f is not None and r not in totals:
+            floors.setdefault(f, r)
+    plain = [r for r in rows if r not in totals and _floor_of(r["row"]) is None]
+    qf = _floor_of(question)
+    if _TOTAL_Q.search(question) and qf is None:
+        if totals:
+            return totals[0], f"the printed total row '{totals[0]['row']}'", 0.85
+        if len(floors) >= 2:
+            s = sum(r["n"] for r in floors.values())
+            return {**next(iter(floors.values())), "n": s, "sum_of": list(floors.values())}, \
+                f"the sum of the printed per-floor rows ({len(floors)} floors)", 0.6
+        return None, "the question asks the whole building; the sheet prints no total", 0.0
+    if qf is not None:
+        if qf in floors:
+            return floors[qf], f"the printed row for that floor '{floors[qf]['row']}'", 0.85
+        if not floors and len({r["n"] for r in plain}) == 1 and _sheet_floor(lines) == qf:
+            return plain[0], "the sheet's own floor (its title) with one printed count", 0.75
+        return None, "no printed row for the asked floor", 0.0
+    # 'this floor' / no scope: the sheet's floor row, else every non-total row agrees, else one statement
+    sf = _sheet_floor(lines)
+    if sf is not None and sf in floors:
+        return floors[sf], f"the sheet's own floor ({sf}) row '{floors[sf]['row']}'", 0.8
+    cand = [*floors.values(), *plain]
+    if cand and len({r["n"] for r in cand}) == 1:
+        return cand[0], ("every printed per-floor row gives the same number" if len(cand) > 1 else
+                         "one printed count on the sheet"), 0.75 if len(cand) > 1 else 0.7
+    return None, f"{len(cand)} different printed counts and the question names no floor", 0.0
+
+
+@register("stated_count")
+class StatedCount(BaseSolver):
+    """'How many dorm rooms are on the second floor?' = the sheet's printed 'SECOND FLOOR = 48 DORMS' (text layer, $0)."""
+    sources = ()
+
+    def can_handle(self, path: str, question: str) -> bool:
+        return str(path).lower().endswith((".pdf", *_IMG))
+
+    def solve(self, path: str, question: str) -> Answer:
+        from stoa.data import abspath
+
+        stems = asked_types(question)
+        if (not stems and not _TYPE_Q.search(question)) or _STEPS_Q.search(question):
+            return self.abstain("not a 'how many <room kind>' question")
+        p = str(abspath(path))
+        img = p.lower().endswith(_IMG)
+        try:
+            lines = _display_lines(p, img)
+        except Exception as e:  # noqa: BLE001
+            return self.abstain(f"could not read the text ({type(e).__name__})")
+        if not lines:
+            return self.abstain("no text layer read yet")
+        tq = type_quantities(lines, question)
+        if tq is not None:
+            used, why = tq
+            space = "image_px" if img else "pdf_pt"
+            n = sum(r["n"] for r in used)
+            ev = [Evidence(file=path, page=0, bbox=r["box"], bbox_space=space, exact=True,
+                           note=f"printed quantity: {r['row']} {r['text']}".strip()) for r in used]
+            return Answer(value=n, unit="count", confidence=0.5 if img else 0.6, evidence=ev, solver=self.name,
+                          trace=[f"stated_count: {why}: " + " + ".join(f"'{r['row']} {r['text']}' = {r['n']}"
+                                                                      for r in used) + f" = {n}"],
+                          assumptions=[f"Convention: the quantity printed on the type sheet (KPL / pcs / Stk) is the "
+                                       f"number built ({why})"])
+        rows = stated_rows(lines, stems)
+        row, why, conf = pick_stated(rows, question, lines)
+        if row is None:
+            return self.abstain(why)
+        used = row.get("sum_of") or [row]
+        space = "image_px" if img else "pdf_pt"
+        ev = [Evidence(file=path, page=0, bbox=r["box"], bbox_space=space, exact=True,
+                       note=f"printed: {(r['row'] + ' ') if r['row'] else ''}{r['text']}") for r in used]
+        if img:
+            conf -= 0.1  # OCR can misread a digit
+        others = [f"{r['row'] or '(no label)'}: {r['n']}" for r in rows if r not in used][:6]
+        return Answer(value=int(row["n"]), unit="count", confidence=round(conf, 2), evidence=ev, solver=self.name,
+                      trace=[f"stated_count: {why}: " + "; ".join(f"'{(r['row'] + ' ') if r['row'] else ''}{r['text']}'"
+                                                                 for r in used)],
+                      assumptions=[f"Convention: the count printed on the sheet is taken as stated ({why}); rooms "
+                                   "were not counted one by one", *([f"other printed counts of this kind: {', '.join(others)}"]
+                                               if others else [])])
