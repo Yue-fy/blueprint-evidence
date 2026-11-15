@@ -13,6 +13,7 @@ No VLM call beyond the cached text layer.
 
 from __future__ import annotations
 
+import os
 import re
 
 import cv2
@@ -73,6 +74,21 @@ def region(rgb: np.ndarray, seed: tuple[int, int], grow_px: int) -> np.ndarray |
     return comp
 
 
+DIM_IDS = os.environ.get("STOA_O1_DIM_IDS", "1") != "0"
+_THOU_ID = re.compile(r"^\d{1,3}\.\d{3}$")
+
+
+def _dim_string(rid, ids) -> bool:
+    """'7.200' with no name and no printed area, in line with >= 2 more such strings (a dimension chain: same row or
+    same column): a mm dimension with a thousands point, not room 7.200."""
+    if not _THOU_ID.match(rid.text.strip()):
+        return False
+    h, w = max(6.0, rid.box[3] - rid.box[1]), max(6.0, rid.box[2] - rid.box[0])
+    mates = [j for j in ids if j is not rid and _THOU_ID.match(j.text.strip()) and
+             (abs(j.cy - rid.cy) < 0.6 * h or abs(j.cx - rid.cx) < 0.6 * min(w, j.box[2] - j.box[0]))]
+    return len(mates) >= 2
+
+
 def _rooms(layer: T.TextLayer) -> list[dict]:
     """Room records: number label (if any), name above it, printed area under it."""
     ids = [i for i in layer.items if _ROOM_ID.match(i.text.strip())]
@@ -101,6 +117,8 @@ def _rooms(layer: T.TextLayer) -> list[dict]:
         name = min(names, key=lambda i: rid.cy - i.cy).text if names else ""
         if best:
             used.add(best[0])
+        elif not name and DIM_IDS and _dim_string(rid, ids):
+            continue  # O1 c12 (X1 sl-323): '7.200' / '79.200' on a dimension chain are mm, not room numbers
         out.append({"id": rid.text.strip(), "label": rid, "name": name,
                     "area": best[1] if best else None})
     for k, a in enumerate(areas):  # printed areas with no room number (plans without numbering)
@@ -125,6 +143,30 @@ _SHAFT_NAME = re.compile(r"schacht|luftraum|gaine|^vide|cavedio|vuoto|shaft|void
 _TOTAL_LINE = re.compile(r"total|gesamt|summe|yht|yhteensä|asuinpinta|wohnfl|nutzfl|bgf|ngf|gfa|nfa|somme|totale|"
                          r"surface habitable|superficie utile|bostadsyta|boyta|net area|gross", re.I)
 _NUMBERED_Q = re.compile(r"numbered|nummeriert|numérotées?|numerat[ei]|numeroid", re.I)
+TYPED_GUARD = os.environ.get("STOA_O1_TYPED_ROOMS", "1") != "0"
+_TYPED_Q = re.compile(r"\b([A-Za-z][\w&-]*)\s+(?:class ?rooms?|rooms?|offices?|labs?|laborator(?:y|ies)|studios?|stores?|"
+                      r"toilets?|bedrooms?|halls?|suites?|workshops?|wcs?)\b", re.I)
+_GENERIC_Q = {
+    "all", "the", "every", "each", "these", "those", "this", "that", "of", "numbered", "indoor", "interior", "internal",
+    "other", "its", "their", "our", "any", "both", "two", "three", "four", "five", "six", "seven", "eight", "nine", "ten",
+    "many", "floor", "storey", "story", "level", "ground", "first", "second", "third", "upper", "lower", "top", "plan",
+    "building", "sheet", "drawing", "whole", "entire", "total", "combined", "and", "or", "in", "on", "with", "without",
+    "net", "gross", "individual", "separate", "main", "labelled", "labeled", "named", "called", "marked", "are", "is",
+    "what", "how", "many", "rooms", "room", "area", "areas", "up", "add", "sum"}
+
+
+def typed_rooms(question: str) -> str | None:
+    """O1 c14 (X1 EFA scans): 'total area of the ICT classrooms' / 'the three art rooms (Art 1, …)' name a room TYPE by
+    a qualifier: a sum by printed name, never the floor's room labels (the floor path summed one stray '7.200' as
+    4.59 m2 @0.1 and pre-empted the traced copy's printed 272). Replay over 169 past floor-scope raster answers: every
+    question with such a qualifier was wrong (English / ICT / art / Humanities / Business Studies / maths / Infants);
+    'all rooms', modules and labelled names are untouched. -> the qualifier, or None. STOA_O1_TYPED_ROOMS=0 = off."""
+    if not TYPED_GUARD or _LABELLED.search(question):
+        return None
+    for m in _TYPED_Q.finditer(question):
+        if m.group(1).lower() not in _GENERIC_Q:
+            return m.group(1)
+    return None
 
 
 def numbering_gaps(layer: T.TextLayer) -> list[str]:
@@ -204,6 +246,8 @@ def room_set(path: str, layer: T.TextLayer, question: str, px_per_m: float | Non
         scope = "unit"
     elif not (name or _FLOOR_SUM.search(question)):
         return None
+    elif not name and typed_rooms(question):
+        return None  # 'the ICT classrooms' is a sum by room name (area_tags / lineplan), not the floor's room labels
     all_rooms = _rooms(layer)
     if name and not any(r["name"] and (T.norm(r["name"]) == T.norm(name) or T.match_score(name, r["name"]) >= 0.9)
                         for r in all_rooms):

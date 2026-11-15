@@ -10,5 +10,5 @@ and it counts exactly on unseen US and UK sheets. When Stoa told us scans are th
 simulated scans the same evening: on a scanned school plan it went from fifty-four doors to a hundred, matching
 the clean drawing.
 
-About seventeen euros in total. The production path is one setting away: our own models on confidential GPUs in
+About fifteen euros of GPU time in total. The production path is one setting away: our own models on confidential GPUs in
 Finland.

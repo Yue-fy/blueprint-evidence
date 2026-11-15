@@ -405,10 +405,196 @@ def room_area_walls(path: str, label_box: list[float], px_per_m: float, gap_m: f
                       f"= {m2:.2f} m²", *notes]}
 
 
+# O1 c11 (X1 21:32, AFCEE A-101 scan: 'perimeter of the Break Room (2.02)'): small rooms on US CAD sheets carry their
+# tag OUTSIDE the room with a leader arrow into it; the fill from the tag floods the exterior (None). Then the room is
+# the blank region at the leader's tip. STOA_O1_LEADER=0: off.
+LEADER = os.environ.get("STOA_O1_LEADER", "1") != "0"
+LEADER_MAX_M2 = 400.0  # a fill from the tag above this is no room (callers cap rooms at 120 / 400 m²)
+
+
+def label_group(layer: T.TextLayer, lab: T.TextItem) -> list[float]:
+    """The label's box grown by the lines stacked directly above / below it (name, number, printed area)."""
+    G = list(lab.box)
+    h = max(4.0, lab.box[3] - lab.box[1])
+    grew = True
+    while grew:
+        grew = False
+        for it in layer.items:
+            b = it.box
+            if b[0] >= G[2] or b[2] <= G[0] or (b[0] >= G[0] and b[2] <= G[2] and b[1] >= G[1] and b[3] <= G[3]):
+                continue
+            if -0.3 * h <= b[1] - G[3] < 0.8 * h or -0.3 * h <= G[1] - b[3] < 0.8 * h:
+                if (b[2] - b[0]) <= 3 * (G[2] - G[0]) and (b[3] - b[1]) <= 1.6 * h:
+                    G = [min(G[0], b[0]), min(G[1], b[1]), max(G[2], b[2]), max(G[3], b[3])]
+                    grew = True
+    return G
+
+
+def _rect_dist(pt, B) -> float:
+    dx = max(B[0] - pt[0], 0.0, pt[0] - B[2])
+    dy = max(B[1] - pt[1], 0.0, pt[1] - B[3])
+    return float(np.hypot(dx, dy))
+
+
+LEADER_GRAY = 215  # leaders are thin and often light grey on scans (AFCEE A-101 scanned PDF: broken at the ink's 190)
+
+
+def _solid(win: np.ndarray, a, b, share: float = 0.85) -> bool:
+    """Ink (within 1 px) at >= `share` of 25 points between 10 % and 90 % of the segment a-b."""
+    H, W = win.shape
+    hit = n = 0
+    for t in np.linspace(0.1, 0.9, 25):
+        x, y = int(round(a[0] + t * (b[0] - a[0]))), int(round(a[1] + t * (b[1] - a[1])))
+        if 1 <= x < W - 1 and 1 <= y < H - 1:
+            n += 1
+            hit += bool(win[y - 1:y + 2, x - 1:x + 2].any())
+    return n > 0 and hit >= share * n
+
+
+def _ends_in_blank(win: np.ndarray, far, near, h: float) -> bool:
+    """Walking on from the far end along the line, the ink (line + arrowhead) stops within 1.2 text heights and the
+    next 0.5 text heights are blank paper: the tip sits in a room, not on a wall or a longer line."""
+    H, W = win.shape
+    d = np.subtract(far, near)
+    d = d / max(1e-6, float(np.hypot(*d)))
+    k, gap = 0, 0
+    while k < 1.2 * h:
+        x, y = int(round(far[0] + k * d[0])), int(round(far[1] + k * d[1]))
+        if not (0 <= x < W and 0 <= y < H):
+            return False
+        gap = gap + 1 if not win[y, x] else 0
+        if gap >= 3:
+            break
+        k += 1
+    else:
+        return False
+    for j in range(int(k), int(k + 0.5 * h)):
+        x, y = int(round(far[0] + j * d[0])), int(round(far[1] + j * d[1]))
+        if not (0 <= x < W and 0 <= y < H) or win[y, x]:
+            return False
+    return True
+
+
+def _arrowhead(win: np.ndarray, far, near, h: float) -> bool:
+    """More ink in a disc (radius 0.4 text heights) around the line's far end than around its middle: a filled arrow
+    or dot (the line alone gives the same count at both). The far end may stop at the head's base or its tip."""
+    r = max(4, int(round(0.4 * h)))
+    yy, xx = np.ogrid[-r:r + 1, -r:r + 1]
+    disc = (xx * xx + yy * yy) <= r * r
+
+    def ink_at(c):
+        x, y = int(round(c[0])), int(round(c[1]))
+        if y - r < 0 or x - r < 0 or y + r + 1 > win.shape[0] or x + r + 1 > win.shape[1]:
+            return None
+        return int(win[y - r:y + r + 1, x - r:x + r + 1][disc].sum())
+
+    d = np.subtract(far, near)
+    d = d / max(1e-6, float(np.hypot(*d)))
+    tip = max((ink_at((far[0] + k * d[0], far[1] + k * d[1])) or 0) for k in (-r, 0, r))
+    mid = ink_at(((far[0] + near[0]) / 2, (far[1] + near[1]) / 2))
+    return mid is not None and tip >= max(1.8 * mid, mid + 0.6 * r * r)
+
+
+def leader_tip(path: str, layer: T.TextLayer, lab: T.TextItem, px_per_m: float) -> tuple[float, float] | None:
+    """The far end of the one leader line that starts at the label group's edge: a thin straight ink line (Hough),
+    >= 2.5 text heights long, its near end within 1.5 text heights of the group, running AWAY from it (the distance to
+    the group grows by >= 80 % of its length: walls beside the tag run along it), not part of a thick wall. Two
+    leaders in different directions -> None (ambiguous)."""
+    G = label_group(layer, lab)
+    h = max(6.0, lab.box[3] - lab.box[1])
+    with Image.open(T._abspath(path)) as im:
+        W, H = im.size
+        R = int(12 * h)
+        wx0, wy0, wx1, wy1 = max(0, int(G[0]) - R), max(0, int(G[1]) - R), min(W, int(G[2]) + R), min(H, int(G[3]) + R)
+        g = np.asarray(im.crop((wx0, wy0, wx1, wy1)).convert("L"), dtype=np.int16)
+    win = (g < LEADER_GRAY).astype(np.uint8)
+    for it in layer.items:  # text strokes are no lines
+        b = it.box
+        win[max(0, int(b[1]) - wy0):max(0, int(b[3]) + 1 - wy0), max(0, int(b[0]) - wx0):max(0, int(b[2]) + 1 - wx0)] = 0
+    w = max(2, int(round(0.1 * px_per_m)))
+    thick = cv2.morphologyEx(win, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_RECT, (w, w))) > 0
+    segs = cv2.HoughLinesP(win * 255, 1, np.pi / 180, threshold=int(1.5 * h), minLineLength=int(2.5 * h), maxLineGap=6)
+    if segs is None:
+        return None
+    hits = []
+    for x0, y0, x1, y1 in segs.reshape(-1, 4):
+        a, b = (float(x0 + wx0), float(y0 + wy0)), (float(x1 + wx0), float(y1 + wy0))
+        da, db = _rect_dist(a, G), _rect_dist(b, G)
+        near, far, dn, df = (a, b, da, db) if da <= db else (b, a, db, da)
+        n = float(np.hypot(far[0] - near[0], far[1] - near[1]))
+        if dn > 1.5 * h or df - dn < 0.8 * n:
+            continue
+        ts = np.linspace(0.2, 0.8, 13)
+        pts = [(int(round(near[1] + t * (far[1] - near[1]))) - wy0, int(round(near[0] + t * (far[0] - near[0]))) - wx0)
+               for t in ts]
+        if sum(bool(thick[y, x]) for y, x in pts if 0 <= y < thick.shape[0] and 0 <= x < thick.shape[1]) > 0.3 * len(pts):
+            continue  # a wall
+        if not _solid(win, (near[0] - wx0, near[1] - wy0), (far[0] - wx0, far[1] - wy0)):
+            continue  # dashed: a grid / axis line passing the tag (EFA 'Dining' render: the grid line to a wall)
+        if not _arrowhead(win, (far[0] - wx0, far[1] - wy0), (near[0] - wx0, near[1] - wy0), h):
+            continue  # a leader ends in an arrowhead or a dot; a bare line beside a tag may be anything
+        if not _ends_in_blank(win, (far[0] - wx0, far[1] - wy0), (near[0] - wx0, near[1] - wy0), h):
+            continue  # the ink runs on past the far end (a wall, a longer line): no arrow tip in a room
+        hits.append((n, near, far))
+    if not hits:
+        return None
+    hits.sort(key=lambda t: -t[0])
+    d0 = np.subtract(hits[0][2], hits[0][1]) / hits[0][0]
+    for n, near, far in hits[1:]:
+        d = np.subtract(far, near) / n
+        if float(np.dot(d0, d)) < 0.9 and n >= 0.6 * hits[0][0]:
+            return None  # two leaders: which room is meant is not clear
+    return hits[0][2]
+
+
+LABEL_FIT = float(os.environ.get("STOA_O1_LABEL_FIT", "1.5") or 0)  # region px >= this x the label box px
+
+
 def room_area(path: str, label_box: list[float], px_per_m: float, door_m: float = 1.05,
               ink: np.ndarray | None = None, wall_m: float = 0.0, hull: bool = False, clip: bool = False,
               clip_m2: float = 3.0, others: list | None = None, fixture_retry: bool = False,
-              grow: int = 0, solid: bool = False, bridge_m: float = 0.0, large: bool = False) -> dict | None:
+              grow: int = 0, solid: bool = False, bridge_m: float = 0.0, large: bool = False,
+              layer: T.TextLayer | None = None) -> dict | None:
+    """layer (optional): the text layer; when the fill from the label finds no room (None, or > LEADER_MAX_M2) and a
+    leader line with an arrowhead / dot runs from the label group into the drawing, the room at its tip (LEADER)."""
+    r0 = _room_area_at(path, label_box, px_per_m, door_m, ink, wall_m, hull, clip, clip_m2, others, fixture_retry,
+                       grow, solid, bridge_m, large)
+    if r0 is not None and LABEL_FIT and px_per_m and \
+            r0["m2"] * px_per_m ** 2 < LABEL_FIT * (label_box[2] - label_box[0]) * (label_box[3] - label_box[1]):
+        r0 = None  # O1 c12 (X1 sl-292): a region smaller than the name printed in it is a fixture / court marking
+    if not LEADER or layer is None or (r0 is not None and r0["m2"] <= LEADER_MAX_M2):
+        # only when the tag's own fill found no room (or an oversized region): preferring a leader whenever one was
+        # seen moved 25 of 248 Swiss PNG rooms, mostly to fixtures (within 2 % 90 -> 87; artifacts/O1/c11/swiss_*)
+        return r0
+    lab = next((i for i in layer.items if [round(v, 1) for v in i.box] == [round(v, 1) for v in label_box]), None)
+    if lab is None:
+        return r0
+    try:
+        tip = leader_tip(path, layer, lab, px_per_m)
+    except Exception:  # noqa: BLE001 - a second chance, never a reason to fail
+        return r0
+    if tip is None:
+        return r0
+    seed = [tip[0] - 2, tip[1] - 2, tip[0] + 2, tip[1] + 2]
+    r = _room_area_at(path, seed, px_per_m, door_m, ink, wall_m, hull, clip, clip_m2, others, fixture_retry, grow,
+                      solid, bridge_m, large)
+    if r is None:
+        return r0
+    if r0 is not None and abs(r["m2"] - r0["m2"]) <= 0.02 * max(r0["m2"], 1e-6) and \
+            max(abs(a - b) for a, b in zip(r["box"], r0["box"])) <= 0.1 * px_per_m:
+        return r0  # the leader points into the room the tag already filled
+    G = label_group(layer, lab)
+    poly = np.asarray(r.get("polygon") or [], np.float32)
+    if len(poly) >= 3 and cv2.pointPolygonTest(poly, ((G[0] + G[2]) / 2, (G[1] + G[3]) / 2), False) >= 0:
+        return r0  # the tip's region holds the tag itself: no leader into another room
+    r["notes"].insert(0, f"the label '{lab.text}' sits outside its room: its leader line ends at ({tip[0]:.0f}, "
+                         f"{tip[1]:.0f}) px, and the room is the blank region there")
+    r["leader"] = [list(map(float, tip))]
+    return r
+
+
+def _room_area_at(path, label_box, px_per_m, door_m, ink, wall_m, hull, clip, clip_m2, others, fixture_retry, grow,
+                  solid, bridge_m, large) -> dict | None:
     # large: the caller knows the image is a whole large-format CAD sheet (a printed 1:N on a standard paper size,
     # clean render) -> door gaps are bridged at any resolution (textqa._large; O1 c6: D1's line-only school sheets as
     # 300-dpi PNGs = 59 / 29.5 px/m, below BRIDGE_MIN_PX_M)

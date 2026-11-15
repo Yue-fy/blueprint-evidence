@@ -136,7 +136,11 @@ and USACE door counts and toilet skirting, were added), and the sealed set grew 
 | `ed95f26` (d26) | 86.7% (78 / 90); 0 wrong at confidence ≥ 0.8; evidence on 98%; 158 / 207 on the open set grown to 207 (57 new rows: 19 piping questions on the M-101A sheet, asked on its PDF, on its PNG and on the whole sheet set, 11 / 19 right on each; 125 / 150 on d25's rows: 7 W / 0 L); mean 17 s, p95 54 s per question | 59.4% (19 / 32); 47.7% (31 / 65); 49.5% (51 / 103); 54.5% (78 / 143); 53.2% (92 / 173) |
 | `12b136d` (d27) | 86.7% (78 / 90), the same answers on the 90; 0 wrong at confidence ≥ 0.8; evidence on 98%; 178 / 210 on the open set grown to 210 (175 / 207 on d26's rows: 19 W / 2 L; areas 62 / 74, lengths 57 / 67, counts 59 / 69); mean 5.4 s, p95 22 s per question | 59.4% (19 / 32); 49.2% (32 / 65); 52.4% (54 / 103); 58.0% (83 / 143); 57.2% (99 / 173) |
 | `e3a1d9f` (d28) | 86.7% (78 / 90), the same answers on the 90; 25 answers at confidence ≥ 0.8 (11 at d27), 1 of them wrong (a pressure-gauge count on Stoa's PNG of the piping plan, 20 against 21, at 0.80); evidence on 99%; 190 / 216 on the open set grown to 216 (185 / 210 on d27's rows: 8 W / 1 L; areas 64 / 76, lengths 62 / 71, counts 64 / 69); mean 6.4 s, p95 25 s per question | 59.4% (19 / 32); 49.2% (32 / 65); 55.3% (57 / 103); 60.1% (86 / 143); 58.4% (101 / 173) |
-| **`f2cd8f1` (d29)** | **86.7% (78 / 90)**, the same answers on the 90; 25 at confidence ≥ 0.8, the same 1 wrong; evidence on 99%; 198 / 249 on the open set grown to 249 (190 / 216 on d28's rows: 0 W / 0 L; the 33 new rows 8 / 33, 5 with the d28 code: the DfE west-facade windows 18, all DfE doors 115, the A-103 doors 2; areas 64 / 76, lengths 63 / 79, counts 71 / 94); mean 7.6 s, p95 32 s per question | 65.6% (21 / 32); 52.3% (34 / 65); 54.4% (56 / 103); 59.4% (85 / 143); **58.4% (101 / 173)** (1 real W / 3 real L: window counts on one EFA ground-floor sheet over by a third; 2 W only from the new scorer) |
+| `f2cd8f1` (d29) | 86.7% (78 / 90), the same answers on the 90; 25 at confidence ≥ 0.8, the same 1 wrong; evidence on 99%; 198 / 249 on the open set grown to 249 (190 / 216 on d28's rows: 0 W / 0 L; the 33 new rows 8 / 33, 5 with the d28 code: the DfE west-facade windows 18, all DfE doors 115, the A-103 doors 2; areas 64 / 76, lengths 63 / 79, counts 71 / 94); mean 7.6 s, p95 32 s per question | 65.6% (21 / 32); 52.3% (34 / 65); 54.4% (56 / 103); 59.4% (85 / 143); 58.4% (101 / 173) (1 real W / 3 real L: window counts on one EFA ground-floor sheet over by a third; 2 W only from the new scorer) |
+| **`aff2f1f` (d30)** | **91.1% (82 / 90; 4 W / 0 L**: the slab areas and the genset footprint on Stoa's PNG copy of the S-100F slab plan); 25 at confidence ≥ 0.8, the same 1 wrong; evidence on 100%; 249 / 316 on the open set grown to 316 (212 / 249 on d29's rows: 14 W / 0 L; areas 88 / 107, lengths 70 / 93, counts 91 / 116); mean 6.0 s, p95 20 s per question | 62.5% (20 / 32); 53.8% (35 / 65); 55.3% (57 / 103); 59.4% (85 / 143); **58.4% (101 / 173)** |
+| `b8146dd` (d31) | **91.1% (82 / 90; 0 W / 0 L)**, the same answers on the 90; 25 at confidence ≥ 0.8, the same 1 wrong; evidence on 100%; 315 / 381 on the open set grown to 381 (262 / 316 on d30's rows: 13 W / 0 L; the 66 rows added at d30 48 / 66, 36 at d30; the 65 added at d31 53 / 65; areas 123 / 141, lengths 81 / 102, counts 111 / 138); mean 7.0 s, p95 25 s per question | 62.5% (20 / 32); 58.5% (38 / 65); 59.2% (61 / 103); 62.2% (89 / 143); **61.3% (106 / 173)** |
+| `4b62b93` (d32) | **91.1% (82 / 90; 0 W / 0 L)**, the same answers on the 90; 48 at confidence ≥ 0.8 (25 at d31: the new confidence map, see [Calibration](#calibration)), the same 1 wrong; evidence on 100%; 314 / 381 on the open set (315 at d31: 2 W / 3 L; areas 123 / 141, lengths 79 / 102, counts 112 / 138); mean 5.2 s, p95 16 s per question | the sealed lane did not finish at d32 (stopped for memory); 61.3% (106 / 173) at d31 |
+| **`e4a166b` (d33, the freeze build)** | **91.1% (82 / 90; 0 W / 0 L)**, the same answers on the 90; 48 at confidence ≥ 0.8, the same 1 wrong; evidence on 100%; **322 / 381** on the open set (314 at d32: 8 W / 0 L; areas 126 / 141, lengths 81 / 102, counts 115 / 138); 191 answers at confidence ≥ 0.8, 189 right; mean 4.0 s, p95 15 s per question | **64.7% (112 / 173)** (the d32 lane did not finish; 61.3% at d31) |
 
 Gate d20 added 10 questions on a fitness-centre module sheet to dev (66 / 100 with them) and grew the sealed set to
 65 questions with line-only school plans and Stoa-style image copies of the sheets; the common rows are compared above.
@@ -172,14 +176,55 @@ line beats a model's foot mark. Its two losses are on a JPEG copy of a school sh
 length). Runs: d27 `20261114-201523-upload-stoa_like_dev-b617`, `-201523-upload-stoa_like_sealed-4a76`, replay
 `-202054-upload-stoa_like_dev-7a85`.
 
+What d33 changed (open set; run `20261115-025342-upload-stoa_like_dev-3085`): on Stoa's 90 nothing; on the 381 open questions 8 won and 0 lost. On a traced picture the skirting no longer runs along door recesses and open door leaves (the DfE PNG copy's multi-purpose hall 55.45 → 50.54 m, gold 50.4); rooms asked by number ('Art 1, Art 2 and Art 3') are all found and summed from their printed tags on an EFA sheet, its PNG copy and a phone photo of it (328.95 / 242 / 232 → 272 m², gold 272); the school's overall length on a PNG copy is its printed 79.2 m again (d32's OCR loss); and three counts by printed label on sheets of the US sets are right (numbered rooms of a filter building 6 → 4, fire extinguisher cabinets 5 where a text answer came before, restrooms 1 → 2). These were fixed on the rows where they were found, so they are not a forecast; on the held-out sibling sheets d33 answers 112 of 173 (106 at d31). Confidence on the open set: 191 answers marked sure, 189 right; ECE 0.128 (0.113 at d32), AUROC 0.906 (0.890), Brier 0.094 (0.101).
+
+What d32 changed (open set; run `20261115-021939-upload-stoa_like_dev-22f0`): on Stoa's 90 nothing; on the 381 open questions 2 won and 3 lost. Won: a Finnish door-count question ('Kuinka monta ovea pohjapiirustuksessa on?') now reaches the door-symbol reader (115 doors on the DfE sheet, gold 115; it was a vision estimate of 10), and the ICT classrooms of an EFA sheet are both found and summed (124 m², gold 124; 62 before). Lost: a kitchen traced from the wall lines comes out smaller, 60.87 m² against 63.0 (62.01 before, within 2%); a break room's skirting is now traced longer and unsure (11.56 m against 10.57 m), and the general agent then computes it from the room's area (37.93 ft against 34.65); and an OCR vocabulary repair turns a school's printed overall length on a PNG copy into 33.0 m (79.2 before, now at confidence 0.16). The bigger change is the confidence: from d32 a fitted map sets it from what the answer rests on, so 187 answers on the open set are marked sure (112 at d31), 184 of them right, and ECE falls from 0.213 to 0.113 ([Calibration](#calibration)). Answers were also faster in this run (mean 7.0 → 5.2 s): the wall-line tracer now reuses the regions it has already filled, and the machine's load differs between runs. On scans (measured by our scan tester on the d32 candidates, not by the gate): a PDF whose OCR text layer is junk is now read as a scan, so on 67 such test copies of scanned sheets 10 → 37 are right (28 won, 1 lost), and on their image-only originals 34 → 39 (`d0514b4`); and on a sealed 1948 Nordic scan whose dimensions are bare numbers in centimetres, 1 → 4 of 11 are right and its confident wrong answers fall from 6 to 0 (`4b62b93`).
+
+What d31 changed (open set; run `20261115-005654-upload-stoa_like_dev-35aa`): 13 won, 0 lost on d30's 316 rows, none of
+them on Stoa's 90. Pumps named only by a text callout are counted with the tagged family (M-101A pumps 5 -> 7 on the PDF
+and on the PNG; the FSCV-tagged components 2 -> 7 from the piping reader); sums and counts over rooms with one exact
+printed name on a sheet nobody tuned on (an EFA colour sheet: the English classrooms 578 -> 495 m², the MFL rooms 363 ->
+330 m², the rooms of 55 m² 41 -> 17, on the PDF and its PNG copy); on a sheet read as a picture, the reader's own
+number is kept and its box measured against the scale bar is only a cross-check (the sports hall 1.48 -> 33.0 m, the
+printed '33,000' marked); an overall size is read as the outermost printed dimension total along that side (the
+teaching block's depth 37.85 m, the sum of its chain, on the PDF and its PNG copy); the four Infants classrooms are
+summed from rooms traced from the wall lines instead of the sheet's printed target (2,190 -> 249.98 m², gold 248); the
+main hall on a PNG copy is traced whole (59.13 -> 178.64 m², gold 180); and the AFCEC north-wing door count checks
+the wing's repeated room modules (33 -> 34 on the PDF). Most of these are on sheets added as twins of the sealed set's
+weakest kinds, so they are fixes measured where they were made, not a forecast. On the held-out sibling sheets, which
+nobody looks at row by row, d31 answers 106 of 173 (101 at d30). Real drawings from outside the dataset, development
+set: 118 of 168, as at d30 (2 won: a kitchen and a kitchen-plus-living sum on a German flat plan; 2 lost: a room area
+on a picture and a wall thickness). Skirting on line-only school plans 21 = 21 / 29; DfE sibling plans 139 -> 141 / 202
+(3 won, 1 lost).
+
+What d30 changed: the slab reader measures a slab from the dimension chains printed along it (read by OCR on a
+picture), checked against its traced fill, instead of from the traced outline alone, so on Stoa's PNG copy of the S-100F slab plan the 300 mm D16 slab (218.63 m²), the 150 mm D13 slab
+(61.69 m², asked two ways) and the genset footprint (26.49 m²) are now right, as on the PDF. The other 10 wins on the
+open set are on the fitness-centre module sheets (door counts from the door schedule and from the drawn doors, the break
+room's skirting, perimeter and door opening) and one DfE sliding-door count; no row of d29's open set was lost. Of the
+66 questions added to the open set at d30 (most of them written as twins of the sealed set's weakest kinds), 36 are
+right. On the held-out siblings the score is unchanged (101 / 173). On real drawings from outside the dataset d30 loses
+two on the development set (120 -> 118 / 168, no wins; see [Real drawings](#real-drawings-from-outside-the-dataset)) and two on the held-out set (61 -> 59 /
+120). Line-only school plans 79 -> 77 / 129 (1 won, 3 lost: sums over 'all the rooms labelled X' that now take in one
+room too many or too few), skirting 21 = 21 / 29, and the DfE sibling plans 97 -> 139 / 202 (42 won, 0 lost: room
+areas, perimeters and skirting, 36 of them on the three A0 sibling sheets, which the line tracer now renders finer; a fix
+measured on this probe). In replay, the hosted step no longer wins anything on the 90 (82 = 82). Runs: d30
+`20261114-233219-upload-stoa_like_dev-c166`, replay `-234032-upload-stoa_like_dev-353a`, wild
+`-234812-upload-wild_dev-8e85` and `-234128-upload-wild_sealed-5632`, EFA `-234925-upload-efa_area_probe-f5a4` and
+`-235411-upload-efa_skirting_probe-e347`, DfE siblings `-235712-upload-dfe26_sibling_probe-e428`.
+
 What d29 changed: fixes made from our expert's hand-measured answers on the DfE sheet (see the Human audit): the
 windows on a named facade are counted from the window symbols drawn on that side (18, as she counted; 0 before), and
 every door symbol of the sheet is counted (115, as she counted; 101 before). Of the 33 questions added to the open set
 at d29, 8 are right (5 with the d28 code); the other 216 are unchanged. On the held-out sets the changes are neutral
 within noise: siblings 101 = 101 (one real win, three real losses, all window counts on one EFA ground-floor sheet,
-over by a third), other real drawings 62 -> 61. From d29 the scorer also reads feet-and-inches and fractions (see How
-we score). Runs: d29 `20261114-214036-upload-stoa_like_dev-5459`, replay `-214851-upload-stoa_like_dev-d86d`, wild
-`-214944-upload-wild_sealed-2a60`.
+over by a third), other real drawings 62 -> 61. The other lanes moved up or stayed: real-drawing development set 119 ->
+120 / 168, line-only school plans 78 -> 79 / 129, DfE sibling plans 96 -> 97 / 202 (against d27), and scans of the
+example sheets 40% -> 54% (see Scans of the example sheets). From d29 the scorer also reads feet-and-inches and
+fractions (see How we score). Runs: d29 `20261114-214036-upload-stoa_like_dev-5459`, replay
+`-214851-upload-stoa_like_dev-d86d`, wild `-215759-upload-wild_dev-6376` and `-214944-upload-wild_sealed-2a60`, EFA
+`-220619-upload-efa_area_probe-da9d` and `-221154-upload-efa_skirting_probe-bbdd`, DfE siblings
+`-221501-upload-dfe26_sibling_probe-91b9`, scans `-220856-upload-scan_dev-1afd`.
 
 What d28 changed: the piping reader also reads image sheets (it runs on the sheet's traced text and lines), so the
 piping questions on Stoa's PNG copy of M-101A went from 22 to 27 of 31 (its PDF copy stays at 26 of 27), and a phone
@@ -234,17 +279,33 @@ Stoa expects scanned and photographed prints. To measure what a scan costs us, 9
 development sheets are also asked on simulated scans of their sheet (v2 simulator: the page frame kept, the content
 skewed inside it, blur and faded lines, at 200 or 300 dpi), once as a PNG and once as an image-only PDF, plus 8
 questions on real scans of historical sheets. These are scans of sheets we tuned on, so they show what scanning
-alone takes away. Gate d27 (`12b136d`, private, run `20261114-203122-upload-scan_dev-e4ed`), the eval's scoring:
+alone takes away. Private, the eval's scoring, on the same 182 answers at both gates (runs
+`20261114-203122-upload-scan_dev-e4ed` and `20261114-220856-upload-scan_dev-1afd`):
 
-| Upload condition | Right | Areas | Lengths | Counts |
-|---|---|---|---|---|
-| Scanned PNG | 38.5% (35 / 91) | | | |
-| Image-only PDF (scanned) | 41.8% (38 / 91) | | | |
-| Both scanned conditions | **40.1% (73 / 182)** | 31.0% (26 / 84) | 42.0% (21 / 50) | 54.2% (26 / 48) |
-| Real scans of historical sheets | 5 / 8 | | | |
+| Upload condition | Gate d27 (`12b136d`) | Gate d29 (`f2cd8f1`) |
+|---|---|---|
+| Scanned PNG | 38.5% (35 / 91) | 53.8% (49 / 91) |
+| Image-only PDF (scanned) | 41.8% (38 / 91) | 54.9% (50 / 91) |
+| **Both scanned conditions** | **40.1% (73 / 182)** | **54.4% (99 / 182)** |
+| of which areas | 31.0% (26 / 84) | 54.8% (46 / 84) |
+| of which lengths | 42.0% (21 / 50) | 46.0% (23 / 50) |
+| of which counts | 54.2% (26 / 48) | 62.5% (30 / 48) |
+| Real scans of historical sheets | 5 / 8 | 5 / 8 |
 
-Paired with the same question on the vector PDF (68 pairs per scanned condition, the
-workspace repository's `experiments/x1/cond_table.py`, which also accepts a second reading where a row has one): the vector sheet is right
+What changed on scans between d27 and d29 (the raster readers, gates d28 and d29): a scan's text layer joins the text
+recognition (OCR) with the local vision model's reading where the OCR found nothing, and a file keeps the layer it was
+first read with; an OCR read that runs over its time budget now finishes in the background and is cached instead of
+being dropped; and an area is no longer read off a number the sheet prints only as a dimension string (an EFA
+classroom was 7.2 m² from its "7,200" bay width, now traced: 61.79 m²). On the 227 scan, render and photo answers both
+runs share: 30 won and 2 lost, every one a changed value. Caveat: the d29 run is a re-run, so each scan's text had already been read once (it
+is cached by file content); on a first upload the text recognition can run out of its time budget and the answer then
+falls back to a weaker reading (our cold run of lighter scans: the first question per file 3 of 11 right, the later
+questions 41 of 80). The gate set has since grown to 259 scan answers (77 new: the piping plan, more DfE and AFCEC
+questions): 50.2% (130 / 259) at d29.
+
+Paired with the same question on the vector PDF at d29: the vector sheet is right on 79 of 91, the scanned PNG on 49
+and the image-only PDF on 50. At d27 (68 pairs per scanned condition, the workspace repository's
+`experiments/x1/cond_table.py`, which also accepts a second reading where a row has one): the vector sheet was right
 on 60 of 68, the scanned PNG on 23 and the image-only PDF on 26; a question right on the scan but wrong on the vector
 sheet happened once. Against a clean PNG export of the same sheet (23 pairs): 20 right on the export, 12 on its scan.
 Room areas suffer most. The likely causes: on a scan the room labels and the printed scale must be read by OCR
@@ -288,7 +349,8 @@ bundled here.
 | `a486439` (d25, runs `-190624-upload-wild_dev-58f0`, `-wild_sealed-9599`) | 70.8% (119 / 168; 1 W / 3 L against d22; areas 35 / 50, lengths 51 / 68, counts 33 / 50) | 50.8% (61 / 120) |
 | `12b136d` (d27, runs `-202557-upload-wild_dev-ac31`, `-202242-upload-wild_sealed-e741`) | 70.8% (119 / 168; 0 W / 0 L against d25) | 50.8% (61 / 120) |
 | `e3a1d9f` (d28, runs `-212458-upload-wild_dev-3031`, `-211927-upload-wild_sealed-66aa`) | 70.8% (119 / 168; 0 W / 0 L against d27) | 51.7% (62 / 120) |
-| **`f2cd8f1` (d29, run `-214944-upload-wild_sealed-2a60`)** | not run at the merge | **50.8%** (61 / 120; 1 real loss: a length answered with a raw string of several dimensions at confidence 0.65; 1 W / 1 L from the new scorer) |
+| `f2cd8f1` (d29, runs `-215759-upload-wild_dev-6376`, `-214944-upload-wild_sealed-2a60`) | 71.4% (120 / 168; 1 W / 0 L against d28, a count 3 -> 2; areas 35 / 50, lengths 51 / 68, counts 34 / 50) | 50.8% (61 / 120; 1 real loss: a length answered with a raw string of several dimensions at confidence 0.65; 1 W / 1 L from the new scorer) |
+| **`aff2f1f` (d30, runs `-234812-upload-wild_dev-8e85`, `-234128-upload-wild_sealed-5632`)** | 70.2% (118 / 168; 0 W / 2 L against d29: a bedroom count on a photographed plan now 'unknown' at confidence 0.13, and a house footprint without its porches read from a larger outline, 216 against 47.6 m² at 0.35; areas 34 / 50, lengths 51 / 68, counts 33 / 50) | **49.2%** (59 / 120; 2 fewer than d29, aggregate only) |
 
 Gate d14 runs: `20261114-152311-upload-wild_dev-8df4` and `20261114-152311-upload-wild_sealed-dcd8`.
 
@@ -354,15 +416,24 @@ Where a drawing goes is a server setting. Each step of the pipeline, and what it
 | No-GPU mode (`STOA_MODE=api`): steps meant for the local model | Google's Gemini API (Gemini 3 Flash) | what the local model would see: page images and the question |
 | Optional EU text model for free-text steps (`STOA_TEXT_BACKEND=verda`) | Verda Inference (EU) | text only |
 
-In the web app the **Private** switch (top bar; off by default, remembered per browser, `?private=1` in the URL)
+In the web app the **Private** switch (top bar; on by default from the freeze build on, remembered per browser, `?private=0` / `?private=1` in the URL)
 sends `private: 1` with each question. For that question the upload worker turns Gemini, Nemotron and the no-GPU
 route off, falls back from a hosted free-text model to the local one (an `eu: 1` request keeps Verda's EU model),
 and refuses steps that only exist as hosted models (the Nemotron second-opinion button) with a message.
 Underneath, `STOA_PRIVATE=1` makes `stoa.llm` refuse every call to a hosted model before it is sent (our own
 servers on loopback or a private network stay allowed; `STOA_EU_ONLY=1` also allows Verda), and the upload's
 text-layer warm-up runs that way too, so a private question cannot leak through a background step. Each answer
-card then reads "Stayed on our server" or names the hosted step it used. The switch's note shows the measured
-trade-off below.
+card then reads "Stayed on our server" or names the hosted step it used. The card also reads the answer's cost record: a
+hosted call counted there names its provider (or "a hosted AI model" when no step of the answer names one), even when
+that step's reply timed out or was replaced by a reading from the sheet. The answer's trace also holds the network
+layer's own list of the hosts it reached. The
+switch's note shows the measured trade-off below.
+
+We also checked private mode from outside our code, at the operating system: tracing the network system calls of
+the web app's answer worker (`strace -f -e connect`) over four private answers on Stoa's sheets (a room area, a door
+count, a pump count, a slab area; no hosted call counted) showed 11 connections, all to this machine (the local model
+and the door detector), and no name lookup. The same room question with Private off looked up Google and connected
+to it. The trace covers the worker's processes; the API process is covered by `tests/test_t2_private_e2e.py`.
 
 On the server, `STOA_PRIVATE=1` (or the pipeline argument `private=1`) turns every hosted step off for all
 questions, and `STOA_EU_ONLY=1` with it still allows Verda's EU text model. The last line of every answer's
@@ -376,9 +447,9 @@ Every eval number in this document, unless it says otherwise, ran that way. The 
 
 | | Private | Hybrid (Gemini + Nemotron) |
 |---|---|---|
-| Real drawings, held out: right (105 questions, same code `fc0927a`, same rows) | 49.5% (52) | **64.8%** (68; 19 won / 3 lost) |
-| Same rows: wrong answers at confidence 0.8 or more | 5 | 2 |
-| Same rows: mean / p95 time per question | 7.7 s / 23 s | 28 s / 62 s |
+| Real drawings, held out: right (105 questions, same rows; private `02a7a4d`, hybrid `fc0927a`: the same product code) | 48.6% (51) | **64.8%** (68; 20 won / 3 lost) |
+| Same rows: wrong answers at confidence 0.8 or more | 6 | 2 |
+| Same rows: mean / p95 time per question | 4.7 s / 15 s | 28 s / 64 s |
 | Real drawings, development set: $ per 1,000 questions (`ad739c9`) | $0.19 | $7.82 |
 | Stoa's example sheets in the web app, Gemini step on (`1795365`, 17 questions, 3 rounds) | 12 / 17 (our reading before the Gemini step) | 11 / 17; median 8–12 s, slowest 77–102 s; 15 of 18 answers "expensive" |
 | Stoa's example sheets, gate run (`1795365`): the 90 questions in Stoa's kinds; time over all development rows | **81.1%**; mean 9.5 s, p95 37 s | not re-run on this code (61% at `504060a`) |
@@ -392,8 +463,10 @@ Every eval number in this document, unless it says otherwise, ran that way. The 
 | All 216 open stoa-like questions, same run pair | 88.0% (190) | 89.4% (193; 3 won / 0 lost); 23 answers called a hosted model; $0.58 against $1.66 per 1,000 |
 | Same 90 questions, `f2cd8f1` (d29), replayed the same way | 86.7% (78) | **90.0%** (81; 3 won / 0 lost); 22 of the 90 answers called a hosted model; $0.87 against $3.34 per 1,000 questions as recorded |
 | All 249 open stoa-like questions, same run pair | 79.5% (198) | 80.7% (201; 4 won / 1 lost); 31 answers called a hosted model; $0.63 against $1.81 per 1,000 |
+| Same 90 questions, `aff2f1f` (d30), replayed the same way | **91.1%** (82) | 91.1% (82; 0 won / 0 lost); 17 of the 90 answers called a hosted model; $0.81 against $2.96 per 1,000 questions as recorded |
+| All 316 open stoa-like questions, same run pair | 78.8% (249) | 79.1% (250; 1 won / 0 lost); 21 answers called a hosted model; $0.50 against $1.20 per 1,000 |
 
-The replayed rows (d25 to d29) measure the Gemini step only: a replay makes no new hosted call, and the Nemotron
+The replayed rows (d25 to d30) measure the Gemini step only: a replay makes no new hosted call, and the Nemotron
 check had no cached answers in those runs, so it was never called there (the gate logs called it "unavailable").
 Nemotron's verdicts were measured once on their own, on 40 unsure answers (Saturday midday): next to evidence boxes
 it mostly agrees with them (12 of its 20 agreements were right answers), but on answers without located evidence
@@ -473,6 +546,15 @@ stretches with machine load, so the CPU part is good to about a factor of two):
 
 | Run | Input | Questions | Right | Median / p95 time | $ per 1,000 Qs | of which CPU |
 |---|---|---|---|---|---|---|
+| `e4a166b` (d33), open stoa-like questions, private | vector PDF | 245 | 91% | 1.6 / 13 s | $0.08 | |
+| | PNG picture | 144 | 76% | 1.6 / 18 s | $0.83 | |
+| | phone photo | 12 | 7 of 12 | 3.5 / 7 s | $2.33 | |
+| | all 401 | 401 | 84.5% | 1.6 / 15 s | $0.42 | $0.11 |
+| `4b62b93` (d32), open stoa-like questions, private | vector PDF | 245 | 90% | 1.4 / 15 s | $0.11 | |
+| | PNG picture | 144 | 73% | 1.7 / 18 s | $0.83 | |
+| | phone photo | 12 | 6 of 12 | 2.3 / 7 s | $2.61 | |
+| | all 401 | 401 | 82.4% | 1.6 / 16 s | $0.45 | $0.13 |
+| Same rows, hybrid (hosted answers replayed, priced as if called) | all 401 | 401 | 82.7% (one gain: a phone photo) | 2.3 / 20 s | $1.04 | $0.17 |
 | `ed95f26` (d26), open stoa-like questions, private | vector PDF | 136 | 78% | 4.6 / 41 s | $0.23 | $0.15 |
 | | PNG picture | 87 | 73% | 3.9 / 99 s | $1.60 | $0.61 |
 | | phone photo | 5 | 4 of 5 | 11 / 124 s | $2.01 | $0.48 |
@@ -510,6 +592,34 @@ it: new wording, a translation, two readers that disagree, a wrong-shaped answer
 
 On the dataset, confidence is well calibrated. On unseen wording (`hard2r`) it is too cautious. On held-out real
 drawings it is weak: only a few answers are marked sure, and 4 of the 7 that were are wrong.
+
+**From d32 on** (`45cbee2`), the upload solver's last step re-maps the confidence of every numeric answer with a small
+logistic model of what the answer rests on (`stoa/trust/calibrate.py`): the reader's own confidence, whether its
+evidence supports the number (supported, approximate or not located), what it is based on (a labelled printed value,
+one mark per item, a traced outline …), the kind of quantity and the medium. It was fitted on the d30 gate runs, and
+it never changes a value. On top of the fit, an answer whose evidence was not located stays below 0.4, and only a
+supported, labelled printed value may reach 0.9 ("very sure"). Kill switch: `STOA_T1_CALIBRATE=0`.
+
+- On the open stoa-like set (381 questions), d31 `b8146dd` against d32 `4b62b93`: ECE 0.213 → 0.113, AUROC 0.858 →
+  0.890, Brier 0.144 → 0.101; answers at 0.8 or more 112 (109 right) → 187 (184 right). This is partly in-sample (the
+  fit used d30's runs of these sheets). On the freeze build d33 (`e4a166b`): ECE 0.128, AUROC 0.906, Brier 0.094; 191
+  answers at 0.8 or more, 189 right.
+- Out of sample, on 198 rows of runs made after it went live: ECE 0.116 → 0.104, Brier 0.201 → 0.190. On the three
+  sealed sets the Brier score improves on all three: real drawings 0.222 → 0.216, stoa-like siblings 0.165 → 0.132,
+  scans 0.184 → 0.171 (the scans' ECE gets worse, 0.137 → 0.239, on only 15 rows).
+- The price: on the stoa-like sealed set, wrong answers at confidence 0.6 or more rose from 5 to 19, while right ones
+  rose from 47 to 92. One bucket is over-confident on sheets nobody tuned on: supported counts from marks on vector
+  sheets, 15 of 29 right at a mean confidence of 0.71.
+- On simple apartment plans it is too cautious. With every dataset file uploaded alone (a sample of 11,891
+  questions, `d0514b4`), counts on CubiCasa-style plans were shown at about 0.3 and were right about 85% of the time
+  (ECE 0.040 → 0.270 against the 15:30 code; answers at 0.8 or more went from 97.1% to 99.6% right, 244 → 19 wrong).
+  `45cbee2` keeps the counting model's own confidence when it is 0.9 or more; offline on the same rows that gives an
+  ECE of 0.153 and 7,307 answers at 0.8 or more, 99.1% right.
+- **The freeze build** (d33 `e4a166b`, which adds a narrower rule for those counts, `4127a05`): the same 11,891
+  uploads re-run for real on a Verda GPU give ECE 0.271 → 0.167 and AUROC 0.879 → 0.918 against d32, with 7,269
+  answers at 0.8 or more, 99.2% right (56 wrong; 244 with the 15:30 code); every deterministic reader's values are
+  identical. On the stoa-like sealed set d33 has ECE 0.116, Brier 0.114 and AUROC 0.918; 26% of its answers are at
+  0.8 or more, 95.6% of them right.
 
 ## Evidence
 
@@ -571,12 +681,12 @@ On wild-dev (114 questions, same code, runs `20261114-151435-upload-wild_dev-180
 Caveats. The branch did not yet have the other fixes, so "Gemini off" here is below the gate's 56.1–64.9%.
 
 **Confirmed on the held-out files** (night `fc0927a`, the hybrid as the API ships it: Gemini escalation and Nemotron
-verify on, solver `upload`): wild-sealed **64.8%** (68 / 105) against 49.5% (52 / 105) with Gemini off on the same code
-and rows (19 won / 3 lost); areas 24 → 29 of 48, lengths 11 → 18 of 28, counts 17 → 21 of 29; wrong at confidence ≥ 0.8
-5 → 2. 110 Gemini calls (the day's cap; 11 questions hit it and ran Gemini off, so 64.8% is a slight lower bound), mean
-latency 28 s, p95 62 s (Gemini off: 7.7 s / 23 s). So the escalation's gain transfers to unseen files, while most of our
+verify on, solver `upload`): wild-sealed **64.8%** (68 / 105) against 48.6% (51 / 105) with Gemini off on the same product
+code and rows (`02a7a4d`; 20 won / 3 lost); areas 23 → 29 of 48, lengths 11 → 18 of 28, counts 17 → 21 of 29; wrong at
+confidence ≥ 0.8 6 → 2. 110 Gemini calls (the day's cap; 11 questions hit it and ran Gemini off, so 64.8% is a slight lower bound), mean
+latency 28 s, p95 64 s (Gemini off: 4.7 s / 15 s). So the escalation's gain transfers to unseen files, while most of our
 later deterministic tuning did not (development rows we had looked at: 69%; newer unseen rows: 36%). Phone-photo counts
-with tiles and two samples take 60–260 s. Gemini is on by default in the API and the web app. It is off in every
+with tiles and two samples take 60–260 s. Gemini is on by default in the API; the web app starts in Private mode, and the visitor turns Gemini on. It is off in every
 gate and in every other number on this page.
 
 ## The whole dataset on one Verda GPU
@@ -595,14 +705,15 @@ From the real-drawing exam (above) and from our red team. The red team wrote 992
 overnight, each family aimed at the weakness the last one found.
 
 - **Stoa's own kinds of question are the hardest, and our gains on their four example sheets carry over only
-  partly.** On the four sheets we answer 86.7% (78 / 90, local models only, gates d26 to d29; 81.1% at d22). On held-out
+  partly.** On the four sheets we answer 91.1% (82 / 90, local models only, gates d30 and d31; 86.7% at d26 to d29, 81.1% at d22). On held-out
   sibling sheets of the same sets: 59.4% on the first 32 questions, 49.2% (32 / 65) on the grown set, 58.0% (83 / 143)
-  on the set as it stood at d23 and 58.4% (101 / 173) on the final one (d28 and d29; 57.2% at d27, 41.3% on the 143 at d23;
-  by kind at d28: areas 72 / 108, counts 14 / 30, lengths 15 / 35); the 25 sibling
+  on the set as it stood at d23 and 64.7% (112 / 173) on the final one at d33 (61.3% at d31, 58.4% at d28 to d30, 57.2% at d27, 41.3% on
+  the 143 at d23; by kind at d33: areas 79 / 108, counts 14 / 30, lengths 19 / 35; at d28: 72 / 108, 14 / 30, 15 / 35); the 25 sibling
   questions added to the open set late on Saturday were 4 / 25 right at d19. On 15 unseen line-only school plans in the
-  style of the DfE sheet, 78 of 129 room-area, perimeter and label-count questions are right at d27 (68 at d25, 50 at
-  d23, 17 at d19), and 21 of 29 skirting lengths that ignore door openings (18 at d25, 12 at d23, 2 at d22). On 202 questions about the five
-  sibling plans of the DfE sheet itself (gold measured two ways), 96 are right at d27 (93 at d25, 94 at d23). The causes we measured at d19 (d22 fixes the second and the fourth): big rooms cut by dash-dot centre
+  style of the DfE sheet, 77 of 129 room-area, perimeter and label-count questions are right at d30 (79 at d29, 78 at d27, 68 at d25,
+  50 at d23, 17 at d19), and 21 of 29 skirting lengths that ignore door openings (d27 to d30; 18 at d25, 12 at d23, 2 at d22). On 202 questions about the five
+  sibling plans of the DfE sheet itself (gold measured two ways), 141 are right at d31 (139 at d30, 97 at d29, 96 at d27, 93 at d25, 94 at d23; the d30 fix, a finer render of A0 pages for the line
+  tracer, was measured on this same probe, so that gain is not independent). The causes we measured at d19 (d22 fixes the second and the fourth): big rooms cut by dash-dot centre
   and overhead lines; sheets drawn at "1:200 @ A1" but stored as A3 pages
   (true scale 1:400); the middle of a solid wall strip taken as the room edge instead of its inner face (areas 1–6%
   too large); skirting questions that say "ignoring door openings" parsed as questions about doors. Room areas on
@@ -614,6 +725,12 @@ overnight, each family aimed at the weakness the last one found.
 - **Confident misses on held-out real drawings** (4 of 7 confident answers wrong on wild-sealed). On the dataset,
   answers at conf ≥ 0.8 are 98–99% right; do not carry that trust over to arbitrary uploads yet.
 - **Gains that only fit the files we looked at.** See "What carried over" above.
+- **Sums and counts by type on a new sheet.** The cheap readers of printed room tags are right on single rooms and
+  single tags, but on sheets nobody tuned on they are confidently wrong when they add rooms up or count them by type.
+  On 38 new development questions written as twins of the sealed set's weakest kinds (fresh EFA school sheets and a
+  USACE plan, uploaded alone, local models only, the night's newest code late on Saturday), 13 were right. Examples:
+  the ICT rooms summed to 2,071 m² against 124 m² at confidence 0.65 to 0.75; a sports hall with court lines drawn
+  inside traced as a 1.5 m² room; a clean 200 dpi picture of a CAD plan taken for a CubiCasa-style picture.
 - **The table reader runs model-written code, in a sandbox.** For questions over schedules and extracted tables,
   the local model writes a few lines of pandas over the tables we extracted, and `stoa/sandbox.py` runs them: the code
   is checked against an allow-list first (no imports, no names starting with `_`, no methods that read, write or
@@ -635,8 +752,15 @@ overnight, each family aimed at the weakness the last one found.
   and a rewording can still send a question down another path.
 - **Real Revit CAD files** have no closed room outlines (rooms are text tags, walls are lines). They need the line
   tracer, and are often answered with "missing: room outlines" instead of a number.
-- **Latency with escalation.** Hosted Gemini counts on phone photos can take minutes.
+- **Latency with escalation.** Hosted Gemini counts on phone photos can take minutes. With the Private switch off (the
+  visitor's choice), an answer can also wait for the Gemini step, up to its 25 s timeout, even when our own reading
+  was already right: in our audit of the demo (`1eedc72`), the pump count on Stoa's PNG of the piping plan took 28.4 s
+  because the Gemini reply never came, where the audit's earlier run of the same question took 1.3 s; the answer was
+  right both times. Private mode does not wait for a hosted step.
 - **Large multi-page PDF sets** (25+ pages) are not solved well: the right page is not always found.
+- **A plan PDF exported from an IFC model, uploaded without the model,** loses what the model knew: with every
+  dataset file uploaded alone (`d0514b4`), counts on such sheets were right 32.8% of the time, volumes 7.4% and
+  lengths 16.7%. Upload the IFC model with its sheets (as a project) when you have it.
 
 ## Human audit: the expert workbench
 
@@ -692,6 +816,58 @@ all three within tolerance. With her 8 hand-made answers on the DfE sheet as an 
 and all 8 at d29 (`f2cd8f1`), with the west-facade windows (18) and the sheet's door count (115) as she counted.
 This is not an independent test: those fixes were made from her answers and written methods. Our confidence on these
 8 is still low (0.40 to 0.55 on the right areas and lengths).
+
+By Saturday 23:00 she had answered all 21 of Stoa's questions on the four example sheets this way (20 numeric, one
+free-text; 14 have no other reference). Gate d29 (`f2cd8f1`) agrees on 16 of the 20 numeric ones (exact counts,
+areas and lengths within 2%): the DfE sheet 8 of 8 (not independent, see above), the S-100F slab plan 2 of 4, the
+AFCEC dormitory 3 of 4 and the M-101A piping plan 3 of 4. She answered those 12 questions on the last three sheets
+after the d29 code was built, so **8 of 12** is our closest thing to an independent check on Stoa's own sheets (her four
+misses were fixed from her answers afterwards, so later gates are no longer independent on them). All 21 answers came from
+our local readers or the local model; no hosted model answered. The four misses: two slab areas 2.0% and 2.8% short at
+confidence 0.40 (traced outline without the stair pocket she includes: 300.63 against 306.8 m², 212.45 against 218.6 m²); the
+north-wing doors on the AFCEC sheet (12 against 34, a guess at confidence 0.105); and the pumps on M-101A (5 against
+7 at confidence 0.70: we counted the fire-pump family, she also counted the jockey pump and the drain pump). On the free-text question
+(what the 16" line connects) ours names the source only; she follows the line to each pump.
+To check that this is the readers and not our caches, we asked the same 20 numeric questions again through the web
+app's "Many questions" list, private, on byte-new copies of the four sheets (1 KB appended after each file's end
+marker, so every cache keyed by file content missed), on `c662016` (the d29 answer code): the same **16 of 20** (DfE
+8 of 8, S-100F 2 of 4, AFCEC 3 of 4, M-101A 3 of 4) with the same four misses. On the cold AFCEC copy the picture had
+not yet been traced as vector lines, so the north-wing door question found no plan view to count in and fell back to
+the same guess, 12 at confidence 0.1.
+
+**After her four misses.** Each of the three numeric findings was fixed from her own written method, on the owner's
+branch, 23 to 29 minutes after her save: the slab reader now takes slab sizes from the printed dimension strings, as she
+asked ("read the dimensions; do not trace"), and keeps the stair pocket (218.61 and 306.79 m², hers 218.6 and 306.8);
+pumps named only by a text callout (the jockey pump, the pumphouse drain pump) are counted with the tagged family (7,
+hers 7); and the north-wing door count follows her rule that wardrobe and closet doors are not doors a person walks
+through (34, one box per door, hers 34). Gate d30 (`aff2f1f`, private) agrees on 18 of the 20 numeric answers, and
+the d31 candidate (`52faf7c`, private) on **19 of 20**: the pump fix is in d31, and the north-wing door count also needs a
+newer version of our door-symbol detector service (34 with it, 36 with the version the gates use). The 8 questions on
+the last three sheets that no fix ever used were all right at d29 and still are at d30 and d31. Her 19 backed verdicts
+from the morning audit all still hold on d31. On byte-new copies of the four sheets the d31 candidate also scores 19 of
+20 (the north-wing doors there: a guess labelled as such, at confidence 0.1, with the detector service busy). With
+the d32 answer code (`d0514b4`), the web app's "Many questions" list on byte-new copies scores 19 of 20 too, private
+and with no hosted call: DfE 8 of 8 in 10 s, S-100F 4 of 4, M-101A 4 of 4 in 2 s with no model call at all, AFCEC 3 of
+4 (the north-wing doors are now counted from the drawn door symbols, 36 against her 34 with the gates' detector,
+instead of guessed; the first question on a new copy waits about 50 s for the detector). The 18 and
+19 are not independent tests, because those fixes were made from her answers; the independent figure stays 8 of 12
+above. What it
+shows is the loop: an expert's hand answer and method on the customer's own sheet became a fix the same evening, with
+her earlier verdicts as a regression check. The free-text answer (what the 16" line connects) is still partial. The
+fixes are not fully wording-proof: on 46 other wordings of her 20 numeric questions (short, imperative, 'Sum of …', one
+Finnish), 42 are right at `52faf7c` (34 on an earlier d31 build; 8 wordings fixed by patches for plural 'areas', 'How
+many m²', ', in m²' endings and 'staircase', none lost), and 18 of the 20 questions are right on every wording. Left: the
+Finnish door-count wording (a whole-sheet guess) and four wordings of the north-wing door count. Eval run
+`20261114-233445-upload-human-a809` (scored 17 of 20 at first, because the eval read her "6,095" ft² as 6.095; the
+scorer is fixed since).
+
+With the d32 answer code (`4b62b93`, private, no hosted model) the numbers are: **19 of 20** with the door detector
+the gates use and **20 of 20** with the newer detector (v5) the live demo runs, which counts the north wing's 34 doors
+at confidence 0.71; with v2 that count is 36, marked as a rough count (confidence 0.26). Over her 20 answers the right
+ones average confidence 0.81 and the wrong one 0.26 (Brier 0.053; 0.158 on d31). On the 46 other wordings 43 are
+right (the 3 misses are north-wing wordings on the gates' detector; the Finnish door question now gives her 115), on
+byte-new copies 19 of 20, and through the real web upload page in Private mode 19 of 20. Her 19 backed verdicts from
+the morning audit all still hold. Still not an independent test: the independent figure stays 8 of 12.
 
 ## Internal audit: a random sample of the shipped demo
 

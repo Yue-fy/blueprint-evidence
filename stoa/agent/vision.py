@@ -38,7 +38,11 @@ STRUCTURED = ("ifc", "dxf", "svg_ifc", "schedule", "plan_rooms", "label_count", 
               "lengths",
               # G1 c7 (S0/RL d25 replay: A-101F doors openings 6 @0.70 ✓ -> Gemini 5 @0.30): DR's vector swing / tag
               # counter and the other printed-text readers are deterministic evidence too
-              "openings", "room_size", "slab_area", "area_table", "pipe_runs", "piping")
+              "openings", "room_size", "slab_area", "area_table", "pipe_runs", "piping",
+              # G1 c11 (M1 22:16, preview f420f958): the facade reader's 18 west-facade windows (one exact box per window,
+              # DR's openings agrees) went to Gemini ('no confident structured count') and Gemini's single reading ≈ 10 was
+              # shown on top: a drawn per-window count is deterministic evidence like openings
+              "facade")
 SECOND = os.environ.get("STOA_VISION_SECOND", "1") != "0"
 # areas (captain 15:43): our outline x our scale gives the value; Gemini says WHERE the room is and its own estimate is
 # only a cross-check. Our area answers below this confidence get the cross-check (uploads only, gemini=1).
@@ -91,6 +95,72 @@ def task_of(question: str, ans: Answer | None = None) -> str:
     return t
 
 
+def _native_vector(path: str) -> bool:
+    try:
+        from stoa.formats.normalize import native_vector_pdf
+    except ImportError:  # P1's helper not on this branch
+        return False
+    return bool(path) and native_vector_pdf(path)
+
+
+def _printed_exact(ans: Answer) -> bool:
+    """An exact (printed text) evidence box whose note carries the answer's number (or the sum's terms all printed)."""
+    if not isinstance(ans.value, (int, float)) or isinstance(ans.value, bool):
+        return False
+    v = float(ans.value)
+    for e in ans.evidence or []:
+        if not getattr(e, "exact", False):
+            continue
+        note = str(e.note or "")
+        if re.search(r"\b(?:traced|measured|estimated|outline|at 1:\d)", note, re.I):
+            continue  # our own measurement's note prints the number too (T1 21:25)
+        for tok in re.findall(r"\d[\d,]*(?:\.\d+)?", note):
+            try:
+                x = float(tok.replace(",", ""))
+            except ValueError:
+                continue
+            if x > 0 and abs(x - v) <= 0.005 * max(abs(v), 1e-9):
+                return True
+    return False
+
+
+# captain 00:31 (AUDIT RECHECK-0026 (1)): readers that MEASURE an outline / line at a scale (not a picture guess)
+MEASURING = ("plan_rooms", "room_size", "line_rooms", "lengths", "slab_area", "pdf_vector", "dxf", "ifc", "svg_ifc",
+             "pipe_runs", "footprint", "facade")
+_KNOWN_SCALE = re.compile(r"\bscale: 1:\d+ printed|\bat the printed scale\b|\bscale bar\b|\bprinted (?:dimension|scale)|"
+                          r"\bdimension (?:chain|string)s?\b|\bthe drawing'?s? own units\b|\bmodel units\b", re.I)
+_UNKNOWN_SCALE = re.compile(r"\b(?:no|unknown|assumed|guessed|estimated) scale\b|\bscale (?:unknown|not (?:found|printed))|"
+                            r"\bscale check: [^✓]*✗|\bpaper size\b", re.I)
+
+
+def settled(ans: Answer, question: str = "") -> str | None:
+    """Why a LOCAL answer needs no hosted second look, or None (captain 00:31, AUDIT RECHECK-0026 (1)): the hybrid default
+    added a 25 s Gemini wait to answers that were already right (M-101A FP pumps 5 @0.8: 1.3 -> 28.4 s; the scanned
+    kitchen re-ask 46 s). Skip it when the answer is LOCATED (boxes / outlines / a model element) AND printed (an exact
+    text box carrying the value), or measured by a measuring reader at a known scale, or >= 0.8. Gemini stays for unsure,
+    unlocated and unfamiliar sheets (where it earns its points)."""
+    from stoa.pipeline import _located
+
+    if os.environ.get("STOA_G1_SETTLED", "1") == "0":  # kill switch (freeze): every answer may get the hosted look
+        return None
+    if ans.value is None or not _located(ans) or str(ans.solver or "").endswith(("prior", "dummy")):
+        return None
+    if _words_only(ans.value):
+        return None
+    base = str(ans.solver or "").split("/")[-1]
+    if ans.confidence >= 0.8:
+        return f"located {base} answer @{ans.confidence:.2f}"
+    if _printed_exact(ans) and ans.confidence >= 0.5:
+        return f"the value is printed on the sheet at the marked spot ({base} @{ans.confidence:.2f})"
+    t = task_of(question, ans) if question else ""
+    if t in ("area", "length") and base in MEASURING and ans.confidence >= 0.5 and \
+            isinstance(ans.value, (int, float)) and not isinstance(ans.value, bool):
+        said = " ".join(str(x) for x in [*(ans.assumptions or []), *(ans.trace or [])])
+        if _KNOWN_SCALE.search(said) and not _UNKNOWN_SCALE.search(said):
+            return f"measured by {base} at a known scale @{ans.confidence:.2f}"
+    return None
+
+
 def wanted(ans: Answer, question: str = "", path: str = "") -> str | None:
     """Why this answer gets a vision reading (hybrid routing), or None. The count / length rules are for UPLOADS
     (files outside the dataset, captain 15:01): dataset drawings keep their tuned readers (the demo's tour answers)."""
@@ -113,9 +183,23 @@ def wanted(ans: Answer, question: str = "", path: str = "") -> str | None:
         if not Path(rel).is_absolute() and str(rel).startswith("data/"):
             return None  # a dataset file (not a style-guessed upload: those stay hybrid)
     base = s.split("/")[-1]
+    if settled(ans, question):  # captain 00:31: a located printed / measured / >= 0.8 answer waits for no hosted call
+        return None
+    if t in ("area", "length") and ans.confidence >= 0.5 and _printed_exact(ans):
+        # captain 20:56 (2b): a local reading whose evidence IS the printed number (an exact text box carrying the value:
+        # an area tag, a printed dimension, a table cell) needs no Pro call to confirm it (cost tier stays cheap)
+        return None
     if t == "area" and ans.confidence < AREA_CHECK_BELOW and isinstance(ans.value, (int, float)):
         # captain 15:43: Gemini only as a CROSS-CHECK of our outline / scale on areas (it never answers an area alone)
+        if os.environ.get("STOA_VECTOR_XCHECK", "0") != "1" and _located(ans) and _native_vector(path):
+            # P1 21:25: not on a LOCATED reading from a NATIVE vector page (CAD / Revit export; pictures, scans and
+            # traced copies keep it): 34 cached cross-checks there (6 runs) never pointed outside our outline and never
+            # moved a value (6 raised a right answer to 0.6), each was a Pro call = an 'Expensive' badge and ~7 s
+            return None
         return f"area cross-check of our {base} reading @{ans.confidence:.2f}"
+    if t == "count" and base == "raster" and ans.confidence >= 0.55 and _located(ans) and any(
+            re.match(r"\d+ circled type tags of the sheet's schedule", str(x)) for x in ans.trace or []):
+        return None  # O1 23:47: one exact box per ringed type tag + the sheet's own schedule = a structured count
     if t == "count" and not (base in STRUCTURED and ans.confidence >= 0.7):
         return f"no confident structured count ({base} @{ans.confidence:.2f})"
     if t == "length" and not (base in STRUCTURED and ans.confidence >= 0.6):
@@ -401,7 +485,7 @@ def measure_at_point(path: str, question: str, g: Answer) -> Answer | None:
     ev = [Evidence(file=path, page=0, bbox=[min(xs), min(ys), max(xs), max(ys)], bbox_space="pdf_pt",
                    polygon=[[round(x, 2), round(y, 2)] for x, y in poly], exact=False,
                    note=f"room outline traced from the wall lines at 1:{n:g}: {a} m² (located by Gemini)")]
-    label = g.trace[0].split(" vision")[0] if g.trace else "Gemini"
+    label = label_of(g)
     return Answer(value=a, unit="m2", confidence=conf, evidence=ev + g.evidence[:2], solver="pipeline/gemini_locate",
                   trace=[f"{label} located the room; its outline traced from the wall lines at 1:{n:g} (printed): {a} m² "
                          f"({r.get('support')}/{r.get('n_readings')} readings agree); {label}'s own estimate "
@@ -528,7 +612,7 @@ def measure_raster_at_point(path: str, question: str, g: Answer) -> Answer | Non
     k = 1 / zoom
     poly = [[round(px * k, 2), round(py * k, 2)] for px, py in (r.get("polygon") or [])]
     bx = [round(c * k, 2) for c in r["box"]]
-    label = g.trace[0].split(" vision")[0] if g.trace else "Gemini"
+    label = label_of(g)
     ev = [Evidence(file=path, page=0, bbox=bx, bbox_space=space, polygon=poly or None, exact=False,
                    note=f"room outline traced on the drawing at {scale_words}: {a} {'ft²' if sqft else 'm²'} (located by "
                         f"{label})")]
@@ -693,7 +777,7 @@ def _backed_area(path: str, question: str, ans: Answer, g: Answer, back: dict, h
     steps = [f"{label} multiplied the printed dimensions {a} x {b} {u} = {g.value:g} {g.unit}; both numbers found by our "
              f"text layer inside the boxes it marked ✓ → confidence {BACKED_CONF}"]
     if ours:
-        steps.append(f"our {str(ans.solver or '').split('/')[-1]} reading {str(ans.value)[:30]} {ans.unit or ''} "
+        steps.append(f"{_our(ans)} {str(ans.value)[:30]} {ans.unit or ''} "
                      f"@{c0:.2f} had no such backing → kept as the alternative")
         out.missing = [*out.missing, f"our first reader answered {str(ans.value)[:40]} {ans.unit or ''} @{c0:.2f} "
                                      f"({ans.solver})"]
@@ -706,17 +790,42 @@ def _backed_area(path: str, question: str, ans: Answer, g: Answer, back: dict, h
                           "options": [
                               {"label": f"{a} x {b} {u} (printed dimensions)", "value": g.value, "unit": g.unit,
                                "evidence": list(range(len(back["boxes"]))), "question": question},
-                              {"label": f"our {str(ans.solver or '').split('/')[-1]} reading", "value": ans.value,
+                              {"label": _our(ans), "value": ans.value,
                                "unit": ans.unit, "evidence": list(range(n, len(out.evidence))), "question": question}],
                           "click": "room"})
     return out
+
+
+_SCALE_PRINTED = re.compile(r"\b(?:printed|scale bar|bar\b)", re.I)
+_SCALE_CHECKED = re.compile(r"scale check[^;]*✓|bar (?:agrees|matches|checks)|agrees with the (?:scale )?bar|"
+                            r"bar[- ]agreed|door swings measure[^;]*✓", re.I)
+
+
+def strong_outline(question: str, ans: Answer) -> str | None:
+    """Captain 21:39 (X1's DfE scanned print, Laundry traced 7.12 m², gold 7.0, shown as 'Our guess' because Gemini's
+    visual 12.5 m² pointed outside it): our reading is STRONG when (1) a closed outline is drawn (a polygon), (2) the
+    outline's label is the room the question names, and (3) the scale is printed AND independently checked (bar / door
+    swings). -> why (str) or None."""
+    poly = [e for e in (ans.evidence or []) if getattr(e, "polygon", None) and len(e.polygon) >= 4]
+    if not poly:
+        return None
+    lab = str(poly[0].note or "").split(":", 1)[0].strip()
+    words = [w for w in re.findall(r"[a-zà-ÿ]{3,}", lab.lower()) if w not in ("room", "the", "traced", "outline")]
+    if not words or not all(re.search(rf"\b{re.escape(w)}", question.lower()) for w in words):
+        return None
+    notes = [*ans.assumptions, *ans.trace]
+    if not any(re.search(r"\bscale\b", n, re.I) and _SCALE_PRINTED.search(n) for n in notes):
+        return None
+    if not any(_SCALE_CHECKED.search(n) for n in notes):
+        return None
+    return f"closed outline labelled '{lab}', printed scale checked"
 
 
 def _area_crosscheck(path: str, question: str, ans: Answer, g: Answer, head: str) -> Answer:
     """Our area stays the value (captain 15:43); Gemini checks WHICH room we measured (its point inside our outline)
     and roughly HOW BIG (its own estimate). Same room + estimate within 10 % -> 'two independent methods agree'
     (>= 0.6); Gemini points at ANOTHER room -> <= 0.3, with that room measured as the alternative."""
-    label = g.trace[0].split(" vision")[0] if g.trace else "Gemini"
+    label = label_of(g)
     gv = g.value if isinstance(g.value, (int, float)) and (g.unit or ans.unit) == ans.unit else None
     ours = float(ans.value)
     pt = _POINTS.get((str(path), question))
@@ -724,12 +833,20 @@ def _area_crosscheck(path: str, question: str, ans: Answer, g: Answer, head: str
     near = gv is not None and abs(gv - ours) <= 0.1 * ours
     c0 = ans.confidence
     note = f"{head}{label} cross-check: its estimate {gv if gv is not None else '-'} {ans.unit or ''}"
+    strong = strong_outline(question, ans) if not near else None
     if inside is False:
         alt = measure_at_point(path, question, g) or measure_raster_at_point(path, question, g)
-        ans.confidence = round(min(c0, 0.3), 3)
+        if strong:
+            # captain 21:39: a strong measured outline loses a little, not its 'best estimate' standing
+            ans.confidence = round(min(c0, max(0.42, c0 - 0.1)), 3)
+        else:
+            ans.confidence = round(min(c0, 0.3), 3)
         ans.missing = [*ans.missing, f"{label} points at a different room than the one measured"
-                       + (f" (measured there: {alt.value} {alt.unit})" if alt is not None else "")]
-        note += f"; it points OUTSIDE the outline we measured → confidence {c0:.2f} → {ans.confidence:.2f}"
+                       + (f" (measured there: {alt.value} {alt.unit})" if alt is not None else "")
+                       + (f"; its visual estimate {gv:g} {ans.unit or ''}" if gv is not None else "")]
+        note += f"; it points OUTSIDE the outline we measured → confidence {c0:.2f} → {ans.confidence:.2f}" + \
+            (f" (ours is a {strong}: lowered moderately)" if strong else "")
+        _second_reading(ans, question, label, gv, alt)
     elif near:
         ans.confidence = round(max(c0, 0.6), 3)
         ans.assumptions = [*ans.assumptions, f"two independent methods agree ({ans.solver}: {ours:g}; {label}: {gv:g}"
@@ -739,16 +856,41 @@ def _area_crosscheck(path: str, question: str, ans: Answer, g: Answer, head: str
     else:
         if gv is not None:
             ans.missing = [*ans.missing, f"{label} estimated {gv:g} {ans.unit or ''} (a visual estimate, not measured)"]
+            if ours > 0 and abs(gv - ours) > 0.25 * ours:
+                _second_reading(ans, question, label, gv, None)
         note += (" points inside our outline (same room)" if inside else "") + "; our measurement is kept"
     ans.trace = [*ans.trace, note]
     ans.cost = ans.cost.add(g.cost) if ans.cost else g.cost
     return ans
 
 
+def _second_reading(ans: Answer, question: str, label: str, gv, alt) -> None:
+    """Captain 21:39: the second reading's VALUE in the answer (W5 shows both): Answer.clarify with our measured outline
+    first (the value), then the other reading(s). Never replaces an existing clarify."""
+    if getattr(ans, "clarify", None) or gv is None and alt is None:
+        return
+    n = len(ans.evidence or [])
+    opts = [{"label": f"{_our(ans)} (measured outline)", "value": ans.value,
+             "unit": ans.unit, "evidence": list(range(min(n, 1))), "question": question}]
+    if alt is not None and isinstance(alt.value, (int, float)):
+        opts.append({"label": f"the room {label} points at (measured)", "value": alt.value, "unit": alt.unit,
+                     "evidence": [], "question": question})
+    if gv is not None:
+        opts.append({"label": f"{label}'s visual estimate (not measured)", "value": gv, "unit": ans.unit,
+                     "evidence": [], "question": question})
+    set_clarify(ans, {"ask": "Two readings differ: is the outlined room the one you mean?", "why": "second reading differs",
+                      "options": opts, "click": "room"})
+
+
+def _clip_text(t, n: int) -> str:
+    t = str(t)
+    return t if len(t) <= n else t[: n - 1] + "…"
+
+
 def _unmeasured(ans: Answer, g: Answer, head: str) -> Answer:
     """Nothing of ours could measure the room (no outline, or no scale): Gemini's figure is shown only as an unmeasured
     estimate at <= ESTIMATE_CAP, and the user is asked for the scale (W5's 'set the scale' tool)."""
-    label = g.trace[0].split(" vision")[0] if g.trace else "Gemini"
+    label = label_of(g)
     g.confidence = round(min(g.confidence, ESTIMATE_CAP), 3)
     g.solver = "pipeline/gemini_estimate"
     g.assumptions = [f"NOT MEASURED: {label}'s visual estimate (our tracer found no closed room outline at a known "
@@ -809,10 +951,34 @@ def vision_step(path: str, question: str, ans: Answer, why: str = "") -> Answer:
             kept.confidence = round(min(kept.confidence, 0.5), 3)
             return set_clarify(kept, {
                 "ask": "Two readings disagree: which area do you mean?", "why": "two backed readings disagree",
-                "options": [{"label": f"our {base} reading", "value": ans.value, "unit": ans.unit,
+                "options": [{"label": _our(ans), "value": ans.value, "unit": ans.unit,
                              "evidence": list(range(len(kept.evidence))), "question": question},
                             {"label": f"{back['a']} x {back['b']} {back['unit']} (printed dimensions)",
                              "value": g.value, "unit": g.unit, "evidence": [], "question": question}],
+                "click": "room"})
+        veto = next((str(t)[len("size check: "):] for t in reversed(ans.trace or []) if str(t).startswith("size check: ")),
+                    None)
+        if ours_num and veto and isinstance(g.value, (int, float)):
+            # QA 22:40 (EFA 2F scan, cold copy): 'Add up the areas of Science Lab 1 to Science Lab 5.' -> ours 1274 = the
+            # sheet's printed 'Overall GIFA 1274m2' (size check -> 0.1, value KEPT) vs Gemini 415 = the gold: a reading
+            # our own size check rejected is never the headline; Gemini's unmeasured estimate is, ours the alternative
+            m = measure_at_point(path, question, g) or measure_raster_at_point(path, question, g)
+            if m is not None:  # the room Gemini points at, measured by our geometry: better than either reading
+                m.trace = [*ans.trace[:3], head.rstrip(": ") + ":", g.trace[0], *m.trace]
+                m.missing.append(f"our first reader's {str(ans.value)[:40]} {ans.unit or ''} was rejected: "
+                                 f"{_clip_text(veto, 90)}")
+                return m
+            out = _unmeasured(ans, g, head)
+            out.trace = [*out.trace, f"{_our(ans)} {ans.value} {ans.unit or ''} was rejected by the size check "
+                                     f"({_clip_text(veto, 90)}) → not shown as the answer"]
+            out.missing = [*out.missing, f"our reader's {ans.value} {ans.unit or ''} was rejected: {_clip_text(veto, 90)}"]
+            label = label_of(g)
+            return set_clarify(out, {
+                "ask": "Our reading failed a size check: which area is right?", "why": _clip_text(veto, 120),
+                "options": [{"label": f"{label}'s visual estimate (not measured)", "value": g.value, "unit": g.unit,
+                             "evidence": [], "question": question},
+                            {"label": f"{_our(ans)} (rejected: {_clip_text(veto, 50)})", "value": ans.value,
+                             "unit": ans.unit, "evidence": [], "question": question}],
                 "click": "room"})
         if ours_num and (why.startswith("area cross-check") or _located(ans)):
             return _area_crosscheck(path, question, ans, g, head)
@@ -834,11 +1000,11 @@ def vision_step(path: str, question: str, ans: Answer, why: str = "") -> Answer:
                     f"ours shown at confidence {c0:.2f} → {min(c0, 0.3):.2f}, pick one")
                 out.confidence = round(min(c0, 0.3), 3)
                 if isinstance(g.value, (int, float)):
-                    label = g.trace[0].split(" vision")[0] if g.trace else "Gemini"
+                    label = label_of(g)
                     out = set_clarify(out, {
                         "ask": "Two unmeasured readings disagree: which area is right?",
                         "why": "neither reading has a located outline",
-                        "options": [{"label": f"our {base} reading (not located)", "value": ans.value, "unit": ans.unit,
+                        "options": [{"label": f"{_our(ans)} (not located)", "value": ans.value, "unit": ans.unit,
                                      "evidence": list(range(len(out.evidence))), "question": question},
                                     {"label": f"{label}'s visual estimate", "value": g.value, "unit": g.unit,
                                      "evidence": [], "question": question}],
@@ -863,7 +1029,7 @@ def vision_step(path: str, question: str, ans: Answer, why: str = "") -> Answer:
                      f"{g.value}) ✓ confidence {ans.confidence:.2f} → {c:.2f}"
                      + (" (not raised: not every counted item is marked)" if partial else "")]
         ans.assumptions = [*ans.assumptions, f"two independent methods agree ({ans.solver}: {ans.value}; "
-                                             f"{g.trace[0].split(' vision')[0]}: {g.value})"]
+                                             f"{label_of(g)}: {g.value})"]
         ans.confidence = c
         ans.cost = g.cost
         return ans
@@ -899,7 +1065,7 @@ def vision_step(path: str, question: str, ans: Answer, why: str = "") -> Answer:
         # QA arbiter r2-r4 (DfE laundry skirting raster 10.01 m ✓ -> Gemini 14.5): an evidence-backed reading (tags,
         # printed text, a measured outline) is never replaced by one unconfirmed vision reading; Gemini's figure is
         # kept as the alternative to check
-        return _kept(ans, g, head, f"our {base} reading is backed by drawn / printed evidence; {label_of(g)}'s single "
+        return _kept(ans, g, head, f"{_our(ans)} is backed by drawn / printed evidence; {label_of(g)}'s single "
                      f"visual reading {g.value} {g.unit or ''} is shown as the alternative", float(ans.confidence or 0))
     if ours:
         g.confidence = round(min(g.confidence, DISAGREE_CONF if g2 is None else g.confidence), 3)
@@ -909,7 +1075,30 @@ def vision_step(path: str, question: str, ans: Answer, why: str = "") -> Answer:
 
 
 def label_of(g: Answer) -> str:
-    return g.trace[0].split(" vision")[0] if g.trace else "Gemini"
+    """The hosted model's name for a customer-facing label ('Gemini 3.1 Pro'), never a raw trace line: UX 02:34 (F8's stack,
+    Enlisted dormitory example) — g.trace[0] was the 'recognised: {"kind": …}' JSON line and the clarify BUTTON showed it."""
+    for t in g.trace or []:
+        t = str(t)
+        if " vision" in t and not t.lstrip().startswith(("recognised", "{", "[")):
+            name = t.split(" vision")[0].strip()
+            if name and len(name) <= 40 and not re.search(r"[{}\[\]\"=:]", name):
+                return name
+    return "Gemini"
+
+
+_READER_WORDS = {"plan_rooms": "measured outline", "line_rooms": "measured outline", "room_size": "measured room",
+                 "area_tags": "printed area tag", "area_table": "printed area table", "pdf_text": "printed text",
+                 "pdf_vector": "measured drawing", "raster": "reading of the picture", "lengths": "measured length",
+                 "slab_area": "measured slab", "footprint": "measured building outline", "takeoff": "measured rooms",
+                 "openings": "door finder", "label_count": "printed labels", "stated_count": "printed count",
+                 "schedule": "schedule", "dxf": "CAD drawing", "ifc": "building model", "vlm_lora": "picture model",
+                 "vlm_direct": "picture model", "agent": "general agent", "prior": "typical value", "facade": "facade count"}
+
+
+def _our(ans: Answer) -> str:
+    """'our <words> reading' for a customer-facing label (UX 02:35: never a solver id like 'plan_rooms')."""
+    base = str(ans.solver or "").split("/")[-1]
+    return f"our {_READER_WORDS.get(base, 'own')} reading"
 
 
 def _kept(ans: Answer, g: Answer, head: str, why: str, conf: float) -> Answer:

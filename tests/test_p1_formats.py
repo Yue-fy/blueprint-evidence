@@ -90,6 +90,13 @@ def test_multipage_pdf_answers_from_picked_page_and_points_back(tmp_path):
     normalize.restore(ans, prep)
     assert ans.evidence[0].file.endswith("set.pdf") and ans.evidence[0].page == 2
     assert ans.evidence[0].bbox == [1, 2, 3, 4] and "page 3" in ans.assumptions[0]
+    # DR 21:57: the copy says which set and page it came from, wherever it lives (openings reads the DOOR SCHEDULE page)
+    from stoa.formats import pages
+
+    from pathlib import Path
+
+    assert pages.copy_origin(prep.path) == (str(Path(src).resolve()), 2)
+    assert pages.copy_origin(src) is None
 
 
 def test_single_page_and_images_unchanged(tmp_path):
@@ -171,6 +178,41 @@ def test_scanned_pdf_page_is_read_as_image_and_evidence_lands_on_the_page(tmp_pa
     assert ev.file.endswith("scan.pdf") and ev.page == 0 and ev.bbox_space == "pdf_pt"
     assert ev.bbox == pytest.approx([57.6, 38.4, 115.2, 76.8]) and ans.assumptions[0].startswith("scanned PDF")
     assert normalize.scan_png(_plan_pdf(tmp_path / "vec.pdf")) is None  # a vector sheet is not a scan
+
+
+def test_scan_with_a_scanners_invisible_ocr_layer_is_read_as_a_scan(tmp_path, monkeypatch):
+    """X1 01:00: 'scan to searchable PDF' pages (one page-sized image + an INVISIBLE OCR layer, render mode 3) used to
+    fail scan_png's text test and went 'page+render' with the scanner's (often junk) layer as their text."""
+    from PIL import Image
+
+    from stoa.formats import pages
+
+    png = tmp_path / "scan.png"
+    Image.new("L", (1200, 800), 255).save(png)
+
+    def scan_pdf(name, render_mode, pages_n=1):
+        doc = pymupdf.open()
+        for _ in range(pages_n):
+            pg = doc.new_page(width=576, height=384)
+            pg.insert_image(pg.rect, filename=str(png))
+            for i in range(30):
+                pg.insert_text((40, 20 + 12 * i), "./ \u2022 \u00abSi,:, k4: lll ,,. ~ GROUND FLOOR", fontsize=8,
+                               render_mode=render_mode)
+        doc.save(tmp_path / name)
+        return str(tmp_path / name)
+
+    junk = scan_pdf("junk.pdf", 3)
+    got = normalize.scan_png(junk)
+    assert got is not None and got[0].endswith(".scan.png") and got[1] == pytest.approx(1200 / 576)
+    assert normalize.prepare(junk, "How big is the kitchen?").kind == "scan"
+    assert normalize.scan_png(scan_pdf("visible.pdf", 0)) is None  # VISIBLE text over a picture: not judged a scan
+    two = scan_pdf("set.pdf", 3, pages_n=2)
+    sc = pages.page_scores(two)
+    assert [(p["vector_bytes"], p["own_chars"]) for p in sc] == [(0, 0), (0, 0)] and pages.scanned_set(sc)
+    monkeypatch.setenv("STOA_SCAN_OCR_LAYER", "0")
+    pages._SCORES.clear()
+    assert normalize.scan_png(junk) is None and not pages.scanned_set(pages.page_scores(two))
+    assert normalize.ocr_layer_scan(pymupdf.open(_plan_pdf(tmp_path / "vec.pdf"))[0]) is False
 
 
 def test_svg_ifc_holes_circles_and_printed_scale(tmp_path):
@@ -1047,7 +1089,7 @@ def test_question_waits_for_the_uploads_running_warm(tmp_path, monkeypatch):
     assert W.wait_for_warm(png) == 0.0  # never warmed: no lock file, nothing waits
     started = threading.Event()
 
-    def slow(path):
+    def slow(path, later=None):
         started.set()
         time.sleep(1.0)
         return {"path": str(path)}
@@ -1060,7 +1102,7 @@ def test_question_waits_for_the_uploads_running_warm(tmp_path, monkeypatch):
     th.join()
     assert 0.5 <= waited <= 3.0
     assert W.wait_for_warm(png) < 0.5  # finished: the lock file stays, unlocked
-    monkeypatch.setattr(W, "_warm", lambda p: time.sleep(2.0) or {})
+    monkeypatch.setattr(W, "_warm", lambda p, later=None: time.sleep(2.0) or {})
     th = threading.Thread(target=W.warm, args=(str(png),))
     th.start()
     time.sleep(0.2)
@@ -1072,7 +1114,7 @@ def test_question_waits_for_the_uploads_running_warm(tmp_path, monkeypatch):
     copy.write_bytes(png.read_bytes())
     other = tmp_path / "other.png"
     other.write_bytes(b"y")
-    monkeypatch.setattr(W, "_warm", lambda p: time.sleep(1.0) or {})
+    monkeypatch.setattr(W, "_warm", lambda p, later=None: time.sleep(1.0) or {})
     th = threading.Thread(target=W.warm, args=(str(png),))
     th.start()
     time.sleep(0.2)
@@ -1395,6 +1437,9 @@ def test_private_mode_request_flag_and_service_urls(monkeypatch):
     import stoa.agent as agent_pkg
 
     monkeypatch.setattr(agent_pkg, "private", fake, raising=False)
+    from stoa import netguard
+
+    monkeypatch.setattr(netguard, "relay_for_url", lambda url: None, raising=False)  # not this machine's live tunnels
     llm.check_private("gemini")  # neither signal: allowed
     tok = fake._CTX.set(True)
     try:
@@ -1409,6 +1454,36 @@ def test_private_mode_request_flag_and_service_urls(monkeypatch):
         fake._CTX.reset(tok)
     assert not llm.private_mode()
     llm.check_private_url("https://ocr.example.com")  # not private: allowed
+
+
+def test_private_mode_refuses_a_local_port_that_forwards_outside(monkeypatch):
+    """T2 00:26: 127.0.0.1:8145 is an ssh tunnel to V1's detector twin on another machine: in private mode the reader
+    gets a clear refusal (netguard would refuse the socket anyway, reported as 'the detector service is down')."""
+    from stoa import llm, netguard
+
+    monkeypatch.setenv("STOA_PRIVATE", "1")
+    monkeypatch.setattr(netguard, "relay_for_url", lambda url: "ssh tunnel to verda" if ":8145" in url else None,
+                        raising=False)
+    llm.check_private_url("http://127.0.0.1:8140", "door detector")
+    with pytest.raises(llm.ExternalCallBlocked, match="forwards outside this server .ssh tunnel to verda"):
+        llm.check_private_url("http://127.0.0.1:8145", "door detector")
+    # H 01:45: EU mode (STOA_EU_ONLY=1) allows the relay ports the operator lists as our own EU instance, as netguard
+    # does at the socket; strict private mode and unlisted ports are still refused
+    monkeypatch.setattr(netguard, "eu_only", lambda: True, raising=False)
+    monkeypatch.setattr(netguard, "_eu_relay_ports", lambda: {8145}, raising=False)
+    llm.check_private_url("http://127.0.0.1:8145", "door detector")
+    monkeypatch.setattr(netguard, "_eu_relay_ports", lambda: {8148}, raising=False)
+    with pytest.raises(llm.ExternalCallBlocked):
+        llm.check_private_url("http://127.0.0.1:8145", "door detector")
+    monkeypatch.setattr(netguard, "eu_only", lambda: False, raising=False)
+    monkeypatch.setattr(netguard, "_eu_relay_ports", lambda: {8145}, raising=False)
+    with pytest.raises(llm.ExternalCallBlocked):
+        llm.check_private_url("http://127.0.0.1:8145", "door detector")
+    monkeypatch.setenv("STOA_PRIVATE_RELAY_NOTE", "0")  # kill switch: netguard alone decides
+    llm.check_private_url("http://127.0.0.1:8145", "door detector")
+    monkeypatch.delenv("STOA_PRIVATE_RELAY_NOTE")
+    monkeypatch.delenv("STOA_PRIVATE")
+    llm.check_private_url("http://127.0.0.1:8145", "door detector")  # not private: allowed
 
 
 def test_warm_command_is_private(monkeypatch, tmp_path):
@@ -1642,6 +1717,14 @@ def test_native_vector_pdf_tells_cad_exports_from_scans_and_traced_copies(tmp_pa
     assert not normalize.native_vector_pdf(tmp_path / "scan.png")
     assert not normalize.native_vector_pdf(tmp_path / "missing.pdf")
     assert not normalize.native_vector_pdf(cad, page=3)
+    # our paper / page copies draw the original page as a Form XObject (A/B 21:55: EFA '.paperA1.pdf' rows kept paying
+    # for the cross-check): the drawing inside still counts, and a wrapped scan is still a scan
+    for src, want in ((cad, True), (str(tmp_path / "scan.pdf"), False)):
+        w = pymupdf.open()
+        w.new_page(width=1684, height=1190).show_pdf_page(pymupdf.Rect(0, 0, 1684, 1190), pymupdf.open(src), 0)
+        out = tmp_path / f"wrapped_{want}.paperA1.pdf"
+        w.save(str(out))
+        assert normalize.native_vector_pdf(out) is want
 
 
 def test_a_question_naming_a_schedule_goes_to_the_schedule_page(tmp_path):
@@ -1676,3 +1759,380 @@ def test_a_question_naming_a_schedule_goes_to_the_schedule_page(tmp_path):
     # the plan's own questions stay on the plan; a schedule the set does not print changes nothing
     assert pages.pick_page(f, "How many doors are there in module 07?")[0] == 0
     assert pages.pick_page(f, "According to the window schedule, how many windows are in module 07?")[0] == 0
+
+
+def test_a_schedule_question_on_a_picture_reads_the_schedule_as_a_table(monkeypatch):
+    # X1 21:22: a SCANNED A-602 door schedule was counted as door symbols (vlm_lora 0); its table is read from the
+    # image's OCR text on a traced copy instead (sc-289 0 -> 2 = gold)
+    from types import SimpleNamespace
+
+    from stoa.solvers import upload as U
+    from stoa.solvers.raster import textlayer as T
+
+    items = [SimpleNamespace(text=t) for t in ("A-602", "DOOR SCHEDULE", "DOOR NUMBER", "7.00A", "SEE NOTES")]
+    monkeypatch.setattr(T, "text_layer", lambda p, *a, **k: SimpleNamespace(items=items))
+    prep = SimpleNamespace(path="/x/set.p2.scan.png", scan_zoom=2.45)
+    img = Answer(value=0, unit="count", confidence=0.75, solver="pipeline/vlm_lora")
+    q = "How many doors does the door schedule list for the restrooms module (module 05)?"
+    assert U._schedule_image(prep, q, img) == "DOOR SCHEDULE"
+    assert U._schedule_image(prep, "How many doors are on this plan?", img) is None  # no schedule named
+    assert U._schedule_image(prep, "According to the window schedule, how many windows?", img) is None  # not printed
+    table = Answer(value=2, unit="count", confidence=0.3, solver="pipeline/pdf_text")
+    assert U._table_reading(table) and U._schedule_image(prep, q, table) is None  # a table reader already answered
+
+
+def _scan_pdf(path, page_in, img_px):
+    """A scanned PDF: one grey image of img_px pixels filling a page of page_in inches (no text, no paths)."""
+    import io
+
+    from PIL import Image
+
+    buf = io.BytesIO()
+    Image.new("L", img_px, 255).save(buf, format="PNG")
+    doc = pymupdf.open()
+    pg = doc.new_page(width=page_in[0] * 72, height=page_in[1] * 72)
+    pg.insert_image(pg.rect, stream=buf.getvalue())
+    doc.save(path)
+    return str(path)
+
+
+def test_paper_of_a_scanned_pdf_from_its_image_pixels_or_its_page(tmp_path):
+    """P1 22:40 (d29 scan_dev): the 6000-px render of a scanned PDF is untagged, so 4 scanned Stoa sheets were never
+    traced. (1) the page image's own pixels + the printed size: S-100F scan 6623 x 4678 + 'ISO A1' -> A1 @200, the render
+    at 6000 px -> 181.2 dpi; (2) no size printed: the page's own size when the image fills it at a scan dpi (MFC ANSI D
+    @200, AFCEC Tabloid @300); an 'ISO A1' title block on an A3 page that is no A1 at its pixels = a reduced copy -> None."""
+    from stoa.formats.paper import paper_of_scan
+
+    a1 = _scan_pdf(tmp_path / "s100.pdf", (33.11, 23.39), (6623, 4678))
+    dpi, sheet, how = paper_of_scan(a1, (6000, 4238), ["ISO A1", "A2", "SCALE:1:50"], use_page=False)
+    assert sheet == "A1" and abs(dpi - 181.2) < 0.3 and "6623 x 4678" in how
+    ansi = _scan_pdf(tmp_path / "mfc.pdf", (34, 22), (6800, 4400))
+    assert paper_of_scan(ansi, (6000, 3883), ["FLOOR PLAN"], use_page=False) is None
+    dpi, sheet, how = paper_of_scan(ansi, (6000, 3883), ["FLOOR PLAN", "A1"])  # a lone 'A1' is a grid reference
+    assert sheet == "ANSI D" and abs(dpi - 176.5) < 0.3 and "page size" in how
+    tab = _scan_pdf(tmp_path / "afcec.pdf", (17, 11), (5100, 3300))
+    assert paper_of_scan(tab, (5100, 3300), ["SCALE : 1\" = 40'-0\""])[:2] == (300.0, "Tabloid")
+    # an A3 page scanned at 300 dpi: 'A1' printed and A1 @150 fits its pixels -> A1 (the drawing's own paper)
+    a3 = _scan_pdf(tmp_path / "efa.pdf", (16.54, 11.69), (4961, 3508))
+    assert paper_of_scan(a3, (4961, 3508), ["1:200 @ A1", "A1"])[1] == "A1"
+    assert paper_of_scan(a3, (4961, 3508), ["1:100"])[1] == "A3"
+    # a reduced copy that names another ISO size its pixels do not fit: no guess
+    a3b = _scan_pdf(tmp_path / "red.pdf", (16.54, 11.69), (3508, 2480))
+    assert paper_of_scan(a3b, (3508, 2480), ["ISO A0"]) is None
+    # custom page / an image covering part of the page / an odd scan resolution: no guess
+    odd = _scan_pdf(tmp_path / "odd.pdf", (20, 13), (4000, 2600))
+    assert paper_of_scan(odd, (4000, 2600), []) is None
+    odd2 = _scan_pdf(tmp_path / "odd2.pdf", (34, 22), (6000, 3882))
+    assert paper_of_scan(odd2, (6000, 3882), []) is None  # 176.5 dpi: a render, not a scanner's resolution
+
+
+def test_prepare_records_the_scanned_pdf_it_rendered(tmp_path):
+    pdf = _scan_pdf(tmp_path / "scan.pdf", (16.54, 11.69), (1654, 1169))
+    prep = normalize.prepare(pdf, "How big is the kitchen?")
+    assert prep.kind == "scan" and prep.scan_pdf == pdf and prep.path.endswith(".scan.png")
+
+
+def test_paper_of_image_reads_a_scan_render_through_its_sidecar(tmp_path, monkeypatch):
+    """Readers that only get the render (openings, takeoff) find the scanned PDF via '<render>.json' (scan_png)."""
+    from PIL import Image
+
+    from stoa.formats.paper import paper_of_image
+
+    pdf = _scan_pdf(tmp_path / "s100.pdf", (33.11, 23.39), (6623, 4678))
+    png, zoom = normalize.scan_png(pdf, max_side=3000)  # 72 dpi at least: 2384 px
+    w = Image.open(png).size[0]
+    assert w < 6623
+    dpi, sheet = paper_of_image(png, ["ISO A1"])
+    assert sheet == "A1" and abs(dpi - w / 33.11) < 0.2
+    assert paper_of_image(png, ["1:50"]) is None  # no size printed: the pixel rule stays strict
+    monkeypatch.setenv("STOA_SCAN_PAPER", "0")
+    assert paper_of_image(png, ["ISO A1"]) is None
+
+
+def test_traced_copy_keeps_a_piping_span_but_not_ocr_area_tags():
+    """P1 22:50: on a traced scan the piping reader's tag-to-tag span is a measurement (scanned M-101A 4/4 = gold);
+    its other answers and area_tags (3 right / 14 wrong on traced copies) are not."""
+    from stoa.solvers.upload import _measured
+
+    span = Answer(value="6.5 ft", confidence=0.82, solver="pipeline/piping",
+                  trace=["parsed scale: 18 PDF points per foot", "measured tag-center span: 117.00 PDF points"])
+    assert _measured(span)
+    assert not _measured(Answer(value="16 inches", confidence=0.95, solver="pipeline/piping", trace=[]))
+    assert not _measured(Answer(value="6.5 ft", confidence=0.82, solver="pipeline/piping", trace=["read a label"]))
+    assert not _measured(Answer(value=362.0, confidence=0.6, solver="pipeline/area_tags", trace=[]))
+    assert _measured(Answer(value=3.17, confidence=0.4, solver="pipeline/line_rooms", trace=[]))
+    # door swings traced at 1:480 are glyph-sized (AFCEC PNG: 494 doors vs 81 on its PDF twin); 1:200 stays
+    big = ["[openings] openings: 592 door-swing arcs on the vector page (printed scale 1:480)"]
+    assert not _measured(Answer(value=494, confidence=0.55, solver="pipeline/openings", trace=big))
+    ok = ["[openings] openings: 115 door-swing arcs on the vector page (printed scale 1:200)"]
+    assert _measured(Answer(value=98, confidence=0.5, solver="pipeline/openings", trace=ok))
+
+
+def test_warm_traces_a_scanned_pdf_whose_paper_is_known(tmp_path, monkeypatch):
+    """P1 22:50: the upload pre-read traces a scanned PDF page with the paper the question's _as_vector will use
+    (upload.trace_paper), so the first area question does not pay the trace."""
+    from stoa.formats import vectorize as V
+    from stoa.formats import warm as W
+    from stoa.solvers.raster import textlayer as T
+
+    items = [T.TextItem(text="ISO A1", box=[10, 10, 60, 20])]
+    monkeypatch.setattr(T, "text_layer", lambda p, *a, **k: T.TextLayer(path=p, size=(1, 1), items=items))
+    monkeypatch.setattr(T, "is_clean", lambda p: False)
+    traced = []
+    monkeypatch.setattr(V, "traced_copy", lambda png, dpi: traced.append((png, dpi)) or png)
+    pdf = _scan_pdf(tmp_path / "s100.pdf", (33.11, 23.39), (3311, 2339))  # A1 scanned at 100 dpi
+    out = W.warm(pdf)
+    assert out["error"] == "" and out["kind"] == "scan"
+    assert len(traced) == 1 and traced[0][0].endswith(".scan.png")
+    assert any(d.startswith("vector copy of the scan (A1 at 100 dpi") for d in out["done"]), out["done"]
+
+
+def test_over_budget_traced_pass_tells_the_user_to_ask_again(tmp_path, monkeypatch):
+    """X1 22:22: the first question on a new sheet runs over the traced-copy budget and gets the image's weak guess;
+    the card now says the drawing's lines are still being measured (a re-ask reads the warm copy)."""
+    from stoa.formats import vectorize as V
+    from stoa.solvers import upload as U
+
+    png = tmp_path / "sheet.png"
+    png.write_bytes(b"x")
+    monkeypatch.setattr(U, "trace_paper", lambda prep: ((150.0, "A3"), "from its metadata"))
+    monkeypatch.setattr(V, "traced_copy", lambda p, dpi: str(tmp_path / "sheet.vec6.pdf"))
+    calls = []  # 1st = the trace (done), 2nd = the traced copy's readers (over their budget)
+    monkeypatch.setattr(U, "_solve_within", lambda fn, budget, late=None: calls.append(budget) or
+                        ((fn(), 0.1) if len(calls) == 1 else (None, budget)))
+    prep = normalize.Prepared(original=str(png), path=str(png))
+    ans0 = Answer(value=26.5, unit="m2", confidence=0.3, solver="pipeline/raster",
+                  trace=["intent: area slab [drawing] (lang en)"])
+    out = U.Upload._as_vector(object.__new__(U.Upload), prep, "What is the slab area?", ans0)
+    assert out.value == 26.5 and "ask again in about a minute" in out.missing[0]
+    assert any("no reading within" in str(t) for t in out.trace)
+    assert calls == [U.TRACE_WAIT_S, U.VECTOR_BUDGET_S]
+
+
+def test_a_long_trace_does_not_hold_the_question(tmp_path, monkeypatch):
+    """P1 00:40 (S0 d30 wild-sealed): a 14 MB scan traced for 132 s BEFORE the readers' 30 s budget, so each of its 4
+    questions took 184-210 s (d29: 4-8 s). The wait for the trace is bounded (STOA_TRACE_WAIT); the image answer
+    stands with the 'ask again' note and the trace finishes in the background."""
+    import threading
+    import time
+
+    from stoa.formats import vectorize as V
+    from stoa.solvers import upload as U
+
+    png = tmp_path / "scan.png"
+    png.write_bytes(b"x")
+    go, done = threading.Event(), threading.Event()
+    monkeypatch.setattr(U, "trace_paper", lambda prep: ((100.0, "A1"), "from its pixels"))
+    monkeypatch.setattr(V, "traced_copy", lambda p, dpi: go.wait(5) and done.set() or str(tmp_path / "scan.vec6.pdf"))
+    monkeypatch.setattr(U, "TRACE_WAIT_S", 0.2)
+    (tmp_path / "scan.vec6.pdf").write_bytes(b"%PDF")
+    read, seen = threading.Event(), []
+    monkeypatch.setattr(U.Pipeline, "solve", lambda self, p, q: seen.append((go.is_set(), p)) or read.set() or
+                        Answer(value=None, solver="pipeline/prior"))
+    monkeypatch.setattr(U, "_VEC_NONE", {})
+    prep = normalize.Prepared(original=str(png), path=str(png))
+    ans0 = Answer(value=174.0, unit="ft2", confidence=0.2, solver="pipeline/vlm_direct",
+                  trace=["intent: area bedroom [drawing] (lang en)"])
+    t0 = time.perf_counter()
+    out = U.Upload._as_vector(object.__new__(U.Upload), prep, "How big is bedroom A?", ans0)
+    assert time.perf_counter() - t0 < 2.0
+    assert out.value == 174.0 and out.missing[0] == U.TRACE_NOTE
+    assert any("still being made after 0 s" in str(t) for t in out.trace), out.trace
+    assert not seen  # no readers before the copy exists
+    go.set()
+    assert done.wait(5) and read.wait(5)  # the trace ran on in its daemon thread, then the copy's readers
+    assert seen == [(True, str(tmp_path / "scan.vec6.pdf"))]
+    time.sleep(0.1)
+    assert list(U._VEC_NONE.values()) == ["no measured reading (pipeline/prior; read after a late trace)"]
+
+
+def test_warm_traces_after_releasing_the_question_lock(tmp_path, monkeypatch):
+    """P1 00:40: a question waits for warm (wait_for_warm) but not for warm's trace: the trace runs unlocked."""
+    import fcntl
+
+    from stoa.formats import vectorize as V
+    from stoa.formats import warm as W
+    from stoa.solvers.raster import textlayer as T
+
+    monkeypatch.setenv("STOA_CACHE", str(tmp_path / "cache"))
+    items = [T.TextItem(text="ISO A1", box=[10, 10, 60, 20])]
+    monkeypatch.setattr(T, "text_layer", lambda p, *a, **k: T.TextLayer(path=p, size=(1, 1), items=items))
+    monkeypatch.setattr(T, "is_clean", lambda p: False)
+    pdf = _scan_pdf(tmp_path / "s100.pdf", (33.11, 23.39), (3311, 2339))
+    held = []
+
+    def trace(png, dpi):
+        with open(W._lock_path(pdf), "a") as f:
+            try:
+                fcntl.flock(f, fcntl.LOCK_SH | fcntl.LOCK_NB)
+                fcntl.flock(f, fcntl.LOCK_UN)
+                held.append(False)
+            except OSError:
+                held.append(True)
+        return png
+
+    monkeypatch.setattr(V, "traced_copy", trace)
+    out = W.warm(pdf)
+    assert held == [False] and out["error"] == ""
+    assert any(d.startswith("vector copy of the scan (A1 at 100 dpi") for d in out["done"]), out["done"]
+
+
+# --- captain 23:04 (Ziying): count small symbols on the FULL-resolution original, not the 6000 px copy ----------------
+def _sheet(path, size, dpi=None):
+    from PIL import Image, ImageDraw
+
+    im = Image.new("L", size, 255)
+    d = ImageDraw.Draw(im)
+    for i in range(0, size[0], max(1, size[0] // 20)):
+        d.line([(i, 0), (i, size[1] - 1)], fill=0, width=1)
+    im.save(path, **({"dpi": (dpi, dpi)} if dpi else {}))
+    return path
+
+
+def test_full_resolution_finds_the_original_of_both_copy_kinds(tmp_path):
+    big = _sheet(tmp_path / "a.png", (3000, 2000), dpi=300)
+    # eval / CLI copy next to its original ('<stem>.s6000.png' + sidecar)
+    r = normalize.shrink_image(big, tmp_path / "a.s1500.png", 1500)
+    assert r["factor"] == pytest.approx(0.5)
+    full, k = normalize.full_resolution(tmp_path / "a.s1500.png")
+    assert full == str(big) and k == pytest.approx(2.0)
+    # web upload: shrunk in place, the original kept as '<stem>.full<ext>'
+    up = tmp_path / "up"
+    up.mkdir()
+    _sheet(up / "b.full.png", (3000, 2000))
+    normalize.shrink_image(_sheet(up / "b.png", (3000, 2000)), up / "b.png", 1200)
+    full, k = normalize.full_resolution(up / "b.png")
+    assert full.endswith("b.full.png") and k == pytest.approx(2.5)
+    # an image that is its own original; a '.full' sibling of another shape is not taken
+    assert normalize.full_resolution(big) == (str(big), 1.0)
+    _sheet(tmp_path / "c.full.png", (3000, 3000))
+    _sheet(tmp_path / "c.png", (1200, 800))
+    assert normalize.full_resolution(tmp_path / "c.png")[1] == 1.0
+
+
+def test_crop_full_cuts_the_original_and_maps_points_back(tmp_path):
+    from PIL import Image
+
+    big = _sheet(tmp_path / "a.png", (3000, 2000), dpi=300)
+    normalize.shrink_image(big, tmp_path / "a.s1500.png", 1500)
+    c = normalize.crop_full(tmp_path / "a.s1500.png", (100, 200, 400, 500), pad=10)
+    assert c["k"] == pytest.approx(2.0) and c["offset"] == (90.0, 190.0) and c["size"] == (640, 640)
+    with Image.open(c["path"]) as im:
+        assert im.size == (640, 640) and round(im.info["dpi"][0]) == 300
+    assert normalize.to_path_px(c, [(0, 0), (640, 640), (20, 20, 40, 40)]) == [
+        (90.0, 190.0), (410.0, 510.0), (100.0, 200.0, 110.0, 210.0)]
+    small = normalize.crop_full(tmp_path / "a.s1500.png", (0, 0, 1500, 1000), max_side=2000)
+    assert small["k"] == pytest.approx(2000 / 1500) and small["size"] == (2000, 1333)
+    with pytest.raises(ValueError):
+        normalize.crop_full(tmp_path / "a.s1500.png", (5, 5, 5, 5))
+    own = normalize.crop_full(big, (0, 0, 100, 100))
+    assert own["k"] == 1.0 and "itself" in own["note"]
+
+
+def test_crop_full_never_writes_next_to_the_upload(tmp_path, monkeypatch):
+    monkeypatch.setenv("STOA_CACHE", str(tmp_path / "cache"))
+    up = tmp_path / "up"
+    up.mkdir()
+    _sheet(up / "b.full.png", (3000, 2000))
+    normalize.shrink_image(_sheet(up / "b.png", (3000, 2000)), up / "b.png", 1200)
+    c = normalize.crop_full(up / "b.png", (10, 10, 200, 200))
+    assert c["k"] == pytest.approx(2.5) and not c["path"].startswith(str(up))
+    assert sorted(p.name for p in up.iterdir()) == ["b.full.png", "b.png"]
+
+
+def test_svg_ifc_plural_area_words_and_slab_areas_are_not_room_sums():
+    from stoa.solvers.svg_ifc import _AREA, _VOL
+
+    assert _AREA.search("Sum of all slab areas?") and _AREA.search("Wie groß sind die Flächen?")
+    assert _VOL.search("Total volumes of the slabs?") and not _AREA.search("How many cubicles?")
+    import os
+
+    f = os.path.join(os.environ.get("STOA_PREVIEW", ""), "data/ifc_models/kit-fzk-haus_ac20-fzk-haus_plan-02-dachgeschoss.svg")
+    if not os.path.exists(f):
+        pytest.skip("preview dataset not here")
+    from stoa.solvers.svg_ifc import SvgIfc
+
+    for q in ("Sum of all slab areas?", "Sum of all slab area?"):  # H 23:52: was the ROOMS' sum @0.85 (singular)
+        a = SvgIfc().solve(f, q)
+        assert a.value is None and any("IFC model" in m for m in a.missing)
+    assert SvgIfc().solve(f, "What are the room areas in total?").value == pytest.approx(86.36, abs=0.01)
+
+
+def test_16bit_grey_pictures_and_tiffs_keep_their_greys(tmp_path, monkeypatch):
+    """P1 c15: Pillow 13 converts 16-bit grey ('I;16') to 'L' / 'RGB' by CLIPPING (grey 50 -> 255), so a scanner's
+    16-bit PNG / TIFF reached every PIL reader with its mid-grey ink gone. prepare() reads them (and TIFF / WebP / BMP /
+    GIF on the CLI path) from an 8-bit copy in the side cache with the same pixels; evidence goes back to the upload."""
+    from pathlib import Path
+
+    import numpy as np
+    from PIL import Image
+
+    monkeypatch.setenv("STOA_CACHE", str(tmp_path / "cache"))
+    g = np.tile(np.array([0, 50, 128, 200, 255], dtype=np.uint16), (40, 10)) * 257
+    png, tif, plain = tmp_path / "a" / "s.png", tmp_path / "b" / "s.tif", tmp_path / "c" / "s.png"
+    for p in (png, tif, plain):
+        p.parent.mkdir()
+    Image.fromarray(g).save(png)
+    Image.fromarray(g).save(tif, compression="tiff_lzw")
+    Image.fromarray((g // 257).astype(np.uint8)).save(plain)
+    assert list(np.asarray(Image.open(png).convert("L"))[0, :5]) == [0, 255, 255, 255, 255]  # the clipping itself
+    for p in (png, tif):
+        prep = normalize.prepare(str(p), "How big is room 1?")
+        assert prep.kind == "picture" and "8-bit PNG" in prep.notes[0]
+        assert list(np.asarray(Image.open(prep.path).convert("L"))[0, :5]) == [0, 50, 128, 200, 255]
+        assert [f.name for f in p.parent.iterdir()] == [p.name]  # nothing written next to the upload
+        ans = Answer(value=1.0, evidence=[Evidence(file=prep.path, bbox=[1, 2, 3, 4], bbox_space="image_px")])
+        normalize.restore(ans, prep)
+        assert Path(ans.evidence[0].file).name == p.name and ans.evidence[0].bbox == [1, 2, 3, 4]
+    assert normalize.prepare(str(plain), "q").kind == "as_is"  # 8-bit PNGs untouched
+    monkeypatch.setenv("STOA_PICTURE_PNG", "0")
+    assert normalize.prepare(str(png), "q").kind == "as_is"  # kill switch
+    big = tmp_path / "d" / "big.png"
+    big.parent.mkdir()
+    Image.fromarray(np.tile(g, (1, 20))).save(big)  # 1000 px wide -> shrunk to 500
+    r = normalize.shrink_image(big, tmp_path / "d" / "big.s500.png", 500)
+    assert r["factor"] == 0.5  # mean grey of the pattern 0/50/128/200/255 = 127; clipped it would be ~204
+    assert np.asarray(Image.open(r["path"]).convert("L")).mean() < 160
+
+
+def test_transparent_png_is_read_on_white_on_the_cli_path(tmp_path, monkeypatch):
+    """F6 01:17: a CAD export's transparent PNG (black RGB under alpha 0) read as a BLACK sheet on the CLI / API path."""
+    import numpy as np
+    from PIL import Image
+
+    monkeypatch.setenv("STOA_CACHE", str(tmp_path / "cache"))
+    g = np.full((50, 60), 255, np.uint8)
+    g[10:20, :] = 0
+    t, o = tmp_path / "t.png", tmp_path / "o.png"
+    Image.fromarray(np.dstack([np.zeros_like(g)] * 3 + [255 - g]), "RGBA").save(t)
+    Image.fromarray(np.dstack([g] * 3 + [np.full_like(g, 255)]), "RGBA").save(o)
+    prep = normalize.prepare(str(t), "q")
+    assert prep.kind == "picture" and "transparent" in prep.notes[0]
+    assert list(np.asarray(Image.open(prep.path).convert("L"))[[0, 15], 0]) == [255, 0]
+    assert normalize.prepare(str(o), "q").kind == "as_is"  # opaque RGBA: untouched
+
+
+def test_dwg_text_cut_inside_a_utf8_character_is_rejoined_and_a_failed_save_keeps_the_file(tmp_path, monkeypatch):
+    """QA 02:02: LibreDWG cut an MTEXT chunk inside the bullet's UTF-8 bytes ('\\xe2\\x80' | '\\xa2'); ezdxf gave lone
+    surrogates, PyMuPDF raised and the whole DWG upload failed. And an ezdxf save that failed half-way left 0 bytes."""
+    import ezdxf
+
+    raw = b"  0\r\nMTEXT\r\n  3\r\nNOTES \xe2\x80\r\n  1\r\n\xa2 SALVAGE\r\n  1\r\nok \xc3\xa4\r\n"
+    out, n = dwg._rejoin_utf8(raw)
+    assert n == 1 and out == b"  0\r\nMTEXT\r\n  3\r\nNOTES \r\n  1\r\n\xe2\x80\xa2 SALVAGE\r\n  1\r\nok \xc3\xa4\r\n"
+    assert dwg._rejoin_utf8(out) == (out, 0)
+    doc = ezdxf.new("R2000")
+    t = doc.modelspace().add_text("App. A", dxfattribs={"insert": (5, 5), "halign": 1, "align_point": (0, 0)})
+    assert t.dxf.align_point == (0, 0, 0)
+    p = tmp_path / "x.dxf"
+    doc.saveas(p)
+    size = p.stat().st_size
+
+    def boom(self, *a, **k):
+        raise AttributeError("'str' object has no attribute 'dxf'")
+
+    monkeypatch.setattr(ezdxf.document.Drawing, "saveas", boom)
+    assert dwg.fix_converted(p) == [] and p.stat().st_size == size  # nothing claimed, file intact
+    monkeypatch.undo()
+    assert dwg.fix_converted(p) == ["1 aligned texts placed at their insert point"]
+    assert ezdxf.readfile(p).modelspace().query("TEXT")[0].dxf.align_point == (5, 5, 0)

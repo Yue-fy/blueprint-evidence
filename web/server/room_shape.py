@@ -15,6 +15,8 @@ edge, not most of the plan); the region is then grown back by the same amount. A
 An item may carry "scale_n" (the drawing's 1:N, vector PDFs only): then E1's wall-line tracer runs first
 (stoa.evidence.linework.measure_room: door swings closed at the doorway line, outline at the lines' middle, other rooms'
 printed names kept out; DfE laundry 7.03 m² vs 5.68 here, gold 7.0) and this flood fill is the fallback.
+On a picture an item may carry "px_per_m" instead: the same tracer runs on the upload's traced copy (<stem>.vec6.pdf)
+when there is one (pic_lines, W6's lineroom.py).
 An item may list "others": [[x, y], ...], the label points of OTHER rooms (same space): a region holding one of them
 leaked through a door into that room, so the walls are thickened further (none closed → no outline).
 Output, per item: {"i", "poly": [[x, y], ...] in the evidence's own space, "area": in that space's units squared,
@@ -53,6 +55,34 @@ def wall_lines(abs_path: str, page: int, pt: tuple[float, float], scale_n: float
         return None
     m_per_pt = float(scale_n) * PT_TO_M_AT_1
     return r["polygon"], float(r["area_m2"]) / (m_per_pt * m_per_pt), "wall lines"
+
+
+def pic_lines(abs_path: str, pt: tuple[float, float], px_per_m: float):
+    """W6 00:48 (UX S-B2): on a PICTURE with a traced copy (<stem>.vec6.pdf, P1's vectorize) E1's wall-line tracer runs
+    on that copy (W6's web/src/mobile/lineroom.py, called, not copied): (poly image_px, area px², how) or None.
+    DfE Level 00 PNG, 680 taps around 170 room names: right room 488 / wrong 31 vs the flood fill's 346 / 238; hall
+    246.97 m² (printed 247.73; flood fill 271). Needs the picture's px per m (door-swing radii). ROOM_E1=0 turns it off."""
+    if not abs_path.lower().endswith((".png", ".jpg", ".jpeg")) or not px_per_m or px_per_m <= 0 or os.environ.get("ROOM_E1", "1") == "0":
+        return None
+    try:
+        import importlib.util
+
+        spec = importlib.util.spec_from_file_location("w6_lineroom", os.path.join(REPO, "web", "src", "mobile", "lineroom.py"))
+        if spec is None or spec.loader is None:
+            return None
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        r = mod.trace(abs_path, float(pt[0]), float(pt[1]), float(px_per_m))
+    except Exception as e:  # noqa: BLE001
+        print(f"room_shape: picture wall-line tracer: {e}", file=sys.stderr)
+        return None
+    poly = r.get("poly") if isinstance(r, dict) and r.get("ok") else None
+    if not poly or len(poly) < 3:
+        return None
+    a = 0.0
+    for (x1, y1), (x2, y2) in zip(poly, poly[1:] + poly[:1]):
+        a += x1 * y2 - x2 * y1
+    return poly, abs(a) / 2, "wall lines (traced copy)"
 
 
 def load(abs_path: str, page: int):
@@ -266,6 +296,41 @@ def main() -> None:
     items = [it for it in req.get("items") or [] if it.get("bbox") and len(it["bbox"]) >= 4]
     res: dict[int, tuple | None] = {}
     start = {k: 0 for k in range(len(items))}
+    hh, ww = walls.shape
+    thin_px = max(10.0, 0.008 * max(hh, ww))  # ~0.7 m at 1:200 on an A3 render: thinner than any door
+    open_walls: list = []
+
+    def thin(r) -> bool:
+        """UX NEW-R1: on a parquet-hatched floor the fill stopped at the floorboard lines: a 'room' 120 x 6 px. A room is
+        never thinner than a door."""
+        import cv2
+
+        x0, y0, x1, y1 = r[5]
+        a, b = sorted((x1 - x0 + 1, y1 - y0 + 1))
+        # W6 01:51: a 16-17 px strip passed 'a < thin_px' (thin_px 16 on a 2000 px picture). The mean width 2A/P of
+        # the outline catches it whatever its bounding box (a 16 x 300 strip: 15 px; a 2 m room at 1:100: ~100 px).
+        per = float(cv2.arcLength(np.asarray(r[0], np.float32).reshape(-1, 1, 2), True))
+        mean_w = 2.0 * r[1] / per if per > 0 else 0.0
+        return a <= thin_px or mean_w < thin_px or (b > 25 * a and a < 2 * thin_px)  # a long corridor is not thin
+
+    def opened(kk: int):
+        """The wall mask with pattern lines thinner than kk px (floorboards, tiles, hatching) opened away."""
+        import cv2
+
+        while len(open_walls) <= kk:
+            open_walls.append(None)
+        if open_walls[kk] is None:
+            open_walls[kk] = cv2.morphologyEx(walls, cv2.MORPH_OPEN, np.ones((kk, kk), np.uint8))
+        return open_walls[kk]
+
+    def hatch(r, kk: int) -> float:
+        """Share of the region's pixels that are pattern lines (in the wall mask, gone once opened with kk)."""
+        import cv2
+
+        m = np.zeros_like(walls)
+        cv2.fillPoly(m, [np.asarray(r[0], np.int32)], 255)
+        inside = m > 0
+        return float(((walls > 0) & (opened(kk) == 0) & inside).sum()) / max(1, int(inside.sum()))
 
     def run(k: int):
         bb = items[k]["bbox"][:4]
@@ -275,7 +340,19 @@ def main() -> None:
         # found by its printed name on an upload; the other names on the sheet are the other rooms)
         others = [((float(p[0]) - ox) * f, (float(p[1]) - oy) * f) for p in (items[k].get("others") or [])[:200] if len(p) >= 2]
         try:
-            return outline(walls, seed, b, footprint, start[k], others)
+            r = outline(walls, seed, b, footprint, start[k], others)
+            # UX NEW-R1 (parquet / tiled floors): the fill stops at the pattern lines (a floorboard: 120 x 6 px). Open
+            # the pattern away step by step while the room found is full of pattern lines (>= 3 % of it) and keeps
+            # growing; a leak (None) stops it. Plans without patterns keep the first outline (DfE: opened = none).
+            if r is not None and thin(r) and os.environ.get("ROOM_UNHATCH", "1") != "0":
+                best = None
+                for kk in (3, 5, 7):
+                    r2 = outline(opened(kk), seed, b, footprint, start[k], others)
+                    if r2 is None or hatch(r2, kk) < 0.03 or (best is not None and r2[1] <= 1.2 * best[1]):
+                        break
+                    best = r2
+                r = best if best is not None and not thin(best) else None
+            return r
         except Exception as e:  # noqa: BLE001
             print(f"room_shape: {e}", file=sys.stderr)
             return None
@@ -283,11 +360,15 @@ def main() -> None:
     # vector PDF at a known scale: the wall-line tracer first (items it outlines skip the flood fill)
     lined: dict[int, tuple] = {}
     for k, it in enumerate(items):
+        bb = it["bbox"][:4]
+        mid = ((bb[0] + bb[2]) / 2, (bb[1] + bb[3]) / 2)
+        hit = None
         if it.get("scale_n"):
-            bb = it["bbox"][:4]
-            hit = wall_lines(req["abs"], int(req.get("page") or 0), ((bb[0] + bb[2]) / 2, (bb[1] + bb[3]) / 2), float(it["scale_n"]))
-            if hit:
-                lined[k] = hit
+            hit = wall_lines(req["abs"], int(req.get("page") or 0), mid, float(it["scale_n"]))
+        elif it.get("px_per_m"):  # a picture at a known scale with a traced copy (W6 00:48)
+            hit = pic_lines(req["abs"], mid, float(it["px_per_m"]))
+        if hit:
+            lined[k] = hit
     todo = [k for k in range(len(items)) if k not in lined]
     for _ in range(len(CLOSING)):
         for k in todo:

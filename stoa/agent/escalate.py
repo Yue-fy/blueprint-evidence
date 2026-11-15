@@ -105,15 +105,26 @@ def escalate(pipe, path: str, question: str, ans: Answer, gemini: bool, verify: 
     from stoa.pipeline import _located
     from stoa.router.prior import known_template
 
+    if str(ans.solver or "") in ("pipeline/clarify", "pipeline/takeoff"):
+        # captain 00:31 (RECHECK-0026 (2)): a question sent back to the visitor (which room?) or answered from the
+        # sheet's own takeoff gets no hosted picture guess ('≈ 1,000 m · I cannot calculate … rough estimate')
+        if gemini or verify:
+            ans.trace = [*ans.trace, "no hosted reading: " + ("the question needs a choice first" if ans.value is None
+                                                              else "answered from this sheet's takeoff")]
+        return ans
     if gemini and os.environ.get("STOA_GEMINI_VISION_STEP", "1") != "0" and \
             str(path).lower().endswith((".pdf", ".png", ".jpg", ".jpeg", ".webp", ".tif", ".tiff", ".bmp")):
         # G1 cycle 3 (captain 14:39): the cascade fell to the prior / found nothing located -> Gemini looks at the page
-        from stoa.agent.vision import vision_step, wanted
+        from stoa.agent.vision import settled, vision_step, wanted
 
         why = wanted(ans, question, path)
+        done = None if why else settled(ans, question)
+        if done:  # captain 00:31: say why no hosted call was made (the card's cost tier stays cheap)
+            ans.trace = [*ans.trace, f"no hosted second look: {done}"]
+            gemini = False
         if why:
             if _team_calls_today() >= TEAM_DAY_CAP:
-                ans.trace = [*ans.trace, f"vision reading skipped: the team's Gemini calls today reached {TEAM_DAY_CAP}"]
+                ans.trace = [*ans.trace, f"vision reading skipped: the Gemini calls logged today reached {TEAM_DAY_CAP} (STOA_GEMINI_TEAM_CAP)"]
             else:
                 ans = vision_step(path, question, ans, why=why)
                 if str(ans.solver or "").startswith("pipeline/gemini_") or any(
@@ -126,7 +137,7 @@ def escalate(pipe, path: str, question: str, ans: Answer, gemini: bool, verify: 
         return ans
     if gemini and ans.confidence < GEMINI_BELOW and not known_template(question):
         if _team_calls_today() >= TEAM_DAY_CAP:
-            ans.trace = [*ans.trace, f"escalation skipped: the team's Gemini calls today reached {TEAM_DAY_CAP}"]
+            ans.trace = [*ans.trace, f"escalation skipped: the Gemini calls logged today reached {TEAM_DAY_CAP} (STOA_GEMINI_TEAM_CAP)"]
         else:
             ans = gemini_step(pipe, path, question, ans)
     if verify and ans.confidence < VERIFY_BELOW and not _located(ans):

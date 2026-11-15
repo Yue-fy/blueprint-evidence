@@ -380,6 +380,38 @@ class PlanRooms(BaseSolver):
                 if model_scope:
                     a.assumptions.insert(0, f"this sheet shows {n_sp} spaces; the question asks about the whole model")
                 return a
+            # G1 (X1 21:26 rp-065, AFCEC A-2 PDF): 'How many dormitory rooms are there on this level?' -> 2 @0.70 = the
+            # two 'OPEN TO BELOW' fills. A question naming a room KIND counts only polygons labelled like it; none ->
+            # not this reader (the printed '48 DORMS' / the labels answer)
+            try:
+                from stoa.solvers.label_count import _noun_matches, asked_types
+
+                kinds = [s for s in asked_types(question) if s not in ("rooms", "room", "spaces", "space", "spac")]
+            except Exception:  # noqa: BLE001
+                kinds = []
+            if kinds:
+                same = [r for r in rooms if any(_noun_matches(w, kinds) for w in
+                                                re.findall(r"[A-Za-zÄÖÜäöüßÅå]{3,}", r.get("label") or ""))]
+                if not same:
+                    # sl-067 'How many accessible (ABA) dorm rooms are drawn on this floor?' = the same 2 fills (gold 2:
+                    # a highlight colour marks the asked subset): not an abstention, but not 0.70 either
+                    return Answer(value=len(rooms), unit="count", confidence=min(0.45, conf_cap + 0.15),
+                                  evidence=ev(rooms), solver=self.name,
+                                  trace=trace + [f"rooms counted: {len(rooms)} filled polygons; none is labelled like "
+                                                 f"'{kinds[0]}' (labels: " + ", ".join(r["label"][:24] for r in rooms[:6])
+                                                 + ") -> the fill colour may mark the asked rooms"],
+                                  assumptions=["a room = a filled polygon (its fill colour taken as marking the asked kind)"],
+                                  missing=[f"none of the {len(rooms)} filled polygons carries a '{kinds[0]}' label: check "
+                                           "the legend for what the fill colour means"])
+                if len(same) < len(rooms):
+                    return Answer(value=len(same), unit="count", confidence=min(0.6, conf_cap + 0.15),
+                                  evidence=ev(same), solver=self.name,
+                                  trace=trace + [f"rooms counted: {len(same)} of {len(rooms)} labelled polygons are "
+                                                 f"labelled like '{kinds[0]}'"],
+                                  assumptions=["a room = a filled polygon labelled like the asked kind; counted: "
+                                               + ", ".join(r["label"][:30] for r in same[:12])
+                                               + (" …" if len(same) > 12 else "")],
+                                  missing=["rooms of that kind drawn without their own filled outline are not counted"])
             # S0 13:11 (d4 lone run): room counts @0.80 were off by 1-8 (rooms without their own outline) -> 0.7
             return Answer(value=len(rooms), unit="count", confidence=min(0.7, conf_cap + 0.25), evidence=ev(rooms),
                           trace=trace + [f"rooms counted: {len(rooms)} labelled polygons"], solver=self.name,

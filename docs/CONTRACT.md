@@ -188,7 +188,7 @@ wrong dimension (m for an area question) is wrong. Counts are rounded to the nea
   models only), `hard` (generality), `human` (the expert's own questions from agent H's workbench,
   `$JUNCTION_SHARED/human/questions.jsonl`; last save per qid wins; `meta.kind = "human:<sureness>"`; report it
   separately from dev), or any split file path.
-- **Hosted Gemini guard** (COMMON.md, Sat 10:50: no bulk use of Google's hackathon key): a run of more than 200
+- **Hosted Gemini guard** (no bulk use of Google's hackathon key): a run of more than 200
   questions hides `GEMINI_API_KEY` / `GOOGLE_API_KEY` from every solver (printed on stderr) unless `--allow-gemini`.
   Solvers that call Gemini must therefore work (fall back) without the key. `experiments/F/probe_suite.py` always hides it.
 - **Ad-hoc question files** (e.g. the example questions Stoa shows on Saturday): `--split path/to/file.jsonl`, one

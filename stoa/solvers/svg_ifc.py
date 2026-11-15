@@ -28,9 +28,14 @@ SVG = "{http://www.w3.org/2000/svg}"
 M_PER_UNIT = 0.1  # 1:100 on paper mm (see module doc)
 CLASSES = {"door": "IfcDoor", "window": "IfcWindow", "room": "IfcSpace", "space": "IfcSpace", "wall": "IfcWall",
            "slab": "IfcSlab", "column": "IfcColumn", "stair": "IfcStair", "beam": "IfcBeam", "railing": "IfcRailing"}
-_VOL = re.compile(r"\b(volume|volumen|volym|tilavuus|cubage)\b|m³|m3\b", re.I)
-_AREA = re.compile(r"\b(area|fläche|flache|surface|superficie|pinta-ala|ala|yta|oppervlakte|areal)\b|m²|m2\b|"
+# plurals too (H 23:52: 'Sum of all slab areas?' did not read as an area: the slab question then abstained as a volume)
+_VOL = re.compile(r"\b(volumes?|volumen|volymer|volym|tilavuus|tilavuudet|cubage)\b|m³|m3\b", re.I)
+_AREA = re.compile(r"\b(areas?|flächen|fläche|flachen|flache|surfaces?|superficies?|pinta-alat|pinta-ala|ala|ytor|yta|"
+                   r"oppervlakten|oppervlakte|arealer|areal)\b|m²|m2\b|"
                    r"nettofläche|grundfläche|wohnfläche", re.I)
+
+
+_PICK = re.compile(r"\b(which|where|who|whose|name|names|list|largest|smallest|biggest|most|least|compare)\b", re.I)
 
 
 _TOK = re.compile(r"[MmLlHhVvAaCcSsQqTtZz]|-?(?:\d+\.?\d*|\.\d+)(?:[eE][-+]?\d+)?")
@@ -340,6 +345,8 @@ class SvgIfc(BaseSolver):
         task = it.task
         if task == "volume" and not _VOL.search(question):  # 'CUBICLES' is not a volume (intent parser reads 'cubic')
             task = "area" if _AREA.search(question) else task
+        elif task == "text" and _AREA.search(question) and not _VOL.search(question) and not _PICK.search(question):
+            task = "area"  # H 23:52: the parser reads the plural 'Sum of all slab areas?' as a text question
         trace = [f"IfcConvert-style SVG: {len(svg['elements'])} IFC elements "
                  f"({', '.join(sorted({e['cls'] for e in svg['elements']}))})", f"question: {task} {it.target} [{it.scope}]"]
         mpu, how = scale_of(svg)
@@ -371,6 +378,11 @@ class SvgIfc(BaseSolver):
             return Answer(value=len(items), unit="count", confidence=conf, evidence=ev, trace=trace, solver=self.name,
                           assumptions=assume, missing=missing)
         if task == "area":
+            other = CLASSES.get(it.target or "")
+            if other and other != "IfcSpace":  # 'Sum of all slab areas?' was answered with the ROOMS' sum @0.85
+                return Answer.abstain(self.name, f"the area of {it.target}s is not the rooms' area, and a plan cut "
+                                      f"shows only the {it.target}s it cuts", trace,
+                                      missing=[f"the IFC model ({other} quantities) for {it.target} areas"])
             spaces = [e for e in svg["elements"] if e["cls"] == "IfcSpace" and e["area_units"] > 0]
             if not spaces:
                 return Answer.abstain(self.name, "no IfcSpace outlines on this sheet", trace)

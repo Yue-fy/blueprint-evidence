@@ -35,25 +35,38 @@ HOP = {"connection", "keep-alive", "proxy-authenticate", "proxy-authorization", 
 CHUNK = 64 * 1024
 
 LOGIN_PAGE = """<!doctype html><html lang="en"><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1"><title>Blueprints Talk: sign in</title>
+<meta name="viewport" content="width=device-width, initial-scale=1"><title>Blueprint Evidence: sign in</title>
 <style>
- :root {{ color-scheme: light dark; --bg:#f6f5f2; --fg:#1d1d1b; --muted:#6b6b66; --card:#fff; --line:#d9d7d0; --acc:#2f5d50; }}
- @media (prefers-color-scheme: dark) {{ :root {{ --bg:#161614; --fg:#ecebe6; --muted:#a3a29b; --card:#20201d; --line:#3a3a35; --acc:#7fb8a5; }} }}
- body {{ margin:0; min-height:100vh; display:grid; place-items:center; background:var(--bg); color:var(--fg);
-        font:16px/1.45 system-ui, sans-serif; padding:16px; box-sizing:border-box; }}
- form {{ background:var(--card); border:1px solid var(--line); border-radius:10px; padding:28px; width:100%; max-width:360px; }}
- h1 {{ font-size:20px; margin:0 0 4px; }} p {{ color:var(--muted); margin:0 0 18px; font-size:14px; }}
+ /* UX M12 (23:30): the app's own name, logo letter, colours and font (web/src/style.css tokens), no team-internal copy */
+ :root {{ color-scheme: light dark; --bg:#f5f5f7; --panel:#fff; --ink:#1d1d1f; --muted:#6e6e73; --line:rgba(0,0,0,.14);
+         --accent:#0071e3; --accent-ink:#0062c4; --logo:#1d1d1f; --logo-ink:#fff; }}
+ @media (prefers-color-scheme: dark) {{ :root {{ --bg:#000; --panel:#1c1c1e; --ink:#f5f5f7; --muted:#98989d;
+         --line:rgba(255,255,255,.2); --accent:#0a84ff; --accent-ink:#409cff; --logo:#f5f5f7; --logo-ink:#1d1d1f; }} }}
+ body {{ margin:0; min-height:100vh; display:grid; place-items:center; background:var(--bg); color:var(--ink);
+        font:16px/1.45 -apple-system, BlinkMacSystemFont, "Inter Variable", "Inter", "Segoe UI", Roboto, "Helvetica Neue",
+        Arial, sans-serif; padding:16px; box-sizing:border-box; }}
+ form {{ background:var(--panel); border:1px solid var(--line); border-radius:14px; padding:28px; width:100%; max-width:360px;
+        box-sizing:border-box; }}
+ .brand {{ display:flex; align-items:center; gap:12px; margin-bottom:14px; }}
+ .logo {{ width:38px; height:38px; border-radius:9px; background:var(--logo); color:var(--logo-ink); display:grid;
+         place-items:center; font-weight:800; font-size:19px; box-shadow:inset 0 -3px 0 var(--accent); flex:none; }}
+ h1 {{ font-size:20px; margin:0; }} p {{ color:var(--muted); margin:0 0 18px; font-size:14px; }}
+ label {{ display:block; font-size:14px; font-weight:600; margin-bottom:6px; }}
  input {{ width:100%; box-sizing:border-box; padding:10px 12px; font-size:16px; border:1px solid var(--line);
-         border-radius:6px; background:transparent; color:var(--fg); }}
- button {{ margin-top:12px; width:100%; padding:10px; font-size:16px; border:0; border-radius:6px; background:var(--acc);
-          color:var(--card); cursor:pointer; }}
- .err {{ color:#b3261e; font-size:14px; margin-top:10px; min-height:1em; }}
+         border-radius:8px; background:transparent; color:var(--ink); }}
+ input:focus {{ outline:2px solid var(--accent); outline-offset:1px; }}
+ button {{ margin-top:12px; width:100%; padding:10px; font-size:16px; font-weight:600; border:0; border-radius:8px;
+          background:var(--accent); color:#fff; cursor:pointer; }}
+ button:hover {{ background:var(--accent-ink); }}
+ .err {{ color:#d70015; font-size:14px; margin-top:10px; min-height:1em; }}
 </style></head><body>
 <form method="post" action="/__gate/login">
- <h1>Blueprints Talk</h1><p>Team Hannah Family · Junction 2026. Enter the shared password.</p>
+ <div class="brand"><div class="logo" aria-hidden="true">B</div><h1>Blueprint Evidence</h1></div>
+ <p>Ask a drawing or a building model. This preview is private: enter the password you were given.</p>
  <input type="hidden" name="next" value="{next}">
- <input type="password" name="password" placeholder="Password" autofocus required autocomplete="current-password">
- <button type="submit">Sign in</button><div class="err">{err}</div>
+ <label for="pw">Password</label>
+ <input id="pw" type="password" name="password" autofocus required autocomplete="current-password">
+ <button type="submit">Sign in</button><div class="err" role="alert">{err}</div>
 </form></body></html>"""
 
 
@@ -161,6 +174,9 @@ def make_handler(g: Gate):
                 client = self._client()
                 if g.limited(client):
                     self._login_page(nxt, "Too many attempts. Wait 10 minutes.", 429)
+                    return True
+                if not form.get("password", [""])[0]:  # UX MINOR 17: an empty submit is not a wrong password
+                    self._login_page(nxt, "Enter the password.", 400)
                     return True
                 if not g.ok_password(form.get("password", [""])[0]):
                     g.failed(client)

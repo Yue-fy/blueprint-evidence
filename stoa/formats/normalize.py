@@ -11,6 +11,10 @@ The solvers read PDF (page 0), PNG/JPG, IFC, DXF and IfcConvert-style SVG. Stoa 
   .dxf, other layer names -> a copy with its layers renamed to the reader's roles by name (AIA A-DOOR, German Tür, …;
                           stoa/formats/dxflayers.py); no recognisable names -> answers capped (see solvers/upload.py)
   .heic/.heif          -> <stem>.jpg, upright (iPhone photos; needs pi-heif or pillow-heif, else a plain message)
+  .tif/.webp/.bmp/.gif -> <stem>.png in $STOA_CACHE/formats (first page, transparent background on white), and a
+  16-bit grey PNG      -> the same, greys SCALED to 8 bit (Pillow clips them: grey 50 -> 255), and a transparent PNG
+                          -> on white; same pixel grid, so the evidence stays on the uploaded file (the web upload
+                          converts TIFF / WebP / BMP / GIF and flattens transparency itself)
   .pdf with > 1 page   -> one-page copy of the page the question is about (stoa.formats.pages.pick_page)
   scanned .pdf page    -> PNG at the scan's own resolution (image-only page: no text, no paths), so the image readers
                           (raster, VLM) read it: Swiss sheet scanned 10% as PDF vs 55% as PNG (up_fmt3)
@@ -28,6 +32,7 @@ or under $STOA_CACHE/formats when that folder is read-only.
 from __future__ import annotations
 
 import contextlib
+import functools
 import hashlib
 import json
 import os
@@ -37,6 +42,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 HEIC_EXT = {".heic", ".heif", ".hif"}
+PIC_EXT = {".tif", ".tiff", ".webp", ".bmp", ".gif"}  # pictures the readers do not open: -> PNG (readable_picture)
+DEEP_MODES = {"I;16", "I;16B", "I;16L", "I;16N", "I", "F"}  # > 8 bits per grey pixel
 SVG_PDF_VERSION = 2  # in the cached file's name: a fix to the conversion never reuses an older copy
 _IFC_SVG = re.compile(rb'class="[^"]*\bIfc[A-Z]')
 _LEN = re.compile(r"^\s*([0-9.]+)\s*([a-z%]*)\s*$")
@@ -48,7 +55,8 @@ class Prepared:
     original: str  # the uploaded file
     path: str  # the file to solve
     kind: str = "as_is"  # as_is | dwg | dxf_roles | svg_pdf | heic | page | scan (an image-only PDF page, as PNG) |
-    #                      shrink (an image above STOA_IMAGE_MAX_SIDE px, read from a smaller copy)
+    #                      shrink (an image above STOA_IMAGE_MAX_SIDE px, read from a smaller copy) | picture (a
+    #                      TIFF / WebP / BMP / GIF or 16-bit grey PNG read as an 8-bit PNG, same pixels) | picture+shrink
     page: int = 0  # page of the ORIGINAL the solved file shows (multi-page PDFs)
     pages: int = 1
     notes: list[str] = field(default_factory=list)  # assumptions to show with the answer
@@ -59,6 +67,119 @@ class Prepared:
     img_scale: float = 0.0  # shrink: solved-image pixels per ORIGINAL image pixel (0 = not shrunk)
     sheet: str = ""  # page: the picked page's own sheet number ('M-101A'), when its title block prints one
     paper_f: float = 0.0  # paper: the solved PDF page is the original page enlarged this many times (0 = not)
+    scan_pdf: str = ""  # scan: the one-page PDF whose page 0 was rendered to path (its page size / image pixels: paper)
+
+
+def eight_bit(im):
+    """(image, note): a grey picture with more than 8 bits per pixel (a scanner's 16-bit grey PNG / TIFF: mode 'I;16',
+    'I', 'F') as 8-bit 'L', SCALED. Pillow 13's convert('L' / 'RGB') CLIPS instead (grey 50 of 255 stored as 12850 ->
+    255): mid-grey ink, pencil lines and anti-aliased text vanish for every PIL reader, while cv2 scales (P1 c15). 12-bit
+    data in a 16-bit file (max <= 4095) is scaled by 4095. Any other mode: (im, "") unchanged."""
+    if im.mode not in DEEP_MODES:
+        return im, ""
+    import numpy as np
+    from PIL import Image
+
+    a = np.asarray(im).astype(np.float32)
+    hi = float(np.nanmax(a)) if a.size else 0.0
+    top = 65535.0 if hi > 4095 else 4095.0 if hi > 255 else 1.0 if (im.mode == "F" and hi <= 1.0) else 255.0
+    out = Image.fromarray(np.clip(np.nan_to_num(a) * (255.0 / top) + 0.5, 0, 255).astype(np.uint8), "L")
+    if "dpi" in im.info:
+        out.info["dpi"] = im.info["dpi"]
+    bits = "16-bit" if top > 4095 else "12-bit" if top > 255 else "high bit-depth"
+    return out, f"{bits} grey picture: its greys were scaled to 8 bit before reading"
+
+
+def is_deep(path: str | Path) -> bool:
+    """Is this picture a grey image with more than 8 bits per pixel (see eight_bit)? False when unreadable."""
+    from PIL import Image
+
+    Image.MAX_IMAGE_PIXELS = None
+    try:
+        with Image.open(path) as im:
+            return im.mode in DEEP_MODES
+    except Exception:  # noqa: BLE001
+        return False
+
+
+@functools.lru_cache(maxsize=256)
+def _alpha_min(path: str, mtime: float, size: int) -> int:
+    from PIL import Image
+
+    Image.MAX_IMAGE_PIXELS = None
+    with Image.open(path) as im:
+        return int(im.convert("RGBA").getextrema()[3][0])
+
+
+def needs_picture_png(path: str | Path) -> bool:
+    """Should prepare() read this PNG from readable_picture's copy? 16-bit grey (eight_bit), or a TRANSPARENT background
+    (F6 01:17: cv2.imread / convert("RGB") drop alpha, a CAD export's black-under-alpha-0 sheet reads as BLACK; the web
+    upload flattens it, the CLI / API path did not). Header only for opaque modes; the alpha check decodes once per file."""
+    from PIL import Image
+
+    Image.MAX_IMAGE_PIXELS = None
+    try:
+        with Image.open(path) as im:
+            mode, transp = im.mode, "transparency" in im.info
+        if mode in DEEP_MODES:
+            return True
+        if mode in ("RGBA", "LA", "PA") or (mode == "P" and transp):
+            st = Path(path).stat()
+            return _alpha_min(str(path), st.st_mtime, st.st_size) < 255
+    except Exception:  # noqa: BLE001 — unreadable: the readers say so
+        return False
+    return False
+
+
+def _side_cache(src: Path) -> Path:
+    """$STOA_CACHE/formats/<hash of the path>: converted copies that must never appear next to an upload (the web's
+    upload list shows that folder's files)."""
+    root = Path(os.environ.get("STOA_CACHE", Path.home() / ".cache" / "stoa")) / "formats"
+    d = root / hashlib.sha1(str(src.resolve()).encode()).hexdigest()[:12]
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def readable_picture(path: str | Path) -> tuple[str, str]:
+    """(png, note): a PNG the image readers open, for TIFF / WebP / BMP / GIF pictures and 16-bit grey PNGs (the CLI /
+    API path; the web upload converts the first four itself, web/server/normalize_upload.py): first page / frame,
+    16-bit greys scaled (eight_bit), a transparent background on white, CMYK / palette / 1-bit as RGB / grey. The SAME
+    pixel grid as the original (no EXIF turn, no resize), so evidence maps back 1:1. Cached in the side cache."""
+    from PIL import Image
+
+    Image.MAX_IMAGE_PIXELS = None
+    src = Path(path)
+    dst = _side_cache(src) / f"{src.stem}.png"
+    with Image.open(src) as im:
+        n = getattr(im, "n_frames", 1) or 1
+        fmt = (im.format or src.suffix[1:]).upper()
+        if not dst.exists() or dst.stat().st_mtime < src.stat().st_mtime:
+            im.seek(0)
+            im.load()
+            out, _ = eight_bit(im)
+            if out.mode in ("RGBA", "LA", "PA") or (out.mode == "P" and "transparency" in out.info):
+                rgba = out.convert("RGBA")
+                bg = Image.new("RGBA", rgba.size, (255, 255, 255, 255))
+                bg.alpha_composite(rgba)
+                out = bg.convert("RGB")
+            elif out.mode not in ("RGB", "L"):
+                out = out.convert("L" if out.mode in ("1", "L;16") else "RGB")
+            keep = {}
+            try:
+                dpi = im.info.get("dpi")
+                if dpi and float(dpi[0]) > 0 and float(dpi[1]) > 0:
+                    keep = {"dpi": (float(dpi[0]), float(dpi[1]))}
+            except (TypeError, ValueError, IndexError):
+                keep = {}
+            tmp = tmp_path(dst)
+            out.save(tmp, "PNG", **keep)
+            os.replace(tmp, dst)
+        deep = im.mode in DEEP_MODES
+    what = ("16-bit grey PNG" if deep else "PNG with a transparent background (filled with white)") if fmt == "PNG" \
+        else f"{fmt} picture" + (" (16-bit greys)" if deep else "")
+    note = (f"{what} read as an 8-bit PNG copy" + (" (greys scaled, not clipped to white)" if deep else "")
+            + (f"; page 1 of {n} read, the other pages were not" if n > 1 and fmt in ("TIFF", "MPO") else ""))
+    return str(dst), note
 
 
 def _cache_dir(src: Path) -> Path:
@@ -141,6 +262,30 @@ def svg_to_pdf(path: str | Path, out_dir: str | Path | None = None) -> tuple[str
     return str(dst), (x0, y0, w / width_pt if width_pt else 1.0)
 
 
+def _invisible_share(pg) -> float:
+    """Share of the page's text spans drawn invisibly (render mode 3 = an OCR layer over a scan)."""
+    try:
+        tr = pg.get_texttrace()
+    except Exception:  # noqa: BLE001
+        return 0.0
+    return sum(1 for t in tr if t.get("type") == 3) / len(tr) if tr else 0.0
+
+
+def ocr_layer_scan(pg) -> bool:
+    """X1 c13: a scanned page carrying a scanner's OCR layer: one image over >= 50 % of the page, >= 80 % of the text
+    invisible (render mode 3), <= 50 vector drawings. Such a page is read like an image-only scan (its layer ignored).
+    STOA_SCAN_OCR_LAYER=0 turns the rule off."""
+    if os.environ.get("STOA_SCAN_OCR_LAYER", "1") == "0" or _invisible_share(pg) < 0.8:
+        return False
+    try:
+        area = max(pg.rect.get_area(), 1e-9)
+        big = any((r & pg.rect).get_area() >= 0.5 * area for im in pg.get_images(full=True)
+                  for r in pg.get_image_rects(im[0]))
+        return big and len(pg.get_drawings()) <= 50
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def scan_png(pdf: str, max_side: int = 6000) -> tuple[str, float] | None:
     """(PNG path, px per pt) when page 0 is a scan: (almost) no text, no vector paths, one image over >= 50% of the
     page. Rendered at the image's own resolution (capped at max_side px), so no detail is lost or invented."""
@@ -151,7 +296,11 @@ def scan_png(pdf: str, max_side: int = 6000) -> tuple[str, float] | None:
     with pymupdf.open(pdf) as d:
         pg = d[0]
         imgs = pg.get_images(full=True)  # cheap checks first: most uploads are vector sheets
-        if not imgs or pg.rotation or _stream_bytes(pg) > 20_000 or len((pg.get_text() or "").strip()) >= 20:
+        txt = (pg.get_text() or "").strip()
+        # X1 c13: a scanner's OCR layer (invisible text, render mode 3: office 'searchable PDF', Adobe Scan, archive
+        # scans) made every such page a 'vector' page rendered at ~130 dpi with the layer as its text; it is a scan
+        ocr = bool(imgs) and len(txt) >= 20 and ocr_layer_scan(pg)
+        if not imgs or pg.rotation or (not ocr and (_stream_bytes(pg) > 20_000 or len(txt) >= 20)):
             return None
         best, px = 0.0, 0
         for im in imgs:
@@ -167,7 +316,28 @@ def scan_png(pdf: str, max_side: int = 6000) -> tuple[str, float] | None:
         # A4), so 'printed 1:100 + page size' would be wrong; a drawn scale bar shrinks with the copy and stays right.
         # Whole-number dpi resampling also moved scan counts on up_fmt3 (0 W / 0 L, values jitter): kept as it was.
         _render(pg, zoom, dst, pdf, tag=False)
+    _scan_sidecar(dst, pdf, zoom)
     return str(dst), zoom
+
+
+def _scan_sidecar(png: Path, pdf: str, zoom: float) -> None:
+    """'<render>.json' {scan_pdf, zoom}: which scanned PDF page this render shows, so a reader that only has the render
+    (openings, takeoff, upload) can read the paper from the scan's own pixels (paper.paper_of_image -> paper_of_scan)."""
+    import json
+
+    side = Path(f"{png}.json")
+    want = {"scan_pdf": str(Path(pdf).resolve()), "zoom": zoom}
+    try:
+        if json.loads(side.read_text()) == want:
+            return
+    except (OSError, ValueError):
+        pass
+    try:
+        tmp = side.with_name(f".{side.name}.{os.getpid()}.tmp")
+        tmp.write_text(json.dumps(want))
+        os.replace(tmp, side)
+    except OSError:
+        pass
 
 
 def render_png(pdf: str, dpi: int = 0, max_side: int = 4500) -> tuple[str, float]:
@@ -189,6 +359,45 @@ def render_png(pdf: str, dpi: int = 0, max_side: int = 4500) -> tuple[str, float
     return str(dst), zoom
 
 
+_OCR_WORD = None
+
+
+def junk_ocr_layer(pg) -> bool:
+    """X1 c13: a scanner's OCR layer (INVISIBLE text, render mode 3, over the scan) that is mostly garbage ('./•',
+    '«Si,:,', 'k4:') passes every per-character check (ordinary letters and punctuation) and holds none of the printed
+    numbers; used as 'the PDF's own text' it stops our OCR and leaves the VLM nothing to cite (a 1940s Nordic scan PDF:
+    0 / 7 lengths). Junk = >= 80 % of the text is invisible and < 30 % of its words look like words or numbers (junk
+    layers 0.05-0.11; real sheet text 0.23-0.86; visible text is never judged)."""
+    import re
+
+    global _OCR_WORD
+    if _OCR_WORD is None:
+        _OCR_WORD = re.compile(r"^(?:[A-Za-zÄÖÅÜäöåüßÉéÈèÀà]{3,}|\d+(?:[.,]\d+)?(?:m2|m²|mm|cm|m)?|\d{1,3}(?:,\d{3})+|"
+                               r"[A-Z]{1,3}[-.]?\d{1,4}[A-Z]?)[.,:;]?$")
+    try:
+        tr = pg.get_texttrace()
+    except Exception:  # noqa: BLE001 - an old PyMuPDF: judge nothing
+        return False
+    if not tr or sum(1 for s in tr if s.get("type") == 3) < 0.8 * len(tr):
+        return False
+    if os.environ.get("STOA_JUNK_OCR", "1") == "all" and _scan_page(pg):
+        # X1 c13 (USDA 1966 plan, Internet Archive scan): a GOOD scanner OCR layer reads the prose but none of the plan's
+        # labels / dimensions; scanner OCR is made for prose, ours (tiled) for drawings -> any invisible layer on a scan
+        return True
+    words = [w[4] for w in pg.get_text("words")]
+    return len(words) >= 20 and sum(1 for w in words if _OCR_WORD.match(w)) < 0.3 * len(words)
+
+
+def _scan_page(pg) -> bool:
+    """One raster image covers >= 80 % of the page (a scanned sheet)."""
+    area = abs(pg.rect) or 1.0
+    try:
+        return any(abs(r & pg.rect) >= 0.8 * area for img in pg.get_images(full=True)
+                   for r in pg.get_image_rects(img[0]))
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def seed_text_layer(pdf: str, png: str, zoom: float, min_chars: int = 20) -> int:
     """Give the image readers the PDF's OWN words for a render of its page 0 (S0 16:48: Stoa's S-100F A1 sheet, read as
     an image at 135 dpi, made PP-OCR run 10+ min per question, 3 at once, on a page whose text layer was already
@@ -207,6 +416,8 @@ def seed_text_layer(pdf: str, png: str, zoom: float, min_chars: int = 20) -> int
         printable = sum(ch.isprintable() or ch in "\n\t" for ch in raw)
         if printable < 0.97 * len(raw):
             return 0
+        if os.environ.get("STOA_JUNK_OCR", "1") != "0" and junk_ocr_layer(pg):
+            return 0  # a scanner's junk OCR layer: our OCR reads the scan instead
         items = []
         for b in pg.get_text("dict").get("blocks", []):
             for ln in b.get("lines", []):
@@ -249,6 +460,7 @@ def shrink_image(src: str | Path, dst: str | Path, max_side: int = 6000) -> dict
         if max(W, H) <= max_side:
             return {"path": str(src), "factor": 1.0, "size": (W, H), "clean": None, "note": ""}
         f = max_side / max(W, H)
+        im, _ = eight_bit(im)  # P1 c15: a 16-bit grey scan; convert("RGB") below would clip its greys to white
         if im.mode in ("RGBA", "LA", "P"):  # transparent pixels -> white paper
             rgba = im.convert("RGBA")
             im2 = Image.new("RGBA", rgba.size, (255, 255, 255, 255))
@@ -400,13 +612,135 @@ def shrunk_copy(src: Path, side: int) -> tuple[str, float, str] | None:
             try:
                 tmpm = tmp_path(meta)
                 tmpm.write_text(json.dumps({"v": SHRINK_VERSION, "src_size": [W, H], "factor": r["factor"],
-                                            "note": r["note"], "clean": r["clean"], "flat": r.get("flat")}))
+                                            "note": r["note"], "clean": r["clean"], "flat": r.get("flat"),
+                                            "src": str(src)}))  # P1: full_resolution() finds the original
                 os.replace(tmpm, meta)
             except OSError:
                 pass
             return r["path"], r["factor"], r["note"]
         finally:
             fcntl.flock(lockf, fcntl.LOCK_UN)
+
+
+def _img_size(p: Path) -> tuple[int, int] | None:
+    from PIL import Image
+
+    Image.MAX_IMAGE_PIXELS = None
+    try:
+        with Image.open(p) as im:  # header only: no pixels decoded
+            return im.size
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def full_resolution(path: str | Path) -> tuple[str, float]:
+    """(original, k) for an image the readers see SHRUNK (captain 23:04, Ziying: door arcs on Stoa's 10,200 px AFCEC A-2
+    are a few px wide on the 6,000 px copy): k = original px per px of `path` (>= 1; a box in `path`'s px x k = the same
+    box on the original). Sources, in order: the cache copy's sidecar '<copy>.json' {"src"} (shrunk_copy), the copy
+    next to its original ('<stem>.s6000.png' <- '<stem>.png' / .jpg), the web upload's '<stem>.full<ext>' sibling (the
+    upload is shrunk in place; also one folder up for style-tagged copies), each checked against the PNG's
+    'stoa_src_size' tag when it has one and against the aspect ratio. Else (path, 1.0): the image is its own original.
+    Use it for COUNTING small symbols (doors, fixtures, tags) on a region (crop_full); keep `path` for overview reads."""
+    p = Path(path)
+    me = _img_size(p)
+    if me is None:
+        return str(p), 1.0
+    tag = None
+    try:
+        from PIL import Image
+
+        with Image.open(p) as im:
+            raw = str(im.info.get("stoa_src_size") or "")
+        if re.fullmatch(r"\d+x\d+", raw):
+            tag = tuple(int(v) for v in raw.split("x"))
+    except Exception:  # noqa: BLE001
+        pass
+    cands: list[Path] = []
+    try:
+        meta = p.with_name(p.name + ".json")
+        if meta.exists():
+            src = json.loads(meta.read_text()).get("src")
+            if src:
+                cands.append(Path(src))
+    except (OSError, ValueError, AttributeError):
+        pass
+    m = re.fullmatch(r"(.+)\.s\d{3,5}", p.stem)
+    if m:
+        cands += [p.with_name(m.group(1) + ext) for ext in (".png", ".jpg", ".jpeg", ".PNG", ".JPG", ".tif", ".tiff")]
+    for d in (p.parent, p.parent.parent):
+        cands.append(d / f"{p.stem}.full{p.suffix}")
+    for c in cands:
+        if c == p or not c.exists():
+            continue
+        sz = _img_size(c)
+        if not sz or max(sz) <= max(me):
+            continue
+        if tag and tuple(sz) != tag:
+            continue  # another file that happens to share the name
+        k = max(sz) / max(me)
+        if abs(sz[0] / sz[1] - me[0] / me[1]) > 0.01 * (me[0] / me[1]):  # not the same picture
+            continue
+        return str(c), round(k, 6)
+    return str(p), 1.0
+
+
+def crop_full(path: str | Path, box, pad: float = 0.0, max_side: int | None = None) -> dict:
+    """Crop `box` = (x0, y0, x1, y1) in `path`'s px (= the evidence space the web draws on) from the FULL-resolution
+    original, for counting small symbols on one region (a wing from stoa.sheet.keyplan.zone_for, a room, a quarter).
+    pad = extra margin in `path`'s px; max_side caps the crop (then k is smaller). The crop is cached in
+    $STOA_CACHE/crops/<hash of the original>/'<stem>.crop-<x0>-<y0>-<x1>-<y1>-<k>.png' with the original's DPI tag.
+    -> {"path": crop file, "k": crop px per `path` px, "offset": (x0, y0) in `path`'s px, "size": (w, h) crop px,
+        "full": the original, "note": one line for a trace}. A point (u, v) of the crop is (x0 + u / k, y0 + v / k) in
+    `path`'s px (to_path_px). With no larger original the crop is cut from `path` itself (k = 1, said in the note)."""
+    from PIL import Image
+
+    Image.MAX_IMAGE_PIXELS = None
+    full, k = full_resolution(path)
+    me = _img_size(Path(path)) or (0, 0)
+    a, b, c_, d = (float(v) for v in box)
+    x0, y0 = max(0.0, min(a, c_) - pad), max(0.0, min(b, d) - pad)
+    x1, y1 = max(a, c_) + pad, max(b, d) + pad
+    if me[0] and me[1]:
+        x1, y1 = min(float(me[0]), x1), min(float(me[1]), y1)
+    if x1 - x0 < 2 or y1 - y0 < 2:
+        raise ValueError(f"empty crop box {box!r} on a {me[0]}x{me[1]} image")
+    kk = k
+    if max_side and max(x1 - x0, y1 - y0) * k > max_side:
+        kk = max_side / max(x1 - x0, y1 - y0)
+    src = Path(full)
+    # never next to the upload: a file there is listed as another sheet of it (the web hides only known derived names)
+    cdir = Path(os.environ.get("STOA_CACHE", Path.home() / ".cache" / "stoa")) / "crops" / hashlib.sha1(
+        str(src.resolve()).encode()).hexdigest()[:12]
+    cdir.mkdir(parents=True, exist_ok=True)
+    out = cdir / f"{src.stem}.crop-{round(x0)}-{round(y0)}-{round(x1)}-{round(y1)}-{kk:.3f}.png"
+    with Image.open(src) as im:
+        dpi = im.info.get("dpi")
+        if not out.exists() or out.stat().st_mtime < src.stat().st_mtime:
+            c = im.crop((round(x0 * k), round(y0 * k), round(x1 * k), round(y1 * k)))
+            c, _ = eight_bit(c)  # P1 c15: a 16-bit grey original (the web's '.full.png'); convert("RGB") would clip it
+            if kk < k:
+                c = c.resize((max(1, round((x1 - x0) * kk)), max(1, round((y1 - y0) * kk))), Image.LANCZOS)
+            if c.mode not in ("RGB", "L", "RGBA", "LA", "1"):
+                c = c.convert("RGB")
+            tmp = tmp_path(out)
+            kw = {"dpi": (dpi[0] * kk / k, dpi[1] * kk / k)} if dpi and kk != k else ({"dpi": dpi} if dpi else {})
+            c.save(tmp, format="PNG", **kw)
+            os.replace(tmp, out)
+    with Image.open(out) as im:
+        size = im.size
+    note = (f"counted on a crop of the full-resolution original ({Path(full).name}, {kk:.2f} px per displayed px)"
+            if kk > 1.0 else "counted on a crop of the image itself (no larger original kept)")
+    return {"path": str(out), "k": kk, "offset": (x0, y0), "size": size, "full": full, "note": note}
+
+
+def to_path_px(crop: dict, pts):
+    """Points / boxes of a crop_full() crop back in the shrunk image's px: [(u, v), ...] or [(u0, v0, u1, v1), ...]."""
+    (x0, y0), k = crop["offset"], float(crop["k"]) or 1.0
+    out = []
+    for q in pts:
+        q = [float(v) for v in q]
+        out.append(tuple(round((x0 if i % 2 == 0 else y0) + v / k, 2) for i, v in enumerate(q)))
+    return out
 
 
 def carry_text_layers(src: Path, dst: Path, factor: float) -> list[str]:
@@ -497,7 +831,7 @@ def native_vector_pdf(path: str | Path, page: int = 0) -> bool:
     layer), False for a scan (an image over half the page, with or without an OCR text layer), for one of our traced
     copies of a picture (<stem>.vecN.pdf, producer stoa.formats.vectorize) and on any read error. Cheap (<= 0.1 s on
     Stoa's sheets), memoised by path + mtime. For callers deciding whether a hosted cross-check is worth paying for:
-    a located reading from a native vector page is its own evidence (P1 21:40, KNOWLEDGE)."""
+    a located reading from a native vector page is its own evidence (P1 21:25, KNOWLEDGE)."""
     p = str(path)
     if not p.lower().endswith(".pdf") or _TRACED_NAME.search(p):
         return False
@@ -518,6 +852,8 @@ def native_vector_pdf(path: str | Path, page: int = 0) -> bool:
                 area = abs(pg.rect) or 1.0
                 cover = max([abs(pymupdf.Rect(i["bbox"]) & pg.rect) / area for i in pg.get_image_info()] or [0.0])
                 stream = sum(len(d.xref_stream(x) or b"") for x in pg.get_contents())
+                if stream < NATIVE_MIN_STREAM:  # our paper / page copies draw the original page as a Form XObject
+                    stream += sum(len(d.xref_stream(x[0]) or b"") for x in pg.get_xobjects())
                 ok = cover < 0.5 and stream >= NATIVE_MIN_STREAM and len((pg.get_text() or "").strip()) >= 20
     except Exception:  # noqa: BLE001 — unreadable: not known to be native
         ok = False
@@ -621,18 +957,32 @@ def prepare(path: str, question: str = "") -> Prepared:
         elif ext in HEIC_EXT:
             prep.path, prep.kind = heic_to_jpg(src), "heic"
             prep.notes.append("HEIC photo converted to JPEG (turned upright) before reading")
-        elif ext in (".png", ".jpg", ".jpeg"):
+            try:  # F6 00:06: an iPhone photo of a printed sheet gets O1's deskew too (the web converts HEIC itself)
+                from stoa.solvers.raster.photo import prepare_hook
+
+                prepare_hook(prep, prep.path, _cache_dir(Path(prep.path)))
+            except ImportError:
+                pass
+        elif ext in (".png", ".jpg", ".jpeg") or (ext in PIC_EXT and os.environ.get("STOA_PICTURE_PNG", "1") != "0"):
+            img = str(src)
+            # P1 c15: TIFF / WebP / BMP / GIF (CLI / API path), 16-bit grey PNGs (any path: the web keeps a <= 6000 px
+            # PNG as uploaded) and transparent-background PNGs (CLI / API) -> an 8-bit PNG, same pixels, on white;
+            # kill switch STOA_PICTURE_PNG=0
+            if os.environ.get("STOA_PICTURE_PNG", "1") != "0" and (ext in PIC_EXT or (ext == ".png" and needs_picture_png(src))):
+                img, note = readable_picture(src)
+                prep.path, prep.kind = img, "picture"
+                prep.notes.append(note)
             side = int(os.environ.get("STOA_IMAGE_MAX_SIDE", str(IMAGE_MAX_SIDE)) or 0)
             try:  # O1 c7: a phone photo of a printed sheet -> the sheet, deskewed to its paper corners + evened light
                 from stoa.solvers.raster.photo import prepare_hook
 
-                photo = prepare_hook(prep, src, _cache_dir(Path(src)))
+                photo = prepare_hook(prep, img, _cache_dir(Path(img)))
             except ImportError:
                 photo = False
-            got = shrunk_copy(Path(src), side) if side > 0 and not photo else None
+            got = shrunk_copy(Path(img), side) if side > 0 and not photo else None
             if got:
                 prep.path, prep.img_scale, note = got
-                prep.kind = "shrink"
+                prep.kind = "shrink" if prep.kind == "as_is" else "picture+shrink"
                 prep.notes.append(note)
         elif ext == ".pdf":
             import pymupdf
@@ -671,12 +1021,14 @@ def prepare(path: str, question: str = "") -> Prepared:
                                   + ("; to ask about another sheet, name its number in the question (e.g. "
                                      f"'on sheet {(rel[0][1] if others and rel[0][1] else None) or ('S-101' if sid == 'A-101' else 'A-101')}')"
                                      if prep.pages >= 4 else ""))
+            scan_src = prep.path if prep.kind == "page" else str(src)
             try:
-                scan = scan_png(prep.path if prep.kind == "page" else str(src))
+                scan = scan_png(scan_src)
             except Exception:  # noqa: BLE001 — a failed scan check leaves the PDF to the PDF readers
                 scan = None
             if scan:  # a scanned print: the PDF readers see no text or paths; the image readers can read it
                 prep.path, prep.scan_zoom = scan
+                prep.scan_pdf = scan_src
                 prep.kind = "scan" if prep.kind == "as_is" else "page+scan"
                 prep.notes.append(f"scanned PDF (the page is one image, no text layer): read as an image at "
                                   f"{72 * prep.scan_zoom:.0f} dpi")
@@ -846,6 +1198,8 @@ def restore(ans, prep: Prepared):
                 if pts:
                     setattr(ev, attr, [[ox + x * k, oy + y * k] for x, y in pts])
         elif prep.kind == "dxf_roles":  # same drawing units, only layer names changed
+            ev.file = orig
+        elif prep.kind == "picture" and ev.bbox_space == "image_px":  # same pixel grid as the uploaded picture
             ev.file = orig
         # dwg / heic: evidence stays on the converted .dxf / .jpg, which a browser or CAD viewer can open
     ans.assumptions = [*prep.notes, *(a for a in ans.assumptions if a not in prep.notes)]

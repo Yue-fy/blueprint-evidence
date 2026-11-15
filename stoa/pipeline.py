@@ -704,6 +704,9 @@ _ROOM_GLOSS = [
                                                                                          "dining hall"),
     (r"turnhalle\w*|sporthalle\w*", "sports hall"), (r"lehrerzimmer\w*", "staff room"),
     (r"hauswirtschaftsraum\w*", "utility room"),
+    # X1 21:26 rp-091 'Hur många meter golvlist behövs på toaletten …?' -> prior 244.8 (no room named in English)
+    (r"toalett\w*|vessa\w*|k[äa]ym[äa]l[äa]\w*|toilette\w*|toiletten", "toilet"),
+    (r"keitti[öo]\w*|k[öo]ket|k[öo]k\b|k[üu]che\b", "kitchen"),
 ]
 _ROOM_GLOSS_RX = [(re.compile(rf"(?<![\w\"']){p}(?![\w\"'])", re.I), en) for p, en in _ROOM_GLOSS]
 
@@ -727,7 +730,8 @@ _OPENING_WORDS = {"door": r"ov(?:i|e)\w*|t[üu]r(?:en)?|d[öo]rr\w*|portes?|port
                   "window": r"ikkun\w*|fenster\w*|f[öo]nster\w*|fen[êe]tres?|finestr\w*|ventan\w*|raam\w*|vindu\w*"}
 _COUNT_FILLER = re.compile(
     r"\b(?:kuinka|monta|montako|onko|on|ovat|niitä|siinä|tässä|t[äa]ll[äa]|piirustuksessa|piirustuksella|kuvassa|"
-    r"tasossa|pohjassa|pohjapiirroksessa|kerroksessa|yhteens[äa]|kaikkiaan|kpl|wie|viele|gibt|es|im|in|der|dem|den|"
+    r"tasossa|pohjassa|pohjapiirroksessa|pohjapiirustuksessa|pohjapiirustuksella|kerroksessa|yhteens[äa]|kaikkiaan|kpl|"
+    r"wie|viele|gibt|es|im|in|der|dem|den|"
     r"die|das|plan|grundriss|zeichnung|auf|sind|hat|ist|insgesamt|hur|m[åa]nga|finns|det|p[åa]|ritningen|planen|"
     r"totalt|combien|de|d|y|a|il|dans|le|la|les|sur|dessin|sont|au|total|quant[ie]|ci|sono|nel|nella|disegno|pianta|"
     r"in totale|cu[áa]nt[oa]s|hay|en|el|plano|hoeveel|zijn|er|op|tekening|het)\b", re.I)
@@ -747,6 +751,18 @@ def _opening_count_english(question: str) -> str | None:
     kind = next((k for k, rx in _OPENING_WORDS.items() if re.search(rf"\b(?:{rx})\b", hinted, re.I)), None)
     if kind is None:
         return None
+    # X1 21:26 rp-093 'Montako ovea hallintomoduulissa (moduuli 02) on?' (PNG: vlm_lora 10, gold 9): a numbered
+    # module is kept as the scope ('… in module 02'); the module's name word ('hallintomoduulissa') goes with it
+    mm = re.search(r"\b(?:moduul\w*|modul\w*|module)\s*(\d{1,3})\b", hinted, re.I)
+    if mm and not gloss:
+        rest = re.sub(r"\(?\b\w*modu\w*\b(?:\s*\d{1,3})?\)?", " ", hinted, flags=re.I)
+        rest = re.sub(rf"\b(?:{_OPENING_WORDS[kind]})\b", " ", rest, flags=re.I)
+        rest = _COUNT_FILLER.sub(" ", rest)
+        if not re.search(r"[A-Za-zÀ-ÿ]{2,}|\d", rest) and re.search(
+                r"\b(?:kuinka monta|montako|wie viele|hur m[åa]nga|combien|quant[ie]|cu[áa]nt[oa]s|hoeveel|anzahl)\b",
+                question, re.I):
+            return f"How many {kind}s are in module {mm.group(1)}?"
+        return None
     rest = re.sub(r'"[^"]{2,40}"', " ", hinted)
     rest = re.sub(rf"\b(?:{_OPENING_WORDS[kind]})\b", " ", rest, flags=re.I)
     rest = _COUNT_FILLER.sub(" ", rest)
@@ -756,6 +772,247 @@ def _opening_count_english(question: str) -> str | None:
                      r"anzahl|lukum[äa][äa]r[äa])\b", question, re.I):
         return None
     return f"How many {kind}s are in the {gloss[0][1]}?" if gloss else f"How many {kind}s are there in the drawing?"
+
+
+# X1 21:26 rephrase probe (judges reword our right answers): keyword-only count questions. 'doors in module 02' parsed
+# as a TEXT question (raster 4 @0.30; 'How many doors does module 02 have?' = openings 9), 'dorm room count' never
+# reached stated_count ('48 DORMS'). Plural countable noun (+ 'count') + a scope phrase, no verb, <= 7 words.
+_TERSE_NOUN = (r"doors|windows|rooms|dorms|dorm rooms|dormitor(?:y rooms|ies)|bedrooms|bathrooms|toilets|wcs|offices|"
+               r"classrooms|stairs|stairways|staircases|lifts|elevators|columns|sinks|showers|urinals|gauges|valves|"
+               r"pumps|tanks|units|apartments|flats|parking spaces|spaces|openings|exits|fixtures")
+_TERSE_COUNT_Q = re.compile(rf"^\s*(?:(?:number|count|no\.?)\s+of\s+)?(?P<x>(?:[a-z][\w'-]*\s+){{0,2}}?(?:{_TERSE_NOUN}))"
+                            rf"(?:\s+count)?(?P<rest>\s+(?:(?:in|on|of|at|inside|within|for|per)\s+[^.?!]{{1,40}}|(?:module|level|floor|storey|wing|block|unit|room|zone|area)\s+[\w.-]{{1,8}}))?\s*[.?!]?\s*$",
+                            re.I)
+_TERSE_SINGULAR_COUNT = re.compile(r"^\s*(?P<x>(?:[a-z][\w'-]*\s+){0,2}?[a-z][\w'-]*?)\s+count(?P<rest>\s+(?:(?:in|on|of|at|"
+                                   r"inside|within|for)\s+[^.?!]{1,40}|(?:module|level|floor|storey|wing|block|unit|room|zone|"
+                                   r"area)\s+[\w.-]{1,8}))?\s*[.?!]?\s*$", re.I)
+_TERSE_STOP = re.compile(r"\b(?:how|what|which|where|when|why|who|is|are|does|do|did|can|could|should|would|will|list|"
+                         r"show|give|name|tell|find|measure|count|area|length|size|width|height|total|sum|percent|"
+                         r"ratio|m2|m²|sf|ft)\b", re.I)
+
+
+def _terse_count(question: str) -> str | None:
+    """'doors in module 02' -> 'How many doors are in module 02?'; 'dorm room count' -> 'How many dorm rooms are there?'
+    (English keyword questions only; anything with a verb, a question word or a quantity word stays as asked)."""
+    q = (question or "").strip()
+    if not q or len(q.split()) > 7 or "?" in q[:-1]:
+        return None
+    m = _TERSE_COUNT_Q.match(q)
+    if m and not _TERSE_STOP.search(m.group("x") or ""):
+        x, rest = m.group("x").strip(), (m.group("rest") or "").strip()
+        if not re.search(r"\bcount\b|^(?:number|no\.?)\s+of\b", q, re.I) and not rest:
+            return None  # a bare 'doors' / 'offices' is not a question
+        return _how_many(x, rest)
+    m = _TERSE_SINGULAR_COUNT.match(q)
+    if m and not _TERSE_STOP.search(m.group("x") or ""):
+        x, rest = m.group("x").strip(), (m.group("rest") or "").strip()
+        if re.fullmatch(r"[A-Z]{1,5}", x):
+            x += " tags"  # 'PG count' = the printed PG tags
+        elif not re.search(r"(?i)s$", x):
+            x += "s"
+        return _how_many(x, rest)
+    return None
+
+
+_TERSE_LENGTH = re.compile(r"^(?:the\s+)?(?P<x>[A-Za-z][\w' -]{1,40}?)\s+(?P<o>overall\s+|total\s+|clear\s+|internal\s+|"
+                           r"inside\s+|outside\s+|external\s+)?(?P<d>width|length|depth|perimeter)(?:\s+in\s+(?P<u>m|"
+                           r"metres|meters|mm|ft|feet))?\s*\??$|^(?P<d2>width|length|depth|perimeter)\s+of\s+(?:the\s+)?"
+                           r"(?P<x2>[A-Za-z][\w' -]{1,40}?)\s*\??$", re.I)
+_LENGTH_NOT = re.compile(r"\b(?:doors?|windows?|openings?|stairs?|staircases?|treads?|risers?|pipes?|ducts?|beams?|"
+                         r"columns?|skirting|baseboards?|average|different|largest|smallest|each|every)\b", re.I)
+
+
+def _terse_length(question: str) -> str | None:
+    """X1 22:22 rp-021: 'pump room overall width' -> intent 'text room' -> raster 15522 mm (the base 'How wide is the
+    pump room part (left) overall, according to the dimensions?' reads 12000 ✓). A keyword-only length of a ROOM /
+    part / building (<= 7 words, no verb) -> 'How wide is the pump room overall?'. Doors / windows / stairs / pipes stay
+    as asked (the dataset's 'door width' questions are schedule text answers)."""
+    q = (question or "").strip()
+    if not q or len(q.split()) > 7 or "?" in q[:-1] or _LENGTH_NOT.search(q):
+        return None
+    m = _TERSE_LENGTH.match(q)
+    if not m:
+        return None
+    x = (m.group("x") or m.group("x2") or "").strip()
+    d = (m.group("d") or m.group("d2") or "").lower()
+    if not x or re.match(r"(?i)(?:what|how|which|is|are|give|find|tell|show)\b", x):
+        return None
+    o = (m.group("o") or "").strip().lower()
+    over = " overall" if o in ("overall", "total") else f" ({o})" if o else ""
+    head = {"width": "How wide is", "length": "How long is", "depth": "How deep is"}.get(d)
+    unit = m.group("u")
+    tail = f" in {unit}" if unit else ""
+    if head:
+        return f"{head} the {x}{over}{tail}?"
+    return f"What is the perimeter of the {x}{tail}?"
+
+
+_SCHEDULE_Q = re.compile(r"(?i)\b(?:(?:listed|shown|scheduled|given|entered)\s+(?:in|on)\s+(?:the\s+)?(?:door|window)\s+"
+                         r"schedule|according to (?:the\s+)?(?:door|window)\s+schedule|(?:door|window)\s+schedule\s+"
+                         r"(?:lists?|shows?|has|contains?|gives?)|(?:rows?|entries|lines)\s+(?:in|of|on)\s+(?:the\s+)?"
+                         r"(?:door|window)\s+schedule|in\s+(?:the\s+)?(?:door|window)\s+schedule)\b")
+# a count WITH a condition on the row (fire rating, a note, a size, a type / material / hardware): not every row
+_SCHEDULE_ATTR = re.compile(r"(?i)\b(?:not|counting|excluding|except|cased|actual|other|apart|fire|rated|rating|note|notes|hardware|wide|width|high|height|tall|type|types|"
+                            r"material|metal|steel|wood|timber|aluminium|aluminum|glass|glazed|louvre?d?|louvered|"
+                            r"hollow|frame|finish|label|carry|carries|with|without|whose|which|that|exterior|interior|"
+                            r"double|pairs?|single|leaves|leaf|sliding|overhead|roll|coiling|automatic|access)\b")
+
+
+_COMMON_AREA = re.compile(r"\bcommon\s+areas?\b(?!\s+space)", re.I)
+
+
+# words a question uses for what drawings abbreviate (T1 22:42 / X1 rp-016: 'What's the footprint of the generator set
+# foundation?' -> raster 419 m² while 'How big is the genset foundation in plan?' -> slab_area 26.486 ✓: S-100F prints
+# 'GENSET'); only multi-word / unambiguous forms
+_DRAWING_WORDS = ((re.compile(r"(?i)\bgenerator[- ]sets?\b"), "genset", "'generator set' = GENSET on drawings"),
+                  (re.compile(r"(?i)\bair[- ]handling[- ]units?\b"), "AHU", "'air handling unit' = AHU on drawings"),
+                  # T3 01:33: 'How many doors does the secondary school have?' on one DfE level matched the 'Secondary
+                  # Classroom' labels (~21, rough guess; the plan holds 201); a school TYPE + 'school' names the whole
+                  # building, never a room label (STOA_G1_SCHOOL=0 turns it off)
+                  (re.compile(r"(?i)\b(?:the\s+|this\s+|our\s+)?(?:primary|secondary|special|sen|infant|junior|high|"
+                              r"middle|elementary|nursery|grammar|comprehensive|all[- ]through)\s+schools?(?:'s)?\b"
+                              if os.environ.get("STOA_G1_SCHOOL", "1") != "0" else r"(?!x)x"),
+                   lambda m: "the building's" if m.group(0).endswith("'s") else "the building",
+                   "'the … school' = the whole building on this plan, not its room labels"))
+
+
+def _drawing_words(question: str) -> tuple[str, str]:
+    q, said = question, []
+    for pat, rep, why in _DRAWING_WORDS:
+        if pat.search(q):
+            q = pat.sub(rep, q)
+            said.append(why)
+    return q, "; ".join(said)
+
+
+def _english_of(question: str, ans) -> str:
+    """The English wording the front end answered (its 'language front end: … "<English>"' trace line), else the
+    question: hooks that run after the solve (E1's area table) see the original words otherwise (rp-064-nordic: FI
+    '… (dormitory) on pohjoissiivessä?' -> prior 55.72 although the table row NORTH WING DORMITORY = 6,285 SF)."""
+    for t in getattr(ans, "trace", None) or []:
+        t = str(t)
+        if t.startswith("language front end:"):
+            m = re.search(r'"([^"]{6,300})"', t)
+            return m.group(1) if m else question
+    return question
+
+
+def _table_wording(question: str) -> str:
+    """The same question in the words E1's printed-area-table reader matches (X1 21:41 / 22:05 rp-071, AFCEC A-2 table
+    'COMMON SPACE 2,911 / COMMON SPACE CIRCULATION 1,240 / UTILITY 328 / TOTAL COMMON SPACE 4,479'): 'What's the total
+    common area on this floor, counting its circulation and utility rooms too?' -> pdf_text 2,911 @0.55 (one row) while
+    '… including its circulation and utility rooms' reads the TOTAL row 4,479 ✓. 'counting (its) X too' = 'including
+    its X'; 'common area' = the table's 'common space'; a keyword-only 'common space total incl circulation' gets its
+    area word. Only for that reader: the question shown and answered elsewhere is unchanged."""
+    q = question or ""
+    q2 = re.sub(r"(?i)\bcounting\s+(its|the|their)\b", r"including \1", q)
+    q2 = re.sub(r"(?i)\b(?:also\s+)?counting\b(?=\s+\w)", "including", q2)
+    q2 = re.sub(r"(?i)\s+(?:too|as well)(?=\s*[?.!]?\s*$)", "", q2)
+    q2 = _COMMON_AREA.sub("common space area", q2)
+    if not re.search(r"\b(?:area|square|sq|sf|m2|m²|ft2|ft²|how (?:big|large)|size|footage)\b", q2, re.I) and \
+            re.search(r"\b(?:space|total)\b", q2, re.I) and len(q2.split()) <= 8:
+        q2 = re.sub(r"\s*\??\s*$", " area?", q2, count=1)
+    return q2
+
+
+def _how_many(x: str, rest: str) -> str:
+    x = x if re.search(r"[A-Z]{2}", x) else x.lower()
+    if rest and not re.match(r"(?i)(?:in|on|at|inside|within|for|per)\b", rest):
+        rest = "in " + re.sub(r"(?i)^of\s+", "", rest)  # 'doors of the laundry' / 'door count module 02'
+    return f"How many {x} are {rest}?" if rest else f"How many {x} are there?"
+
+
+_PRINTED_TOTAL = re.compile(r"\b(?:GIFA|GIA|GEA|G\.I\.A\.?|GROSS(?:\s+(?:INTERNAL|EXTERNAL))?(?:\s+FLOOR)?\s+AREA|"
+                            r"TOTAL(?:\s+[A-Z]+){0,3})\b\W{0,6}(?:[A-Z]+\s+){0,3}[=:\-]?\s*\d[\d,]*(?:\.\d+)?\s*"
+                            r"(?:m2|m²|sq\.?\s?m|SF|S\.F\.|sq\.?\s?ft|ft2|ft²)\b", re.I)
+
+
+def _printed_total(path: str) -> str | None:
+    """A printed whole-floor total on the sheet ('GIFA 1,247 m²', 'TOTAL SECOND FLOOR = 26,562 SF') -> its line."""
+    try:
+        from stoa.data import abspath
+        from stoa.solvers.label_count import _image_lines, text_lines
+
+        p = str(abspath(path))
+        lines = text_lines(p, os.stat(p).st_mtime) if p.lower().endswith(".pdf") else (_image_lines(p) or ())
+    except Exception:  # noqa: BLE001
+        return None
+    for t, _bb in lines:
+        if _PRINTED_TOTAL.search(t) and not re.search(r"\b(?:site|plot|lot|roof)\b", t, re.I):
+            return t
+    # a printed area TABLE with its label and figure in separate cells (AFCEC A-2: 'TOTAL =' … '26,181 SF')
+    lab = next((t for t, _ in lines if re.fullmatch(r"\s*(?:SUB)?TOTAL\b[^0-9]{0,30}[=:]?\s*|\s*(?:GIFA|GIA|GEA|GROSS "
+                                                  r"(?:INTERNAL |EXTERNAL )?(?:FLOOR )?AREA)\b[^0-9]{0,20}", t, re.I)
+                and not re.search(r"\b(?:site|plot|lot|roof)\b", t, re.I)), None)
+    if lab and any(re.fullmatch(r"\s*\d[\d,]*(?:\.\d+)?\s*(?:SF|S\.F\.|m2|m²|sq\.?\s?m|sq\.?\s?ft)\s*", t, re.I)
+                   for t, _ in lines):
+        return lab
+    return None
+
+
+def _skirting_english(question: str) -> str | None:
+    """X1 21:26 rp-091: a non-English skirting question naming ONE glossary room ('Hur många meter golvlist behövs på
+    toaletten, dörröppningen borträknad?') -> 'How many metres of skirting does the toilet need …?'. R2's trigger keeps
+    covered languages untranslated once a target is found ('room'), so the readers never saw an English room name."""
+    from stoa.llm import lang_guess
+    from stoa.router.intent import _SKIRTING
+
+    if lang_guess(question) == "en" or not _SKIRTING.search(question):
+        return None
+    hinted, gloss = _room_gloss(question)
+    if len(gloss) != 1 or re.search(r"\d|\b(?:och|ja|und|et|e|y|en)\b", re.sub(r'"[^"]*"', " ", hinted), re.I):
+        return None
+    incl = re.search(r"\b(?:inklusive|mukaan lukien|einschlie(?:ß|ss)lich|inclu(?:s|ant)\w*)\b", question, re.I)
+    unit = "feet" if re.search(r"\b(?:fot|jalkaa|fu(?:ß|ss)|pieds?|feet)\b", question, re.I) else "metres"
+    tail = " (the room perimeter including the door openings)" if incl else " (room perimeter minus the door openings)"
+    return f"How many {unit} of skirting does the {gloss[0][1]} need{tail}?"
+
+
+_EN_ROOM_WORD = re.compile(r"\b(?:hall|room|office|kitchen|laundry|store|storage|toilet|wc|corridor|classroom|library|"
+                           r"dormitory|dormitories|dorm|"
+                           r"lobby|bedroom|bathroom|dining|studio|gym|foyer|reception|plant|staff|stairs?|stairwell|lift|"
+                           r"garage|closet|utility|entrance|vestibule|shower|changing|meeting|conference|break|common|"
+                           r"circulation|server|mechanical|electrical|janitor|porch|deck|balcony|terrace|living|family|"
+                           r"workshop|canteen|cafeteria|sauna|cellar|basement|attic|loft|nursery|therapy|sports)s?\b", re.I)
+_PAREN_EN = re.compile(r"\(\s*([A-Za-z][A-Za-z'-]+(?:[ -][A-Za-z][A-Za-z'-]*){0,3})\s*\)")
+# X1 22:05 rp-062-nordic 'Paljonko asuntolatilaa (dormitory) on yhteensä kaikissa kolmessa siivessä?': the total / every
+# wing words of the rest stay in the English question (a sum of the table's three DORMITORY rows, not one room)
+_TOTAL_WORDS = re.compile(r"yhteens|\bkaikki|\btotal|sammanlag|\bsamtliga|insgesamt|\bgesamt|\balle[ns]?\b|\bi alt\b|"
+                          r"\bsamlet|\btotaal|\bin totale|\btutt[ie]\b|\btous\b|\btoutes\b", re.I)
+_SIDE_WORDS_ML = (("north", r"pohjois|\bnorr|\bnord|\bnoord"), ("south", r"etel[äa]|\bs[öo]der|\bs[öo]dra|\bs[üu]d|\bsud\b|"
+                                                                    r"\bzuid|\bsyd"),
+                  ("east", r"\bit[äa]\w*siiv|\bit[äa]inen|\b[öo]st|\bost\b|\bostfl|\best\b|\boost"),
+                  ("west", r"l[äa]nsi|\bv[äa]st|\bwest|\bouest|\bovest|\bvest"))
+_WING_WORDS = re.compile(r"siiv|siipi|\bflygel|\bfl[üu]gel|\bvleugel|\bfl[øo]j|\bail(?:e|es)\b|\bal[ae]\b", re.I)
+
+
+def _paren_english_area(question: str) -> str | None:
+    """X1 21:36 (DfE PNG): 'Wie groß ist die Mehrzweckhalle (Multi-Purpose Hall)?' -> intent 'area unknown' -> raster
+    multiplied the scale bar's '10m x 20m' (200 m², gold 244.6; English 247.03). A non-English AREA question about ONE
+    room whose English name is given in parentheses -> 'What is the floor area of the Multi-Purpose Hall?'."""
+    from stoa.llm import lang_guess
+
+    if lang_guess(question) == "en":
+        return None
+    ms = list(_PAREN_EN.finditer(question))
+    if len(ms) != 1 or parse(question).task != "area" or not _EN_ROOM_WORD.search(ms[0].group(1)):
+        return None  # a Swiss label in parentheses ('(Bad)', '(Zimmer)') is the room's own name, not a translation
+    rest = question[:ms[0].start()] + " " + question[ms[0].end():]
+    if re.search(r"\d|\b(?:und|och|ja|et|e|y|en|and|plus|sowie|samt)\b|,", rest, re.I) or len(rest.split()) > 7:
+        return None
+    unit = (" in square feet" if re.search(r"ft²|\bft2\b|sq\.? ?ft|neli[öo]jalka|quadratfu|kvadratfot", question, re.I)
+            else "")
+    name = ms[0].group(1).strip()
+    side = next((en for en, pat in _SIDE_WORDS_ML if re.search(pat, rest, re.I)), None)
+    if _WING_WORDS.search(rest) and side:
+        # rp-064-nordic 'Kuinka monta neliöjalkaa asuntolahuoneita (dormitory) on pohjoissiivessä?' = the NORTH wing's
+        return f"What is the floor area of the {name} in the {side} wing{unit}?"
+    if _TOTAL_WORDS.search(rest):
+        wings = " across all wings" if _WING_WORDS.search(rest) else ""
+        return f"What is the total floor area of the {name}{wings}{unit}?"
+    if _WING_WORDS.search(rest):
+        return None  # a wing named some other way: the translator keeps it
+    return f"What is the floor area of the {name}{unit}?"
 
 
 def _ask_context(path: str, picked):
@@ -942,13 +1199,15 @@ def route(path: str, intent: Intent | None = None) -> list[str]:
     if ext == ".pdf" or ".pdf" in sib:
         if ".dxf" in sib:
             out.append("dxf")
-        if src == "opening_design" or (intent and intent.filters.get("sheet")):
-            out.append("schedule")
         if src == "unknown" and ext == ".pdf":
             # captain 19:15: Erin's piping reader (PR #14; tag families CV / FP / FSCV / FSI / FSR / PS / PG / MAV,
             # labelled line sizes, notes, connections, tagged spans at the printed scale) first on uploaded PDFs; its
-            # can_handle needs a piping word / tag in the question, so other questions skip it for free
+            # can_handle needs a piping word / tag in the question, so other questions skip it for free.
+            # G1 c12 (stoa-like sl-180): BEFORE schedule: 'On sheet M-101A, how many distinct FSCV-tagged components
+            # are shown?' named a sheet, so schedule's LLM table op ran first and its 2 @0.5 was accepted (piping 7 @0.98)
             out.append("piping")
+        if src == "opening_design" or (intent and intent.filters.get("sheet")):
+            out.append("schedule")
         if src == "unknown" and ext == ".pdf" and intent is not None and intent.task == "text":
             # G1 c5 (captain 16:15 piping): 'What does the 16" line connect to?' = the printed run callouts of that size
             # ('16" SS FROM OPERATING TANKS'); a regex check first, so other text questions cost nothing
@@ -1053,6 +1312,36 @@ _UNIT_KIND = {"count": "count", "m2": "area", "m²": "area", "ft2": "area", "sqf
               "ft3": "volume", "m": "length", "ft": "length", "mm": "length", "cm": "length"}
 
 
+def _wordy_quantity(question: str, ans: Answer | None) -> bool:
+    """A count / area / length / volume question answered with words only ('apartment A'): not an answer to it."""
+    if os.environ.get("STOA_G1_AGENT_TYPE", "1") == "0" or ans is None or not isinstance(ans.value, str):
+        return False
+    try:
+        from stoa.router.intent import infer_task
+
+        t = infer_task(question)[0]
+    except Exception:  # noqa: BLE001
+        return False
+    return t in ("count", "area", "volume", "length") and not re.search(r"\d", ans.value)
+
+
+def _living_mixup(question: str, ans: Answer) -> str | None:
+    """X1 01:05 / 01:16 (USDA 1966 farmhouse x1-183 / x1-195 / x1-181): US plans print 'Living area 960' = the DWELLING's
+    heated area. 'What is the floor area of the living room?' took that row (gold 174.42 = LIVING ROOM 15'-2" x 11'-6"),
+    and once the plan's own text is read the mirror case: 'the living area of this house' took the living ROOM."""
+    if os.environ.get("STOA_G1_LIVING", "1") == "0":
+        return None
+    said = " ".join(str(e.note or "") for e in ans.evidence or [])
+    q = question.lower()
+    if re.search(r"\bliving\s*room\b|\bliving-room\b", q) and re.search(r"(?i)\bliving\s+(?:area|space)\b", said) and \
+            not re.search(r"(?i)\bliving\s*room\b", said):
+        return "is the printed 'Living area' row (the dwelling's heated area), not the living room"
+    if re.search(r"\bliving\s+(?:area|space)\b", q) and re.search(r"\b(?:house|dwelling|home|flat|apartment|unit)\b", q) and \
+            re.search(r"(?i)\bliving\s*room\b", said) and not re.search(r"(?i)\bliving\s+(?:area|space)\b", said):
+        return "is the LIVING ROOM, but the question asks for the dwelling's living area"
+    return None
+
+
 def _fits(task: str, ans: Answer | None) -> bool:
     """A count question answered in m² (or an area question in m) is not an answer to it."""
     if ans is None or ans.value is None:
@@ -1096,6 +1385,9 @@ _YESNO_Q = re.compile(r"^\W*(?:does|do|is|are|was|were|can|could|has|have|will|w
                       r"\bja oder nein\b|\boui ou non\b", re.I)
 _HOWMANY_Q = re.compile(r"\bhow (?:many|much)\b|\bby how\b|\bwie viele?\b|\bkuinka mont|\bmontako\b|\bcombien\b|"
                         r"\bquant[ie]\b|\bhur många\b|\bhoeveel\b|\bmitu\b", re.I)
+_HOWMANY_ONLY = re.compile(r"\bhow many\b|\bkuinka mont|\bwie viele?\b|\bcombien\b|\bhur många\b|\bhoeveel\b", re.I)
+_NUM_WORD = re.compile(r"\b(?:none|no|zero|nil|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|dozen|"
+                       r"single|twenty|thirty|forty|fifty|hundred|ei yhtään|keine?)\b", re.I)
 _BARE_NUM = re.compile(r"^\s*-?\d+(?:[.,]\d+)?\s*$")
 _BARE_YN = re.compile(r"^\s*(?:yes|no|ja|nein|kyllä|ei|oui|non|sì|nej)\s*(?:$|[:(,;—–-])", re.I)
 SHAPE_CAP = 0.3
@@ -1125,6 +1417,11 @@ def _shape_guard(question: str, ans: Answer) -> Answer:
         if ranked and _WHICH_Q.search(question) and _SUPERLATIVE.search(question) and not _PLURAL_WHICH.search(question):
             return _shape_capped(ans, "the question asks for the ONE floor/room/sheet with the most/least; the answer "
                                       f"is a ranked list of {len(parts)}")
+        if _HOWMANY_ONLY.search(question) and not re.search(r"\d", v) and not _NUM_WORD.search(v) and \
+                not _YESNO_Q.search(question) and os.environ.get("STOA_G1_SHAPE", "1") != "0":
+            # X1 sl-329 (A-101F): 'How many fire extinguisher cabinets (F.E.C.) are shown on the plan?' -> pdf_text
+            # 'a / F.E.C.' @0.65: a count answered by words with no number in them
+            return _shape_capped(ans, f"the question asks how many; the answer '{_clip(v, 30)}' holds no number")
         return ans
     measured = num and str(ans.unit or "").lower() in ("m", "mm", "cm", "m2", "m²", "m3", "m³", "ft", "in")
     quoted = num and re.search(r"['‘’\"«„]" + re.escape(v.strip()) + r"['’\"»“]", question)
@@ -1170,7 +1467,76 @@ def _length_guard(question: str, ans: Answer) -> Answer:
     if L.WALL_Q.search(q) and "perimeter_m" in code:
         return _shape_capped(ans, "the question asks for wall lengths; the query summed room perimeters (inside "
                                   "faces of rooms, not walls)")
+    if isinstance(ans.value, str) and os.environ.get("STOA_G1_SHAPE", "1") != "0" and "\n" not in ans.value and \
+            len(ans.value) <= 48 and len(_DIM_TOKEN.findall(re.sub(r"\([^)]*\)|=.*$|≈.*$", " ", ans.value))) >= 2 and \
+            not re.search(r"\b(?:x|by|×|to|and|or)\b|×|[-–]\s*\d+(?:[.,]\d+)?\s*(?:mm|cm|m)\b", ans.value):
+        # X1 23:35 (c), wild sealed US Revit sheets: pdf_text '11 3/8" 2'-6" 6 5/8"' @0.65 = several dimensions read off
+        # a note line as ONE length
+        return _shape_capped(ans, f"the answer '{ans.value[:40]}' holds several dimensions, not one length")
     return ans
+
+
+_AXB_AREA_Q = re.compile(r"\b(?:area|footprint|square\s+(?:footage|feet|metres|meters)|sq\.?\s*(?:ft|m)|floor\s+space|"
+                         r"how\s+(?:big|large)|m²|m2|ft²|ft2)\b|m²|ft²", re.I)
+_AXB_SIDE_Q = re.compile(r"\b(?:dimensions?|measurements?|how\s+(?:long|wide|tall|high|deep|thick)|length|width|height|"
+                         r"depth|thickness|size\s+of\s+(?:the\s+)?(?:door|window|opening|pipe|duct|beam|column|bar))\b|"
+                         r"\b(?:door|window|opening|pipe|duct|beam|column|bar|panel|grille|louver|louvre|sign)s?\b", re.I)
+_AXB_FTIN = re.compile(r"^(\d+(?:\.\d+)?)\s*['’]\s*-?\s*(?:(\d+)(?:\s+(\d+)/(\d+))?\s*(?:\"|”|'')?)?$")
+_AXB_INCH = re.compile(r"^(\d+)(?:\s+(\d+)/(\d+))?\s*(?:\"|”|'')$")
+_AXB_METRIC = re.compile(r"^(\d+(?:[.,]\d+)?)\s*(mm|cm|m)$", re.I)
+_AXB_TIMES = r"\s*(?:×|\bx\b|\bX\b|\bby\b|\*)\s*"
+
+
+def _one_dim(s: str) -> tuple[float, str] | None:
+    """'42' - 0"' -> (42.0, 'ft'); '16' - 8"' -> (16.667, 'ft'); '12.80 m' -> (12.8, 'm'); '900 mm' -> (0.9, 'm')."""
+    s = re.sub(r"\s+", " ", s.strip())
+    if m := _AXB_FTIN.match(s):
+        inch = float(m.group(2) or 0) + (float(m.group(3)) / float(m.group(4)) if m.group(3) else 0.0)
+        return float(m.group(1)) + inch / 12.0, "ft"
+    if m := _AXB_INCH.match(s):
+        return (float(m.group(1)) + (float(m.group(2)) / float(m.group(3)) if m.group(2) else 0.0)) / 12.0, "ft"
+    if m := _AXB_METRIC.match(s):
+        return float(m.group(1).replace(",", ".")) * {"mm": 0.001, "cm": 0.01, "m": 1.0}[m.group(2).lower()], "m"
+    return None
+
+
+def _area_product(question: str, ans: Answer) -> Answer:
+    """X1 23:35 (a), wild sealed US Revit sheets (kind, no dev row): an AREA / footprint / 'how big' question answered by
+    the lengths reader with the unmultiplied string "42' - 0\" × 16' - 8\" (12.80 m × 5.08 m)" @0.65 (intent 'text
+    unknown'); the product 700 ft² was the answer. A two-dimension 'A × B' answer to an area wording (not a dimensions /
+    width / door-size wording) becomes A·B in the sheet's own unit (ft² for feet-inches, m² for metric), the printed
+    dimensions kept in the assumptions; a pair that does not parse keeps its value at <= SHAPE_CAP."""
+    if ans.value is None or isinstance(ans.value, bool) or not isinstance(ans.value, str) or \
+            os.environ.get("STOA_G1_AXB", "1") == "0":
+        return ans
+    v = ans.value.strip()
+    if "\n" in v or len(v) > 80 or not _AXB_AREA_Q.search(question) or _AXB_SIDE_Q.search(question):
+        return ans
+    head = re.sub(r"\([^)]*\)", " ", v).strip(" ;,.")
+    parts = re.split(_AXB_TIMES, head)
+    if len(parts) != 2:
+        return ans
+    a, b = _one_dim(parts[0]), _one_dim(parts[1])
+    if a is None and b is not None and b[1] == "m" and _num(parts[0]) is not None:  # '6000 x 4000 mm'
+        a = _one_dim(f"{parts[0].strip()} {re.search(r'(mm|cm|m)$', parts[1].strip(), re.I).group(1)}")
+    out = ans.model_copy(deep=True)
+    if a is None or b is None or a[1] != b[1]:
+        if float(ans.confidence or 0) > SHAPE_CAP and len(_DIM_TOKEN.findall(head)) == 2:
+            return _shape_capped(ans, f"the question asks for an area; the answer '{v[:40]}' is two dimensions")
+        return ans
+    unit = "ft2" if a[1] == "ft" else "m2"
+    area = round(a[0] * b[0], 2)
+    out.value = area
+    out.unit = unit
+    note = f"area = the printed {v[:60]} multiplied ({a[0]:.3g} × {b[0]:.3g} {a[1]})"
+    out.assumptions = [note, *[x for x in ans.assumptions if x != note]]
+    out.trace = [*ans.trace, f"area check: the question asks for an area; '{v[:50]}' is two dimensions -> {area} {unit}"]
+    return out
+
+
+# one printed dimension: feet-inch ('2'-6"', '6 5/8"'), metric with a unit ('2.40 m', '900 mm')
+_DIM_TOKEN =re.compile(r"\d+\s*'\s*-?\s*\d*(?:\s+\d+/\d+)?\s*\"?|\d+(?:\s+\d+/\d+)?\s*\"|\d+(?:[.,]\d+)?\s*(?:mm|cm|m)\b")
+_DOOR_SIZE = re.compile(r"(?i)\bwide\b[^;]{0,30}\bhigh\b|\b(?:min|max)\.?\s+high\b|\bdoor\s+(?:size|leaf|width)\b")
 
 
 _SUM_Q = re.compile(r"\b(?:combined|total|sum|together|altogether)\b.*\b(?:area|size|floor space)s?\b|"
@@ -1238,22 +1604,273 @@ _SKIRT_ALL = re.compile(r"\b(?:all|every|each|whole|entire|building|floor|storey
                         r"rooms|school|unit|wing)\b", re.I)
 
 
-def _skirting_which_room(question: str) -> Answer | None:
+# a whole-sheet scope the sheet's takeoff covers ('all rooms', 'this floor'); a wing / unit / named level is a part of it
+_SKIRT_SHEET = re.compile(r"\b(?:all|every|each|whole|entire|rooms?|floor|storey|story|building|everything|altogether|"
+                          r"overall|together|combined|in total)\b", re.I)
+
+
+def _takeoff_of(path: str):
+    """(takeoff status dict, summary dict) of the sheet's FINISHED takeoff (F2; content-keyed cache, never started here),
+    ('running' | 'none', None) otherwise. The pipeline may see the upload's shrunk copy or its original: both are tried."""
+    try:
+        from stoa.data import abspath
+        from stoa.features import takeoff as T
+    except Exception:  # noqa: BLE001 - the features package is not on this server
+        return "none", None
+    try:
+        a = Path(abspath(path))
+        cands = [a]
+        if ".s6000." in a.name:
+            cands.append(a.with_name(a.name.replace(".s6000.", ".")))
+        else:
+            cands.append(a.with_name(f"{a.stem}.s6000{a.suffix}"))
+        state = "none"
+        for c in cands:
+            if not c.is_file():
+                continue
+            key = T.job_key(str(c), 0)
+            d = T.cache_dir() / key
+            if (d / "result.json").exists():
+                st = T.status(key, None)
+                if st.get("status") == "done":
+                    summ = T.summary(st)
+                    if c != a and a.suffix.lower() != ".pdf":  # the takeoff ran on the other copy: its pixels -> ours
+                        from PIL import Image
+
+                        with Image.open(a) as im_a, Image.open(c) as im_c:
+                            summ = {**summ, "_px_k": im_a.width / max(1, im_c.width)}
+                    return st, summ
+            if d.exists():
+                state = "running"
+        return state, None
+    except Exception:  # noqa: BLE001 - a takeoff that cannot be read is no answer
+        return "none", None
+
+
+_FLOOR_AREA_Q = re.compile(r"^\W*(?:what(?:'s| is)|how (?:big|large|much)(?: is)?|give me|tell me)?\s*(?:the\s+)?"
+                           r"(?:total|whole|overall|net|entire|usable)?\s*(?:internal\s+)?floor\s*(?:area|space)\s*"
+                           r"(?:(?:on|of|in|for)\s+(?:this|the)\s+(?:plan|sheet|drawing|floor|level|storey|page))?\s*"
+                           r"(?:in\s+(?:m2|m²|square met(?:re|er)s))?\W*$", re.I)
+_ROOMS_Q = re.compile(r"^\W*how many rooms(?:\s+(?:are|is) (?:there|shown|drawn))?(?:\s+(?:on|in)\s+(?:this|the)\s+"
+                      r"(?:plan|floor|drawing|sheet|level|page))?(?:\s+(?:are|is) (?:there|shown|drawn))?\W*$", re.I)
+_LARGEST_Q = re.compile(r"\b(?:largest|biggest)\s+room\b", re.I)
+_NOT_A_ROOM_TYPES = ("circulation",)  # a corridor / lobby / stair is a space, not 'the largest room'
+
+
+def _takeoff_rows(st: dict, quantity: str = "area") -> list[dict]:
+    """The takeoff's measured room rows of one quantity (status ok, not sent to review, a real number)."""
+    return [r for r in st.get("rows") or [] if r.get("section") == "room" and r.get("quantity") == quantity
+            and r.get("status") == "ok" and not r.get("review") and isinstance(r.get("value"), (int, float))]
+
+
+def _row_evidence(path: str, r: dict, k: float, note: str) -> Evidence | None:
+    e = next((e for e in r.get("evidence") or [] if isinstance(e.get("bbox"), list) and len(e["bbox"]) == 4), None)
+    if e is None:
+        return None
+    poly = [[round(k * float(x), 1), round(k * float(y), 1)] for x, y in e.get("polygon") or []] or None
+    return Evidence(file=path, page=e.get("page"), bbox=[round(k * float(v), 1) for v in e["bbox"]],
+                    bbox_space=e.get("bbox_space") or ("pdf_pt" if str(path).lower().endswith(".pdf") else "image_px"),
+                    polygon=poly, note=note)
+
+
+GROSS_NET_CAP = 0.25
+
+
+def _gross_below_net(fa: Answer, path: str) -> Answer:
+    """Found on Stoa's DfE L00 PNG (d32 + G1 c14): 'What is the gross floor area of this floor?' = footprint 1,680.5 m²
+    (a traced outline, @0.50) while 'What is the total floor area?' = 1,717.16 m² net from the sheet's finished takeoff
+    (77 measured rooms): a gross area below the rooms inside it cannot be right, and the two cards contradict each other.
+    A TRACED outline smaller than the takeoff's net room sum keeps its value, but its confidence drops to GROSS_NET_CAP and
+    the card says the gross area is at least that sum (printed GIFA rows never come here)."""
+    if os.environ.get("STOA_G1_GROSS_NET", "1") == "0" or not isinstance(fa.value, (int, float)) or \
+            isinstance(fa.value, bool):
+        return fa
+    try:
+        st, summ = _takeoff_of(path)
+    except Exception:  # noqa: BLE001
+        return fa
+    a = (summ or {}).get("area") or {}
+    net = a.get("value")
+    if not isinstance(st, dict) or not isinstance(net, (int, float)) or a.get("estimate") or \
+            str(a.get("unit") or summ.get("unit") or "m2") != str(fa.unit or "m2") or float(fa.value) >= 0.98 * float(net):
+        return fa
+    n = int(((summ or {}).get("rooms") or {}).get("measured") or 0)
+    out = fa.model_copy(deep=True)
+    out.confidence = round(min(float(fa.confidence or 0), GROSS_NET_CAP), 3)
+    note = (f"this traced outline ({float(fa.value):,.0f} {fa.unit}) is smaller than the {n or 'measured'} rooms inside it "
+            f"add up to ({float(net):,.0f} {fa.unit} net, this sheet's takeoff): the outline misses part of the building, "
+            f"so the gross area is at least {float(net):,.0f} {fa.unit}")
+    out.missing = [note, *fa.missing]
+    out.trace = [*fa.trace, f"gross vs net check: outline {fa.value} < net room sum {net} -> confidence "
+                            f"{fa.confidence:.2f} -> {out.confidence:.2f}"]
+    return out
+
+
+def _takeoff_floor(question: str, path: str, task: str) -> Answer | None:
+    """UX M19 / F4 23:49 (captain 'one app, one number'): on Stoa's DfE L00 PNG 'What is the total floor area?' = 9,965 m²
+    @0.05 (agent), 'How many rooms are there?' = 7, 'How big is the largest room?' = 365.49 (a bounding box), while the
+    'This floor at a glance' card beside it shows the sheet's finished takeoff: 77 rooms, 1,717.2 m², the Multi-Purpose
+    Hall 247.73. When that takeoff is DONE (F2, content-keyed cache; never started here) and the sheet prints no total,
+    whole-floor questions answer from it: net floor area = the sum of the measured rooms (each outline marked), the
+    measured room count, the largest measured room. Gross / GIA wordings stay with the footprint reader."""
+    q = _english_of(question, None) if "_english_of" in globals() else question
+    if os.environ.get("STOA_G1_TAKEOFF", "1") == "0":  # kill switch (freeze): whole-floor + skirting takeoff answers
+        return None
+    kind = ("area" if task == "area" and _FLOOR_AREA_Q.match(q) and not re.search(r"\b(?:gross|gia|gifa|gea|external)\b",
+                                                                              q, re.I)
+            else "rooms" if task == "count" and _ROOMS_Q.match(q)
+            else "largest" if task == "area" and _LARGEST_Q.search(q) else None)
+    if kind is None:
+        return None
+    st, summ = _takeoff_of(path)
+    if not isinstance(st, dict) or not summ or summ.get("printed") or summ.get("printed_by_type"):
+        return None
+    try:
+        from stoa.features import takeoff as T
+
+        rtype = T.room_type
+    except Exception:  # noqa: BLE001
+        def rtype(_n):
+            return ""
+    k = float(summ.get("_px_k") or 1.0)
+    rows = _takeoff_rows(st, "area")
+    unit = summ.get("unit") or "m2"
+    rooms = summ.get("rooms") or {}
+    sc = (summ.get("scale") or {}).get("text") or ""
+    head = f"this sheet's finished takeoff (F2: {rooms.get('measured', len(rows))} of {rooms.get('labelled', '?')} room " \
+           f"labels measured{f', scale {sc}' if sc else ''})"
+    if kind == "largest":
+        cand = [r for r in rows if rtype(str(r.get("item") or "")) not in _NOT_A_ROOM_TYPES]
+        if not cand:
+            return None
+        r = max(cand, key=lambda r: float(r["value"]))
+        ev = _row_evidence(path, r, k, f"{r.get('item')}: {float(r['value']):.2f} {unit} (traced outline)")
+        return Answer(value=round(float(r["value"]), 2), unit=unit, confidence=round(min(0.6, float(r.get("confidence") or 0.5)), 2),
+                      solver="pipeline/takeoff", evidence=[ev] if ev else [],
+                      trace=[f"largest room: from {head}", f"largest of {len(cand)} measured rooms (corridors, lobbies "
+                             f"and stairs left out): {r.get('item')} {float(r['value']):.2f} {unit}"],
+                      assumptions=[f"room = {r.get('item')}, the largest of the {len(cand)} measured rooms of this sheet "
+                                   "(corridors, lobbies and stairs are not counted as rooms)",
+                                   *[a for a in r.get("assumptions") or [] if str(a).startswith("scale")][:1]])
+    if kind == "rooms":
+        n = int(rooms.get("measured") or 0)  # F2: labelled = measured + review (the card's room count)
+        lab = int(rooms.get("labelled") or 0)
+        if n <= 0:
+            return None
+        ev = [e for e in (_row_evidence(path, r, k, f"{r.get('item')} (room {i + 1})") for i, r in enumerate(rows)) if e]
+        return Answer(value=n, unit="count", confidence=0.5, solver="pipeline/takeoff", evidence=ev[:n] if len(ev) >= n else ev,
+                      trace=[f"room count: from {head}"],
+                      assumptions=[f"rooms = the {n} measured room outlines of this sheet (each marked); the sheet has "
+                                   f"{lab} room labels" + (f", {int(rooms.get('review') or 0)} to check by hand"
+                                                           if rooms.get("review") else "")])
+    a = summ.get("area") or {}
+    if not isinstance(a.get("value"), (int, float)) or a.get("estimate"):
+        return None
+    ids = set(a.get("ids") or [])
+    used = [r for r in rows if r.get("id") in ids] if ids else rows
+    ev = [e for e in (_row_evidence(path, r, k, f"{r.get('item')}: {float(r['value']):.2f} {unit}") for r in used) if e]
+    return Answer(value=round(float(a["value"]), 2), unit=a.get("unit") or unit,
+                  confidence=round(min(0.5, float(a.get("confidence") or 0.5)), 2), solver="pipeline/takeoff", evidence=ev,
+                  trace=[f"whole-floor area: from {head}", f"net floor area = the sum of {len(used)} measured rooms"],
+                  assumptions=[f"net floor area = the sum of the {len(used)} measured rooms of this sheet (inner wall "
+                               "faces); walls, shafts and unlabelled spaces are not in it, so the gross (GIA) is larger",
+                               *([f"not included: {int(rooms.get('review') or 0)} room(s) to check by hand"]
+                                 if rooms.get("review") else [])])
+
+
+def _skirting_takeoff(question: str, path: str, st: dict, summ: dict) -> Answer | None:
+    """captain 00:31 (AUDIT RECHECK-0026 (2)): 'How much skirting should we order?' on a sheet whose takeoff is done = F3's
+    order list from it (per room: inner outline minus door openings, + waste, stock lengths -> pieces), each room marked;
+    the clarify offers the order / net / every-room (the glance's) figures. Never a picture guess."""
+    try:
+        from stoa.features import orderlist as OL
+
+        ol = OL.build(st)
+        sk = ol["skirting"]
+        line = OL.answer_text(ol)
+    except Exception:  # noqa: BLE001
+        return None
+    lines = [x for x in sk.get("lines") or [] if isinstance(x.get("net_m"), (int, float))]
+    if not lines or not sk.get("total_with_waste_m"):
+        return None
+    ev = []
+    for x in lines:
+        bbs = [e.get("bbox") for e in x.get("evidence") or [] if isinstance(e.get("bbox"), list) and len(e["bbox"]) == 4]
+        if not bbs:
+            continue
+        e0 = (x.get("evidence") or [{}])[0]
+        k = float((summ or {}).get("_px_k") or 1.0)
+        box = [k * min(b[0] for b in bbs), k * min(b[1] for b in bbs), k * max(b[2] for b in bbs), k * max(b[3] for b in bbs)]
+        ev.append(Evidence(file=path, page=e0.get("page"), bbox=[round(float(v), 1) for v in box],
+                           bbox_space=e0.get("bbox_space") or ("pdf_pt" if str(path).lower().endswith(".pdf") else "image_px"),
+                           note=f"{x.get('room')}: {x['net_m']:.2f} m skirting (outline minus door openings)"))
+    o = ol.get("options") or {}
+    waste = o.get("skirting_waste_pct", 10)
+    every = (summ or {}).get("skirting") or {}
+    opts = [{"label": f"Order: net + {waste:g} % waste", "value": round(float(sk["total_with_waste_m"]), 2), "unit": "m",
+             "evidence": []},
+            {"label": f"Net installed length ({len(lines)} rooms)", "value": round(float(sk["total_net_m"]), 2), "unit": "m",
+             "evidence": []}]
+    if isinstance(every.get("value"), (int, float)) and not every.get("estimate") and \
+            abs(float(every["value"]) - float(sk["total_net_m"])) > 0.005 * float(sk["total_net_m"]):
+        opts.append({"label": f"Every measured room incl. wet rooms ({every.get('rooms') or '?'} rooms)",
+                     "value": round(float(every["value"]), 2), "unit": "m", "evidence": []})
+    excl = sk.get("excluded") or []
+    ans = Answer(value=round(float(sk["total_with_waste_m"]), 2), unit="m",
+                 confidence=round(min(0.5, float(sk.get("confidence") or 0.45)), 2), solver="pipeline/takeoff",
+                 evidence=ev,
+                 trace=["skirting: no single room named -> the order list of this sheet's finished takeoff (every room, "
+                        "F2 takeoff + F3 order list; no picture reading)", f"order list: {line}"],
+                 assumptions=[f"order = net skirting of {len(lines)} rooms (each room's inner outline minus its door "
+                              f"openings) + {waste:g} % waste: {line}",
+                              *([f"left out: {len(excl)} rooms that get no timber skirting (tiled wet rooms, stairs, "
+                                 f"lifts, plant rooms)"] if excl else []),
+                              *([f"not included: {len(sk['review'])} room(s) to check by hand (rough or missing reading)"]
+                                if sk.get("review") else []),
+                              "for one room: click it on the plan, or name it ('How much skirting for the Laundry?')"],
+                 missing=[f"{len(sk['review'])} room(s) to check by hand: "
+                          + ", ".join(str(r.get("room")) for r in sk["review"][:6])] if sk.get("review") else [])
+    try:
+        from stoa.agent.vision import set_clarify
+
+        ans = set_clarify(ans, {"ask": "Which figure do you need?",
+                                "why": "the order adds waste for cutting; wet rooms are usually tiled (no skirting)",
+                                "options": opts})
+    except Exception:  # noqa: BLE001
+        pass
+    return ans
+
+
+def _skirting_which_room(question: str, path: str = "") -> Answer | None:
     """QA 20:32 (4): 'How much skirting should we order?' (no room named, two-PNG upload) -> '≈ 1,000 m · read off a
-    picture'. Skirting is per room (installed length = the room's inner perimeter - its doorways): with no room and no
-    whole-floor scope in the question, ask which room (W5's clarify, click: room) instead of guessing a sheet-wide
-    figure. A room name, a click on the plan, or 'all rooms / the whole floor' goes on to the readers."""
-    if not _SKIRT.search(question) or _SKIRT_ALL.search(question):
+    picture'. Skirting is per room (installed length = the room's inner perimeter - its doorways): with no room named,
+    the sheet's finished takeoff answers for every room (captain 00:31: F3's order list, pieces + waste); without one,
+    ask which room (W5's clarify, click: room) instead of guessing a sheet-wide figure. A room name or a click on the
+    plan goes on to the readers; 'all rooms / the whole floor' too when no takeoff is done."""
+    if not _SKIRT.search(question):
         return None
     rest = _SKIRT_FILLER.sub(" ", _SKIRT.sub(" ", question))
-    if re.search(r"[A-Za-zÀ-ÿ]{2,}|\d", rest):
-        return None  # something names the room ('laundry', 'Room 1.04', 'Group Room')
+    whole = bool(_SKIRT_ALL.search(question))
+    named = bool(re.search(r"[A-Za-zÀ-ÿ]{2,}|\d", rest))
+    sheet_wide = not re.search(r"[A-Za-zÀ-ÿ]{2,}|\d", _SKIRT_SHEET.sub(" ", rest))  # nothing but 'all rooms' words left
+    if named and not (whole and sheet_wide):
+        return None  # something names the room ('laundry', 'Room 1.04', 'Group Room') or a part ('the north wing')
+    st, summ = _takeoff_of(path) if path and os.environ.get("STOA_G1_TAKEOFF", "1") != "0" else ("none", None)
+    if isinstance(st, dict):
+        tk = _skirting_takeoff(question, path, st, summ)
+        if tk is not None:
+            return tk
+    if whole:
+        return None  # 'skirting for all rooms' with no takeoff: the readers try
     ans = Answer(value=None, unit="m", confidence=0.0, solver="pipeline/clarify",
                  trace=["skirting: the question names no room (skirting is ordered per room: its inner perimeter minus "
                         "the doorways) -> asking which room"],
                  assumptions=["no room named: not guessing a whole-sheet length"],
                  missing=["which room: click it on the plan, or name it ('How much skirting for the Laundry?'); "
-                          "for every room ask 'skirting for all rooms'"])
+                          + ("every room: this sheet's takeoff is still running, ask again when 'This floor at a glance' "
+                             "shows the skirting" if st == "running" else
+                             "for every room ask 'skirting for all rooms' once 'This floor at a glance' has read the "
+                             "sheet")])
     try:
         from stoa.agent.vision import set_clarify
 
@@ -1269,6 +1886,135 @@ _DIM_OF = [("area", re.compile(r"^(?:m2|m²|sq\.? ?m|sqm|sf|s\.f\.|sq\.? ?ft\.?|
                                r"ha|cm2|cm²|mm2|mm²)$", re.I)),
            ("volume", re.compile(r"^(?:m3|m³|ft3|ft³|cu\.? ?ft|cf|cy|cubic (?:feet|metres?|meters?)|l|litres?|liters?)$", re.I)),
            ("length", re.compile(r"^(?:m|mm|cm|km|ft|feet|foot|in|inch(?:es)?|lf|lin\.? ?ft|'|\"|metres?|meters?)$", re.I))]
+
+
+# a deterministic reader that looked for the asked PART of the drawing and found it is not there (DR 23:07: AFCEC 'doors in
+# the south wing' on a T plan -> openings 'the building has no distinct south wing'; captain 23:04: never end a count on
+# a box-less picture-model guess)
+_SCOPE_ABSENT = re.compile(r"has no distinct \w+ wing|too small to be a wing|names neither a plan view nor a room label|"
+                           r"names no plan view|does not name a view or module", re.I)
+_GUESSERS = ("vlm_lora", "vlm_direct", "vlm_nvidia", "prior", "dummy")
+
+
+def _scope_absent(task: str, best: Answer | None, why: dict, trace: list) -> Answer | None:
+    """A count whose only reading is an unlocated picture-model / prior guess (< 0.3, no exact box) while a reader
+    reported that the asked scope is not on the sheet: the reader's finding is the answer (value None + the reason in
+    missing[0], the guess named as withheld, a clarify asking which part is meant), not the guess."""
+    if task != "count" or best is None or best.value is None or best.confidence >= 0.3:
+        return best
+    if (best.solver or "").split("/")[-1] not in _GUESSERS or any(getattr(e, "exact", False) for e in best.evidence):
+        return best
+    hit = next(((n, w) for n, w in why.items() if w and _SCOPE_ABSENT.search(w)), None)
+    if hit is None:
+        return best
+    name, reason = hit
+    out = best.model_copy(deep=True)
+    out.value, out.unit, out.confidence = None, "count", 0.0
+    # worded as the reader's finding: on a scan it can also miss a wing that is there (X1 sc-315: 'no distinct north wing')
+    out.missing = [f"not counted: the {name} reader did not find the part asked about ({reason})",
+                   f"an unlocated picture-model guess was {best.value} "
+                   f"(confidence {best.confidence:.2f}); it is not given as the answer", *best.missing]
+    out.clarify = {"ask": "Which part of the drawing do you mean? Click it or name it as the sheet labels it.",
+                   "why": reason[:200], "options": [], "click": "room"}
+    msg = f"scope check: {name} found the asked part is not on the sheet ({reason[:120]}) -> the {best.value} guess " \
+          f"({best.solver}, {best.confidence:.2f}, no boxes) is withheld"
+    trace.append(msg)
+    return out
+
+
+_TYPE_TAG_Q = re.compile(r"\btype\s+[A-Z]\b|\b(?:type|door|window)\s+tags?\b|\btagged\b|\bschedule\b")
+_COLD_TEXT = re.compile(r"has not been read yet|text layer (?:is )?not read yet|no text layer read yet", re.I)
+COLD_GUESS_CAP = 0.2
+
+
+def _cold_guess(task: str, best: Answer | None, why: dict, trace: list) -> Answer | None:
+    """captain 00:31 (AUDIT RECHECK-0026 (3), sl-036 DfE PNG cold batch): 'How many group rooms on level 00?' -> the
+    label counter stepped aside ('a large image whose text has not been read yet') and vlm_lora's UNLOCATED 12 @0.35
+    answered (gold 10, the labels' count). A count that only a box-less picture model gave while a label / text reader
+    is waiting for the sheet's text is shown as NOT COUNTED YET: the guess kept, confidence <= COLD_GUESS_CAP, and the
+    card says why and what to do (ask again once the sheet's text is read; the upload's warm-up reads it)."""
+    if task != "count" or best is None or best.value is None or best.confidence >= 0.5 or \
+            os.environ.get("STOA_G1_COLD_GUESS", "1") == "0":
+        return best
+    if (best.solver or "").split("/")[-1] not in _GUESSERS or _located(best):
+        return best
+    hit = next(((n, w) for n, w in why.items() if w and _COLD_TEXT.search(w)), None)
+    if hit is None:
+        return best
+    out = best.model_copy(deep=True)
+    out.confidence = round(min(float(best.confidence), COLD_GUESS_CAP), 3)
+    note = (f"not counted yet: the {hit[0]} reader counts the printed labels, but this sheet's text is not read yet "
+            f"(a large picture: its first reading takes a minute or more); {best.value} is a picture model's guess "
+            f"with nothing marked on the drawing: ask again in a minute")
+    out.assumptions = [note, *[a for a in best.assumptions if a != note]]
+    out.missing = [f"the {hit[0]} reader's count of the printed labels (the sheet's text is still unread)", *best.missing]
+    trace.append(f"cold-text check: {hit[0]} is waiting for the sheet's text -> {best.value} ({best.solver} "
+                 f"@{best.confidence:.2f}, no boxes) shown as 'not counted yet' @{out.confidence:.2f}")
+    return out
+
+
+_PRIVATE_SKIP = re.compile(r"private mode: the ([\w /-]+?) at \S+ is not on this server or our network", re.I)
+
+
+def _private_skip(best: Answer | None, why: dict, trace: list) -> Answer | None:
+    """H 01:30 (Ziying's AFCEC north-wing doors through the real web upload path, Private ON): openings refused the
+    detector (it forwards to the GPU twin = 'outside' in Private mode, by design) and abstained; vlm_lora's box-less 12
+    @0.09 answered with only 'located none of them; count by hand' — not WHY nothing was located. When a reader was
+    skipped because Private mode refused its service, the answer says so in missing (and the assumptions), so the user
+    knows the count / boxes are missing on purpose and what would restore them."""
+    if best is None or os.environ.get("STOA_G1_PRIVATE_WHY", "1") == "0":
+        return best
+    hit = next(((n, m.group(1)) for n, w in why.items() if w and (m := _PRIVATE_SKIP.search(w))), None)
+    if hit is None or (best.value is not None and _located(best) and (best.solver or "").split("/")[-1] not in
+                       _GUESSERS):
+        return best
+    out = best.model_copy(deep=True)
+    note = (f"the {hit[1]} was not used: Private mode keeps every step on this server, and the configured {hit[1]} "
+            f"runs on another machine (switch Private off, or run it on this server, to have it "
+            f"{'find and mark the items' if hit[0] in ('openings', 'door_detect') else 'read the drawing'})")
+    if note not in out.missing:
+        out.missing = [note, *out.missing]
+    trace.append(f"private-mode check: {hit[0]} skipped its {hit[1]} (Private mode) -> said so in missing")
+    return out
+
+
+_VETO_TEXT = re.compile(r"is the sheet's printed|is printed on this metric sheet as a bare number")
+
+
+def _vetoed_headline(ans: Answer) -> Answer:
+    """QA 22:55 round 17 (EFA scans, Gemini off; S0's warm scan_dev sc-063 / sc-083 / sc-084 the same): 'How big is the
+    Sports Hall?' 1274 m², 'Science Labs 1 to 5' 1274, 'the maths classrooms' 2388 = the sheet's printed 'Overall
+    GIFA' lines. _unit_guard's size check found that (conf -> 0.1) but the number stayed the headline. When the
+    escalation did not replace it (Gemini off / failed), a reading the size check matched to PRINTED text (a GIFA /
+    target line, a bare mm dimension) is withheld: value None, what was found in missing[0], a clarify that asks for
+    the room. (The 'larger than the sheet' check is an estimate from the paper size and is not withheld.)"""
+    if ans.value is None or isinstance(ans.value, bool) or not isinstance(ans.value, (int, float)) or \
+            float(ans.confidence or 0) > 0.1:
+        return ans
+    veto = next((str(t)[len("size check: "):] for t in reversed(ans.trace or []) if str(t).startswith("size check: ")),
+                None)
+    m = re.match(r"([\d.,]+)", veto or "")
+    if not veto or not _VETO_TEXT.search(veto) or not m:
+        return ans
+    try:
+        if abs(float(m.group(1).rstrip(".,").replace(",", "")) - float(ans.value)) > 1e-6:
+            return ans
+    except ValueError:
+        return ans
+    out = ans.model_copy(deep=True)
+    out.value, out.confidence = None, 0.0
+    out.evidence = []  # the rejected figure's box would read as 'the answer is here'
+    if hasattr(out, "support"):
+        out.support = None
+    shown = f"{ans.value:g} {ans.unit or ''}".strip()
+    out.missing = [f"not found: the only reading, {shown}, {veto.split(' ', 1)[1] if ' ' in veto else veto}; it is "
+                   "not given as the answer (click the room to measure it)", *[x for x in ans.missing if x != veto]]
+    if not out.clarify:
+        out.clarify = {"ask": "Our only reading failed a size check: which room do you mean?", "why": veto[:200],
+                       "options": [{"label": f"the sheet's printed figure (rejected: {veto[:60]})", "value": ans.value,
+                                    "unit": ans.unit, "evidence": [], "question": ""}], "click": "room"}
+    out.trace = [*out.trace, f"withheld: {shown} ({ans.solver}) failed the size check and no other reading replaced it"]
+    return out
 
 
 def _dimension_guard(question: str, ans: Answer) -> Answer:
@@ -1420,7 +2166,8 @@ def _unit_guard(question: str, ans: Answer, path: str, rec: dict | None) -> Answ
             out.missing = [*out.missing, why]
             return out
     if v is not None and v >= 50 and float(ans.confidence or 0) > 0.1 and parse(question).task == "area" and \
-            not _GROSS_Q.search(question) and str(path).lower().endswith((".pdf", *IMG_EXT)):
+            not _GROSS_Q.search(question) and not _whole_floor_q(question) and \
+            str(ans.solver or "") != "pipeline/footprint" and str(path).lower().endswith((".pdf", *IMG_EXT)):
         hit = _gross_line(path, v, question)
         if hit:
             # X1 18:15 (2) / 18:24: 'total floor area of all the rooms labelled Infants' -> 2190 = the sheet's 'Overall
@@ -1562,6 +2309,20 @@ def _room_range_parts(question: str):
 _GROSS_Q = re.compile(r"(?i)\b(?:gross|gifa|gia|nia|net internal|overall|whole|entire|building|storey|level|"
                       r"floor\b(?!\s*area)|bruttogrundfl|geschoss|kerrosala|bruttoala)")
 _GROSS_LINE = re.compile(r"(?i)\b(?:gifa|gia|nia|gross|overall|target|total|ground\s*:|first\s*:|second\s*:|bgf|brutto)")
+
+
+def _whole_floor_q(question: str) -> bool:
+    """VP 22:24: 'What is the total floor area on this plan?' asks for the gross total itself (VP's
+    is_gross_area_question; 8 right printed answers were cut to 0.1 by the 'not the asked room(s)' guard)."""
+    try:
+        from stoa.sheet.footprint import is_gross_area_question
+    except Exception:  # noqa: BLE001 — VP's module not on this branch: its question form, conservatively
+        return bool(re.search(r"(?i)\b(?:total|gross|overall|whole)\s+(?:internal\s+)?floor\s+area\s+(?:on|of)\s+"
+                              r"(?:this|the)\s+(?:plan|sheet|drawing|floor|level|storey|building)\b|\bGIFA\b|\bGIA\b", question))
+    try:
+        return bool(is_gross_area_question(question))
+    except Exception:  # noqa: BLE001
+        return False
 
 
 def _gross_line(path: str, v: float, question: str = "") -> str | None:
@@ -1976,7 +2737,7 @@ class Pipeline(BaseSolver):
         ctx = _ask_context(path, picked)
         pre = _scale_answer(path, question, _recognition(path, picked)) if _is_upload(path) and ctx is None else None
         if pre is None and ctx is None:
-            pre = _skirting_which_room(question)
+            pre = _skirting_which_room(question, path)
         if pre is not None:
             ans = pre
         else:
@@ -2007,6 +2768,7 @@ class Pipeline(BaseSolver):
         ans = _support.citation_guard(question, ans)
         ans = _parts_guard(question, _length_guard(question, _shape_guard(question, _dims_guard(question, ans, path))),
                            path)
+        ans = _area_product(question, ans)
         ans = _to_asked_unit(question, ans)
         ans = _facade_unresolved(question, ans)
         ans = _dimension_guard(question, ans)
@@ -2030,7 +2792,10 @@ class Pipeline(BaseSolver):
 
             with budget.question():
                 ans = escalate(self, path, question, ans, gemini=self.gemini, verify=self.verify)
-            ans = _length_guard(question, _shape_guard(question, _dims_guard(question, ans, path)))
+            ans = _area_product(question, _length_guard(question, _shape_guard(question, _dims_guard(question, ans,
+                                                                                                      path))))
+        if not defer:
+            ans = _vetoed_headline(ans)
         # E1: evidence for answers that still have none, and outlines, after every solver incl. G1's escalation
         if self.ev_text and ans.value is not None and not ans.evidence:
             try:
@@ -2055,13 +2820,14 @@ class Pipeline(BaseSolver):
         try:  # E1 (captain 16:15): a sheet that prints its own area table ('TOTAL WEST WING = 7,009 SF') answers from it
             from stoa.evidence.areatable import prefer_printed_table
 
-            ans = prefer_printed_table(path, question, ans)
+            ans = prefer_printed_table(path, _table_wording(_english_of(question, ans)), ans)
         except Exception:  # noqa: BLE001
             pass
         try:  # E1 (captain 16:15 (d)): 'area of the 150 mm slab with D13 @ 300' traced around its printed callout
             from stoa.evidence.slabs import prefer_slab_area
 
-            ans = prefer_slab_area(path, question, ans)
+            # T1 22:42: 'footprint of the genset foundation' = its plan area (E1's slab reader reads 'area' words)
+            ans = prefer_slab_area(path, re.sub(r"(?i)\bfootprint\b", "plan area", _english_of(question, ans)), ans)
         except Exception:  # noqa: BLE001
             pass
         try:  # E1: an area answered with a printed extent string ('9'-0" x 9'-11"') -> its product (D1 16:48)
@@ -2257,6 +3023,14 @@ class Pipeline(BaseSolver):
         return ans
 
     def _front_end(self, question: str) -> tuple[str, str | None, Cost | None]:
+        """Drawing-vocabulary synonyms first ('generator set' = the sheet's GENSET), then the rules / translation."""
+        syn, said = _drawing_words(question)
+        q, note, cost = self._front_end_core(syn)
+        if said and q == syn:
+            note = (note + "; " if note else "") + f"read as \"{syn}\" ({said})"
+        return q, note, cost
+
+    def _front_end_core(self, question: str) -> tuple[str, str | None, Cost | None]:
         """(question to answer, note for the trace/assumptions, translation cost). R2's measured trigger: translate
         only a non-English question the rule parser could not read (unknown language, no target, or a free-text
         task); keep the English only if ITS parse finds a target (lang4 CS/HU/TR/RO 38 -> 48/48; hard's 175
@@ -2264,6 +3038,18 @@ class Pipeline(BaseSolver):
         eng = _opening_count_english(question)
         if eng is not None:
             return eng, f"read by the rules as \"{eng}\" (a door / window count; no translation model)", None
+        sk = _skirting_english(question)
+        if sk is not None:
+            return sk, f"read by the rules as \"{sk}\" (a skirting question; room name from the glossary)", None
+        pe = _paren_english_area(question)
+        if pe is not None:
+            return pe, f"read by the rules as \"{pe}\" (the room's English name was given in parentheses)", None
+        tc = _terse_count(question)
+        if tc is not None:
+            return tc, f"read as \"{tc}\" (a keyword-only count question)", None
+        tl = _terse_length(question)
+        if tl is not None:
+            return tl, f"read as \"{tl}\" (a keyword-only length question)", None
         try:
             from stoa.llm import COVERED_LANGS, lang_guess, should_translate, to_english
 
@@ -2549,6 +3335,10 @@ class Pipeline(BaseSolver):
         except Exception as e:  # noqa: BLE001
             return None  # the template path still runs
         if ans.value is None:
+            return None
+        if _wordy_quantity(question, ans):
+            # H 01:1x (wild x1-025 scan JPG 'How many bedrooms does the largest apartment have?' -> 'apartment A' @0.009,
+            # the plan's 'which' sub-answer): a count / size question needs a number; the template path answers instead
             return None
         ans.trace = [f"general agent first: {why}"] + ans.trace
         ans.solver = "pipeline/agent"
@@ -2894,6 +3684,113 @@ class Pipeline(BaseSolver):
         fa.cost.wall_seconds = round(time.perf_counter() - t0, 4)
         return fa
 
+    def _schedule_count_first(self, path: str, question: str, intent, trace: list[str], t0: float) -> Answer | None:
+        """G1 c11 (X1 22:05, F8 21:42): 'How many doors are listed in the door schedule?' -> pdf_text 76 @0.6 (LLM-written
+        table code over a 76-row parse; gold 95) and 'According to the door schedule, how many doors does module 07
+        have?' -> vlm_lora 0 (gold 6). F8's stoa.features.xref.schedule_rows reads the schedule's row keys (one box per
+        row, text only, $0): count the rows of the asked kind, a module's rows by the key's module number ('7.04B' ->
+        module 7). Attribute filters ('fire-rated', 'note A', '3'-0\" wide') are left to the other readers."""
+        if intent.task != "count" or not _SCHEDULE_Q.search(question) or Path(path).suffix.lower() != ".pdf":
+            return None
+        kind = intent.target if intent.target in ("door", "window") else None
+        if kind is None or _SCHEDULE_ATTR.search(_SCHEDULE_Q.sub(" ", question)):
+            return None
+        try:
+            from stoa.solvers import openings as _op
+
+            if hasattr(_op, "door_schedule"):
+                # X1 22:49: DR's openings reads the whole set's DOOR SCHEDULE itself (exclusions 'not counting cased
+                # openings', attributes, modules; SFO sl-276 125 = gold where F8's row ids give 112): the cascade
+                # reaches it, so this F8 fallback steps aside
+                return None
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            from stoa.features.xref import schedule_rows
+        except Exception:  # noqa: BLE001 — F8's reader not on this branch
+            return None
+        page = 0
+        try:
+            rows = [r for r in schedule_rows(path, page) if r.get("kind") == kind]
+        except Exception as e:  # noqa: BLE001
+            trace.append(f"schedule rows: failed ({type(e).__name__}: {_clip(e, 80)})")
+            return None
+        if len(rows) < 3:
+            return None
+        mods = [int(m) for m in re.findall(r"(?i)\bmod(?:ule|uli|ul)?\.?\s*(?:no\.?\s*)?0*(\d{1,2})\b", question)]
+        named = re.search(r"(?i)\b(?:the\s+)?([a-z]+)\s+module\b|\bmodule\s+(?:of\s+)?(?:the\s+)?[a-z]", question)
+        if named and not mods:
+            return None  # a module named by its use only ('the support module'): its number is not in the question
+        def mod_of(key: str):
+            m = re.match(r"\s*0*(\d{1,2})[.-]", str(key))
+            return int(m.group(1)) if m else None
+        if mods:
+            if any(mod_of(r["key"]) is None for r in rows[: max(3, len(rows) // 2)]):
+                return None  # keys without a module prefix ('101A'): no module split on this schedule
+            pick = [r for r in rows if mod_of(r["key"]) in mods]
+            scope = " + ".join(f"module {m:02d}" for m in mods)
+        else:
+            pick, scope = rows, "the whole schedule"
+        tables = sorted({str(r.get("table") or "SCHEDULE") for r in rows})
+        ev = [Evidence(file=str(path), page=page, bbox=list(r["bbox"]), bbox_space="pdf_pt", exact=True,
+                       note=f"{r.get('table') or 'schedule'} row {r['key']}") for r in pick]
+        n = len(pick)
+        a = Answer(value=n, unit="count", confidence=0.85 if n else 0.5, evidence=ev, solver="pipeline/schedule_rows",
+                   assumptions=[f"Includes: every {kind} row of {', '.join(tables)} ({scope}; row keys "
+                                f"{', '.join(r['key'] for r in pick[:6])}{' …' if n > 6 else ''})",
+                                "counted from the printed schedule's rows (one per scheduled " + kind + "), not from "
+                                "the plan's symbols"],
+                   trace=trace + [f"schedule rows (F8 xref): {len(rows)} {kind} rows in {', '.join(tables)}; "
+                                  f"{scope}: {n}" + (f" (module = the number before the '.' of the key)" if mods else "")])
+        if mods and n == 0:
+            a.missing = [f"no {kind} row of {scope} in the schedule (modules listed: "
+                         f"{sorted({m for m in (mod_of(r['key']) for r in rows) if m is not None})})"]
+        a.cost.wall_seconds = round(time.perf_counter() - t0, 4)
+        return a
+
+    def _footprint_first(self, path: str, question: str, trace: list[str], t0: float) -> Answer | None:
+        """G1 c10 (T3 21:00 / F4 20:20 (b): 'What is the total floor area on this plan?' on the DfE GA plans = agent
+        guesses @0.05; VP 21:38 stoa.sheet.footprint): a WHOLE-FLOOR / gross area question -> VP's measured building
+        outline (GIA by default, GEA when asked; the outline polygon as evidence), unless the sheet PRINTS a total
+        (GIFA / TOTAL … m² / SF: the printed figure wins and the readers read it). Accepted from 0.35 (line-only CAD:
+        'estimate'); VP's doubtful outlines (< 0.35, with a clarify) go on to the other readers. $0, ~0.5 s."""
+        try:
+            from stoa.sheet.footprint import footprint_answer, is_gross_area_question
+        except Exception:  # noqa: BLE001 — VP's reader not on this branch
+            return None
+        try:
+            if not is_gross_area_question(question):
+                return None
+            fa = footprint_answer(path, question, 0)
+            # VP 22:06: footprint_answer reads the sheet's PRINTED gross rows itself and picks the floor the question
+            # means ('Overall GIFA / Ground: 1248m²', 'TOTAL SECOND FLOOR = 26,562 SF'), the outline as its check: that
+            # is the sheet's own number (EFA GF was 7.0 m² from pdf_text's 'Interview' tag behind the printed-total gate)
+            if fa is not None and fa.value is not None and str((fa.trace or [""])[0]).startswith("printed (VP)"):
+                if fa.confidence >= 0.6:
+                    fa.trace = trace + list(fa.trace)
+                    fa.solver = "pipeline/footprint"
+                    fa.cost.wall_seconds = round(time.perf_counter() - t0, 4)
+                    return fa
+                trace.append(f"footprint: printed {fa.value} {fa.unit} @{fa.confidence:.2f} (not the asked floor for "
+                             "sure): next reader")
+                return None
+            printed = _printed_total(path)
+            if printed:
+                trace.append(f"footprint: the sheet prints a total ('{_clip(printed, 60)}'): the printed figure is read "
+                             "instead of measuring the outline")
+                return None
+        except Exception as e:  # noqa: BLE001
+            trace.append(f"footprint: failed ({type(e).__name__}: {_clip(e, 80)})")
+            return None
+        if fa is None or fa.value is None or fa.confidence < 0.35:
+            if fa is not None and fa.value is not None:
+                trace.append(f"footprint: {fa.value} {fa.unit} @{fa.confidence:.2f} (doubtful outline): next reader")
+            return None
+        fa.trace = trace + list(fa.trace)
+        fa.solver = "pipeline/footprint"
+        fa.cost.wall_seconds = round(time.perf_counter() - t0, 4)
+        return _gross_below_net(fa, path)
+
     def _lengths_first(self, path: str, question: str, cands: list[str], trace: list[str], t0: float) -> Answer | None:
         """G1 (W5 13:13, Stoa: lengths are the 2nd most asked kind): room length / width / perimeter and the building's
         outer dimensions on a Swiss-style floor (DXF or its PDF alone), read from the outlines with the measured line
@@ -2960,12 +3857,25 @@ class Pipeline(BaseSolver):
         cands = route(path, intent)
         if not self.lora:
             cands = [c for c in cands if c != "vlm_lora"]
+        if os.environ.get("STOA_G1_TYPE_TAG_ROUTE", "1") != "0" and \
+                intent.task == "count" and intent.target in ("door", "window") and "raster" in cands and "vlm_lora" in cands \
+                and cands.index("raster") > cands.index("vlm_lora") and _TYPE_TAG_Q.search(question) and _is_upload(path):
+            # O1 23:47 (D1's hand-lettered WPA scan al0493: type A 11 / B 9 / G 4 / tagged 37, 5/5 in a no-LLM replay):
+            # raster's circled TYPE-tag counter + the sheet's own type schedule before the picture model (vlm_lora 10
+            # @0.11 answered first); it abstains for free without a printed schedule and ringed letters
+            cands.remove("raster")
+            cands.insert(cands.index("vlm_lora"), "raster")
+            trace.append("route: the question names a door / window TYPE (letter, tags, schedule) -> raster's type-tag "
+                         "counter before vlm_lora")
         pre = self._lengths_first(path, question, cands, trace, t0)
         if pre is not None:
             return pre
         fa = self._facade_first(path, question, intent, trace, t0)
         if fa is not None:
             return fa
+        sa = self._schedule_count_first(path, question, intent, trace, t0)
+        if sa is not None:
+            return sa
         if _is_upload(path) and Path(path).suffix.lower() in IMG_EXT:
             # G1 c7: Erin's piping reader on an image of a piping sheet (its tag families / sizes / notes from the
             # already-read text layer; abstains for free on non-piping questions or an unread layer)
@@ -2979,7 +3889,21 @@ class Pipeline(BaseSolver):
                 pa.solver = "pipeline/piping_img"
                 pa.cost.wall_seconds = round(time.perf_counter() - t0, 4)
                 return pa
+        if intent.task in ("area", "count") and _is_upload(path):
+            # UX M19 / F4: whole-floor questions from the sheet's finished takeoff (the card beside it shows the same)
+            try:
+                tk = _takeoff_floor(question, path, intent.task)
+            except Exception as e:  # noqa: BLE001
+                tk = None
+                trace.append(f"takeoff: failed ({type(e).__name__})")
+            if tk is not None:
+                tk.trace = trace + tk.trace
+                tk.cost.wall_seconds = round(time.perf_counter() - t0, 4)
+                return tk
         if intent.task == "area" and _is_upload(path):
+            fp = self._footprint_first(path, question, trace, t0)
+            if fp is not None:
+                return fp
             # G1 c7 (X1 19:33, real HABS scans): a room's size printed under its name ('LIVING ROOM' / 13'-5" x
             # 13'-6") IS its area (181.13 sq ft; d24 answered 14.44 m² from a picture reading @0.05); $0, text layer
             try:
@@ -2987,6 +3911,9 @@ class Pipeline(BaseSolver):
 
                 rs = room_size(path, question)
             except Exception:  # noqa: BLE001
+                rs = None
+            if rs is not None and rs.value is not None and _living_mixup(question, rs):
+                trace.append(f"room_size: {rs.value} {rs.unit} {_living_mixup(question, rs)}: next reader")
                 rs = None
             if rs is not None and rs.confidence >= 0.6:
                 rs.trace = trace + rs.trace
@@ -3011,6 +3938,7 @@ class Pipeline(BaseSolver):
         why = self._agent_reason(path, question, intent, cands) if allow_agent else None
         unsure = None  # a deterministic solver's own answer to the raw question that it was not sure of
         raw_abstained: set[str] = set()  # deterministic solvers that did not understand the question as asked
+        abstain_why: dict[str, str] = {}  # solver -> its abstain reason (a missing scope beats a picture guess)
         if self.raw_first and not known_template(question) and any(TIER.get(c) == "deterministic" for c in cands):
             # unseen wording on a file with a deterministic solver: ask it the question AS ASKED first (dxf / ifc
             # read translations and apply operators themselves, and flag what they could not apply with a low conf)
@@ -3128,6 +4056,7 @@ class Pipeline(BaseSolver):
             total = total.add(_cost_of(ans))
             if ans.value is None:
                 trace.append(f"{name}: abstained ({(ans.missing or ['?'])[0][:80]})")
+                abstain_why.setdefault(name, str((ans.missing or [""])[0]))
                 if any("not understood" in str(x) for x in [*ans.missing, *ans.trace[-2:]]):
                     not_understood.add(name)
                 if name in ("stated_count", "pipe_runs", "door_detect", "openings", "piping"):
@@ -3200,6 +4129,9 @@ class Pipeline(BaseSolver):
             best.solver = n_u
         if best is None:
             best = self._prior_answer(src, intent, trace, gate, question)
+        best = _scope_absent(intent.task, best, abstain_why, trace)
+        best = _cold_guess(intent.task, best, abstain_why, trace)
+        best = _private_skip(best, abstain_why, trace)
         if premise and best.value is not None and best.confidence > 0.3:
             # W2 05:02: "What's the area of room 6.09 (Cuisine)?" (6.09 is not the Cuisine) came back at 0.99 because
             # another path answered the room number alone; the rules' 'labelled X, not Y' must survive
@@ -3419,6 +4351,13 @@ class Pipeline(BaseSolver):
                 if any("not understood" in str(x) for x in [*a.missing, *a.trace[-2:]]):
                     abstained.add(name)
                 continue
+            if intent.task == "area" and _is_upload(path) and isinstance(a.value, str) and _DOOR_SIZE.search(a.value) \
+                    and os.environ.get("STOA_G1_SHAPE", "1") != "0":
+                # X1 23:35 (b): 'How big is <room>?' -> a DOOR-SCHEDULE row's size "2'-10" wide x 6'-8" MIN high" (the
+                # schedule's room column matched the room): a door size is never a room's area
+                trace.append(f"{name} (question as asked): '{str(a.value)[:40]}' is a door size, not the room's area: "
+                             "next reader")
+                continue
             if intent.task in ("area", "volume") and _is_upload(path) and _no_quantity(a):
                 # G1 c5 (X1 16:33, stoa-like sl-016): 'How big is the genset foundation in plan?' -> pdf_text 'SEE
                 # A1/S-513' @0.65 (a reference to another sheet, not an area): not an answer; the next reader measures
@@ -3429,6 +4368,10 @@ class Pipeline(BaseSolver):
                     and _room_number(a, path):
                 trace.append(f"{name} (question as asked): {a.value} is the ROOM NUMBER printed under the room's name, "
                              "not its area: next reader")
+                continue
+            if intent.task == "area" and _is_upload(path) and _living_mixup(question, a):
+                trace.append(f"{name} (question as asked): {a.value} {a.unit or ''} {_living_mixup(question, a)}: "
+                             "next reader")
                 continue
             if intent.task == "area" and _is_upload(path) and _own_number(question, a):
                 # H 17:10 / X1 16:33 (Stoa S-100F): 'What is the area of the 300 mm slab-on-grade?' -> pdf_text '300'
@@ -3591,6 +4534,21 @@ class Pipeline(BaseSolver):
             out = a_u.model_copy(deep=True)
             out.trace = [*ans.trace, f"cross-check: the agent's {_fmt_num(x)} {ans.unit or ''} is the number {n_u} read "
                                      f"printed as '{a_u.value}': the printed unit is kept"]
+            out.confidence = round(min(0.6, max(float(a_u.confidence or 0), float(ans.confidence or 0))), 3)
+            out.cost = ans.cost
+            out.solver = f"pipeline/{n_u}"
+            return out
+        _AREA_U = {"m2": "m2", "m²": "m2", "sqm": "m2", "ft2": "ft2", "ft²": "ft2", "sf": "ft2", "sq ft": "ft2"}
+        if intent.task in ("area", "length") and x is not None and y is not None and y > 0 and \
+                _AREA_U.get(u_a, u_a) != _AREA_U.get(u_s, u_s) and u_a and u_s and \
+                {_AREA_U.get(u_a, u_a), _AREA_U.get(u_s, u_s)} in ({"m2", "ft2"}, {"m", "ft"}) and \
+                abs(x - y) <= 0.02 * y and float(a_u.confidence or 0) >= 0.3:
+            # D1 22:24 (real HAER scan hi76c1): raster read the printed '128,878 SQ FT' @0.40; the agent's look() gave
+            # 128,778 m² (a digit slip AND the unit invented) and 'agreed' within 2 % on the bare numbers: the same
+            # number in another unit is the reader's printed reading copied, not a second source
+            out = a_u.model_copy(deep=True)
+            out.trace = [*ans.trace, f"cross-check: the agent's {_fmt_num(x)} {ans.unit or ''} is {n_u}'s printed "
+                                     f"{a_u.value} {a_u.unit or ''} in another unit: the reader's value and unit are kept"]
             out.confidence = round(min(0.6, max(float(a_u.confidence or 0), float(ans.confidence or 0))), 3)
             out.cost = ans.cost
             out.solver = f"pipeline/{n_u}"

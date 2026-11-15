@@ -300,6 +300,31 @@ def _bedroom_fallback(fm: FloorModel, t: qparse.Term, names: list[str]) -> tuple
     return names, None
 
 
+def _bath_fallback(fm: FloorModel, t: qparse.Term) -> tuple[list[Room], str | None]:
+    """Many Swiss plans print only a number + area in the bathroom, no 'Bad'/'Bain'/'Bagno' (PR 01:40: 339 of 4,560
+    rooms with a bathtub/shower/WC inside, on 125 of 1,040 floors; e.g. floor 9385 room 2.04). 'The bathroom' then
+    abstained and the VLM guessed another printed number ('4.92', the Reduit), and 'how many bathrooms' said 0 @0.69.
+    When no room in scope is labelled as a bathroom, read the UNNAMED rooms with a bathtub or shower drawn inside as
+    the bathrooms (WC-only rooms when there are none), and say so."""
+    if not t.note.startswith("concept bathroom"):
+        return [], None
+    from shapely.geometry import Point
+
+    def holding(kinds):
+        pts = [Point((it.bbox[0] + it.bbox[2]) / 2, (it.bbox[1] + it.bbox[3]) / 2)
+               for k in kinds for it in fm.items.get(k, [])]
+        return [r for r in fm.rooms if not r.name and not r.outdoor and not r.shaft and r.area >= 1.0
+                and (not t.scope or r.unit in t.scope) and any(r.poly.buffer(0.05).contains(p) for p in pts)]
+
+    rooms, what = holding(("bathtub", "shower")), "a bathtub or shower"
+    if not rooms:
+        rooms, what = holding(("toilet",)), "a WC"
+    if not rooms:
+        return [], None
+    return rooms, (f"no room is labelled as a bathroom (Bad/Bain/Bagno); read the {len(rooms)} unnamed room(s) with "
+                   f"{what} drawn inside as the bathroom(s): " + ", ".join(r.label() for r in rooms))
+
+
 def _in_scope(fm: FloorModel, kind: str, bbox, scope: list[str] | None) -> bool:
     """Is an object inside one of the scoped apartments? Fixtures: centre in the UNIT_OUTLINE; doors/windows sit
     in walls, so they count when they touch the outline buffered by 0.3 m (an entrance door counts for the flat)."""
@@ -374,6 +399,12 @@ def _eval_term(fm: FloorModel, t: qparse.Term, qr: qparse.Query) -> _Part:
         if t.scope:
             in_rooms = {id(tx): r for r in fm.rooms for tx in r.texts}
             texts = [tx for tx in texts if (r := in_rooms.get(id(tx))) is not None and r.unit in t.scope]
+        if not texts:
+            baths, bfb = _bath_fallback(fm, t)
+            if baths:
+                return _Part(len(baths), 0.5, [(r.bbox, _room_note(r)) for r in baths],
+                             [f"bathrooms by fixtures = {len(baths)}: {', '.join(r.label() for r in baths)}"],
+                             [f"{t.note}: labels {names}", bfb])
         boxes = []
         for tx in texts:
             room = next((r for r in fm.rooms if tx in r.texts), None)
@@ -439,6 +470,9 @@ def _eval_term(fm: FloorModel, t: qparse.Term, qr: qparse.Query) -> _Part:
         rooms = _rooms_with_name(fm, names)
         if t.scope:  # "the kitchen in apartment A"
             rooms = [r for r in rooms if r.unit in t.scope]
+        if not rooms:
+            rooms, bfb = _bath_fallback(fm, t)
+            fb = bfb or fb
         val = sum(r.net for r in rooms)
         asm = ["net floor area = sum of ROOM_OUTLINE polygon areas"] + ([f"{t.note}: labels {names}"] if t.note else [])
         if t.scope:

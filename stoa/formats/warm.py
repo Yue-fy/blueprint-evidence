@@ -15,7 +15,8 @@ PNG at 6000 px: the first question 158 s cold with tracing, later ones 3-9 s). A
 own text layer is read in milliseconds; one whose text is drawn as outlines gets its page render and that render's
 text layer (OCR) here, as the first question would. Multi-page PDFs need the question to pick a page; a
 SCANNED set (every page a picture, <= pages.SCAN_TEXT_PAGES) gets every page's text read here, for that pick.
-A question on the same file waits for a running warm (wait_for_warm, <= STOA_WARM_WAIT). Never raises.
+A question on the same file waits for a running warm (wait_for_warm, <= STOA_WARM_WAIT), but not for its trace:
+that runs after the lock (the question's own wait for it is STOA_TRACE_WAIT). Never raises.
 Run as a command it is PRIVATE (STOA_PRIVATE=1: no hosted model; STOA_WARM_HOSTED=1 to allow them).
 """
 
@@ -142,13 +143,37 @@ def _outlined(pdf: str, min_chars: int = 20) -> bool:
 
 
 def warm(path: str) -> dict:
+    # P1 00:40: the TRACE runs after the per-file lock is released. A question waits for warm (wait_for_warm, <= 240 s)
+    # and the trace used to sit inside it: Stoa-size scans trace 47-132 s at load, so the first question waited for the
+    # text layer + the whole trace + its own 30 s readers. Now it waits for the text layer only; upload._as_vector
+    # waits for the running trace up to STOA_TRACE_WAIT (traced_copy's own lock: still one trace per sheet).
+    t0 = time.perf_counter()
+    later: list = []
     with _held(path):
-        return _warm(path)
+        out = _warm(path, later)
+    for label, fn in later:
+        t1 = time.perf_counter()
+        try:
+            fn()
+            out["done"].append(f"{label}, {time.perf_counter() - t1:.1f} s)")
+        except Exception as e:  # noqa: BLE001 — warming is only a head start; the question traces it itself
+            out["error"] = out.get("error") or f"{type(e).__name__}: {e}"
+    out["seconds"] = round(time.perf_counter() - t0, 2)
+    return out
 
 
-def _warm(path: str) -> dict:
+def _warm(path: str, later: list | None = None) -> dict:
+    """The locked part of warm(); steps a question need not wait for go to `later` as (label, fn), run unlocked."""
     t0 = time.perf_counter()
     out: dict = {"path": str(path), "done": [], "error": ""}
+
+    def defer(label: str, fn) -> None:
+        if later is None:
+            t1 = time.perf_counter()
+            fn()
+            out["done"].append(f"{label}, {time.perf_counter() - t1:.1f} s)")
+        else:
+            later.append((label, fn))
     try:
         from stoa.formats.normalize import prepare
 
@@ -182,9 +207,18 @@ def _warm(path: str) -> dict:
 
                 hit = V.paper(prep.path) or paper_of_image(prep.path, [i.text for i in tl.items])
                 if hit:
-                    t1 = time.perf_counter()
-                    V.traced_copy(prep.path, hit[0])
-                    out["done"].append(f"vector copy ({hit[1]} at {hit[0]:.0f} dpi, {time.perf_counter() - t1:.1f} s)")
+                    defer(f"vector copy ({hit[1]} at {hit[0]:.0f} dpi", lambda p=prep.path, d=hit[0]: V.traced_copy(p, d))
+            elif getattr(prep, "scan_zoom", 0) and getattr(prep, "scan_pdf", ""):
+                # P1 22:50: a scanned PDF page whose paper is known (its own pixels + printed size, its scale bar, or its
+                # page size): trace it now, so the first area / length question does not pay the trace (+60-70 s at load
+                # ~130 in the d29 scan A/B); upload.trace_paper = the same paper / dpi the question's _as_vector asks for
+                from stoa.formats import vectorize as V
+                from stoa.solvers.upload import trace_paper
+
+                hit, how = trace_paper(prep)
+                if hit:
+                    defer(f"vector copy of the scan ({hit[1]} at {hit[0]:.0f} dpi {how}",
+                          lambda p=prep.path, d=hit[0]: V.traced_copy(p, d))
         elif Path(prep.path).suffix.lower() == ".pdf" and prep.kind in ("as_is", "paper") and _outlined(prep.path):
             # captain 18:21 (7): a one-page sheet whose text is drawn as outlines has no words for the readers; the
             # first question renders the page and OCRs it on CPU (D1's AW-29: 1,148 s at load ~200). Do that render and

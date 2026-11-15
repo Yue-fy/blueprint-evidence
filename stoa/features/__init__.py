@@ -27,10 +27,14 @@ FEATURES: list[str] = [
     "xref",  # F8 cross-references: clickable callouts / sheet references, answers follow them
     "project",  # T3 uploaded project loop: sheets -> one project, levels, building scope, review list
     "privacy",  # T2 privacy: storage note + Delete my files (audit 19:51 fix #3)
+    "orderlist",  # F3 order list (captain 21:51): skirting pieces, doors by size, floor covering, from F2's takeoff
+    "report",  # F8 measurement report: one answer -> print-ready A4 page (crop, formula, scale, sign-off)
+    "checklist",  # F6 check list: takeoff rows + answers ranked by risk, unresolved rows out of the totals
+    "conventions",  # F4 convention switch on the takeoff sheet (web only; reads F2's takeoff, needs 'takeoff')
 ]
 
 # Features that live only in web/src/features (no backend router): reported as "web-only", never as an error.
-WEB_ONLY: set[str] = {"batch"}
+WEB_ONLY: set[str] = {"batch", "conventions"}
 
 # name -> "mounted" | "off" | "web-only" | "<error text>"; filled by include_feature_routers, served at GET /feat
 STATUS: dict[str, str] = {}

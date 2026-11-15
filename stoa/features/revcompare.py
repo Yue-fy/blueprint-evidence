@@ -46,6 +46,7 @@ RENDER_LONG = 3600  # px on the long side of the diff raster (A3 vector: ~3 px p
 SMALL_LONG = 1600  # px for feature matching / ECC
 RASTER_R = int(os.environ.get("STOA_F5_R", "3"))  # pixel tolerance on scans / photos (+ alignment residual)
 GHOST_PAPER = os.environ.get("STOA_F5_GHOST_PAPER", "p90")  # 'median' = cycle 1's paper level (eroded median)
+SPECK = float(os.environ.get("STOA_F5_SPECK", "0.0035"))  # scans: a mark of only dots this small (x sheet side) = dust
 GHOST = float(os.environ.get("STOA_F5_GHOST", "0.25"))  # share of a mark's contrast that still counts as "there" (scans)
 CACHE_DIR = Path(os.environ.get("STOA_FEAT_CACHE", Path(tempfile.gettempdir()) / "stoa-feat")) / FEATURE
 UPLOADS = Path(os.environ.get("STOA_UPLOADS", Path(tempfile.gettempdir()) / "stoa-uploads"))
@@ -76,7 +77,7 @@ def load_sheet(path: str | Path, page: int = 0, long_px: int = RENDER_LONG) -> S
 
         with fitz.open(path) as doc:
             if not 0 <= page < len(doc):
-                raise ValueError(f"{Path(path).name} has {len(doc)} page(s); page {page} does not exist")
+                raise ValueError(f"{Path(path).name} has {_n(len(doc), 'page')}; page {page + 1} does not exist")
             pg = doc[page]
             pg.set_rotation(0)  # pdf_pt = the unrotated page (contract); alignment handles any rotation between sheets
             w, h = pg.rect.width, pg.rect.height
@@ -132,6 +133,8 @@ def best_page(a: Sheet, path_b: str) -> tuple[int, str | None]:
 
 # ------------------------------------------------------------------------------------------------ sets of sheets
 SET_MAX = int(os.environ.get("STOA_F5_SET_MAX", "40"))  # sheets read per side ('what changed in this issue')
+_PLAIN_DEC = re.compile(r"^\d{1,2}\.\d{2,3}$")
+_SHEET_WORD = re.compile(r"^(?:sheet|dwg|drawing|drg|no|nr|number|blatt|piirustus|ritning)[.:]?$", re.I)
 _SHEET_NO = re.compile(r"^(?:[A-Z]{1,3}[-.]?\d{2,4}(?:\.\d{1,3})?[A-Z]?|[A-Z]{1,3}[-.]\d{1,4}[A-Z]?|\d{1,2}(?:\.\d{2,3}){1,3})$")
 _BOILER = re.compile(r"\b(agency|ltd|limited|oy|oyj|ab|gmbh|inc|architects?|arkkitehd\w*|consult\w*|engineers?|designs?|"
                      r"company|client|project|drawn|checked|approved|scale|date|revision|rev|copyright|curriculum)\b|:$", re.I)
@@ -174,11 +177,81 @@ def _page_info(pg) -> dict:
             if sc > best:
                 title, best = txt, sc
     words = pg.get_text("words")
-    nos = [(y1 - y0, t) for x0, y0, x1, y1, t, *_ in words
-           if _SHEET_NO.match(t.strip()) and (x0 - ox) > 0.5 * w and (y0 - oy) > 0.55 * h]
+    # a revision code ('C01', 'P02': printed beside REV / REVISION) is not the sheet number: on Stoa's DfE sheets it
+    # was, so every sheet of a set shared 'C01' (+0.3 to every pairing) and the panel named sheets 'C01 ...'
+    revs = any(_REV_WORD.search(t) for *_, t, _b, _l, _n in words)
+    corner = [(y1 - y0, t.strip()) for x0, y0, x1, y1, t, *_ in words if (x0 - ox) > 0.5 * w and (y0 - oy) > 0.55 * h]
+    iso = [x for x in corner if _ISO_NO.match(x[1]) and re.search(r"\d", x[1])]  # 'SEN-DFE-XX-00-D-X-0201'
+    # a plain decimal ('2.02', '4.85', '18.00') is a room number, a detail callout or a value far more often than a sheet
+    # number (19 of 19 on the team's 232 sheet pages; a Swiss DXF sheet's '4.85'): only beside a 'Sheet' / 'Dwg' label
+    labelled = any(_SHEET_WORD.match(x[1]) for x in corner)
+    nos = iso or [x for x in corner if _SHEET_NO.match(x[1]) and not (revs and _REV_CODE.match(x[1]))
+                  and (labelled or not _PLAIN_DEC.match(x[1]))]
     toks = {_norm_tok(t) for *_, t, _b, _l, _n in words if len(_norm_tok(t)) >= 3}
-    return {"title": title, "sheet_no": max(nos)[1].strip() if nos else None, "tokens": toks,
+    return {"title": _nice_title(title), "sheet_no": max(nos)[1] if nos else None, "tokens": toks,
             "kind": "vector" if len(words) >= 8 else "raster"}
+
+
+_REV_WORD = re.compile(r"^rev(?:ision|s)?\b", re.I)
+_REV_CODE = re.compile(r"^(?:[PCAT]\d{2}(?:\.\d+)?|[A-Z])$")  # P01 preliminary, C01 contract ...; 'Rev C'
+_ISO_NO = re.compile(r"^[A-Z0-9]{2,8}(?:-[A-Z0-9]{1,8}){4,8}$")  # ISO 19650 / BS 1192 drawing number
+
+
+def _nice_title(t: str) -> str:
+    """'FIRST FLOOR PLAN' -> 'First Floor Plan' (shouting titles read badly in a sentence); mixed case stays."""
+    t = re.sub(r"\s+", " ", t or "").strip(" -–:·")
+    if t.isupper() and sum(c.isalpha() for c in t) >= 4:
+        t = " ".join(w if (len(w) <= 3 and any(c.isdigit() for c in w)) else w.capitalize() for w in t.split(" "))
+    return t[:70]
+
+
+def sheet_name(path: str | Path, page: int | None = 0, virtual: str | None = None) -> dict:
+    """What a person calls this sheet (UX NEW-11: the panel spoke in file names): the drawing title printed on it, its
+    sheet number and revision code from the title block. A picture is named from the upload's OCR text layer when the
+    warm-up has read it (never a cold read here), else from its file name ('source': 'file')."""
+    p = Path(path)
+    pg = int(page or 0)
+    out = {"title": None, "number": None, "revision": None, "source": "file",
+           "file": Path(virtual or str(p)).name}
+    try:
+        if p.suffix.lower() == ".pdf":
+            st = p.stat()
+            with _LOCK:
+                hit = _SHEETS.get((str(p), st.st_size, st.st_mtime_ns))
+            if hit is not None and pg < len(hit):  # the set's sheets were listed already (POST /sets)
+                info = hit[pg]
+            else:  # only this page (list_sheets reads up to 40: 3 s on a 9-page set, more on a 156-page one)
+                import fitz
+
+                with fitz.open(str(p)) as doc:
+                    info = _page_info(doc[pg]) if pg < len(doc) else None
+            if info:
+                out["title"], out["number"] = info["title"] or None, info["sheet_no"]
+            from stoa.features.takeoff import sheet_rev  # F2's reader: the ISO number + its revision code
+
+            num, rev = sheet_rev(str(p), pg)
+            out["number"], out["revision"] = num or out["number"], rev
+        elif p.suffix.lower() in IMAGE_EXT and OCR_AREAS:
+            from stoa.solvers.raster.sheet import cached_layer
+
+            layer = cached_layer(str(p))
+            if layer is not None:
+                from stoa.sheet.sets import classify  # VP's sheet reader (title block / view titles) on that layer
+
+                sh = classify(str(p), 0, layer)
+                out["title"], out["number"] = sh.title, sh.number
+    except Exception:  # noqa: BLE001 - a name is a nicety: never fail a compare over it
+        pass
+    if out["title"]:
+        out["title"], out["source"] = _nice_title(out["title"]), "sheet"
+    else:  # 'school-FF-rev-C.pdf' -> 'school FF rev C'
+        out["title"] = re.sub(r"[_\s]+", " ", Path(out["file"]).stem).strip() or out["file"]
+    return out
+
+
+def _n(k: int, word: str, many: str | None = None) -> str:
+    """'1 label', '3 labels', '2 door sets' (UX NEW-11: no 'label(s)')."""
+    return f"{k} {word if k == 1 else (many or word + 's')}"
 
 
 def list_sheets(path: str | Path, virtual: str | None = None) -> list[dict]:
@@ -284,7 +357,7 @@ def match_sets(a: list[tuple[str, str]], b: list[tuple[str, str]]) -> dict:
     pub = lambda xs: [{k: v for k, v in x.items() if k != "tokens"} for x in xs]  # noqa: E731
     only_a = [i for i in range(len(sa)) if i not in used_a]
     only_b = [j for j in range(len(sb)) if j not in used_b]
-    bits = [f"{len(pairs)} sheet(s) in both"]
+    bits = [f"{_n(len(pairs), 'sheet')} in both"]
     if only_b:
         bits.append(f"{len(only_b)} only in the new issue")
     if only_a:
@@ -358,8 +431,12 @@ class Alignment:
         if self.method == "none":
             return "could not be lined up"
         if self.method.startswith("text"):
-            unit = "pt" if a.space == "pdf_pt" else "px"
-            return f"by the words printed on both sheets (exact to {self.residual_px / a.zoom:.1f} {unit})"
+            r = self.residual_px / a.zoom  # in the sheet's own units (UX M11: '(exact to 0.0 pt)' was jargon)
+            if a.space != "pdf_pt":
+                return f"by the words printed on both sheets (they match to within {max(1, round(r))} px)"
+            mm = r * 25.4 / 72
+            return ("by the words printed on both sheets (they match exactly)" if mm < 0.05 else
+                    f"by the words printed on both sheets (they match to within {mm:.1f} mm on the paper)")
         lin = self.M[:2, :2]  # (render sizes differ by file type, so a scale here would mean nothing to a visitor)
         angle = math.degrees(math.atan2(lin[1, 0], lin[0, 0]))
         bits = []
@@ -431,10 +508,20 @@ def _fit(pb: np.ndarray, pa: np.ndarray, thr: float, homography: bool = False) -
             return None, 0, float("inf")
         M = np.vstack([A, [0, 0, 1]])
     mask = inl.ravel().astype(bool)
-    if mask.sum() == 0:
+    if mask.sum() == 0 or not _sane(M):
         return None, 0, float("inf")
     proj = cv2.perspectiveTransform(pb[mask].reshape(-1, 1, 2), M).reshape(-1, 2)
     return M, int(mask.sum()), float(np.median(np.linalg.norm(proj - pa[mask], axis=1)))
+
+
+def _sane(M: np.ndarray | None) -> bool:
+    """A usable B->A transform: finite, invertible, scale within 1/30..30 and a mild perspective. Two unrelated sheets
+    can give a RANSAC fit that squeezes every match onto one spot (AFCEC A-2 vs A-101: a singular matrix that crashed
+    the compare with LinAlgError)."""
+    if M is None or not np.all(np.isfinite(M)):
+        return False
+    d = abs(float(np.linalg.det(M[:2, :2])))
+    return 1e-3 < d < 1e3 and abs(float(np.linalg.det(M))) > 1e-9 and float(np.abs(M[2, :2]).max()) < 1e-2
 
 
 def _ecc(a: Sheet, b: Sheet, M: np.ndarray, homography: bool) -> np.ndarray | None:
@@ -444,6 +531,8 @@ def _ecc(a: Sheet, b: Sheet, M: np.ndarray, homography: bool) -> np.ndarray | No
     sa, fa = _small(a.gray, 1400)
     sb, fb = _small(b.gray, 1400)
     S_a, S_b = np.diag([fa, fa, 1.0]), np.diag([fb, fb, 1.0])
+    if not _sane(M):
+        return None
     Ms = S_a @ M @ np.linalg.inv(S_b)  # B small -> A small
     W = np.linalg.inv(Ms)  # ECC's warp maps template (A) coords -> input (B) coords
     W /= W[2, 2]
@@ -457,9 +546,13 @@ def _ecc(a: Sheet, b: Sheet, M: np.ndarray, homography: bool) -> np.ndarray | No
     except cv2.error:
         return None
     W2 = w if homography else np.vstack([w, [0, 0, 1]])
-    Ms2 = np.linalg.inv(W2.astype(np.float64))
+    try:
+        Ms2 = np.linalg.inv(W2.astype(np.float64))
+    except np.linalg.LinAlgError:
+        return None
     out = np.linalg.inv(S_a) @ Ms2 @ S_b
-    return out / out[2, 2]
+    out = out / out[2, 2]
+    return out if _sane(out) else None
 
 
 def warp_to(a: Sheet, b_img: np.ndarray, M: np.ndarray, fill: int = 255, nearest: bool = False) -> np.ndarray:
@@ -566,6 +659,16 @@ def _box_to_a(a: Sheet, b: Sheet, M: np.ndarray, box) -> tuple[float, float, flo
     return float(q[:, 0].min()), float(q[:, 1].min()), float(q[:, 0].max()), float(q[:, 1].max())
 
 
+# the footer web/server/normalize_upload.py prints on a sheet it draws from a lone DXF upload ('Sheet drawn from
+# flat-B.dxf at 1:100 on A3 (no original sheet uploaded)'): ours, not the drawing's; two revisions differ by file name
+_MADE_FOOTER = re.compile(r"^\s*sheet drawn from .+? at 1\s*:\s*\d+\b", re.I)
+
+
+def _line_key(t: str) -> str:
+    """A text line's identity for the change list: the made-sheet footer is one line whatever file it names."""
+    return "\x00made-sheet-footer" if _MADE_FOOTER.match(t) else _norm_tok(t)
+
+
 def text_changes(a: Sheet, b: Sheet, M: np.ndarray, tol_pt: float = 3.0) -> list[dict]:
     """Printed text LINES compared in A's native units: same text at the same place = unchanged (not listed); same
     text elsewhere = moved; lines that overlap but read differently = changed ('A: 62 m2' -> 'A: 55 m2'); the rest
@@ -577,7 +680,7 @@ def text_changes(a: Sheet, b: Sheet, M: np.ndarray, tol_pt: float = 3.0) -> list
     diag = math.hypot(*a.native)
     idx: dict[str, list[int]] = collections.defaultdict(list)
     for j, ln in enumerate(bl):
-        idx[_norm_tok(ln[4])].append(j)
+        idx[_line_key(ln[4])].append(j)
 
     def ctr(bx):
         return (bx[0] + bx[2]) / 2, (bx[1] + bx[3]) / 2
@@ -586,7 +689,7 @@ def text_changes(a: Sheet, b: Sheet, M: np.ndarray, tol_pt: float = 3.0) -> list
     lone_a: list[int] = []
     for i, ln in enumerate(a.lines):
         cx, cy = ctr(ln)
-        hit = next((j for j in idx.get(_norm_tok(ln[4]), []) if j not in used_b
+        hit = next((j for j in idx.get(_line_key(ln[4]), []) if j not in used_b
                     and abs(ctr(bl[j])[0] - cx) <= tol and abs(ctr(bl[j])[1] - cy) <= tol), None)
         if hit is None:
             lone_a.append(i)
@@ -607,7 +710,7 @@ def text_changes(a: Sheet, b: Sheet, M: np.ndarray, tol_pt: float = 3.0) -> list
     for i in lone_a:
         ln = a.lines[i]
         cx, cy = ctr(ln)
-        cands = [j for j in idx.get(_norm_tok(ln[4]), []) if j not in used_b]
+        cands = [j for j in idx.get(_line_key(ln[4]), []) if j not in used_b]
         j = min(cands, key=lambda j: math.dist(ctr(bl[j]), (cx, cy)), default=None)
         if j is not None and math.dist(ctr(bl[j]), (cx, cy)) <= 0.2 * diag:
             used_b.add(j)
@@ -631,7 +734,8 @@ def text_changes(a: Sheet, b: Sheet, M: np.ndarray, tol_pt: float = 3.0) -> list
     for j in lone_b:
         if j not in paired_b:
             out.append(row("added", None, j))
-    return out
+    # the made-sheet footer is never a change, even when the two sheets were drawn at different scales (moved)
+    return [t for t in out if not any(_MADE_FOOTER.match(t.get(k) or "") for k in ("old", "new"))]
 
 
 BLUR_MATCH = os.environ.get("STOA_F5_BLUR", "1") != "0"
@@ -731,6 +835,7 @@ def _label_like(t: str) -> bool:
 
 
 OCR_MIN_SCORE = float(os.environ.get("STOA_F5_OCR_SCORE", "0.8"))  # a reading below this is 'could not be read'
+SMALL_DIGITS_PX = float(os.environ.get("STOA_F5_SMALL_DIGITS", "16"))  # word box px: a number read from smaller text is a guess
 
 
 def _reading(r: tuple[str, float]) -> tuple[str, float]:
@@ -963,6 +1068,54 @@ def _short_misread(x: str, y: str, score: float) -> bool:
     return score < 0.95 or kind(nx) != kind(ny)
 
 
+_DICT: set[str] | None = None
+
+
+def _dictionary() -> set[str]:
+    """English words (the system word lists, lower case; empty when none is installed: the rule then stays off)."""
+    global _DICT
+    if _DICT is None:
+        words: set[str] = set()
+        for f in ("/usr/share/dict/british-english", "/usr/share/dict/american-english", "/usr/share/dict/words"):
+            try:
+                words.update(w.strip().lower() for w in open(f, encoding="utf-8", errors="ignore") if w.strip())
+            except OSError:
+                pass
+        _DICT = {re.sub(r"[^a-z]", "", w) for w in words}
+    return _DICT
+
+
+def _wordlike(t: str, vocab: dict[str, str]) -> bool:
+    """Every 3+-letter word of an OCR reading is a word: the sheets' own, a room word, English (plural too), or a short
+    acronym in capitals ('SWR'). 'Abom', 'Chetr', 'ine acicn' are OCR misreads of blurred labels, not renames
+    (F5 noise pairs: 6 of 8 false 'renamed label' rows on 16 PDF-vs-own-scan pairs)."""
+    import difflib
+
+    d = _dictionary()
+    if not d:
+        return True
+    for w in re.findall(r"[A-Z]?[a-z]+|[A-Z]+(?![a-z])", t):  # glued words split at a case change ('KitcheneWALL')
+        k = w.lower()
+        if len(k) < 3 or k in vocab or k in d or (k.endswith("s") and k[:-1] in d) or (w.isupper() and len(w) <= 4):
+            continue
+        if len(k) >= 5 and difflib.get_close_matches(k, vocab.keys(), n=1, cutoff=0.8):
+            continue  # a known word with a glyph or two misread ('Kitchene' for 'Kitchenette'): readable enough
+        return False
+    return True
+
+
+def _spillover(old: str, new: str, near: set[str]) -> bool:
+    """One reading is the other plus words printed right next to the label ('Music' -> 'Music 2' where the room number
+    '2' sits beside it): the OCR crop took in a neighbour, nothing was renamed."""
+    a, b = old.split(), new.split()
+    if len(a) > len(b):
+        a, b = b, a
+    if not a or a != b[:len(a)] and a != b[len(b) - len(a):]:
+        return False
+    extra = b[len(a):] if a == b[:len(a)] else b[:len(b) - len(a)]
+    return bool(extra) and all(re.sub(r"[^0-9a-z]", "", w.lower()) in near for w in extra)
+
+
 def _same_text(x: str, y: str) -> bool:
     """OCR noise is not a change: equal after normalising or up to glyphs OCR confuses, or the same digits and ≥ 75 %
     alike otherwise."""
@@ -1111,6 +1264,10 @@ def scan_text_changes(a: Sheet, b: Sheet, M: np.ndarray, slack: int) -> tuple[li
     vocab = {re.sub(r"[^a-z]", "", w.lower()): w for w in ROOM_WORDS}
     vocab.update({re.sub(r"[^a-z]", "", w[4].lower()): w[4].strip(".,;:()") for s_ in (a, b) for w in s_.words
                   if w[4].isalpha() and len(w[4]) >= 4})
+    # the vector sheet's printed words (all of them, single digits too) in A's frame: a reading's neighbours
+    vec_words = [(list(w[:4]), re.sub(r"[^0-9a-z]", "", w[4].lower())) for w in a.words] if a.words else \
+        [(list(_box_to_a(a, b, M, w[:4])), re.sub(r"[^0-9a-z]", "", w[4].lower())) for w in b.words]
+    vec_words = [x for x in vec_words if x[1]]
     unread = 0
     for (v, bx, ta, tb, pa, pb), (ia, ib) in zip(flagged, slots):
         ra = (ta, 1.0) if ta is not None else _reading((_snap(reads[ia][0], vocab), reads[ia][1]))
@@ -1134,6 +1291,23 @@ def scan_text_changes(a: Sheet, b: Sheet, M: np.ndarray, slack: int) -> tuple[li
         if old and new and _short_misread(old, new, min(ra[1] if ta is None else 1.0, rb[1] if tb is None else 1.0)):
             unread += 1  # '11' -> 'FI' on an unchanged sheet: OCR on a 2-glyph crop is not evidence of a rename
             continue
+        if old and new:
+            h = max(1e-6, min(bx[2] - bx[0], bx[3] - bx[1]))
+            near = {t_ for w, t_ in vec_words
+                    if w[0] < bx[2] + 3 * h and w[2] > bx[0] - 3 * h and w[1] < bx[3] + 3 * h and w[3] > bx[1] - 3 * h}
+            if _spillover(old, new, near):
+                px.append([x * a.zoom for x in bx])
+                continue
+        if (ta is None and old and not _wordlike(old, vocab)) or (tb is None and new and not _wordlike(new, vocab)):
+            unread += 1  # a reading that is no word at all: OCR could not read the blurred label
+            continue
+        if old and new and not re.search(r"[A-Za-z]", old + new):
+            nb = native_b(bx)
+            hb = min(nb[2] - nb[0], nb[3] - nb[1]) * (b.zoom if b.space == "pdf_pt" else 1.0)
+            shape = lambda t: re.sub(r"\d", "9", re.sub(r"\s", "", t))  # noqa: E731  '7,200' -> '9,999'
+            if hb < SMALL_DIGITS_PX and shape(old) != shape(new):
+                unread += 1  # '7,200' -> '2200' / '120' on 14-px text: a separator or digit lost = a misread
+                continue  # ('48' -> '55', '1965' -> '1972' keep their shape: real edits on small text stay)
         if not old or not new:  # one side read nothing: only a near-blank patch means the label is really gone
             blank = pa if not old else pb
             if float(blank.std()) > 12:
@@ -1145,7 +1319,7 @@ def scan_text_changes(a: Sheet, b: Sheet, M: np.ndarray, slack: int) -> tuple[li
                      "box_b": [round(x, 2) for x in native_b(bx)] if new else None,
                      "box_b_in_a": [round(x, 2) for x in bx], "source": "read from the scan by OCR", "ncc": round(v, 2)})
     if unread:
-        info["note"] = (info["note"] + "; " if info["note"] else "") + f"{unread} label(s) differ but could not be read"
+        info["note"] = (info["note"] + "; " if info["note"] else "") + f"{_n(unread, 'label')} differ but could not be read"
     if unread >= 10 and unread >= 0.8 * len(flagged):  # the copy is too coarse for its labels: say so, plainly
         hs = sorted(min(f_[1][2] - f_[1][0], f_[1][3] - f_[1][1]) for f_ in flagged)
         raster = b if a.kind == "vector" else a
@@ -1165,8 +1339,72 @@ def _iou(p, q) -> float:
     return i / u if u > 0 else 0.0
 
 
-_AREA_LINE = re.compile(r"^(?:(?:[A-Za-z]{1,4}|area|nia|gia)\s*[:=]\s*)?(?P<v>\d{1,3}(?:,\d{3})+|\d+(?:\.\d+)?)\s*"
-                        r"(?P<u>m2|m²|sq\.?\s?m|sqm|sf|s\.f\.|sq\.?\s?ft\.?|ft2|ft²)$", re.I)
+# 'A: 62 m2', '468 SF', and in brackets '(55.0 m2)' (DfE 2012 baseline designs print the area under the name that way)
+_AREA_LINE = re.compile(r"^[(\[]?\s*(?:(?:[A-Za-z]{1,4}|area|nia|gia)\s*[:=]\s*)?(?P<v>\d{1,3}(?:,\d{3})+|\d+(?:\.\d+)?)\s*"
+                        r"(?P<u>m2|m²|sq\.?\s?m|sqm|sf|s\.f\.|sq\.?\s?ft\.?|ft2|ft²)\s*[)\]]?$", re.I)
+
+
+def _upright_copy(path: str, page: int) -> tuple[str, np.ndarray] | None:
+    """A PDF page whose text mostly runs sideways or upside down (a sheet re-plotted turned 90 / 180 / 270 degrees):
+    a copy turned back upright (cached) and the 2x3 affine from the copy's points to the page's. None = upright.
+    Room-tag readers pair a name with the number BELOW it: on the DfE first floor turned 90 degrees they paired the
+    wrong ones and 31 of 32 rooms 'changed' (cost -EUR 835 instead of +EUR 380)."""
+    import cv2
+    import fitz
+
+    with fitz.open(path) as doc:
+        pg = doc[page]
+        if pg.rotation:  # a sheet stored with a /Rotate flag reads upright on screen: the readers handle it already
+            return None   # (70 of 197 dataset pages, e.g. the AFCEC dorm set; only content drawn turned is turned here)
+        dirs: collections.Counter = collections.Counter()
+        for blk in pg.get_text("dict").get("blocks", []):
+            for ln in blk.get("lines", []):
+                dx, dy = ln["dir"]
+                dirs[round(math.degrees(math.atan2(dy, dx)) / 90) % 4] += sum(len(sp["text"].strip()) for sp in ln["spans"])
+        k, n = dirs.most_common(1)[0] if dirs else (0, 0)
+        if k == 0 or n < 0.6 * sum(dirs.values()) or n < 40:
+            return None
+        st = os.stat(path)
+        key = hashlib.sha256(json.dumps([str(path), st.st_mtime_ns, st.st_size, page, 1]).encode()).hexdigest()[:16]
+        out_p = CACHE_DIR / "upright" / f"{key}.pdf"
+        if not out_p.exists():
+            out_p.parent.mkdir(parents=True, exist_ok=True)
+            for rot in (k * 90, 360 - k * 90):  # whichever turn brings the text upright
+                nd = fitz.open()
+                w, h = pg.rect.width, pg.rect.height
+                npg = nd.new_page(width=h if k % 2 else w, height=w if k % 2 else h)
+                npg.show_pdf_page(npg.rect, doc, page, rotate=rot)
+                d2: collections.Counter = collections.Counter()
+                for blk in npg.get_text("dict").get("blocks", []):
+                    for ln in blk.get("lines", []):
+                        dx, dy = ln["dir"]
+                        d2[round(math.degrees(math.atan2(dy, dx)) / 90) % 4] += 1
+                if d2 and d2.most_common(1)[0][0] == 0:
+                    tmp = out_p.with_suffix(".tmp.pdf")
+                    nd.save(str(tmp))
+                    os.replace(tmp, out_p)
+                    break
+            else:
+                return None
+        words_b = pg.get_text("words")
+    with fitz.open(str(out_p)) as nd:
+        words_u = nd[0].get_text("words")
+    cb = collections.Counter(w[4] for w in words_b)
+    cu = collections.Counter(w[4] for w in words_u)
+    pb = {w[4]: ((w[0] + w[2]) / 2, (w[1] + w[3]) / 2) for w in words_b if cb[w[4]] == 1 and len(w[4]) >= 3}
+    pu = {w[4]: ((w[0] + w[2]) / 2, (w[1] + w[3]) / 2) for w in words_u if cu[w[4]] == 1 and w[4] in pb}
+    if len(pu) < 6:
+        return None
+    src = np.float32([pu[t] for t in pu])
+    dst = np.float32([pb[t] for t in pu])
+    A, _ = cv2.estimateAffinePartial2D(src, dst, method=cv2.RANSAC, ransacReprojThreshold=2.0)
+    return (str(out_p), A) if A is not None else None
+
+
+def _map_box(A: np.ndarray, box) -> list[float]:
+    x0, y0, x1, y1 = box
+    pts = np.array([[x0, y0, 1], [x1, y0, 1], [x1, y1, 1], [x0, y1, 1]], float) @ A.T
+    return [float(pts[:, 0].min()), float(pts[:, 1].min()), float(pts[:, 0].max()), float(pts[:, 1].max())]
 
 
 def area_tags(s: Sheet) -> list[dict]:
@@ -1177,6 +1415,12 @@ def area_tags(s: Sheet) -> list[dict]:
         try:
             from stoa.solvers.area_tags import read_tags
 
+            up = _upright_copy(s.path, s.page or 0) if UPRIGHT else None
+            if up:  # a sheet re-plotted turned: read its tags upright, boxes back on the page
+                tags = read_tags(up[0], 0)
+                if len(tags) >= 3:
+                    return [{"name": t.get("name") or t.get("number") or "", "value": t["value"], "unit": t["unit"],
+                             "box": _map_box(up[1], t["bbox"]), "tag_box": _map_box(up[1], t["tag_bbox"])} for t in tags]
             tags = read_tags(s.path, s.page or 0)
             if len(tags) >= 3:
                 return [{"name": t.get("name") or t.get("number") or "", "value": t["value"], "unit": t["unit"],
@@ -1193,7 +1437,9 @@ def area_tags(s: Sheet) -> list[dict]:
         u = "ft2" if ul in ("sf", "sqft", "ft2", "ft²") else "m2"
         h = y1 - y0
         cx = (x0 + x1) / 2
-        above = [ln for ln in s.lines if 0 <= y0 - ln[3] <= 1.2 * h + 1 and ln[1] < y0
+        lo = -0.6 * h if s.space == "image_px" else 0.0  # OCR boxes of a scan overlap the line below by ~40 %
+        above = [ln for ln in s.lines if lo <= y0 - ln[3] <= 1.2 * h + 1 and ln[1] < y0
+                 and (ln[1] + ln[3]) / 2 < (y0 + y1) / 2 - 0.25 * h
                  and abs((ln[0] + ln[2]) / 2 - cx) <= max(x1 - x0, ln[2] - ln[0]) * 0.75
                  and not _AREA_LINE.match(ln[4].strip()) and sum(c.isalpha() for c in ln[4]) >= 2]
         name_ln = max(above, key=lambda ln: ln[3], default=None)
@@ -1204,13 +1450,126 @@ def area_tags(s: Sheet) -> list[dict]:
     return out
 
 
-def area_changes(a: Sheet, b: Sheet, M: np.ndarray) -> dict:
-    """Room tags compared by name (and place): per name the printed areas before / after, rooms added / removed."""
+OCR_AREAS = os.environ.get("STOA_F5_OCR_AREAS", "1") != "0"  # room tags on scans from the upload's OCR text layer
+LAYER_WAIT_S = float(os.environ.get("STOA_F5_LAYER_WAIT", "180"))  # a just-uploaded scan: its text layer may follow
+
+
+def layer_lines(s: Sheet) -> list[tuple] | None:
+    """A scan's printed lines from the text layer the upload warm-up read (stoa.formats.warm; memory or disk cache,
+    never a cold read here), in the sheet's own image px. Tiles overlap: an item mostly covered by an earlier one is
+    dropped ('Yf 5' under 'Yr 5' is one label). None = not read (yet)."""
+    if s.space != "image_px" or not OCR_AREAS:
+        return None
+    try:
+        from stoa.solvers.raster.sheet import cached_layer
+
+        layer = cached_layer(s.path)
+    except Exception:  # noqa: BLE001
+        return None
+    if layer is None:
+        return None
+    lw, lh = (layer.size or s.native)[:2]
+    fx, fy = s.native[0] / max(lw, 1), s.native[1] / max(lh, 1)  # a layer read on a resized copy
+    kept: list[tuple] = []
+    for it in layer.items:
+        t = re.sub(r"\s+", " ", it.text or "").strip()
+        if not t:
+            continue
+        if re.search(r"\d\s*(?:m2|m²|sqm)$", t, re.I):  # OCR'd area tags: 'A 55 m2', 'A.4 m2', 'A8m2' -> 'A: 55 m2'
+            t = re.sub(r"^([A-Za-z])\s*[.;,:]?\s*(?=\d)", r"\1: ", t)
+        b = (it.box[0] * fx, it.box[1] * fy, it.box[2] * fx, it.box[3] * fy)
+        ar = max((b[2] - b[0]) * (b[3] - b[1]), 1.0)
+        if any(max(0.0, min(b[2], k[2]) - max(b[0], k[0])) * max(0.0, min(b[3], k[3]) - max(b[1], k[1]))
+               > 0.5 * min(ar, max((k[2] - k[0]) * (k[3] - k[1]), 1.0)) for k in kept):
+            continue
+        kept.append((*b, t))
+    return kept
+
+
+class PatchTest:
+    """Is the printed text in this box (A native units) the same on both sheets, by their own pixels? The label check's
+    test (scan_text_changes), for one box at a time: True / False / None (could not be compared)."""
+
+    def __init__(self, a: Sheet, b: Sheet, M: np.ndarray, slack_px: float):
+        Da, Db = np.diag([a.zoom, a.zoom, 1.0]), np.diag([b.zoom, b.zoom, 1.0])
+        self.Gb = np.linalg.inv(Db) @ np.linalg.inv(M) @ Da
+        self.a, self.sa, self.sb, self.slack = a, _Src(a), _Src(b), slack_px / a.zoom
+
+    def __call__(self, bx, strict: bool = False) -> bool | None:
+        """strict: True only when clearly identical (correlation >= 0.9, largest glyph difference <= 0.2): at 4-8 pt
+        text on a 150-dpi scan one changed digit ('12' -> '10') scores 0.26 and an unchanged one 0.30, so the label
+        check's own threshold (0.3) cannot overrule an OCR reading."""
+        th = max(1e-6, min(bx[2] - bx[0], bx[3] - bx[1]))
+        sc = 28 / th
+        if max(bx[2] - bx[0], bx[3] - bx[1]) * sc > 1600:
+            sc = 1600 / max(bx[2] - bx[0], bx[3] - bx[1])
+        m = 0.3 * th
+        try:
+            pa = _local_patch(self.sa, np.eye(3), bx, sc, m)
+            pb = _local_patch(self.sb, self.Gb, bx, sc, m + self.slack)
+            got = None if pa is None or pb is None else _ncc(pa, pb, 0.06 * th * sc, glyph=max(5, round(0.6 * th * sc)))
+        except Exception:  # noqa: BLE001
+            return None
+        if got is None:
+            return None
+        if strict:
+            return got[0] >= 0.9 and got[1] <= 0.2
+        return not (got[0] < TEXT_NCC or got[1] > TEXT_DIFF)
+
+    def close(self) -> None:
+        self.sa.close()
+        self.sb.close()
+
+
+def _nkey(n: str) -> str:
+    return re.sub(r"[^0-9a-z]", "", n.lower())
+
+
+def _snap_name(n: str, known: list[str]) -> str:
+    """An OCR'd room name -> the other sheet's name it most likely is: equal letters / digits, or the same digits and
+    >= 2/3 alike ('Yf 5' -> 'Yr 5', 'Ofice' -> 'Office'); else unchanged (a new room keeps its own name)."""
+    import difflib
+
+    keys = {_nkey(x): x for x in known}
+    k = _nkey(n)
+    if k in keys:
+        return keys[k]
+    dig = re.sub(r"\D", "", k)
+    best = None
+    for kk, x in keys.items():
+        if re.sub(r"\D", "", kk) != dig or len(kk) < 2:
+            continue
+        r_ = difflib.SequenceMatcher(None, k, kk).ratio()
+        if r_ >= 0.66 and (best is None or r_ > best[0]):
+            best = (r_, x)
+    return best[1] if best else n
+
+
+def _number_same(a: Sheet, t: dict, same_fn) -> bool:
+    """The tag's number looks clearly identical on both sheets: its own printed word(s) on a vector A (the digits of
+    the value, inside the tag), else the whole tag line; every one must pass the strict pixel test."""
+    tb = t.get("tag_box") or t["box"]
+    digits = re.sub(r"\D", "", f"{t['value']:g}")
+    boxes = [list(w[:4]) for w in a.words if re.sub(r"\D", "", w[4]) == digits and digits
+             and w[0] >= tb[0] - 1 and w[2] <= tb[2] + 1 and w[1] >= tb[1] - 1 and w[3] <= tb[3] + 1]
+    return all(same_fn(bx, strict=True) is True for bx in (boxes or [tb]))
+
+
+def area_changes(a: Sheet, b: Sheet, M: np.ndarray, ocr: tuple[str, ...] = (), same_fn=None) -> dict:
+    """Room tags compared by name (and place): per name the printed areas before / after, rooms added / removed.
+    ocr: the sides ('a' / 'b') whose lines came from a scan's OCR layer: their room names are snapped to the other
+    sheet's names first, and a value that differs only by OCR is checked against the pixels (same_fn(tag box in A) is
+    True = the printed number looks the same on both sheets: OCR misread '80' as '60', not a change)."""
     ta, tb = area_tags(a), area_tags(b)
+    if "b" in ocr and ta:
+        tb = [{**t, "name": _snap_name(t["name"], [x["name"] for x in ta])} for t in tb]
+    if "a" in ocr and tb:
+        ta = [{**t, "name": _snap_name(t["name"], [x["name"] for x in tb])} for t in ta]
     if len(ta) < 2 and len(tb) < 2:
         return {"rooms": [], "by_name": [], "total": None}
     tbs = [(*_box_to_a(a, b, M, t["box"]), t) for t in tb]
     used: set[int] = set()
+    fixed = [0]  # OCR readings the pixels overruled
     rooms = []
     diag = math.hypot(*a.native)
     for t in ta:
@@ -1222,18 +1581,32 @@ def area_changes(a: Sheet, b: Sheet, M: np.ndarray) -> dict:
         if j is not None and math.dist(((tbs[j][0] + tbs[j][2]) / 2, (tbs[j][1] + tbs[j][3]) / 2), c) > 0.25 * diag:
             j = None
         if j is None:
+            if "b" in ocr and same_fn is not None and _number_same(a, t, same_fn):
+                # the OCR did not read this tag on the scan, but its pixels are clearly still there: not removed
+                rooms.append({"name": t["name"], "old": t["value"], "new": t["value"], "unit": t["unit"],
+                              "box_a": t["box"], "box_b": None, "kind": "same"})
+                fixed[0] += 1
+                continue
             rooms.append({"name": t["name"], "old": t["value"], "new": None, "unit": t["unit"], "box_a": t["box"],
                           "box_b": None, "kind": "removed"})
             continue
         used.add(j)
         tbj = tbs[j][4]
         kind = "same" if abs(tbj["value"] - t["value"]) < 1e-9 else "changed"
+        cb = ((tbs[j][0] + tbs[j][2]) / 2, (tbs[j][1] + tbs[j][3]) / 2)
+        in_place = math.dist(cb, c) <= 1.5 * max(t["box"][3] - t["box"][1], 1e-6)  # a moved tag: other pixels there
+        if kind == "changed" and ocr and in_place and same_fn is not None and _number_same(a, t, same_fn):
+            tbj = {**tbj, "value": t["value"]}  # the pixels say the number did not change
+            kind = "same"
+            fixed[0] += 1
         rooms.append({"name": t["name"], "old": t["value"], "new": tbj["value"], "unit": t["unit"],
-                      "box_a": t["box"], "box_b": tbj["box"], "kind": kind})
+                      "box_a": t["box"], "box_b": tbj["box"], "box_b_in_a": [round(v, 2) for v in tbs[j][:4]],
+                      "kind": kind})
     for j, x in enumerate(tbs):
         if j not in used:
             rooms.append({"name": x[4]["name"], "old": None, "new": x[4]["value"], "unit": x[4]["unit"],
-                          "box_a": None, "box_b": x[4]["box"], "kind": "added"})
+                          "box_a": None, "box_b": x[4]["box"], "box_b_in_a": [round(v, 2) for v in x[:4]],
+                          "kind": "added"})
     by: dict[tuple, dict] = {}
     for r_ in rooms:
         k = (r_["name"].lower(), r_["unit"])
@@ -1247,8 +1620,11 @@ def area_changes(a: Sheet, b: Sheet, M: np.ndarray) -> dict:
         so, sn = sum(d["old"]), sum(d["new"])
         if sorted(d["old"]) == sorted(d["new"]):
             continue
+        # the rooms of this name whose printed area changed in place (Swiss sheets: 13 rooms named 'Zimmer', one changed)
+        ch = [[r_["old"], r_["new"]] for r_ in rooms if r_["kind"] == "changed" and r_["name"].lower() == d["name"].lower()
+              and r_["unit"] == d["unit"]]
         by_name.append({**d, "count_old": len(d["old"]), "count_new": len(d["new"]), "sum_old": round(so, 3),
-                        "sum_new": round(sn, 3), "delta": round(sn - so, 3)})
+                        "sum_new": round(sn, 3), "delta": round(sn - so, 3), "changed": ch})
     by_name.sort(key=lambda d: (not (d["count_old"] == d["count_new"] > 0), -abs(d["delta"])))  # same rooms first
     units = {r_["unit"] for r_ in rooms}
     total = None
@@ -1258,7 +1634,10 @@ def area_changes(a: Sheet, b: Sheet, M: np.ndarray) -> dict:
         total = {"unit": units.pop(), "old": round(so, 3), "new": round(sn, 3), "delta": round(sn - so, 3),
                  "rooms_old": sum(1 for r_ in rooms if r_["old"] is not None),
                  "rooms_new": sum(1 for r_ in rooms if r_["new"] is not None)}
-    return {"rooms": [r_ for r_ in rooms if r_["kind"] != "same"], "by_name": by_name, "total": total}
+    out = {"rooms": [r_ for r_ in rooms if r_["kind"] != "same"], "by_name": by_name, "total": total}
+    if fixed[0]:
+        out["ocr_overruled"] = fixed[0]
+    return out
 
 
 def _ghost(self_g: np.ndarray, other_g: np.ndarray, pix: np.ndarray, box: tuple[slice, slice]) -> bool:
@@ -1306,10 +1685,15 @@ def door_changes(a: Sheet, b: Sheet, M: np.ndarray, scale_a: float | None) -> di
         bb.append({"c": ((box[0] + box[2]) / 2, (box[1] + box[3]) / 2), "r": (box[2] - box[0]) / 2, "box_b": sq(x["c"], x["r"]),
                    "box_in_a": [round(v, 2) for v in box]})
     used: set[int] = set()
+    pair_a, pair_b = _door_pairs(arcs_a), _door_pairs(arcs_b)
     out = {"count_old": len(arcs_a), "count_new": len(arcs_b), "unchanged": 0, "moved": [], "removed": [], "added": [],
+           "sets_old": len(arcs_a) - len(pair_a) // 2, "sets_new": len(arcs_b) - len(pair_b) // 2,
            "source": "door swing arcs read from the vector paths of both sheets (openings reader)",
            "scale": f"1:{scale_a:g}" if scale_a else None}
     rest = []
+    set_a = {id(x): min(i, pair_a.get(i, i)) for i, x in enumerate(arcs_a)}  # a double door's two leaves: one set id
+    for j, y in enumerate(bb):
+        y["_set"] = min(j, pair_b.get(j, j))
     for x in arcs_a:
         j = min((j for j, y in enumerate(bb) if j not in used and abs(y["r"] - x["r"]) <= 0.12 * x["r"]),
                 key=lambda j: math.dist(bb[j]["c"], x["c"]), default=None)
@@ -1326,10 +1710,35 @@ def door_changes(a: Sheet, b: Sheet, M: np.ndarray, scale_a: float | None) -> di
             out["moved"].append({"box_a": sq(x["c"], x["r"]), "box_b": bb[j]["box_b"], "box_b_in_a": bb[j]["box_in_a"],
                                  "moved_m": round(float(math.dist(bb[j]["c"], x["c"]) * m_pt), 2)})
         else:
-            out["removed"].append({"box_a": sq(x["c"], x["r"])})
+            out["removed"].append({"box_a": sq(x["c"], x["r"]), "set": set_a[id(x)]})
     for j, y in enumerate(bb):
         if j not in used:
-            out["added"].append({"box_b": y["box_b"], "box_b_in_a": y["box_in_a"]})
+            out["added"].append({"box_b": y["box_b"], "box_b_in_a": y["box_in_a"], "set": y["_set"]})
+    out["sets_removed"] = len({d["set"] for d in out["removed"]})
+    out["sets_added"] = len({d["set"] for d in out["added"]})
+    return out
+
+
+def _door_pairs(arcs: list[dict]) -> dict[int, int]:
+    """Double doors among swing arcs: two leaves of the same width (±12 %) whose hinges are 1.8-2.2 leaf widths apart
+    and whose closed leaves meet in the middle (an end of each arc within 0.25 r of the hinges' midpoint). DfE 630 FF:
+    39 leaves = 5 pairs + 29 single = 34 door sets (= the pipeline's 'How many doors are there?' 34). {i: partner}."""
+    cand = []
+    for i, x in enumerate(arcs):
+        for j in range(i + 1, len(arcs)):
+            y = arcs[j]
+            if abs(x["r"] - y["r"]) > 0.12 * x["r"]:
+                continue
+            d = math.dist(x["c"], y["c"]) / max(x["r"], 1e-9)
+            if not 1.8 <= d <= 2.2:
+                continue
+            mid = ((x["c"][0] + y["c"][0]) / 2, (x["c"][1] + y["c"][1]) / 2)
+            if all(min(math.dist(z["p0"], mid), math.dist(z["p1"], mid)) <= 0.25 * z["r"] for z in (x, y)):
+                cand.append((abs(d - 2), i, j))
+    out: dict[int, int] = {}
+    for _, i, j in sorted(cand):
+        if i not in out and j not in out:
+            out[i], out[j] = j, i
     return out
 
 
@@ -1400,6 +1809,18 @@ def pixel_regions(a: Sheet, a_ink: np.ndarray, b_ink_w: np.ndarray, valid: np.nd
                 na = 0
             if nr + na < min_px:
                 continue
+            # dust / toner specks: separate dot-sized blobs and no stroke at all (F5 noise pairs: 3 dots above a
+            # title block were 'linework added 2.7 x 2.4 m' on 2 of 16 unchanged scans); a real edit draws lines
+            if SPECK > 0:
+                nc, _, stc, _ = cv2.connectedComponentsWithStats(((removed[sl] | added[sl]) & m).astype(np.uint8), 8)
+                ext = stc[1:, 2:4]
+                big_side, small_side = ext.max(axis=1), np.maximum(1, ext.min(axis=1))
+                fill = stc[1:, 4] / np.maximum(1, ext[:, 0] * ext[:, 1])
+                # round FILLED dots only (dust 5 x 5 px, fill 0.8-0.9); a deleted fitting's leftovers on a scan are
+                # strokes (3 x 8) or hollow (fill 0.38) and stay a change (dfe_sen00 scans: 28 fittings deleted)
+                if nc > 2 and (big_side <= SPECK * long_side).all() and (big_side <= 1.6 * small_side).all() \
+                        and (fill >= 0.6).all():
+                    continue
         ys, xs = np.nonzero((removed[sl] | added[sl]) & m)
         box = [float(x + xs.min()), float(y + ys.min()), float(x + xs.max() + 1), float(y + ys.max() + 1)]
         kind = "removed" if na < 0.15 * nr else "added" if nr < 0.15 * na else "changed"
@@ -1445,15 +1866,30 @@ def compare(path_a: str, path_b: str, page_a: int = 0, page_b: int | None = 0, v
     if page_b is None or page_b < 0:  # B's page that shares the most printed words with A (sets: the same floor)
         page_b, page_note = best_page(a, path_b)
     b = load_sheet(path_b, page_b)
+    va, vb = virtual_a or path_a, virtual_b or path_b
+    # the sheets' printed names: a PDF's at once (PyMuPDF is not thread-safe); a picture's title from its OCR text
+    # layer (VP's sheet reader, ~3 s on a 14,000-px plan) beside the alignment
+    names: dict = {k: sheet_name(pth, s_.page, v) for k, pth, s_, v in (("a", path_a, a, va), ("b", path_b, b, vb))
+                   if s_.space == "pdf_pt"}
+    namer = threading.Thread(target=lambda: names.update({k: sheet_name(pth, None, v) for k, pth, s_, v in
+                                                          (("a", path_a, a, va), ("b", path_b, b, vb)) if k not in names}),
+                             daemon=True)
+    namer.start()
     exact = a.kind == "vector" and b.kind == "vector"
     a_ink, b_ink = ink_mask(a, "strong", exact), ink_mask(b, "strong", exact)
     a_weak, b_weak = (a_ink, b_ink) if exact else (ink_mask(a, "weak", exact), ink_mask(b, "weak", exact))
     al = align(a, b, a_ink, b_ink)
-    va, vb = virtual_a or path_a, virtual_b or path_b
-    res: dict = {"a": {"file": va, "page": a.page, "kind": a.kind, "space": a.space, "size": list(a.native)},
-                 "b": {"file": vb, "page": b.page, "kind": b.kind, "space": b.space, "size": list(b.native)},
+    res: dict = {"a": {"file": va, "page": a.page, "kind": a.kind, "space": a.space, "size": list(a.native),
+                       "zoom": a.zoom},
+                 "b": {"file": vb, "page": b.page, "kind": b.kind, "space": b.space, "size": list(b.native),
+                       "zoom": b.zoom},
                  "alignment": al.describe(a), "regions": [], "text": [], "quantities": [], "summary": "",
                  "page_b_note": page_note}
+    namer.join(timeout=20)
+    res["a"]["name"] = names.get("a") or {"title": Path(va).stem, "number": None, "revision": None, "source": "file",
+                                          "file": Path(va).name}
+    res["b"]["name"] = names.get("b") or {"title": Path(vb).stem, "number": None, "revision": None, "source": "file",
+                                          "file": Path(vb).name}
     if not al.ok:
         res["summary"] = ("Could not line the two sheets up (" + al.note + "). If they are two versions of the same "
                           "sheet, try the vector PDFs or cleaner scans; nothing is marked.")
@@ -1575,20 +2011,181 @@ def compare(path_a: str, path_b: str, page_a: int = 0, page_b: int | None = 0, v
             "id": i + 1, "kind": rg["kind"], "what": "linework", "description": desc, "near": near,
             "box_a": [round(v, 2) for v in box_a], "box_b": [round(v, 2) for v in to_native_b(bp)],
             "px_removed": rg["px_removed"], "px_added": rg["px_added"], "moved_m": moved,
+            "size_m": [round(w_n * m_per_unit, 2), round(h_n * m_per_unit, 2)] if m_per_unit else None,
+            # scans / photos: the run's length from its own ink (the box can run on along a wall it joins)
+            "run_m": _ink_run_m(added if rg["kind"] == "added" else removed, bp, m_per_unit / a.zoom)
+            if (not exact and m_per_unit and rg["kind"] in ("added", "removed")) else None,
         })
+    if exact and m_per_unit and res["regions"] and (WALL_MEASURE or HATCH_EDGE):
+        try:
+            b_w = warp_to(a, b.gray, al.M)
+            if HATCH_EDGE:
+                _mark_hatch_edges(a, b_w, res["regions"], m_per_unit)
+            if WALL_MEASURE:
+                _wall_lengths(a, b_w, valid, res["regions"], m_per_unit)
+        except Exception:  # noqa: BLE001  (a bonus reading for the cost lines: never lose the diff for it)
+            pass
     res["text"] = [{k: t.get(k) for k in ("kind", "old", "new", "box_a", "box_b", "box_b_in_a", "shift", "source")} for t in texts]
     res["quantities"] = quants
-    res["areas"] = area_changes(a, b, al.M) if (a.lines and b.lines) else {"rooms": [], "by_name": [], "total": None}
+    ocr_sides, pending = [], []
+    for side, s_ in (("a", a), ("b", b)):  # scans: room tags from the upload's OCR layer (after the text diff above)
+        if not s_.lines and s_.space == "image_px" and OCR_AREAS:
+            got = layer_lines(s_)
+            if got:
+                s_.lines = got
+                ocr_sides.append(side)
+            elif time.time() - Path(s_.path).stat().st_mtime < LAYER_WAIT_S:
+                pending.append(side)  # just uploaded: the warm-up is probably still reading it
+    pt = PatchTest(a, b, al.M, r + 2) if ocr_sides else None
+    try:
+        res["areas"] = area_changes(a, b, al.M, tuple(ocr_sides), pt) if (a.lines and b.lines) else \
+            {"rooms": [], "by_name": [], "total": None}
+    finally:
+        if pt is not None:
+            pt.close()
+    if ocr_sides and res["areas"]["by_name"]:
+        res["areas"]["source"] = "room tags read from the scan by OCR: check the numbers on the drawing"
+    res["areas_pending"] = bool(pending) and not (a.lines and b.lines)
     res["doors"] = door_changes(a, b, al.M, float(scale_txt[2:]) if scale_txt else None) if exact else None
     res["changed_share"] = round(changed_share, 4)
     res["same_sheet"] = bool(al.overlap >= 0.8 and changed_share <= 0.25)
+    # two DIFFERENT drawings (another floor / building / discipline) that still line up somewhat: never priced.
+    # Measured: 22 same-sheet scans / photos / exports 0.92-0.99, the real revisions 0.93-0.99 (DfE 2014 FF 0.935,
+    # 2012 FF 0.926); other floors of one school 0.62-0.78, scans of another floor 0.68-0.70 (cross_pairs.py)
+    res["other_sheet"] = bool(al.overlap < OTHER_SHEET)
+    res["drawing_kind"] = {"a": drawing_kind(a), "b": drawing_kind(b)}
     res["approximate"] = not exact  # scans / photos: marks are pixel differences, drawn dashed in the UI
     res["summary"] = summarize(res, al)
     res["suggested_questions"] = suggest_questions(res, skip)
+    res["revision_cost"] = revision_cost(res)  # floor, doors, walls now; skirting (traced rooms) via /cost
     if out_dir is not None:
         write_images(a, b, al.M, removed, added, Path(out_dir), texts)
     res["wall_seconds"] = round(time.perf_counter() - t0, 2)
     return res
+
+
+def _ink_run_m(mask: np.ndarray, box_px: list, m_per_px: float) -> float | None:
+    """Length of a thin run of changed ink on a scan / photo, from the ink itself: along the box's long side, count the
+    columns where the ink is at least half the run's typical thickness (bits < 3 px dropped), pieces joined across gaps
+    up to 1.2 m, the longest chain's span.
+    The box alone runs on along a wall the new one joins: the DfE L00 scan's new wall (true 6.49 m) measured 7.0 m
+    upright but 8.7 m when the same scan was turned 270° (a 1-2 px residual along the joining wall)."""
+    try:
+        x0, y0, x1, y1 = (int(round(v)) for v in box_px)
+        crop = mask[max(0, y0):max(0, y1), max(0, x0):max(0, x1)]
+        if crop.size == 0:
+            return None
+        horiz = crop.shape[1] >= crop.shape[0]
+        prof = crop.sum(axis=0 if horiz else 1).astype(float)
+        on = prof[prof > 0]
+        if len(on) < 3:
+            return None
+        solid = np.flatnonzero(prof >= max(2.0, 0.5 * float(np.percentile(on, 75))))
+        if not len(solid):
+            return None
+        segs = [g for g in np.split(solid, np.flatnonzero(np.diff(solid) > 3) + 1) if len(g) >= 3]
+        if not segs:
+            return None
+        # pieces of one wall: the new wall crosses existing lines (no NEW ink there: DfE L00 scan gaps 0.26 / 0.5 m)
+        # or a door opening (<= 1.2 m); a piece further away is something else (the tail along a joining wall)
+        join = 1.2 / m_per_px
+        chains: list[list] = [[segs[0]]]
+        for g in segs[1:]:
+            if g[0] - chains[-1][-1][-1] <= join:
+                chains[-1].append(g)
+            else:
+                chains.append([g])
+        best = max(chains, key=lambda c: sum(len(g) for g in c))
+        return round(int(best[-1][-1] - best[0][0] + 1) * m_per_px, 2)
+    except Exception:  # noqa: BLE001
+        return None
+
+
+OTHER_SHEET = float(os.environ.get("STOA_F5_OTHER", "0.85"))
+UPRIGHT = os.environ.get("STOA_F5_UPRIGHT", "1") != "0"  # read room tags of a turned re-plot on an upright copy  # overlap below this = two different drawings: no cost
+_VIEW3D = re.compile(r"\b(?:axo(?:nometric)?|isometric|exploded|3d)\b", re.I)
+
+
+def drawing_kind(s: Sheet) -> str | None:
+    """'plan' / 'elev' (a section or an elevation, also a 3D / axonometric view) from the sheet's printed title lines
+    (stoa.formats.pages._sheet_kind on the text lines; images: their OCR'd lines when the upload read them), else None.
+    DfE 2012 420-place sections and 3D sections -> 'elev' (their compare priced section lines as partitions: +EUR 13,489)."""
+    try:
+        from stoa.formats.pages import _sheet_kind
+
+        lines = [t for *_, t in (s.lines or [])] or [t for *_, t in (layer_lines(s) or [])]
+        text = "\n".join(lines)
+        k = _sheet_kind(text)
+        if k is None and any(len(t) <= 60 and _VIEW3D.search(t) for t in lines):
+            k = "elev"
+        return k
+    except Exception:  # noqa: BLE001
+        return None
+
+
+WALL_MEASURE = os.environ.get("STOA_F5_WALLS", "1") != "0"
+HATCH_EDGE = os.environ.get("STOA_F5_HATCH_EDGE", "1") != "0"
+
+
+def _mark_hatch_edges(a: Sheet, b_w: np.ndarray, regions: list[dict], m_per_unit: float) -> None:
+    """A thin run with REPEATED lines right beside it (a 0.6 m strip with >= 15 % ink crossing >= 3 separate lines) is
+    the edge of a hatched area (a roof block, paving, a slab), not a partition: r['beside_hatch']. DfE 2012 420-place
+    second floor: an 8.7 m roof-block edge was priced as a removed wall (4 lines beside it); real partitions and the
+    DfE 2014 window filled in next to the solid outer wall cross <= 2 (vector pairs, F5 cycle 5)."""
+    ppm = a.zoom / m_per_unit  # render px per metre
+    strip, gap = max(4, int(0.6 * ppm)), max(2, int(0.08 * ppm))
+    for r_ in regions:
+        sz = r_.get("size_m")
+        if not sz or r_["kind"] not in ("added", "removed") or not (min(sz) <= WALL_THIN_M and max(sz) >= WALL_MIN_M):
+            continue
+        g = a.gray if r_["kind"] == "removed" else b_w
+        x0, y0, x1, y1 = (int(round(v * a.zoom)) for v in r_["box_a"])
+        if (x1 - x0) >= (y1 - y0):  # strips above and below; rows (axis 0) cross the strip
+            sides = (g[max(0, y0 - gap - strip):max(0, y0 - gap), x0:x1], g[y1 + gap:y1 + gap + strip, x0:x1])
+        else:
+            sides = (g[y0:y1, max(0, x0 - gap - strip):max(0, x0 - gap)].T, g[y0:y1, x1 + gap:x1 + gap + strip].T)
+        for s_ in sides:
+            if s_.size == 0:
+                continue
+            ink = s_ < 160
+            if ink.mean() < 0.15:
+                continue
+            crossed = (np.diff(ink.astype(np.int8), axis=0) == 1).sum(axis=0) + ink[0]
+            if float(np.median(crossed)) >= 3:
+                r_["beside_hatch"] = True
+                break
+
+
+def _wall_ink(g: np.ndarray) -> np.ndarray:
+    """Per pixel: 1 / the local width of THICK dark ink (walls drawn solid; thin lines, text, hatching, door leaves
+    opened away), so the sum over a wall = its length in px. Width = 2 x the distance-transform ridge within 15 px."""
+    import cv2
+
+    thick = cv2.morphologyEx((g < 110).astype(np.uint8), cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)))
+    dt = cv2.distanceTransform(thick, cv2.DIST_L2, 3)
+    ridge = cv2.dilate(dt, np.ones((15, 15), np.uint8))
+    return np.where(thick > 0, 1.0 / np.maximum(2.0 * ridge, 1.0), 0.0).astype(np.float32)
+
+
+def _wall_lengths(a: Sheet, b_gray_w: np.ndarray, valid: np.ndarray, regions: list[dict], m_per_unit: float) -> None:
+    """Wall length inside each changed region on both vector sheets ('walls_m' {old, new}): the thick-ink length map of
+    each version summed over the region's box padded by 14 px (a strip that filled a window in a thick outer wall counts
+    the wall's whole width). Each pixel belongs to ONE region (moved runs first, then by size), so overlapping boxes do
+    not count a change twice. DfE 630 FF: the new partition 7.1 m (box 7.09), a window filled in 1.35 m (1.2), the
+    classrooms' moved partitions +0.65 m (same length); about ±15 % per region: approximate."""
+    ca, cb = _wall_ink(a.gray), _wall_ink(b_gray_w)
+    cb = np.where(valid, cb, ca)
+    taken = np.zeros(ca.shape, bool)
+    k = m_per_unit / a.zoom  # metres per render px
+    order = sorted(regions, key=lambda r_: (not r_.get("moved_m"), -((r_["box_a"][2] - r_["box_a"][0]) * (r_["box_a"][3] - r_["box_a"][1]))))
+    H, W = ca.shape
+    for r_ in order:
+        x0, y0, x1, y1 = (v * a.zoom for v in r_["box_a"])
+        sl = (slice(max(0, int(y0) - 14), min(H, int(math.ceil(y1)) + 14)), slice(max(0, int(x0) - 14), min(W, int(math.ceil(x1)) + 14)))
+        free = ~taken[sl]
+        la, lb = float(ca[sl][free].sum()) * k, float(cb[sl][free].sum()) * k
+        taken[sl] = True
+        r_["walls_m"] = {"old": round(la, 2), "new": round(lb, 2)}
 
 
 def summarize(res: dict, al: Alignment) -> str:
@@ -1597,12 +2194,12 @@ def summarize(res: dict, al: Alignment) -> str:
     nt = collections.Counter(t["kind"] for t in texts)
     parts = []
     if regs:
-        parts.append(f"{len(regs)} linework change(s) ({n['added']} added, {n['removed']} removed, "
+        parts.append(f"{_n(len(regs), 'linework change')} ({n['added']} added, {n['removed']} removed, "
                      f"{n['changed']} changed)")
     if texts:
-        parts.append(", ".join(f"{v} text line(s) {k}" for k, v in nt.most_common()))
+        parts.append(", ".join(f"{_n(v, 'label')} {k}" for k, v in nt.most_common()))
     head = "; ".join(parts) if parts else "No differences found"
-    out = f"{head} (lined up {res['alignment'].get('how', al.method)}, {al.overlap:.0%} of the linework matches)."
+    out = f"{head} (lined up {res['alignment'].get('how', al.method)}, {res['alignment']['overlap']:.0%} of the linework matches)."
     dr = res.get("doors") or {}
     if dr.get("count_old") is not None and (dr["moved"] or dr["added"] or dr["removed"]):
         out += (f" Door leaves (swing arcs) {dr['count_old']} → {dr['count_new']}: {len(dr['added'])} added, {len(dr['removed'])} "
@@ -1615,16 +2212,21 @@ def summarize(res: dict, al: Alignment) -> str:
             if d["count_old"] == d["count_new"] and len(set(d["old"])) == 1 and len(set(d["new"])) == 1:
                 lines.append(f"{d['name']}: {_fmt_q(d['old'][0])} → {_fmt_q(d['new'][0])} {u}"
                              + (f" (×{d['count_old']})" if d["count_old"] > 1 else ""))
+            elif _partial(d, u):
+                lines.append(f"{d['name']}: {_partial(d, u)}")
             else:
-                lines.append(f"{d['name']}: {d['count_old']} room(s) {_fmt_q(d['sum_old'])} {u} → {d['count_new']} "
-                             f"room(s) {_fmt_q(d['sum_new'])} {u}")
+                lines.append(f"{d['name']}: {_n(d['count_old'], 'room')} {_fmt_q(d['sum_old'])} {u} → "
+                             f"{_n(d['count_new'], 'room')} {_fmt_q(d['sum_new'])} {u}")
         out += " Printed room areas: " + "; ".join(lines) + "."
         tot = ar.get("total")
         if tot and tot["delta"]:
             u = "m²" if tot["unit"] == "m2" else "ft²"
             out += f" Sum of all printed room areas {_fmt_q(tot['old'])} → {_fmt_q(tot['new'])} {u} ({tot['delta']:+,.1f})."
-    if not res.get("same_sheet", True):
-        out += (f" {res['changed_share']:.0%} of the linework differs and {al.overlap:.0%} lines up: these may be "
+    if res.get("other_sheet"):
+        out += (f" Only {res['alignment']['overlap']:.0%} of the linework lines up: these look like two different drawings (another "
+                "floor or sheet?), not two versions of one; the marks show where they differ, nothing is priced.")
+    elif not res.get("same_sheet", True):
+        out += (f" {res['changed_share']:.0%} of the linework differs and {res['alignment']['overlap']:.0%} lines up: these may be "
                 "different sheets (another floor?) or a poor scan; treat the marks with care.")
     return out
 
@@ -1663,6 +2265,448 @@ _ROOM_STOP = re.compile(r"\b(plan|level|floor|scale|drawing|dwg|rev|date|title|n
                         r"project|client|status|sheet|north|copyright|issue)\b", re.I)
 
 
+# ------------------------------------------------------------------------ the cost of a revision (captain 21:51)
+# Estimators turn quantity changes into money and orders (artifacts/RESEARCH/VERIFIED.md): every line here is a NET
+# quantity change between the two versions × an EXAMPLE unit price the visitor overwrites in the panel (never shown as
+# a real price). What we could not measure is listed for a person's check and kept OUT of the total.
+PRICES = [
+    {"key": "door", "label": "Door set (leaf, frame, ironmongery)", "unit": "door", "eur": 450.0},
+    {"key": "skirting", "label": "Skirting", "unit": "m", "eur": 12.0},
+    {"key": "floor", "label": "Floor covering", "unit": "m²", "eur": 38.0},
+    {"key": "floor_wet", "label": "Floor tiling (wet rooms)", "unit": "m²", "eur": 65.0},
+    {"key": "partition", "label": "Partition wall", "unit": "m²", "eur": 95.0},
+]
+WALL_H = float(os.environ.get("STOA_F5_WALL_H", "2.7"))  # m: partition height, an assumption the panel lets you change
+TRACE_TOL = 0.08  # a traced room outline is used when its area is within 8 % of the room's printed area
+WALL_THIN_M, WALL_MIN_M = 0.45, 0.5  # a linework region this thin and at least this long = one wall run
+SKIRT_MAX_ROOMS = 40  # rooms traced per compare (2 traces each, ~0.5 s per trace)
+FT2 = 0.09290304
+
+
+def _wet(name: str) -> bool:
+    """F2's room types (stoa.features.takeoff.room_type): a wet room is tiled and gets no skirting."""
+    try:
+        from stoa.features.takeoff import room_type
+
+        return room_type(name) == "wet"
+    except Exception:  # noqa: BLE001
+        return bool(re.search(r"toilet|\bwc\b|shower|bath|changing|laundry|cleaner", name, re.I))
+
+
+def _no_skirting(name: str, wet: bool = False) -> bool:
+    """Rooms without skirting: stairs / lifts / voids (lineplan's rule) and, unless `wet` (F4's Conventions tab 'wet
+    rooms included'), tiled wet rooms."""
+    if not wet and _wet(name):
+        return True
+    try:
+        from stoa.evidence import lineplan
+
+        return bool(lineplan._NO_SKIRTING.search(name))
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _room_marks(rooms: list[dict], name: str) -> list[dict]:
+    out = []
+    for r_ in rooms:
+        if r_["name"].lower() != name.lower():
+            continue
+        if r_.get("box_a"):
+            out.append({"box": r_["box_a"], "kind": "removed" if r_["kind"] == "removed" else "changed"})
+        if r_.get("box_b_in_a") and r_["kind"] == "added":
+            out.append({"box": r_["box_b_in_a"], "kind": "added"})
+    return out
+
+
+def _partial(d: dict, u: str) -> str | None:
+    """'12.09 → 10.5 m² (1 of 13 rooms)': some of the rooms sharing a name changed, the others did not."""
+    ch = d.get("changed") or []
+    if d["count_old"] != d["count_new"] or not ch or len(ch) >= d["count_old"]:
+        return None
+    return (", ".join(f"{_fmt_q(o)} → {_fmt_q(n)}" for o, n in ch[:3]) + (", …" if len(ch) > 3 else "")
+            + f" {u} ({len(ch)} of {d['count_old']} rooms)")
+
+
+def _each(vals: list[float], u: str) -> str:
+    return " + ".join(_fmt_q(v) for v in vals) + f" {u}"
+
+
+def best_gap(x: dict, y: dict, m_unit: float | None) -> float:
+    """Distance between two boxes' centres in metres (sheet A units × m_unit)."""
+    cx = ((x["box_a"][0] + x["box_a"][2]) / 2, (x["box_a"][1] + x["box_a"][3]) / 2)
+    cy = ((y["box_a"][0] + y["box_a"][2]) / 2, (y["box_a"][1] + y["box_a"][3]) / 2)
+    return math.dist(cx, cy) * (m_unit or 0.0)
+
+
+def withheld(res: dict) -> str | None:
+    """Why this compare gets no cost (None = priced): two different drawings that line up only partly (another floor
+    of the same school: -EUR 30,556 .. -EUR 68,797 'saved'), or a section / elevation / 3D view (its long lines are
+    floors, roofs and facades, not partitions)."""
+    kinds = res.get("drawing_kind") or {}
+    if "elev" in (kinds.get("a"), kinds.get("b")):
+        return ("this is a section or an elevation: its lines are floors, roofs and facades, not partitions or doors. "
+                "Compare the two floor plans for a cost")
+    if res.get("other_sheet"):
+        ov = (res.get("alignment") or {}).get("overlap") or 0.0
+        return (f"these look like two different drawings (only {ov:.0%} of the linework lines up: another floor, "
+                "building or sheet?), so a cost would compare two drawings, not two versions of one")
+    return None
+
+
+def revision_cost(res: dict, skirting: dict | None = None) -> dict:
+    """The quantity changes between the two versions as priced lines (example prices; the panel recomputes with the
+    visitor's own): floor finishes from the printed room areas, door SETS from the swing arcs (a double door = 1 set),
+    partitions from wall runs that appear / vanish (× WALL_H), skirting from each changed room's traced outline minus
+    its openings (`skirting`, from skirting_changes: slower, so the panel fetches it from /cost). 'review' = things
+    seen but not measured: never in the total."""
+    why = withheld(res)
+    if why:  # two different drawings, or a section / elevation: a total would be a made-up number
+        return {"prices": PRICES, "wall_height_m": WALL_H, "lines": [], "total_eur": 0.0, "skirting": "n/a",
+                "review": [{"id": "review:withheld", "item": "Not priced", "why": why, "marks": []}],
+                "currency": "EUR", "withheld": why, "rule": "only two versions of the same floor plan are priced",
+                "prices_note": "example prices — use your own", "summary": f"Not priced: {why}."}
+    lines: list[dict] = []
+    review: list[dict] = []
+    ar = res.get("areas") or {}
+    rooms = ar.get("rooms") or []
+    ocr = bool(ar.get("source"))
+    for d in ar.get("by_name") or []:
+        if d["unit"] not in ("m2", "ft2"):
+            continue
+        k, u = (1.0, "m²") if d["unit"] == "m2" else (FT2, "m²")
+        uniform = d["count_old"] == d["count_new"] and len(set(d["old"])) == 1 and len(set(d["new"])) == 1
+        unit_txt = "m²" if d["unit"] == "m2" else "ft²"
+        detail = (f"{_fmt_q(d['old'][0])} → {_fmt_q(d['new'][0])} {unit_txt}" + (f" each, {d['count_old']} rooms" if d["count_old"] > 1 else "")
+                  if uniform else f"new room: {_each(d['new'], unit_txt)}" if not d["count_old"]
+                  else f"room gone: {_each(d['old'], unit_txt)}" if not d["count_new"]
+                  else _partial(d, unit_txt) or f"{_each(d['old'], unit_txt)} → {_each(d['new'], unit_txt)}")
+        lines.append({"id": f"floor:{d['name']}", "group": "floor", "item": d["name"], "detail": detail,
+                      "old": round(d["sum_old"] * k, 2), "new": round(d["sum_new"] * k, 2), "delta": round(d["delta"] * k, 2),
+                      "unit": u, "price": "floor_wet" if _wet(d["name"]) else "floor", "approx": ocr,
+                      "how": "printed room areas on both sheets" + (" (read from the scan by OCR: check)" if ocr else ""),
+                      "marks": _room_marks(rooms, d["name"])})
+    dr = res.get("doors")
+    if dr and dr.get("count_old") is not None:
+        sa = dr.get("sets_added", len(dr["added"]))
+        sr = dr.get("sets_removed", len(dr["removed"]))
+        how = "door swings drawn on the sheets (no model); a double door = 1 set"
+        if sa:
+            lines.append({"id": "doors:added", "group": "doors", "item": "New doors", "delta": sa, "unit": "door",
+                          "price": "door", "how": how, "detail": f"{_n(len(dr['added']), 'leaf', 'leaves')} = {_n(sa, 'door set')}, only on the new version",
+                          "marks": [{"box": x["box_b_in_a"], "kind": "added"} for x in dr["added"]]})
+        if sr:
+            lines.append({"id": "doors:removed", "group": "doors", "item": "Doors taken out", "delta": -sr, "unit": "door",
+                          "price": "door", "how": how, "detail": f"{_n(len(dr['removed']), 'leaf', 'leaves')} = {_n(sr, 'door set')}, only on the old version",
+                          "marks": [{"box": x["box_a"], "kind": "removed"} for x in dr["removed"]]})
+        if dr["moved"]:
+            lines.append({"id": "doors:moved", "group": "doors", "item": "Doors moved", "delta": 0, "unit": "door",
+                          "price": None, "how": how, "detail": f"{len(dr['moved'])} leaves at a new place: the same doors, "
+                          "no quantity change (price the move as rework if already built)",
+                          "marks": [{"box": x["box_a"], "kind": "changed"} for x in dr["moved"]]})
+    elif res.get("approximate") and res.get("regions"):  # nothing changed on the scan: no door changed either
+        review.append({"id": "review:doors", "item": "Doors", "why": "door swings are compared on vector PDFs only: "
+                       "check the marked changes on the scan for doors by hand",
+                       "marks": [{"box": r_["box_a"], "kind": r_["kind"]} for r_ in res["regions"][:12]]})
+    moved, unmeasured, walls_on_scan, runs, edges = [], [], [], [], []
+    approx = bool(res.get("approximate"))
+    door_boxes = [] if not dr or dr.get("count_old") is None else (
+        [x["box_a"] for x in dr["removed"]] + [x["box_b_in_a"] for x in dr["added"]]
+        + [x[k] for x in dr["moved"] for k in ("box_a", "box_b_in_a") if x.get(k)])
+
+    def on_door(box) -> bool:  # the linework of a door priced in the Doors lines (leaf + swing)
+        area = max(1e-9, (box[2] - box[0]) * (box[3] - box[1]))
+        for d in door_boxes:
+            g = 0.15 * (d[2] - d[0])
+            iw = min(box[2], d[2] + g) - max(box[0], d[0] - g)
+            ih = min(box[3], d[3] + g) - max(box[1], d[1] - g)
+            if iw > 0 and ih > 0 and iw * ih >= 0.6 * area:
+                return True
+        return False
+
+    for r_ in res.get("regions") or []:
+        if door_boxes and on_door(r_["box_a"]):
+            continue
+        sz = r_.get("size_m")
+        if not sz:
+            walls_on_scan.append(r_)
+            continue
+        long_, thin = max(sz), min(sz)
+        if r_.get("moved_m"):
+            moved.append(r_)
+        elif r_.get("beside_hatch"):
+            edges.append(r_)
+        elif r_["kind"] in ("added", "removed") and (
+                (thin <= WALL_THIN_M and long_ >= WALL_MIN_M) if not approx
+                # scans / photos: marks are padded by the pixel tolerance and blur (the DfE L00 scan's new wall boxes
+                # 7.4 x 0.6 m), and short blobs there are mostly noise: thin for its length and >= 1.5 m long
+                else (thin <= max(WALL_THIN_M, 0.15 * long_) and long_ >= 1.5)):
+            runs.append(r_)
+        else:
+            unmeasured.append(r_)
+    # a run that vanished + a parallel run of about the same length that appeared within 3 m = ONE wall moved (the
+    # tolerance diff sees a move of more than a few px as two runs): priced only by its change in length
+    m_unit = None
+    for r_ in runs:
+        w_n = r_["box_a"][2] - r_["box_a"][0]
+        if w_n > 0 and r_["size_m"][0] > 0:
+            m_unit = r_["size_m"][0] / w_n
+            break
+    rem = [r_ for r_ in runs if r_["kind"] == "removed"]
+    pairs: dict[int, dict] = {}
+    for x in [r_ for r_ in runs if r_["kind"] == "added"]:
+        hx = x["size_m"][0] >= x["size_m"][1]
+        best = None
+        for y in rem:
+            if id(y) in {id(v) for v in pairs.values()} or (y["size_m"][0] >= y["size_m"][1]) != hx:
+                continue
+            lx, ly = max(x["size_m"]), max(y["size_m"])
+            if abs(lx - ly) > 0.15 * max(lx, ly):
+                continue
+            cx = ((x["box_a"][0] + x["box_a"][2]) / 2, (x["box_a"][1] + x["box_a"][3]) / 2)
+            cy = ((y["box_a"][0] + y["box_a"][2]) / 2, (y["box_a"][1] + y["box_a"][3]) / 2)
+            across, along = (abs(cx[1] - cy[1]), abs(cx[0] - cy[0])) if hx else (abs(cx[0] - cy[0]), abs(cx[1] - cy[1]))
+            if m_unit and across * m_unit <= 3.0 and along * m_unit <= 0.25 * max(lx, ly) and (best is None or across < best[0]):
+                best = (across, y)
+        if best:
+            pairs[id(x)] = best[1]
+    paired = {id(v) for v in pairs.values()} | set(pairs)
+    for r_ in runs:
+        if id(r_) in pairs:
+            y = pairs[id(r_)]
+            d_len = round(max(r_["size_m"]) - max(y["size_m"]), 2)
+            moved_by = round(best_gap(r_, y, m_unit), 1)
+            if abs(d_len) < 0.1:
+                moved += [y, r_]
+                continue
+            lines.append({"id": f"wall:{y['id']}-{r_['id']}", "group": "walls",
+                          "item": "Wall moved" + (f" near ‘{r_['near']}’" if r_.get("near") else ""),
+                          "detail": f"#{y['id']} → #{r_['id']}: moved ≈ {moved_by} m, {max(y['size_m']):.1f} → {max(r_['size_m']):.1f} m long",
+                          "delta": d_len, "unit": "m", "price": "partition", "per_height": True,
+                          "how": "the same wall at a new place: only its change in length is priced",
+                          "marks": [{"box": y["box_a"], "kind": "removed"}, {"box": r_["box_a"], "kind": "added"}]})
+            continue
+        if id(r_) in paired:
+            continue
+        add, long_ = r_["kind"] == "added", max(r_["size_m"])
+        if approx:  # a scan's mark is padded on every side alike: take the padding seen across the run off its length
+            long_ = max(WALL_MIN_M, long_ - max(0.0, min(r_["size_m"]) - 0.15))  # DfE L00 scan 7.43 -> 6.99 (true 6.49)
+            run = r_.get("run_m")  # the run's own ink (_ink_run_m): 6.34-6.37 m on that scan / photo turned 0/90/180/270
+            if run and 0.6 * long_ <= run <= long_:  # (box 7.0-8.7 m); a box that also holds a changed label (AFCEC
+                long_ = max(WALL_MIN_M, run)        # A-2: run 1.8 of 15.6 m) keeps the box's length
+        lines.append({"id": f"wall:{r_['id']}", "group": "walls",
+                      "item": f"Wall {'added' if add else 'removed'}" + (f" near ‘{r_['near']}’" if r_.get("near") else ""),
+                      "detail": f"#{r_['id']}: a {'≈ ' if approx else ''}{long_:.1f} m run {'only on the new' if add else 'only on the old'} "
+                                f"version" + (" (measured on a scan / photo: approximate, check)" if approx else ""),
+                      "delta": round(long_ if add else -long_, 2), "unit": "m", "price": "partition", "per_height": True,
+                      "approx": approx, "how": "linework that appears / vanishes, one thin run = one wall; × the wall "
+                      "height" + ("; measured on a scan: approximate" if approx else ""),
+                      "marks": [{"box": r_["box_a"], "kind": r_["kind"]}]})
+    still, no_walls = [], []
+    for r_ in unmeasured:
+        wm = r_.get("walls_m")
+        if not wm:
+            still.append(r_)
+            continue
+        d = round(wm["new"] - wm["old"], 2)
+        if abs(d) < 0.5:  # no wall length changed: the same walls redrawn (moved), or no walls at all (a fitting)
+            (moved if r_["kind"] == "changed" and max(wm["old"], wm["new"]) >= 0.5 else no_walls).append(r_)
+            continue
+        lines.append({"id": f"walls:{r_['id']}", "group": "walls",
+                      "item": "Walls redrawn" + (f" near ‘{r_['near']}’" if r_.get("near") else ""),
+                      "detail": f"#{r_['id']}: walls in this area ≈ {wm['old']:.1f} → {wm['new']:.1f} m (solid wall lines "
+                                "measured on both sheets: approximate, ±15 % of what changed)",
+                      "delta": d, "unit": "m", "price": "partition", "per_height": True, "approx": True,
+                      "how": "length of the solid wall lines in the changed area on each sheet",
+                      "marks": [{"box": r_["box_a"], "kind": r_["kind"]}]})
+    unmeasured = still
+    if no_walls:
+        lines.append({"id": "walls:none", "group": "walls", "item": "Other drawing changes", "delta": 0, "unit": "m",
+                      "price": None, "detail": f"{_n(len(no_walls), 'place')} (#{', #'.join(str(r_['id']) for r_ in no_walls)}): "
+                      "no change in wall length (fittings, furniture, hatching, notes, small bits): not priced here",
+                      "how": "changed linework without solid wall lines",
+                      "marks": [{"box": r_["box_a"], "kind": r_["kind"]} for r_ in no_walls]})
+    if moved:
+        lines.append({"id": "walls:moved", "group": "walls", "item": "Linework moved", "delta": 0, "unit": "m", "price": None,
+                      "detail": f"{_n(len(moved), 'place')} (#{', #'.join(str(r_['id']) for r_ in moved)}): the same lines at a "
+                                "new place, no change in length (price as rework if already built)",
+                      "how": "the same ink shifted by 0.1-3 m", "marks": [{"box": r_["box_a"], "kind": "changed"} for r_ in moved]})
+    if edges:
+        review.append({"id": "review:edges", "item": f"Edge of a hatched area changed in {_n(len(edges), 'place')}",
+                       "why": "a thick line along hatching appeared or vanished (#" + ", #".join(str(r_["id"]) for r_ in edges)
+                              + "): a roof, slab or paving edge rather than a partition, check by hand",
+                       "marks": [{"box": r_["box_a"], "kind": r_["kind"]} for r_ in edges]})
+    if unmeasured:
+        review.append({"id": "review:walls", "item": f"Walls redrawn in {_n(len(unmeasured), 'place')}",
+                       "why": "several lines changed together (#" + ", #".join(str(r_["id"]) for r_ in unmeasured)
+                              + "): wall lengths there are not measured, check by hand",
+                       "marks": [{"box": r_["box_a"], "kind": r_["kind"]} for r_ in unmeasured]})
+    if walls_on_scan:
+        review.append({"id": "review:scanwalls", "item": f"Linework changed in {_n(len(walls_on_scan), 'place')}",
+                       "why": "on a scan / photo without a printed scale we do not price wall lengths: check by hand",
+                       "marks": [{"box": r_["box_a"], "kind": r_["kind"]} for r_ in walls_on_scan]})
+    sk_status = "n/a"
+    if skirting is not None:
+        sk_status = "done"
+        for g in skirting.get("by_name") or []:
+            lines.append({"id": f"skirting:{g['name']}", "group": "skirting", "item": g["name"], "detail": g["detail"],
+                          "old": g["old"], "new": g["new"], "delta": round(g["new"] - g["old"], 2), "unit": "m",
+                          "delta_net": round(g["new"] - g["old"], 2), "wet": bool(g.get("wet")),
+                          "delta_whole": round(g.get("new_p", g["new"]) - g.get("old_p", g["old"]), 2),
+                          "price": "skirting", "approx": True, "how": skirting.get("how", ""), "marks": g["marks"],
+                          "outlines": g.get("outlines", [])})
+        review += skirting.get("review") or []
+    elif any(r_["name"] and not _no_skirting(r_["name"], True) for r_ in rooms):
+        if res["a"]["kind"] == res["b"]["kind"] == "vector":
+            sk_status = "pending"  # POST /cost traces the changed rooms
+        else:
+            review.append({"id": "review:skirting-scan", "item": "Skirting", "why": "room outlines are traced on vector "
+                           "PDFs only: measure the skirting of the changed rooms by hand", "marks": []})
+    prices = {p["key"]: p["eur"] for p in PRICES}
+    for ln in lines:
+        ln["eur"] = round(ln["delta"] * (WALL_H if ln.get("per_height") else 1.0) * prices[ln["price"]], 2) if ln["price"] else 0.0
+    total = round(sum(ln["eur"] for ln in lines), 2)
+    out = {"prices": PRICES, "wall_height_m": WALL_H, "lines": lines, "review": review, "total_eur": total,
+           "skirting": sk_status, "currency": "EUR",
+           "rule": "net quantity changes between the two versions; floor = printed room areas; doors = door sets "
+                   "(a double door is 1 set); walls = solid wall lines that appear, vanish or are redrawn × the wall height; skirting = traced "
+                   "room outline minus openings (stairs, lifts: none; tiled wet rooms: none unless the Conventions tab includes them); moved items are not priced; items to "
+                   "check are not in the total",
+           "prices_note": "example prices — use your own"}
+    out["summary"] = cost_summary(out)
+    return out
+
+
+def cost_summary(c: dict) -> str:
+    """One plain line at the given prices: 'This revision: floor area +4 m² (+€152) · … → +€2,142 (example prices)'."""
+    by: dict[str, list[dict]] = collections.defaultdict(list)
+    for ln in c["lines"]:
+        if ln["price"]:
+            by[ln["group"]].append(ln)
+    eur = lambda v: ("+" if v > 0 else "−" if v < 0 else "±") + f"€{abs(v):,.0f}"  # noqa: E731
+    bits = []
+    for g, word, u in (("floor", "floor area", "m²"), ("doors", "doors", ""), ("skirting", "skirting", "m"), ("walls", "walls", "m")):
+        ls = by.get(g)
+        if not ls:
+            continue
+        e = sum(ln["eur"] for ln in ls)
+        if g == "doors":
+            plus, minus = sum(ln["delta"] for ln in ls if ln["delta"] > 0), -sum(ln["delta"] for ln in ls if ln["delta"] < 0)
+            q = " ".join(x for x in (f"+{plus}" if plus else "", f"−{minus}" if minus else "") if x) + (" door set" if plus + minus == 1 else " door sets")
+        else:
+            q = f"{word} {sum(ln['delta'] for ln in ls):+.1f} {u}".replace("+-", "−").replace("-", "−")
+        bits.append(f"{q} ({eur(e)})")
+    if not bits:
+        return "No priced quantity changed." + (f" {_n(len(c['review']), 'item')} to check by hand." if c["review"] else "")
+    s = "This revision: " + " · ".join(bits) + f" → {eur(c['total_eur'])} at {c['prices_note'].split(' —')[0]}"
+    if c["review"]:
+        s += f"; {_n(len(c['review']), 'item')} to check by hand (not in the total)"
+    return s + "."
+
+
+def _to_a(res: dict, pts: list) -> list:
+    """Points in B's native units -> A's native units through the stored alignment (render px matrix + zooms)."""
+    M = np.array(res["alignment"]["matrix"], float)
+    zb, za = res["b"].get("zoom") or 1.0, res["a"].get("zoom") or 1.0
+    p = np.c_[np.asarray(pts, float) * zb, np.ones(len(pts))] @ M.T
+    return [[round(float(x / w / za), 2), round(float(y / w / za), 2)] for x, y, w in p]
+
+
+def skirting_changes(res: dict, abs_a: str, abs_b: str, wet: bool = False) -> dict:
+    """Skirting of every room whose printed area changed (or that is new / gone), on BOTH vector sheets: E1's room
+    tracer at the room's own tag (stoa.evidence.lineplan._measure) and its skirting rule (outline minus openings,
+    jamb to jamb: lineplan._skirting). A trace is used only when its area agrees with the room's printed area within
+    TRACE_TOL; a room name with any copy that fails goes to 'review' (not priced). Stairs / lifts: none; wet rooms none
+    unless `wet`. Each room carries both the net run (openings deducted) and the whole outline (old_p / new_p), so the
+    panel follows F4's 'door openings deducted or not' without another trace."""
+    out = {"by_name": [], "review": [], "rooms": 0, "traces": 0, "seconds": 0.0,
+           "how": f"traced room outline minus door openings, on both sheets; each outline checked against the room's "
+                  f"printed area (±{TRACE_TOL:.0%} of the printed figure, read as 12.5-13.5 when it says 13)"}
+    if not (res["a"]["kind"] == res["b"]["kind"] == "vector" and res["a"]["space"] == "pdf_pt"):
+        return out
+    t0 = time.perf_counter()
+    from stoa.evidence import lineplan
+    from stoa.evidence.linework import sheet_scales
+
+    pg_a, pg_b = res["a"]["page"] or 0, res["b"]["page"] or 0
+    sa, sb = sheet_scales(abs_a, pg_a), sheet_scales(abs_b, pg_b)
+    n_a = float(sa[0]) if sa else None
+    n_b = float(sb[0]) if sb else n_a
+    if not n_a:
+        out["review"].append({"id": "review:skirting", "item": "Skirting", "why": "no printed scale on the sheet: "
+                              "room outlines cannot be measured", "marks": []})
+        return out
+    out["wet"] = wet
+    rooms = [r_ for r_ in (res.get("areas") or {}).get("rooms") or [] if not _no_skirting(r_["name"], wet)]
+    if len(rooms) > SKIRT_MAX_ROOMS:
+        out["review"].append({"id": "review:skirting-more", "item": f"Skirting in {len(rooms) - SKIRT_MAX_ROOMS} more rooms",
+                              "why": f"only the first {SKIRT_MAX_ROOMS} changed rooms are traced", "marks": []})
+        rooms = rooms[:SKIRT_MAX_ROOMS]
+
+    def trace(path, page, n, box, printed, unit):
+        pt = ((box[0] + box[2]) / 2, (box[1] + box[3]) / 2)
+        try:
+            m = lineplan._measure(path, page, pt, n, tuple(box))
+        except Exception:  # noqa: BLE001
+            m = None
+        out["traces"] += 1
+        if m is None:
+            return None, "its walls could not be traced around the label"
+        k = FT2 if unit == "ft2" else 1.0
+        want = printed * k
+        # a printed '13 m2' is anything from 12.5 to 13.5: the tolerance starts from that range (DfE 2012 SEN Resource
+        # and Food Bay '13 m2' trace 14.1 = +8.5 % of 13 but +4.4 % of 13.5; the 8 % alone sent them to 'check by hand')
+        half = 0.5 if float(printed).is_integer() else 0.05
+        if not (printed - half) * k * (1 - TRACE_TOL) <= m["area_m2"] <= (printed + half) * k * (1 + TRACE_TOL):
+            return None, f"the traced outline ({m['area_m2']:.1f} m²) does not match the printed {_fmt_q(want)} m²"
+        try:
+            sk = lineplan._skirting(path, page, n, m)
+        except Exception:  # noqa: BLE001
+            sk = None
+        if sk is None:
+            return None, "no skirting reading for the traced outline"
+        return {"value": float(sk["value_m"]), "perimeter": float(sk["perimeter_m"]), "openings": len(sk.get("openings") or []),
+                "polygon": [[round(float(x), 2), round(float(y), 2)] for x, y in m["polygon"]]}, None
+
+    groups: dict[str, dict] = {}
+    for r_ in rooms:
+        g = groups.setdefault(r_["name"].lower(), {"name": r_["name"], "old": 0.0, "new": 0.0, "n_old": 0, "n_new": 0,
+                                                    "old_p": 0.0, "new_p": 0.0, "fail": None, "marks": [],
+                                                    "outlines": [], "each": []})
+        out["rooms"] += 1
+        for side, path, page, n, box, printed in (("a", abs_a, pg_a, n_a, r_.get("box_a"), r_["old"]),
+                                                  ("b", abs_b, pg_b, n_b, r_.get("box_b"), r_["new"])):
+            if printed is None or not box or g["fail"]:
+                continue
+            got, why = trace(path, page, n, box, printed, r_["unit"])
+            if got is None:
+                g["fail"] = why
+                continue
+            poly = got["polygon"] if side == "a" else _to_a(res, got["polygon"])
+            g["old" if side == "a" else "new"] += got["value"]
+            g["old_p" if side == "a" else "new_p"] += got["perimeter"]
+            g["n_old" if side == "a" else "n_new"] += 1
+            g["outlines"].append({"polygon": poly, "kind": "removed" if side == "a" else "added"})
+            g["each"].append((side, got["value"]))
+        g["marks"] += _room_marks([r_], r_["name"])
+    for g in groups.values():
+        if g["fail"]:
+            out["review"].append({"id": f"review:skirting:{g['name']}", "item": f"Skirting of {g['name']}",
+                                  "why": g["fail"] + ": measure by hand", "marks": g["marks"]})
+            continue
+        if abs(g["new"] - g["old"]) < 0.05 and abs(g["new_p"] - g["old_p"]) < 0.05:
+            continue
+        olds = [v for s_, v in g["each"] if s_ == "a"]
+        news = [v for s_, v in g["each"] if s_ == "b"]
+        detail = (f"{' + '.join(f'{v:.1f}' for v in olds) or '—'} → {' + '.join(f'{v:.1f}' for v in news) or '—'} m"
+                  if len(olds) + len(news) <= 6 else f"{len(olds)} → {_n(len(news), 'room')}")
+        out["by_name"].append({"name": g["name"], "old": round(g["old"], 2), "new": round(g["new"], 2), "detail": detail,
+                               "old_p": round(g["old_p"], 2), "new_p": round(g["new_p"], 2), "wet": _wet(g["name"]),
+                               "marks": g["marks"], "outlines": g["outlines"]})
+    out["by_name"].sort(key=lambda d: -abs(d["new"] - d["old"]))
+    out["seconds"] = round(time.perf_counter() - t0, 2)
+    return out
+
+
 def _area_q(name: str) -> str:
     """'Staff Room' -> 'What is the area of the Staff Room?'; a code-like label ('Yr 4', 'U106') without 'the'."""
     return f"What is the area of {name}?" if any(c.isdigit() for c in name) else f"What is the area of the {name}?"
@@ -1673,13 +2717,25 @@ def suggest_questions(res: dict, skip: set[str] | None = None, max_rooms: int = 
     area changed first, then rooms next to changed linework, then door / window counts when linework changed."""
     out: list[dict] = []
     seen: set[str] = set()
+    same: set[tuple] = set()  # one room per identical change: 'Yr 3' stands for Yr 3-6 (all 62 -> 55 m2)
+    cand = []
     for d in (res.get("areas") or {}).get("by_name", []):
-        if d["name"].lower() in seen or _ROOM_STOP.search(d["name"]):
+        change = (tuple(sorted(set(d["old"]))), tuple(sorted(set(d["new"]))), d.get("unit"))
+        if d["name"].lower() in seen or _ROOM_STOP.search(d["name"]) or change in same:
             continue
         seen.add(d["name"].lower())
+        same.add(change)
+        cand.append(d)
+    # by_name lists rooms on both versions first: keep 2 of them and 2 new / gone rooms (the DfE pair asked two locker
+    # bays, -2 and -1 m2, and never the new 69 m2 Practical Science room), then fill up in the same order
+    both = [d for d in cand if d.get("count_old", 1) and d.get("count_new", 1)]
+    one = [d for d in cand if not (d.get("count_old", 1) and d.get("count_new", 1))]
+    pick = both[:2] + one[:2]
+    pick += [d for d in cand if d not in pick][:max(0, max_rooms - len(pick))]
+    pick = sorted(pick[:max_rooms], key=cand.index)
+    seen = {d["name"].lower() for d in pick}
+    for d in pick:
         out.append({"question": _area_q(d["name"]), "kind": "area", "region": None})
-        if len(seen) >= max_rooms:
-            break
     for rg in res.get("regions", []):
         name = rg.get("near")
         if len(seen) >= max_rooms:
@@ -1727,7 +2783,7 @@ def _ask_local(abs_path: str, virtual: str, question: str) -> dict:
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)  # type: ignore[union-attr]
     return mod.answer({"abs": abs_path, "virtual": virtual, "question": question,
-                       "solver_args": {"gemini": 0, "verify": 0}})
+                       "solver_args": {"gemini": 0, "verify": 0}, "private": True})  # T2 21:59: every hosted step off
 
 
 # ------------------------------------------------------------------------------------------------------ router
@@ -1748,6 +2804,10 @@ def resolve(path: str) -> Path:
         raise ValueError("path must be 'upload/<id>/<name>' or dataset-relative 'data/...'")
     if path.startswith("upload/"):
         p = (UPLOADS / path[len("upload/"):]).resolve()
+        m = re.match(r"^upload/([^/\\]+)/([a-z0-9_]+)/([^/\\]+)$", path)
+        if m and not p.is_file():  # F8 22:42: a picture whose drawing style the upload guessed ('cubicasa5k') is shown
+            # as upload/<id>/<style>/<name> but stored at <uploads>/<id>/data/<style>/<name> (web/mock/stoaApi.ts)
+            p = (UPLOADS / m.group(1) / "data" / m.group(2) / m.group(3)).resolve()
         if UPLOADS.resolve() not in p.parents:
             raise ValueError("path outside the upload folder")
     else:
@@ -1771,6 +2831,9 @@ DEMOS = {
         "a": "baseline-designs-630-place-primary-schoo__3fe_630_place_jmi_primary_school_ff_62m2.pdf",
         "b": "baseline-designs-630-place-primary-schoo__3fe_630_place_jmi_primary_school_ff_with_55m2_classrooms.pdf",
         "a_name": "school-first-floor-62m2-classrooms.pdf", "b_name": "school-first-floor-55m2-classrooms.pdf",
+        # what the panel calls the two versions (UX NEW-11: not the file names)
+        "a_label": {"title": "Primary school, first floor", "version": "issue A (62 m² classrooms)"},
+        "b_label": {"title": "Primary school, first floor", "version": "issue B (55 m² classrooms)"},
         "credit": "Drawings: Education Funding Agency (DfE) baseline designs, 2014, Open Government Licence v3.0",
     },
     # a whole issue: two 2-page sets (ground + first floor), pages in another order in the new issue; built on demand
@@ -1781,9 +2844,23 @@ DEMOS = {
         "b": ["baseline-designs-630-place-primary-schoo__3fe_630_place_jmi_primary_school_ff_with_55m2_classrooms.pdf",
               "baseline-designs-630-place-primary-schoo__3fe_630_place_jmi_primary_school_gf_002.pdf"],
         "a_name": "school-issue-1.pdf", "b_name": "school-issue-2.pdf",
+        "a_label": {"version": "issue 1"}, "b_label": {"version": "issue 2"},
         "credit": "Drawings: Education Funding Agency (DfE) baseline designs, 2014, Open Government Licence v3.0",
+        "thumb_pages": (1, 0),  # the catalogue picture: the first floor (A's 2nd sheet = B's 1st), the sheet that changed
     },
 }
+
+
+def _demo_names(res: dict) -> None:
+    """The one-click examples' versions get the names the panel shows ('issue A (62 m² classrooms)'), by file name."""
+    for side in ("a", "b"):
+        nm = (res.get(side) or {}).get("name")
+        if not nm:
+            continue
+        for d in DEMOS.values():
+            for which in ("a", "b"):
+                if nm.get("file") == d.get(f"{which}_name") and d.get(f"{which}_label"):
+                    nm.update(d[f"{which}_label"])
 
 
 def _demo_files(d: dict, which: str) -> list[str]:
@@ -1822,22 +2899,456 @@ def demo_path(demo: str, which: str) -> Path:
     return out
 
 
+def change_window(overlay: np.ndarray, frac: float = 0.42, aspect: float = 16 / 9) -> tuple[int, int, int, int]:
+    """The aspect-shaped window (``frac`` of the image width) holding the most change ink of an overlay (red removed,
+    green added, orange text boxes): (x0, y0, x1, y1) in pixels. The whole image when nothing is coloured."""
+    h, w = overlay.shape[:2]
+    b, g, r = (overlay[..., i].astype(np.int16) for i in range(3))
+    ink = ((np.abs(r - g) > 60) | (np.abs(g - r) > 60) | (np.abs(r - b) > 90)).astype(np.float64)
+    ww = max(16, min(w, int(round(frac * w))))
+    wh = max(9, min(h, int(round(ww / aspect))))
+    if not ink.any():
+        return 0, 0, w, h
+    ii = np.pad(ink.cumsum(0).cumsum(1), ((1, 0), (1, 0)))
+    step = max(1, min(w, h) // 120)
+    ys = np.arange(0, h - wh + 1, step)
+    xs = np.arange(0, w - ww + 1, step)
+    Y, X = np.meshgrid(ys, xs, indexing="ij")
+    tot = ii[Y + wh, X + ww] - ii[Y, X + ww] - ii[Y + wh, X] + ii[Y, X]
+    k = np.unravel_index(int(np.argmax(tot)), tot.shape)
+    x0, y0 = int(X[k]), int(Y[k])
+    return x0, y0, x0 + ww, y0 + wh
+
+
+def demo_thumb(demo: str, width: int = 960) -> Path:
+    """The catalogue card's picture of an example (UX 23:0x: the card showed a generic icon): its compare overlay
+    (removed red, added green) cut to the 16:9 window with the most changes, strokes thickened so they survive the
+    downscale. Made once (one compare, ~3 s) and kept next to the demo files' cache."""
+    import cv2
+
+    d = DEMOS.get(demo)
+    if not d:
+        raise KeyError(demo)
+    srcs = [DEMO_DIR / f for w in ("a", "b") for f in _demo_files(d, w)]
+    out = CACHE_DIR / "demo" / f"{demo}-thumb-{width}.png"
+    if out.is_file() and all(p.is_file() for p in srcs) and out.stat().st_mtime >= max(p.stat().st_mtime for p in srcs):
+        return out
+    pa, pb = demo_path(demo, "a"), demo_path(demo, "b")
+    page_a, page_b = d.get("thumb_pages", (0, 0))
+    work = CACHE_DIR / "demo" / f"{demo}-thumb"
+    res = compare(str(pa), str(pb), page_a, page_b, out_dir=work)
+    img = cv2.imread(str(work / "overlay.png"), cv2.IMREAD_COLOR)
+    if img is None or not res["alignment"]["ok"]:
+        raise FileNotFoundError(f"{demo}: no overlay")
+    x0, y0, x1, y1 = change_window(img)
+    crop = img[y0:y1, x0:x1]
+    f = max(1, int(round((x1 - x0) / width)))
+    if f > 1:  # a min filter thickens dark and coloured strokes before INTER_AREA averages them away
+        crop = cv2.erode(crop, np.ones((f, f), np.uint8))
+    hh = int(round(crop.shape[0] * width / crop.shape[1]))
+    crop = cv2.resize(crop, (width, hh), interpolation=cv2.INTER_AREA)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    tmp = out.with_suffix(".tmp.png")
+    cv2.imwrite(str(tmp), crop, [cv2.IMWRITE_PNG_COMPRESSION, 6])
+    os.replace(tmp, out)
+    return out
+
+
 _RESULTS: "collections.OrderedDict[str, dict]" = collections.OrderedDict()
 _LOCK = threading.Lock()
 
 
+def _layers_ready(*paths: Path) -> bool:
+    """Every scan among the files has its OCR text layer now (the browser asks again while 'areas_pending')."""
+    try:
+        from stoa.solvers.raster.sheet import cached_layer
+    except Exception:  # noqa: BLE001
+        return False
+    return all(cached_layer(str(p)) is not None for p in paths if p.suffix.lower() in IMAGE_EXT)
+
+
+def _turned_b(pa: Path, page_a: int, pb: Path, page_b: int | None) -> tuple[Path, int | None, str | None]:
+    """B re-plotted TURNED (its content drawn at 90 / 180 / 270 deg, no /Rotate flag) while A reads upright: compare
+    against B's upright copy, an exact vector pair again. The DfE first floor turned 90 / 180 deg was priced +EUR 326 /
+    -EUR 2,028 against B as it is (wall lines rasterised turned and warped back differ by a pixel), +EUR 380 against
+    the copy = the upright pair. Returns (path, page, note); B itself (note None) when nothing is turned."""
+    if not UPRIGHT or pb.suffix.lower() != ".pdf" or pa.suffix.lower() != ".pdf":
+        return pb, page_b, None
+    try:
+        import fitz
+
+        with fitz.open(str(pb)) as d:
+            n = len(d)
+        pg = page_b if page_b is not None and page_b >= 0 else (0 if n == 1 else None)
+        if pg is None or pg >= n or _upright_copy(str(pa), page_a) is not None:
+            return pb, page_b, None
+        u = _upright_copy(str(pb), pg)
+    except Exception:  # noqa: BLE001 - compare B as it is
+        return pb, page_b, None
+    if u is None:
+        return pb, page_b, None
+    deg = round(math.degrees(math.atan2(float(u[1][1][0]), float(u[1][0][0])))) % 360
+    how = "upside down" if deg == 180 else "turned a quarter turn"  # 90 or 270: which way depends on how you look
+    return Path(u[0]), 0, f"The other version is drawn {how} on its page: it was compared on a copy turned back upright"
+
+
+# ---- two versions of a MODEL (IFC): elements matched by GlobalId, exact counts / areas / lengths --------------------
+_IFC_KIND = {"IfcDoor": "door", "IfcWindow": "window", "IfcWall": "wall", "IfcWallStandardCase": "wall",
+             "IfcCurtainWall": "curtain wall", "IfcSpace": "room", "IfcSlab": "slab", "IfcRoof": "roof",
+             "IfcStair": "stair", "IfcStairFlight": "stair flight", "IfcRamp": "ramp", "IfcColumn": "column",
+             "IfcBeam": "beam", "IfcRailing": "railing", "IfcCovering": "covering", "IfcPlate": "plate",
+             "IfcMember": "member", "IfcFooting": "footing", "IfcFurnishingElement": "furniture",
+             "IfcFurniture": "furniture", "IfcSanitaryTerminal": "sanitary fitting", "IfcFlowTerminal": "fitting"}
+IFC_MOVE_M = float(os.environ.get("STOA_F5_IFC_MOVE", "0.05"))  # an element whose box centre moved more = moved
+IFC_OTHER = 0.3  # fewer elements than this share (by id or by place) = two different models
+
+
+def _plural(kind: str) -> str:
+    return kind if kind == "furniture" else kind + "s"
+
+
+def _ifc_kind(cls: str) -> str:
+    return _IFC_KIND.get(cls) or re.sub(r"(?<=[a-z])(?=[A-Z])", " ", cls.removeprefix("Ifc")).lower()
+
+
+def _ifc_centre(e) -> tuple[float, float, float] | None:
+    bb = getattr(e.geo, "bbox", None) if e.geo else None
+    return ((bb[0] + bb[3]) / 2, (bb[1] + bb[4]) / 2, (bb[2] + bb[5]) / 2) if bb else None
+
+
+def _ifc_area(e) -> float | None:
+    """A room's floor area: its NetFloorArea / GrossFloorArea quantity, else the footprint of its geometry."""
+    q = e.qto or {}
+    for suf in ("NetFloorArea", "GrossFloorArea"):
+        v = next((v for k, v in q.items() if k.endswith(suf) and isinstance(v, (int, float)) and v > 0), None)
+        if v:
+            return float(v)
+    fa = getattr(e.geo, "footprint_area", None) if e.geo else None
+    return float(fa) if fa else None
+
+
+def _ifc_len(e) -> float | None:
+    """A wall's length: its axis, else its Length quantity, else the long side of its box."""
+    if e.axis_length:
+        return float(e.axis_length)
+    q = e.qto or {}
+    v = next((v for k, v in q.items() if k.endswith(".Length") and isinstance(v, (int, float)) and v > 0), None)
+    if v:
+        return float(v)
+    bb = getattr(e.geo, "bbox", None) if e.geo else None
+    return float(max(bb[3] - bb[0], bb[4] - bb[1])) if bb else None
+
+
+def _ifc_height(e) -> float | None:
+    q = e.qto or {}
+    v = next((v for k, v in q.items() if k.endswith(".Height") and isinstance(v, (int, float)) and v > 0), None)
+    if v:
+        return float(v)
+    bb = getattr(e.geo, "bbox", None) if e.geo else None
+    return float(bb[5] - bb[2]) if bb and bb[5] > bb[2] else None
+
+
+def _ifc_room_name(e) -> str:
+    n, ln = (e.name or "").strip(), (e.long_name or "").strip()
+    return ln or n or "room" if not (ln and n and ln != n) else ln
+
+
+def _ifc_external(e) -> bool:
+    v = next((v for k, v in (e.props or {}).items() if k.endswith(".IsExternal")), None)
+    return bool(v) if v is not None else False
+
+
+def ifc_compare(pa: Path, pb: Path, virtual_a: str | None = None, virtual_b: str | None = None) -> dict:
+    """Two versions of one model: every element (doors, windows, walls, rooms, slabs …) matched by its GlobalId (an
+    element exported with a new id: same class at the same place); per element added / removed / moved (box centre
+    > IFC_MOVE_M) / resized (room area, wall length, door width or height) / renamed. Exact: no drawing is read."""
+    from stoa.solvers.ifc.index import load_index
+
+    t0 = time.time()
+    ia, ib = load_index(str(pa)), load_index(str(pb))
+    A = {g: e for g, e in ia.elements.items() if e.cls in _IFC_KIND or e.geo}
+    B = {g: e for g, e in ib.elements.items() if e.cls in _IFC_KIND or e.geo}
+    pairs = {g: g for g in A if g in B and A[g].cls == B[g].cls}
+    by_id = len(pairs)
+    # exported anew (new ids): the same class at the same place (box centre within 5 cm) is the same element
+    la = [g for g in A if g not in pairs]
+    free_b = {g for g in B if g not in set(pairs.values())}
+    # a grid of IFC_MOVE_M cells per class: each element looks only at the 27 cells around its own (linear, not n²)
+    cell = max(IFC_MOVE_M, 1e-3)
+    grid: dict[tuple, list[str]] = collections.defaultdict(list)
+    for h in free_b:
+        cb = _ifc_centre(B[h])
+        if cb is not None:
+            grid[(B[h].cls, *(math.floor(v / cell) for v in cb))].append(h)
+    for g in la:
+        ca = _ifc_centre(A[g])
+        if ca is None:
+            continue
+        k0 = [math.floor(v / cell) for v in ca]
+        near = [h for dx in (-1, 0, 1) for dy in (-1, 0, 1) for dz in (-1, 0, 1)
+                for h in grid.get((A[g].cls, k0[0] + dx, k0[1] + dy, k0[2] + dz), ()) if h in free_b]
+        best = min(near, key=lambda h: math.dist(ca, _ifc_centre(B[h])), default=None)
+        if best is not None and math.dist(ca, _ifc_centre(B[best])) <= IFC_MOVE_M:
+            pairs[g] = best
+            free_b.discard(best)
+    strong = len(pairs)  # by id or by place: evidence that the two files are one model (a shared family name is not)
+    # no geometry in the index (furniture, an aggregated roof): the same class, name, type and storey, in file order
+    pool: dict[tuple, list[str]] = collections.defaultdict(list)
+    sname_b = {s_.guid: s_.name for s_ in ib.storeys}
+    sname_a = {s_.guid: s_.name for s_ in ia.storeys}
+    for h in B:
+        if h in free_b and _ifc_centre(B[h]) is None:
+            pool[(B[h].cls, B[h].name, B[h].type_name, sname_b.get(B[h].storey))].append(h)
+    for g in la:
+        if g in pairs or _ifc_centre(A[g]) is not None:
+            continue
+        hs = pool.get((A[g].cls, A[g].name, A[g].type_name, sname_a.get(A[g].storey)))
+        if hs:
+            pairs[g] = hs.pop(0)
+            free_b.discard(pairs[g])
+    st_a = {s.guid: s.name for s in ia.storeys}
+    st_b = {s.guid: s.name for s in ib.storeys}
+    elements: list[dict] = []
+
+    def el(kind, e, eb=None, **kw):
+        return {"change": kind, "cls": e.cls, "kind": _ifc_kind(e.cls),
+                "name": (_ifc_room_name(e) if e.cls == "IfcSpace" else (e.name or e.type_name or "")).strip()[:80],
+                "storey": (st_a.get(e.storey) if eb is None or kind != "added" else st_b.get(e.storey)) or "",
+                "guid_a": e.guid if kind != "added" else None, "guid_b": (eb or e).guid if kind != "removed" else None, **kw}
+
+    for g, h in pairs.items():
+        ea, eb = A[g], B[h]
+        ca, cb = _ifc_centre(ea), _ifc_centre(eb)
+        moved = round(math.dist(ca, cb), 2) if ca and cb and math.dist(ca, cb) > IFC_MOVE_M else None
+        what = []
+        if ea.cls == "IfcSpace":
+            xa, xb = _ifc_area(ea), _ifc_area(eb)
+            if xa and xb and abs(xb - xa) > max(0.05, 0.01 * xa):
+                what.append(("area", round(xa, 2), round(xb, 2), "m²"))
+            if _ifc_room_name(ea) != _ifc_room_name(eb):
+                what.append(("name", _ifc_room_name(ea), _ifc_room_name(eb), ""))
+        elif ea.cls in ("IfcWall", "IfcWallStandardCase", "IfcCurtainWall"):
+            xa, xb = _ifc_len(ea), _ifc_len(eb)
+            if xa and xb and abs(xb - xa) > 0.05:
+                what.append(("length", round(xa, 2), round(xb, 2), "m"))
+        elif ea.cls in ("IfcDoor", "IfcWindow"):
+            for k in ("OverallWidth", "OverallHeight"):
+                xa, xb = (ea.dims or {}).get(k), (eb.dims or {}).get(k)
+                if xa and xb and abs(xb - xa) > 0.01:
+                    what.append(("width" if k.endswith("Width") else "height", round(xa, 3), round(xb, 3), "m"))
+            if (ea.type_name or "") != (eb.type_name or "") and ea.type_name and eb.type_name:
+                what.append(("type", ea.type_name, eb.type_name, ""))
+        if moved or what:
+            elements.append(el("changed" if what else "moved", ea, eb, moved_m=moved,
+                               what=[{"what": w, "old": o, "new": n, "unit": u} for w, o, n, u in what]))
+    matched_b = set(pairs.values())
+    for g, e in A.items():
+        if g not in pairs:
+            elements.append(el("removed", e))
+    for h, e in B.items():
+        if h not in matched_b:
+            elements.append(el("added", e, e))
+    share = len(pairs) / max(1, min(len(A), len(B)))
+    other = strong / max(1, min(len(A), len(B))) < IFC_OTHER
+    # per class: counts before / after and what happened
+    by_class: dict[str, dict] = {}
+    for e in A.values():
+        by_class.setdefault(_ifc_kind(e.cls), {"kind": _ifc_kind(e.cls), "old": 0, "new": 0})["old"] += 1
+    for e in B.values():
+        by_class.setdefault(_ifc_kind(e.cls), {"kind": _ifc_kind(e.cls), "old": 0, "new": 0})["new"] += 1
+    for x in elements:
+        d = by_class[x["kind"]]
+        d[x["change"]] = d.get(x["change"], 0) + 1
+    classes = sorted((d for d in by_class.values() if any(d.get(k) for k in ("added", "removed", "moved", "changed"))),
+                     key=lambda d: (d["kind"] not in ("door", "window", "wall", "room"), -(d.get("added", 0) + d.get("removed", 0) + d.get("changed", 0) + d.get("moved", 0))))
+    # rooms in the by-name shape of the printed areas, so the panel's room list and the cost's floor lines read them
+    rooms_old: dict[str, list[float]] = collections.defaultdict(list)
+    rooms_new: dict[str, list[float]] = collections.defaultdict(list)
+    for e in A.values():
+        if e.cls == "IfcSpace" and _ifc_area(e):
+            rooms_old[_ifc_room_name(e)].append(round(_ifc_area(e), 2))
+    # a room is its id: a renamed room keeps one line, named 'old → new' (not 'gone' + 'new')
+    partner = {h: g for g, h in pairs.items()}
+    renamed: dict[str, str] = {}
+    for h, e in B.items():
+        if e.cls == "IfcSpace" and _ifc_area(e):
+            g = partner.get(h)
+            na, nb = (_ifc_room_name(A[g]) if g else None), _ifc_room_name(e)
+            if na and na != nb:
+                renamed[na] = f"{na} → {nb}"
+            rooms_new[na or nb].append(round(_ifc_area(e), 2))
+    by_name = []
+    for n in sorted(set(rooms_old) | set(rooms_new)):
+        o, w = rooms_old.get(n, []), rooms_new.get(n, [])
+        if sorted(o) == sorted(w):
+            continue
+        ch = [[x["what"][0]["old"], x["what"][0]["new"]] for x in elements if x["cls"] == "IfcSpace" and x["name"] == n
+              and x.get("what") and x["what"][0]["what"] == "area"]
+        by_name.append({"name": renamed.get(n, n), "unit": "m2", "old": o, "new": w, "count_old": len(o), "count_new": len(w),
+                        "sum_old": round(sum(o), 3), "sum_new": round(sum(w), 3), "delta": round(sum(w) - sum(o), 3),
+                        "changed": ch})
+    by_name.sort(key=lambda d: (not (d["count_old"] == d["count_new"] > 0), -abs(d["delta"])))
+    so, sn = sum(sum(v) for v in rooms_old.values()), sum(sum(v) for v in rooms_new.values())
+    total = {"unit": "m2", "old": round(so, 3), "new": round(sn, 3), "delta": round(sn - so, 3),
+             "rooms_old": sum(map(len, rooms_old.values())), "rooms_new": sum(map(len, rooms_new.values()))} if (so or sn) else None
+    nd = by_class.get("door", {"old": 0, "new": 0})
+    parts = [f"{_plural(d['kind'])} {d['old']} → {d['new']}" + "".join(f", {d[k]} {k}" for k in ("added", "removed", "moved", "changed") if d.get(k))
+             for d in classes[:5]]
+    how = (f"by the element ids (GlobalId) the two models share ({by_id} of {min(len(A), len(B))})"
+           + (f"; {len(pairs) - by_id} more by class and place (exported with new ids)" if len(pairs) > by_id else ""))
+    name_a, name_b = ia.project_name or Path(virtual_a or pa.name).stem, ib.project_name or Path(virtual_b or pb.name).stem
+    res = {"model": True, "a": {"file": virtual_a or str(pa), "page": 0, "space": "ifc", "size": None,
+                               "name": {"title": name_a, "number": None, "revision": None, "source": "model", "file": pa.name}},
+           "b": {"file": virtual_b or str(pb), "page": 0, "space": "ifc", "size": None,
+                 "name": {"title": name_b, "number": None, "revision": None, "source": "model", "file": pb.name}},
+           "alignment": {"method": "ids", "ok": not other, "overlap": round(share, 3), "residual": 0.0, "scale": 1.0,
+                         "rotation_deg": 0.0, "how": how, "plain": how},
+           "regions": [], "text": [], "quantities": [], "areas": {"rooms": [], "by_name": by_name, "total": total},
+           "doors": None, "scale": None, "page_b_note": None, "suggested_questions": [],
+           "same_sheet": not other, "other_sheet": other, "approximate": False, "changed_share": round(1 - share, 3),
+           "drawing_kind": {"a": "model", "b": "model"},
+           "model_changes": {"by_class": classes, "elements": elements[:400], "n_elements": len(elements),
+                             "count_a": len(A), "count_b": len(B), "matched": len(pairs), "by_id": by_id},
+           "wall_seconds": round(time.time() - t0, 2)}
+    res["summary"] = ("These look like two different models: only " f"{share:.0%} of the elements match; nothing is priced."
+                      if other else ("What changed in the model: " + "; ".join(parts) + "." if parts else "No differences found in the model."))
+    if total and total["delta"] and not other:
+        res["summary"] += f" Room areas {_fmt_q(total['old'])} → {_fmt_q(total['new'])} m² ({total['delta']:+,.1f})."
+    res["revision_cost"] = ifc_cost(res, A, B, pairs, elements)
+    return res
+
+
+def ifc_cost(res: dict, A: dict, B: dict, pairs: dict, elements: list[dict]) -> dict:
+    """The revision's cost from the model's own quantities (example prices): floors from room areas, door sets from
+    the doors added / removed, partitions from the inner walls added / removed (length × the wall's own height)."""
+    _eur = {p["key"]: p["eur"] for p in PRICES}
+    if res.get("other_sheet"):
+        why = "these look like two different models"
+        return {"prices": PRICES, "wall_height_m": WALL_H, "lines": [], "total_eur": 0.0, "skirting": "n/a",
+                "review": [{"id": "review:withheld", "item": "Not priced", "why": why, "marks": []}], "currency": "EUR",
+                "withheld": why, "rule": "only two versions of the same model are priced",
+                "prices_note": "example prices — use your own", "summary": f"Not priced: {why}."}
+    lines, review = [], []
+    for d in res["areas"]["by_name"]:
+        if not d["delta"]:
+            continue
+        detail = (_partial(d, "m²") or (f"new room: {_each(d['new'], 'm²')}" if not d["count_old"] else
+                  f"room gone: {_each(d['old'], 'm²')}" if not d["count_new"] else f"{_each(d['old'], 'm²')} → {_each(d['new'], 'm²')}"))
+        pk = "floor_wet" if _wet(d["name"]) else "floor"
+        lines.append({"id": f"floor:{d['name']}", "group": "floor", "item": d["name"], "detail": detail,
+                      "old": round(d["sum_old"], 2), "new": round(d["sum_new"], 2), "delta": round(d["delta"], 2), "unit": "m²",
+                      "price": pk, "per_height": False, "approx": False, "how": "room areas in the two models", "marks": [],
+                      "eur": round(d["delta"] * _eur[pk], 2)})
+    add = [x for x in elements if x["cls"] == "IfcDoor" and x["change"] == "added"]
+    rem = [x for x in elements if x["cls"] == "IfcDoor" and x["change"] == "removed"]
+    for xs, sign, item, where in ((add, 1, "Doors added", "only in the new model"), (rem, -1, "Doors taken out", "only in the old model")):
+        if xs:
+            lines.append({"id": f"doors:{'added' if sign > 0 else 'removed'}", "group": "doors", "item": item,
+                          "detail": f"{_n(len(xs), 'door')} {where}", "old": None, "new": None, "delta": sign * len(xs),
+                          "unit": "set", "price": "door", "per_height": False, "approx": False,
+                          "how": "doors in the two models (one IfcDoor = one door set)", "marks": [],
+                          "guids": [x["guid_a"] or x["guid_b"] for x in xs], "eur": round(sign * len(xs) * _eur["door"], 2)})
+    wall_cls = ("IfcWall", "IfcWallStandardCase")
+    for x in elements:
+        if x["cls"] not in wall_cls:
+            continue
+        e = A.get(x["guid_a"]) if x["guid_a"] else B.get(x["guid_b"])
+        if x["change"] in ("added", "removed") or any(w["what"] == "length" for w in x.get("what") or []):
+            if _ifc_external(e):
+                review.append({"id": f"review:wall:{x['guid_a'] or x['guid_b']}", "item": f"Outside wall {x['change']}",
+                               "why": "an outside wall is not a partition: price it by hand", "marks": [],
+                               "guids": [x["guid_a"] or x["guid_b"]]})
+                continue
+            if x["change"] == "added":
+                ln, sign = _ifc_len(e), 1
+            elif x["change"] == "removed":
+                ln, sign = _ifc_len(e), -1
+            else:
+                w = next(w for w in x["what"] if w["what"] == "length")
+                ln, sign = w["new"] - w["old"], 1
+            h = _ifc_height(e) or WALL_H
+            if not ln:
+                continue
+            area = round(sign * ln * h, 2)
+            lines.append({"id": f"walls:{x['guid_a'] or x['guid_b']}", "group": "walls",
+                          "item": f"Wall {x['change']}" + (f" ({x['storey']})" if x["storey"] else ""),
+                          "detail": f"{abs(ln):.2f} m × {h:.2f} m high" + (" longer" if x["change"] == "changed" and ln > 0 else " shorter" if x["change"] == "changed" else ""),
+                          "old": None, "new": None, "delta": area, "unit": "m²", "price": "partition", "per_height": False,
+                          "approx": False, "how": "the wall's own length and height in the model", "marks": [],
+                          "guids": [x["guid_a"] or x["guid_b"]], "eur": round(area * _eur["partition"], 2)})
+    total = round(sum(ln["eur"] for ln in lines), 2)
+    groups = collections.OrderedDict()
+    for ln in lines:
+        groups[ln["group"]] = groups.get(ln["group"], 0.0) + ln["eur"]
+    words = {"floor": "floor", "doors": "doors", "walls": "walls"}
+    summ = " · ".join(f"{words[g]} {'+' if v >= 0 else '−'}€{abs(v):,.0f}" for g, v in groups.items())
+    return {"prices": PRICES, "wall_height_m": WALL_H, "lines": lines, "review": review, "total_eur": total,
+            "skirting": "n/a", "currency": "EUR",
+            "rule": "net changes between the two models from their own quantities: floor = room areas; doors = door sets "
+                    "(one IfcDoor = 1 set); walls = inner walls added, removed or resized × their own height",
+            "prices_note": "example prices — use your own",
+            "summary": f"This revision: {summ} → {'+' if total >= 0 else '−'}€{abs(total):,.0f} at example prices"
+                       + (f"; {_n(len(review), 'item')} to check by hand (not in the total)." if review else ".")
+                       if lines else "No priced quantity changed."}
+
+
+def _sheet_of_cad(p: Path) -> Path:
+    """A CAD file (.dxf) is compared as the sheet drawn from it: the same-stem PDF beside it (the dataset's Swiss
+    floors; an upload's sheet made by web/server/normalize_upload.py)."""
+    if p.suffix.lower() == ".dxf":
+        for q in (p.with_suffix(".pdf"), p.with_suffix(".png")):
+            if q.exists():
+                return q
+        raise ValueError(f"{p.name} is a CAD file without a sheet drawn from it: upload it (it is drawn as a sheet) "
+                         "or print it to PDF")
+    return p
+
+
 def cached_compare(a: str, b: str, page_a: int = 0, page_b: int | None = None) -> dict:
-    pa, pb = resolve(a), resolve(b)
+    pa, pb = _sheet_of_cad(resolve(a)), _sheet_of_cad(resolve(b))
     st_a, st_b = pa.stat(), pb.stat()
     key = hashlib.sha256(json.dumps([str(pa), st_a.st_mtime_ns, st_a.st_size, page_a, str(pb), st_b.st_mtime_ns,
-                                     st_b.st_size, page_b, 8]).encode()).hexdigest()[:16]
+                                     st_b.st_size, page_b, 9]).encode()).hexdigest()[:16]
     with _LOCK:
-        if key in _RESULTS:
-            _RESULTS.move_to_end(key)
-            return {**_RESULTS[key], "cached": True}
-    res = compare(str(pa), str(pb), page_a if pa.suffix.lower() == ".pdf" else 0,
-                  page_b if pb.suffix.lower() == ".pdf" else 0, virtual_a=a, virtual_b=b, out_dir=CACHE_DIR / key)
+        hit = _RESULTS.get(key)
+    if hit is not None and not (hit.get("areas_pending") and _layers_ready(pa, pb)):
+        with _LOCK:
+            if key in _RESULTS:
+                _RESULTS.move_to_end(key)
+        out = {**hit, "cached": True}
+        if hit.get("skirting") is not None:  # /cost traced the rooms already: the cost lines include skirting
+            out["revision_cost"] = revision_cost(hit, hit["skirting"])
+        return out
+    ifc = (pa.suffix.lower() == ".ifc", pb.suffix.lower() == ".ifc")
+    if any(ifc) and not all(ifc):
+        raise ValueError("compare a model (IFC) with another version of the model, a sheet (PDF, image, DXF) with a sheet")
+    if all(ifc):
+        res = ifc_compare(pa, pb, virtual_a=a, virtual_b=b)
+        res["key"] = key
+        # no images, but a folder named by the key: privacy's 'Delete my files' finds a comparison by its folder (T2
+        # recomputes this key for the visitor's files) and then drops the result held here too
+        try:
+            (CACHE_DIR / key).mkdir(parents=True, exist_ok=True)
+            (CACHE_DIR / key / "model.json").write_text('{"model": true}')
+        except OSError:
+            pass
+        res["images"] = None
+        res["cost"] = {"llm_tokens_in": 0, "llm_tokens_out": 0, "gpu_seconds": 0, "api_calls": 0, "cpu_seconds": 0.0,
+                       "ocr_crops": 0, "wall_seconds": res.get("wall_seconds", 0), "tier": "cheap"}
+        with _LOCK:
+            _RESULTS[key] = res
+            while len(_RESULTS) > 64:
+                _RESULTS.popitem(last=False)
+        return {**res, "cached": False}
+    pb_eff, page_b_eff, turned = _turned_b(pa, page_a, pb, page_b)
+    res = compare(str(pa), str(pb_eff), page_a if pa.suffix.lower() == ".pdf" else 0,
+                  page_b_eff if pb.suffix.lower() == ".pdf" else 0, virtual_a=a, virtual_b=b, out_dir=CACHE_DIR / key)
+    if turned:  # B's own boxes (box_b) are in the upright copy's points; everything drawn on A is unaffected
+        res["b"]["page"] = page_b if page_b is not None and page_b >= 0 else 0
+        res["b"]["frame"] = "upright copy"
+        res["page_b_note"] = (res.get("page_b_note") + " " if res.get("page_b_note") else "") + turned + "."
     res["key"] = key
+    _demo_names(res)
     res["images"] = {n: f"/feat/{FEATURE}/image/{key}/{n}.png" for n in ("overlay", "b_aligned", "a")}
     oc = (res.get("text_check") or {}).get("ocr") or {}
     res["cost"] = {"llm_tokens_in": 0, "llm_tokens_out": 0, "gpu_seconds": 0, "api_calls": 0,
@@ -1848,6 +3359,32 @@ def cached_compare(a: str, b: str, page_a: int = 0, page_b: int | None = None) -
         while len(_RESULTS) > 64:
             _RESULTS.popitem(last=False)
     return {**res, "cached": False}
+
+
+def cached_cost(a: str, b: str, page_a: int = 0, page_b: int | None = None, wet: bool = False) -> dict:
+    """The revision's cost lines WITH skirting (each changed room traced on both sheets, ~0.5 s per trace; cached with
+    the compare). Same arguments as the compare call, so it hits the same cache entry."""
+    res = cached_compare(a, b, page_a, page_b)
+    if not res["alignment"]["ok"]:
+        return {"key": res.get("key"), "revision_cost": None}
+    if res.get("model"):  # a model's cost comes from its own quantities: nothing to trace
+        return {"key": res.get("key"), "revision_cost": res.get("revision_cost"), "skirting": None}
+    if withheld(res):
+        return {"key": res.get("key"), "revision_cost": revision_cost(res), "skirting": None}
+    slot = "skirting_wet" if wet else "skirting"  # F4's Conventions 'wet rooms included': traced separately
+    sk = res.get(slot)
+    if sk is None:
+        pa, pb = _sheet_of_cad(resolve(a)), _sheet_of_cad(resolve(b))
+        if res.get("b", {}).get("frame") == "upright copy":  # traced on the same upright copy (its only page)
+            sk = skirting_changes({**res, "b": {**res["b"], "page": 0}}, str(pa), str(_turned_b(pa, page_a, pb, page_b)[0]),
+                                  wet=wet)
+        else:
+            sk = skirting_changes(res, str(pa), str(pb), wet=wet)
+        with _LOCK:
+            if res.get("key") in _RESULTS:
+                _RESULTS[res["key"]][slot] = sk
+    return {"key": res.get("key"), "revision_cost": revision_cost(res, sk),
+            "skirting": {k: sk[k] for k in ("rooms", "traces", "seconds")}}
 
 
 try:
@@ -1862,6 +3399,7 @@ try:
         b: str
         page_a: int = 0
         page_b: int | None = None  # None: the page of B that matches A best
+        wet_skirting: bool = False  # /cost only: F4's Conventions tab includes tiled wet rooms' skirting
 
     class SetsRequest(BaseModel):
         a: list[str]  # issue A: the visitor's open upload + files dropped with it (each PDF page = one sheet)
@@ -1885,6 +3423,17 @@ try:
         except ValueError as e:
             raise HTTPException(400, str(e)) from e
 
+    @router.post("/cost")
+    def cost_route(req: CompareRequest) -> dict:
+        """The cost of the revision (captain 21:51): quantity changes × example prices, skirting traced (slower)."""
+        _guard()
+        try:
+            return cached_cost(req.a, req.b, req.page_a, req.page_b, wet=req.wet_skirting)
+        except FileNotFoundError as e:
+            raise HTTPException(404, f"no such file: {e}") from e
+        except ValueError as e:
+            raise HTTPException(400, str(e)) from e
+
     @router.post("/sets")
     def sets_route(req: SetsRequest) -> dict:
         """Pair the sheets of two issues ('what changed in this issue'); the browser then compares each pair."""
@@ -1898,6 +3447,25 @@ try:
             raise HTTPException(404, f"no such file: {e}") from e
         except ValueError as e:
             raise HTTPException(400, str(e)) from e
+
+    class NameRequest(BaseModel):
+        path: str
+        page: int = 0
+
+    @router.post("/name")
+    def name_route(req: NameRequest) -> dict:
+        """What the sheet on screen is called (its printed title, number, revision; UX C-7: not its file name), for
+        the panel before anything is compared. ~0.1 s for a PDF page; a picture only from its cached text layer."""
+        _guard()
+        try:
+            p = resolve(req.path)
+        except FileNotFoundError as e:
+            raise HTTPException(404, f"no such file: {e}") from e
+        except ValueError as e:
+            raise HTTPException(400, str(e)) from e
+        nm = {"a": {"name": sheet_name(p, req.page if p.suffix.lower() == ".pdf" else 0, req.path)}}
+        _demo_names(nm)
+        return nm["a"]["name"]
 
     @router.get("/image/{key}/{name}.png")
     def image_route(key: str, name: str):
@@ -1916,9 +3484,22 @@ try:
         for k, d in DEMOS.items():
             ok = demo_available(k)
             out.append({"id": k, "title": d["title"], "credit": d["credit"], "available": ok,
+                        "thumb": f"/feat/{FEATURE}/demo/{k}/thumb.png",
                         "a": {"name": d["a_name"], "url": f"/feat/{FEATURE}/demo/{k}/a"},
                         "b": {"name": d["b_name"], "url": f"/feat/{FEATURE}/demo/{k}/b"}})
         return {"demos": out}
+
+    @router.get("/demo/{demo}/thumb.png")  # before /demo/{demo}/{which}: that one would take 'thumb.png' as {which}
+    def demo_thumb_route(demo: str):
+        """The example's picture for the catalogue card (removed red, added green, cut to where most changed)."""
+        _guard()
+        try:
+            p = demo_thumb(demo)
+        except KeyError:
+            raise HTTPException(404, "no such example") from None
+        except FileNotFoundError as e:
+            raise HTTPException(404, str(e)) from None
+        return FileResponse(p, media_type="image/png", headers={"Cache-Control": "max-age=3600"})
 
     @router.get("/demo/{demo}/{which}")
     def demo_file(demo: str, which: str):
@@ -1944,8 +3525,12 @@ def main(argv: list[str] | None = None) -> None:
     ap.add_argument("--page-b", type=int, default=None, help="default: the page of B that matches A best")
     ap.add_argument("--out", default=None, help="write overlay.png / b_aligned.png here")
     ap.add_argument("--impact", action="store_true", help="ask the suggested questions on both (slow: pipeline)")
+    ap.add_argument("--cost", action="store_true", help="price the revision incl. skirting (traces the changed rooms)")
     args = ap.parse_args(argv)
     res = compare(args.a, args.b, args.page_a, args.page_b, out_dir=args.out)
+    if args.cost and res["alignment"]["ok"]:
+        res["skirting"] = skirting_changes(res, args.a, args.b)
+        res["revision_cost"] = revision_cost(res, res["skirting"])
     if args.impact and res["alignment"]["ok"]:
         res["impact"] = impact(res, args.a, args.b)
     print(json.dumps(res, indent=1, default=str))

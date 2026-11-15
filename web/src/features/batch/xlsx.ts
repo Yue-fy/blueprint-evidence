@@ -171,3 +171,68 @@ export async function readXlsx(buf: Uint8Array): Promise<string[][]> {
   }
   return rows;
 }
+
+/** A text document's words, for a question list written in Word / LibreOffice: its paragraphs in order (tables left
+ *  out; a line break inside a paragraph starts a new line, a tab stays a tab) and its tables as rows of cell texts.
+ *  .docx = word/document.xml (w:p, w:t, w:tbl); .odt = content.xml (text:p / text:h, table:table). Headers, footers,
+ *  comments and deleted (tracked) text are left out. */
+export interface DocText { lines: string[]; tables: string[][][] }
+export async function readDocument(name: string, buf: Uint8Array): Promise<DocText> {
+  const odt = /\.odt$/i.test(name);
+  const part = odt ? "content.xml" : "word/document.xml";
+  const files = await unzip(buf, (n) => n === part);
+  if (!files.has(part)) throw new Error(odt ? "not an OpenDocument text file (no content.xml)" : "not a Word .docx file (no word/document.xml)");
+  return odt ? odtText(new TextDecoder().decode(files.get(part)!)) : docxText(new TextDecoder().decode(files.get(part)!));
+}
+
+/** word/document.xml → paragraphs + tables (pure; exported for the tests) */
+export function docxText(xml: string): DocText {
+  const body = xml.replace(/<w:body\b[^>]*>/, "").replace(/<w:sectPr\b[\s\S]*?<\/w:sectPr>/g, "");
+  const para = (p: string) => [...p.matchAll(/<w:t(?:\s[^>]*)?>([\s\S]*?)<\/w:t>|<w:tab\/>|<w:(?:br|cr)(?:\s[^>]*)?\/>/g)]
+    .map((m) => (m[1] !== undefined ? unXml(m[1]) : m[0].startsWith("<w:tab") ? "\t" : "\n")).join("");
+  const paras = (x: string) => [...x.matchAll(/<w:p\b(?:\s[^>]*)?>([\s\S]*?)<\/w:p>/g)].map((m) => para(m[1]));
+  // a heading / title paragraph (its style; Word localises the style ids) is the document's title, not a question
+  const isHeading = (p: string) => HEADING_STYLE.test(p.match(/<w:pStyle\s+w:val="([^"]+)"/)?.[1] ?? "");
+  const textParas = (x: string) => [...x.matchAll(/<w:p\b(?:\s[^>]*)?>([\s\S]*?)<\/w:p>/g)]
+    .map((m) => ({ t: para(m[1]), h: isHeading(m[1]) })).filter((p) => !p.h || /[?？]\s*$/.test(p.t)).map((p) => p.t);
+  const tables: string[][][] = [];
+  for (const t of body.matchAll(/<w:tbl>([\s\S]*?)<\/w:tbl>/g)) {
+    const rows = [...t[1].matchAll(/<w:tr\b(?:\s[^>]*)?>([\s\S]*?)<\/w:tr>/g)]
+      .map((r) => [...r[1].matchAll(/<w:tc>([\s\S]*?)<\/w:tc>|<w:tc\s[^>]*>([\s\S]*?)<\/w:tc>/g)].map((c) => paras(c[1] ?? c[2]).join(" ").replace(/\s+/g, " ").trim()))
+      .filter((r) => r.some((c) => c));
+    if (rows.length) tables.push(rows);
+  }
+  const lines = textParas(body.replace(/<w:tbl>[\s\S]*?<\/w:tbl>/g, "")).flatMap(softLines);
+  return { lines, tables };
+}
+/** A paragraph's soft line breaks (Shift+Enter): a new line, unless the text before has no closing punctuation and the
+ *  text after starts in lower case ('How many doors and windows' / 'are there?' is one question, wrapped by hand). */
+function softLines(p: string): string[] {
+  const out: string[] = [];
+  for (const seg of p.split("\n")) {
+    const prev = out.length ? out[out.length - 1] : null;
+    if (prev !== null && prev.trim() && !/[?？.!:;]\s*$/.test(prev) && /^\s*\p{Ll}/u.test(seg)) out[out.length - 1] = `${prev.trimEnd()} ${seg.trimStart()}`;
+    else out.push(seg);
+  }
+  return out;
+}
+const HEADING_STYLE = /^(?:heading|title|subtitle|otsikko|alaotsikko|otsikko|berschrift|überschrift|titel|untertitel|rubrik|underrubrik|titre|sous-titre|ttulo|título|titolo|kop)\s*\d*$/i;
+
+/** content.xml of an .odt → paragraphs + tables (pure; exported for the tests) */
+export function odtText(xml: string): DocText {
+  const inline = (p: string) => unXml(p.replace(/<text:tab\/>/g, "\t").replace(/<text:line-break\/>/g, "\n")
+    .replace(/<text:s(?:\s+text:c="(\d+)")?\/>/g, (_m, n) => " ".repeat(Number(n ?? 1)))
+    .replace(/<text:note\b[\s\S]*?<\/text:note>/g, "").replace(/<[^>]+>/g, ""));
+  const paras = (x: string) => [...x.matchAll(/<text:(p|h)\b[^>]*?(?:\/>|>([\s\S]*?)<\/text:\1>)/g)].map((m) => inline(m[2] ?? ""));
+  const tables: string[][][] = [];
+  for (const t of xml.matchAll(/<table:table\b[^>]*>([\s\S]*?)<\/table:table>/g)) {
+    const rows = [...t[1].matchAll(/<table:table-row\b[^>]*>([\s\S]*?)<\/table:table-row>/g)]
+      .map((r) => [...r[1].matchAll(/<table:table-cell\b[^>]*?(?:\/>|>([\s\S]*?)<\/table:table-cell>)/g)].map((c) => paras(c[1] ?? "").join(" ").replace(/\s+/g, " ").trim()))
+      .filter((r) => r.some((c) => c));
+    if (rows.length) tables.push(rows);
+  }
+  // text:h = a heading (the document's title), not a question, unless it ends in '?'
+  const lines = [...xml.replace(/<table:table\b[\s\S]*?<\/table:table>/g, "").matchAll(/<text:(p|h)\b[^>]*?(?:\/>|>([\s\S]*?)<\/text:\1>)/g)]
+    .map((m) => ({ t: inline(m[2] ?? ""), h: m[1] === "h" })).filter((p) => !p.h || /[?？]\s*$/.test(p.t)).flatMap((p) => softLines(p.t));
+  return { lines, tables };
+}

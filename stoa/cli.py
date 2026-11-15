@@ -184,6 +184,10 @@ def main(argv=None) -> int:
     a = ap.parse_args(argv)
     if getattr(a, "api", False):
         os.environ["STOA_MODE"] = "api"
+    # P1 00:50: the UI / API bound a question's wait for an image's vector trace (STOA_TRACE_WAIT 90 s) because their
+    # long-lived workers finish a longer trace in the background for the next question. A CLI process exits after its
+    # answers, which would drop that trace every time; a batch run wants the measured reading anyway.
+    os.environ.setdefault("STOA_TRACE_WAIT", "600")
 
     if a.cmd == "intent":
         from stoa.router.intent import parse

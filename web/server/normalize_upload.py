@@ -65,7 +65,62 @@ def image(abs_path: str) -> dict:
         out = ImageOps.exif_transpose(im) if orient not in (None, 1) else im
         if orient not in (None, 1):
             notes.append("turned upright (the photo's rotation tag)")
-        if shrink_image and orient in (None, 1) and p.suffix.lower() in (".png", ".jpg", ".jpeg") and max(out.size) > MAX_SIDE:
+        # F6 01:17: a TRANSPARENT background (CAD / Inkscape / draw.io exports: black RGB under alpha 0) reads as a BLACK
+        # sheet in every geometric reader (cv2.imread / .convert("RGB")) while the browser shows it fine: fill it with
+        # white once here, as OCR and the LLM encoder already do
+        if out.mode in ("RGBA", "LA", "PA") or (out.mode == "P" and "transparency" in out.info):
+            rgba = out.convert("RGBA")
+            if rgba.getextrema()[3][0] < 255:
+                bg = Image.new("RGBA", rgba.size, (255, 255, 255, 255))
+                bg.alpha_composite(rgba)
+                out = bg.convert("RGB")
+                notes.append("transparent background filled with white")
+        # P1 c15: a 16-bit grey picture (a scanner's PNG / TIFF, mode 'I;16'): Pillow's convert("L" / "RGB") CLIPS its
+        # greys (grey 50 -> 255), so every PIL reader, the blueprint test below and the PNG saved below lost the mid-grey
+        # ink; scaled to 8 bit here (stoa.formats.normalize.eight_bit; STOA_PICTURE_PNG=0 = off)
+        try:
+            from stoa.formats.normalize import eight_bit
+        except ImportError:  # an older stoa/: unchanged
+            eight_bit = None
+        if eight_bit is not None and __import__("os").environ.get("STOA_PICTURE_PNG", "1") != "0":
+            out, note8 = eight_bit(out)
+            if note8:
+                notes.append(note8)
+        # QA 01:54: a BLUEPRINT (white lines on a dark blue sheet, a dark-mode CAD export) reads as noise in every reader
+        # (DfE L00 recoloured: hall '≈ 120 m² Rough guess', 'Scale unknown'; the same pixels dark-on-white 247.19 m²).
+        # F6's test (stoa.features.trust_map._is_negative: dark median + thin bright LINES; 0 of 1,196 team drawings
+        # fire) decides; the readers' copy is the darkest channel inverted (255 - min(R, G, B): QA r24b 246.79 / 6.97).
+        # The viewer shows the same copy, so the evidence lands on what the visitor sees. BLUEPRINT_INVERT=0 = off.
+        inverted = False
+        if __import__("os").environ.get("BLUEPRINT_INVERT", "1") != "0":
+            try:
+                import numpy as np
+
+                from stoa.features.trust_map import _is_negative
+
+                if _is_negative(np.asarray(out.convert("L"))):
+                    from PIL import ImageChops
+
+                    r_, g_, b_ = out.convert("RGB").split()
+                    out = ImageOps.invert(ImageChops.darker(ImageChops.darker(r_, g_), b_))
+                    inverted = True
+                    notes.append("a blueprint (white lines on a dark sheet): read with its colours inverted")
+            except ImportError:
+                pass
+        # W6 21:34/21:51: the shrunk copy loses table rows E1's area reader OCRs at full resolution (Stoa's AFCEC A-2:
+        # 'total circulation' 4,470 ft² on the 10,200 px original, 1,240 on the 6,000 px copy). Keep the original next to
+        # it as '<stem>.full<ext>' (a derived file: the upload list hides it), so P1's prepare() can carry its text
+        # layers onto the copy; the browser and the evidence stay on the 6,000 px copy.
+        if max(out.size) > MAX_SIDE and p.suffix.lower() in (".png", ".jpg", ".jpeg") and orient in (None, 1) and not inverted:
+            try:
+                import shutil
+
+                full = p.with_name(f"{p.stem}.full{p.suffix}")
+                if not full.exists():
+                    shutil.copy2(p, full)
+            except OSError:
+                pass
+        if shrink_image and orient in (None, 1) and not inverted and p.suffix.lower() in (".png", ".jpg", ".jpeg") and max(out.size) > MAX_SIDE:
             im.close()  # P1: in place is safe (it reads the image fully before writing)
             r = shrink_image(str(p), str(p), MAX_SIDE)
             return {"abs": str(r.get("path") or p), "note": str(r.get("note") or "")}
@@ -115,7 +170,7 @@ SCALES = (20, 50, 100, 200, 250, 500, 1000, 2000, 5000, 10000)
 UNIT_M = {1: 0.0254, 2: 0.3048, 4: 0.001, 5: 0.01, 6: 1.0, 14: 0.1}  # $INSUNITS -> metres per drawing unit
 
 
-def dxf(abs_path: str) -> dict:
+def dxf(abs_path: str, shown_name: str = "") -> dict:
     """Draw the CAD file on an A3 landscape sheet at the smallest standard scale that fits (1:50, 1:100, ...), lines
     from ezdxf's path module (blocks exploded), every TEXT/MTEXT as real PDF text centred on its insert point (so
     the PDF text layer, and the solvers' DXF-to-PDF fit on room numbers, see the same labels), and one footer line
@@ -186,10 +241,17 @@ def dxf(abs_path: str) -> dict:
         h = float(e.dxf.get("char_height" if e.dxftype() == "MTEXT" else "height", 0.25) or 0.25)
         fs = max(4.0, min(24.0, h * s))
         for k, line in enumerate(txt.splitlines()[:6]):
-            w = pymupdf.get_text_length(line, fontname="helv", fontsize=fs)
-            c = to((ins[0], ins[1]))
-            page.insert_text((c.x - w / 2, c.y + fs * 0.35 + k * fs * 1.15), line, fontname="helv", fontsize=fs)
-    page.insert_text((margin, H - margin / 2), f"Sheet drawn from {p.name} at 1:{n} on A3 (no original sheet uploaded)",
+            # QA 02:02: LibreDWG writes UTF-8 under an ANSI_1252 header; ezdxf hands back lone surrogates ('•' ->
+            # '\udce2\udc80\udca2') and PyMuPDF raised TypeError, failing the whole DWG. Re-decode them; a label that
+            # still cannot be written is skipped, never the sheet.
+            try:
+                line = line.encode("utf-8", "surrogateescape").decode("utf-8", "replace")
+                w = pymupdf.get_text_length(line, fontname="helv", fontsize=fs)
+                c = to((ins[0], ins[1]))
+                page.insert_text((c.x - w / 2, c.y + fs * 0.35 + k * fs * 1.15), line, fontname="helv", fontsize=fs)
+            except Exception:  # noqa: BLE001
+                continue
+    page.insert_text((margin, H - margin / 2), f"Sheet drawn from {shown_name or p.name} at 1:{n} on A3 (no original sheet uploaded)",
                      fontname="helv", fontsize=7, color=(0.45, 0.45, 0.45))
     out.save(dst)
     return {"abs": str(dst), "note": f"sheet drawn from the CAD file at 1:{n}" + (f"; {unit_note}" if unit_note else "")
@@ -267,7 +329,7 @@ def dwg(abs_path: str) -> dict:
             subprocess.run([exe, "-y", "-o", str(out), str(p)], check=True, timeout=120, capture_output=True)
     if not out.exists():
         raise RuntimeError("the DWG could not be converted")
-    r = dxf(str(out))
+    r = dxf(str(out), p.name)  # the footer names the visitor's DWG, not our converted copy (QA 02:02 minor)
     r["note"] = "converted from DWG; " + r["note"]
     return r
 

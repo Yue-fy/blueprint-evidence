@@ -25,7 +25,7 @@
     <div id="app">
       <aside id="side">
         <section id="benchCaption" class="bench-caption" hidden>
-          <h2>How accurate is it?</h2>
+          <h2>How we measured it</h2>
           <p>We asked thousands of questions about drawings the system never saw while we built it, and checked every
             answer against the known right one. Same rules for a general AI model, for comparison.</p>
           <button type="button" class="bc-back">‹ Back to the drawings</button>
@@ -34,6 +34,7 @@
           <button id="projectsBtn" class="proj-back" type="button" title="All projects">‹ Projects</button>
           <div class="ph-name" id="projName"></div>
           <div class="ph-place" id="projPlace"></div>
+          <button id="startOver" class="start-over" type="button" title="Back to how this drawing first opened (Shift+Esc)">↺ Start over</button>
           <button id="diffPill" class="diff-pill" type="button" hidden></button>
         </section>
 
@@ -110,6 +111,7 @@
         </div>
         <div id="tourNote" class="tour-note"></div>
         <div id="views" data-mode="2d">
+          <div id="marksChip" class="marks-chip" role="status" aria-live="polite" hidden></div>
           <div id="xbanner" class="xbanner" hidden></div>
           <section id="bench" class="bench" hidden aria-label="How well it works"></section>
           <div id="featPanels" class="feat-panels" hidden></div>
@@ -121,6 +123,8 @@
               <button type="button" data-zoom="out" title="Zoom out" aria-label="Zoom out">−</button>
               <button type="button" data-zoom="fit" title="Show the answer's places (double-click the drawing: whole sheet)" aria-label="Frame the answer">
                 <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M4 9V4h5M20 9V4h-5M4 15v5h5M20 15v5h-5"/></svg></button>
+              <button type="button" data-zoom="clear" title="Clear marks (Esc): the answer's places, measured lines and outlines" aria-label="Clear marks" aria-pressed="false">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="m7 21-4.3-4.3a1 1 0 0 1 0-1.4l10-10a1 1 0 0 1 1.4 0l5.6 5.6a1 1 0 0 1 0 1.4L11 21"/><path d="M22 21H7"/><path d="m5 11 9 9"/></svg><span class="zc-lbl">Clear marks</span></button>
             </div><div class="pane-label">Drawing</div><div id="elsewhere" class="elsewhere" hidden></div><div class="loading" id="load2d"></div><div id="rgLegend" class="rg-legend" hidden></div></div>
           <div id="pane3d" class="pane"><div id="v3d"></div><div id="vp3d"></div><div class="pane-label" id="label3d">IFC model</div><div class="loading" id="load3d"></div>
             <div id="p3dNote" class="p3d-note" hidden>3D generated from the floor plan · heights estimated</div>

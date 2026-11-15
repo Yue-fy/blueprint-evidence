@@ -32,7 +32,14 @@ _PARTIAL = re.compile(r"\bENLARGED|\bPARTIAL|\bTYPICAL\b|\bTYP\.?\b|\bUNIT\s+PLA
 _LEVEL_WORDS = re.compile(
     r"\b(?:(?:GROUND|GROUD|GRND|BASEMENT|FIRST|SECOND|THIRD|FOURTH|FIFTH|SIXTH|SEVENTH|EIGHTH|1ST|2ND|3RD|\d{1,2}(?:ST|ND|RD|TH))"
     r"\s+(?:FLOOR|LEVEL|STOREY|STORY)|(?:LEVEL|FLOOR|STOREY|KERROS|TASO)\s*[-#:]?\s*\d{1,3}|ROOF|MEZZANINE|"
-    r"\d\.\s*KERROS|ERDGESCHOSS|\bEG\b|\d\.\s*OG\b|UPPER\s+FLOOR|LOWER\s+FLOOR)", re.I)
+    r"\d\.\s*KERROS|ERDGESCHOSS|\bEG\b|\d\.\s*OG\b|UPPER\s+FLOOR|LOWER\s+FLOOR|"
+    # T3 23:09 (Stoa is Finnish): '2. krs' / 'POHJA 3.KRS', 'KERROS 2', Swedish '2. våningen', German 'Obergeschoss 2',
+    # basement / ground / attic / roof words (same keys as stoa.features.project.level_from_name)
+    r"\d{1,2}\.?\s*(?:KRS|V[ÅA]NING\w*|VÅN)\b|V[ÅA]NING\s*\d{1,2}|\d{1,2}\.?\s*OBERGESCHOSS|OBERGESCHOSS\s*\d{1,2}|"
+    r"VESIKATTO\w*|KELLARI\w*|UNTERGESCHOSS|KELLERGESCHOSS|K[ÄA]LLAR\w*|SOUTERRAIN|POHJAKERROS|BOTTENV[ÅA]NING\w*|"
+    r"ENTR[ÉE]PLAN|MARKPLAN|ULLAKKO\w*|DACHGESCHOSS|VINDSPLAN|"
+    # T3 00:05 Estonian: '1.korrus' / 'korrus 2' (entrance floor = 1), kelder / keldrikorrus, katusekorrus / pööning, katus
+    r"\d{1,2}\.?\s*KORRUS\w*|KORRUS\s*\d{1,2}|KELDRI\w*|KELDER|KATUSEKORRUS|P[ÖO][ÖO]NING|KATUSE\s+PLAAN|KATUS\b)", re.I)
 _ORD_EXTRA = {"sixth": 6, "seventh": 7, "eighth": 8}
 _COVER = re.compile(r"\bDRAWING\s+(?:INDEX|LIST)|\bSHEET\s+(?:INDEX|LIST)|\bINDEX\s+OF\s+DRAWINGS|\bCOVER\s+SHEET|"
                     r"\bTITLE\s+SHEET", re.I)
@@ -76,8 +83,23 @@ def _storey_of(text: str) -> tuple[str | None, str | None]:
         return None, None
     name = m.group(0).strip()
     low = name.lower()
-    if "roof" in low:
+    if re.match(r"katusekorrus|p[öo][öo]ning", low):
+        return "attic", name
+    if "roof" in low or low.startswith(("vesikatto", "katuse plaan")) or low == "katus":
         return "roof", name
+    if re.match(r"kellari|untergeschoss|kellergeschoss|k[äa]llar|souterrain|keldri|kelder", low):
+        return "-1", name
+    if re.match(r"pohjakerros|bottenv[åa]ning|entr[ée]plan|markplan", low):
+        return "0", name
+    if re.match(r"ullakko|dachgeschoss|vindsplan", low):
+        return "attic", name
+    m3 = re.match(r"(\d{1,2})\.?\s*(?:krs|v[åa]ning|vån|korrus)", low) or \
+        re.match(r"(?:kerros|v[åa]ning|korrus)\s*(\d{1,2})", low)
+    if m3:                     # Finnish / Swedish count the entrance floor as 1 ('1. kerros' = storey 0)
+        return str(max(int(m3.group(1)) - 1, 0)), name
+    m4 = re.match(r"(\d{1,2})\.?\s*obergeschoss", low) or re.match(r"obergeschoss\s*(\d{1,2})", low)
+    if m4:                     # German 'Obergeschoss 2' / '2. OG' = storey 2 (Erdgeschoss = 0)
+        return str(int(m4.group(1))), name
     if "mezzanine" in low:
         return "mezzanine", name
     if "erdgeschoss" in low or re.fullmatch(r"eg", low):

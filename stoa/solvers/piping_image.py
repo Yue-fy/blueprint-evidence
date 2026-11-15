@@ -55,6 +55,37 @@ def _image_space(ans: Answer) -> Answer:
     return ans
 
 
+def _ocr_doubtful(items: list) -> tuple[list, list[str]]:
+    """(kept, left out) distinct tag IDs read by OCR (captain 00:31, RECHECK-0026 (4): the cold OCR read of Stoa's M-101A
+    PNG gave 'PS-0' from a half-height box beside the real 23 PS types -> 24 @0.8, 'supported' by its own mark). One mark
+    per item does not make each item a DISTINCT real tag: an ID numbered 0 beside >= 10 IDs numbered from 1, or
+    a box under 0.6 x the family's median text height (part of a label), is left out and named."""
+    def num(tag):
+        m = re.search(r"(\d+)\D*$", str(tag))
+        return int(m.group(1)) if m else None
+
+    def height(w):
+        b = getattr(w, "bbox", None) or ()
+        return float(b[3]) - float(b[1]) if len(b) == 4 else 0.0
+
+    import os
+
+    if len(items) < 4 or os.environ.get("STOA_G1_OCR_DOUBT", "1") == "0":  # kill switch (freeze)
+        return items, []
+    nums = [num(t) for t, _ in items]
+    hs = sorted(h for h in (height(w) for _, w in items) if h > 0)
+    med = hs[len(hs) // 2] if hs else 0.0
+    others_from_1 = sum(1 for n in nums if n is not None and n >= 1) >= 10  # a long 1..N series has no ID 0
+    kept, out = [], []
+    for (tag, w), n in zip(items, nums):
+        h = height(w)
+        if (n == 0 and others_from_1) or (med > 0 and 0 < h < 0.6 * med):
+            out.append(f"'{tag}'" + (" (half-height box)" if med > 0 and 0 < h < 0.6 * med else " (no ID 0 in this series)"))
+        else:
+            kept.append((tag, w))
+    return kept, out
+
+
 @register("piping_img")
 class PipingImage(BaseSolver):
     sources = ()
@@ -84,23 +115,27 @@ class PipingImage(BaseSolver):
             # callout / half a note (2 L: '12"' -> 2 inches, note 2) while raster reads sizes / notes right there
             return self.abstain("sizes / notes on images: raster's text reader answers them")
         target = P._count_target(question)
-        if target is None or not re.search(r"\b(?:HOW\s+MANY|COUNT|NUMBER)\b", question, re.I):
+        if target is None or not (re.search(r"\b(?:HOW\s+MANY|COUNT|NUMBER)\b", question, re.I) or P._COUNT_CUE.search(question)):
             return self.abstain("unsupported piping question kind")
         family, distinct = target
         if family == "PS":
             matches = [("PS", w) for w in P._bare_ps_words(page)]
         else:
             matches = [(tag, w) for tag, w in P._word_tags(page) if tag == family or tag.startswith(family)]
+        doubtful: list[str] = []
         if distinct:
             uniq: dict = {}
             for tag, w in matches:
                 uniq.setdefault(tag, w)
-            matches = list(uniq.items())
+            matches, doubtful = _ocr_doubtful(list(uniq.items()))
         if not matches:
             return self.abstain(f"no {family} labels in the image's text layer")
-        a = Answer(value=len(matches), unit="count", confidence=0.8,
+        a = Answer(value=len(matches), unit="count", confidence=0.6 if doubtful else 0.8,
                    evidence=[P._evidence(path, page, tag, w) for tag, w in matches],
                    trace=["the image's text layer (Erin's piping reader)", f"parsed {family} tags",
                           f"counted {'distinct IDs' if distinct else 'printed occurrences'}: {len(matches)}"],
                    solver="piping_img", assumptions=["counted only explicit printed labels read from the image"])
+        if doubtful:
+            a.trace.append(f"left out {len(doubtful)} doubtful OCR reading(s): {', '.join(doubtful)}")
+            a.assumptions.append(f"left out as OCR misreadings (not counted as distinct IDs): {', '.join(doubtful)}")
         return _image_space(a)

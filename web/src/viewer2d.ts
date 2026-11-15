@@ -557,7 +557,8 @@ export class Viewer2D {
       // an item with a value tag ('15.61 m²') carries its number on the tag's left end: [① 15.61 m²]
       const tag = g.querySelector<SVGGElement>("g.vtag-s");
       if (k < 0 || (!at.has(i) && !tag)) return;
-      const [x, y] = tag ? [-Number(tag.dataset.w ?? 0) / 2 - 7, 0] : at.get(i)!;
+      const side = tag?.closest<SVGGElement>(".vtag-beside")?.dataset.side;
+      const [x, y] = tag ? (side ? [side === "r" ? 7 : -7, 0] : [-Number(tag.dataset.w ?? 0) / 2 - 7, 0]) : at.get(i)!;
       const pin = document.createElementNS(SVGNS, "g");
       pin.classList.add("pin");
       if (tag) pin.classList.add("on-tag");
@@ -777,15 +778,56 @@ export class Viewer2D {
 
   /** A value tag ('15.61 m²') on an evidence item: at its outline's centroid, else its box centre; constant size on
    *  screen like the numbered pins. */
-  setValueTag(index: number, text: string) {
+  setValueTag(index: number, text: string, beside = false) {
     const g = this.evLayer.querySelector<SVGGElement>(`g.ev[data-index="${index}"]`);
     const item = this.evidence.find((e) => e.i === index);
     if (!g || !item) return;
     g.querySelector("g.vtag")?.remove();
     if (!text) return;
     const r = item.rect;
-    const x = g.dataset.cx ? Number(g.dataset.cx) : (r[0] + r[2]) / 2;
-    const y = g.dataset.cy ? Number(g.dataset.cy) : (r[1] + r[3]) / 2;
+    // captain 21:39 (2): one room's tag BESIDE it ('Laundry · 7.12 m²' right of its outline, a short leader back to the
+    // edge), so the room's own printed name stays readable; many rooms keep their tags at the centroids
+    const shape = g.querySelector<SVGPolygonElement>("polygon.shape");
+    const sb = beside && shape ? shape.getBBox() : null;
+    const x = sb ? sb.x + sb.width : g.dataset.cx ? Number(g.dataset.cx) : (r[0] + r[2]) / 2;
+    const y = sb ? sb.y + sb.height / 2 : g.dataset.cy ? Number(g.dataset.cy) : (r[1] + r[3]) / 2;
+    if (sb) {
+      const tag = document.createElementNS(SVGNS, "g");
+      tag.classList.add("vtag", "vtag-beside");
+      tag.setAttribute("transform", `translate(${x} ${y})`);
+      // UX minor 4: the side it goes on is chosen per view (placeBeside): right of the outline, else left, else inside
+      tag.dataset.xr = String(sb.x + sb.width);
+      tag.dataset.xl = String(sb.x);
+      tag.dataset.y = String(y);
+      tag.dataset.side = "r";
+      const s = document.createElementNS(SVGNS, "g");
+      s.classList.add("vtag-s");
+      const w = 14 + text.length * 8.4;
+      s.dataset.w = String(w);
+      const lead = document.createElementNS(SVGNS, "line");
+      lead.setAttribute("x1", "-6");
+      lead.setAttribute("y1", "0");
+      lead.setAttribute("x2", "14");
+      lead.setAttribute("y2", "0");
+      lead.classList.add("vtag-lead");
+      const rect = document.createElementNS(SVGNS, "rect");
+      rect.setAttribute("x", "14");
+      rect.setAttribute("y", "-13");
+      rect.setAttribute("width", String(w));
+      rect.setAttribute("height", "26");
+      rect.setAttribute("rx", "13");
+      const t = document.createElementNS(SVGNS, "text");
+      t.setAttribute("x", String(14 + w / 2));
+      t.setAttribute("text-anchor", "middle");
+      t.setAttribute("dy", "0.36em");
+      t.setAttribute("font-size", "14.5");
+      t.textContent = text;
+      s.append(lead, rect, t);
+      tag.append(s);
+      g.append(tag);
+      this.declutterSoon();
+      return;
+    }
     const tag = document.createElementNS(SVGNS, "g");
     tag.classList.add("vtag");
     tag.setAttribute("transform", `translate(${x} ${y})`);
@@ -857,6 +899,11 @@ export class Viewer2D {
       const isPoint = r[2] - r[0] < 1 && r[3] - r[1] < 1;
       const g = document.createElementNS(SVGNS, "g");
       g.classList.add("ev");
+      // a room-type colour (the glance card's rooms): its outline and pin take it, the card's dots are the legend
+      const tint = (ev as { tint?: string }).tint;
+      if (tint && /^#[0-9a-f]{6}$/i.test(tint)) { g.classList.add("tinted"); g.style.setProperty("--tint", tint); }
+      // G1 21:24: the part of the sheet a count searched (a facade strip): a quiet dashed outline, never numbered
+      if (/^\s*searched area\b/i.test(ev.note ?? "")) g.classList.add("searched");
       // W1: elements the plan cut does not draw (slabs, high beams) are boxed from the model footprint
       if (/projected: not drawn/i.test(ev.note ?? "")) g.classList.add("projected");
       g.dataset.index = String(i);
@@ -940,7 +987,11 @@ export class Viewer2D {
       if (hl.length === 1) return this.focusGuid((hl[0] as SVGGElement).dataset.guid ?? "");
       return this.fit();
     }
-    const r = this.evidence.reduce<[number, number, number, number]>((a, e) =>
+    // UX 23:39 M20: the marks that say HOW it was measured (the scale bar, a title-block scale, a searched strip) are not
+    // what was asked: framing them too shrank the Laundry to ~40 px; they are framed only when nothing else is marked
+    const how = (e: { ev: Evidence }) => /^\s*(?:graphic )?scale bar\b|\bscale bar\b.*\bpx per m\b|^\s*searched area\b|^\s*(?:printed )?scale\b/i.test(e.ev.note ?? "");
+    const main = this.evidence.filter((e) => !how(e));
+    const r = (main.length ? main : this.evidence).reduce<[number, number, number, number]>((a, e) =>
       [Math.min(a[0], e.rect[0]), Math.min(a[1], e.rect[1]), Math.max(a[2], e.rect[2]), Math.max(a[3], e.rect[3])],
     [Infinity, Infinity, -Infinity, -Infinity]);
     // at least ~1/5 of the sheet, so a single small box (one room label) is shown with its room around it
@@ -961,11 +1012,21 @@ export class Viewer2D {
   /** Screen pixels on the right that an open panel covers (feature panels, F3 20:30): a zoom to a place centres it in
    *  the part of the viewer left of them. */
   insetRight: () => number = () => 0;
+  /** Screen pixels at the bottom that the tool row (Measure + the plug-in pills) covers (UX pass 2a NEW-2: the guided
+   *  demo framed the dorm's 4th row under 'Ask about an area'): framing keeps the drawing above them. */
+  insetBottom: () => number = () => 0;
+  private bottomPx(): number {
+    try {
+      return Math.max(0, Math.min(this.insetBottom(), (this.el.clientHeight || 600) * 0.35));
+    } catch {
+      return 0;
+    }
+  }
 
   fit() {
     this.lastView = () => this.fit();
     const W = this.el.clientWidth || 800;
-    const H = (this.el.clientHeight || 600) - this.insetTop;
+    const H = (this.el.clientHeight || 600) - this.insetTop - this.bottomPx();
     this.z = Math.min(W / this.w, H / this.h) * 0.96;
     this.tx = (W - this.w * this.z) / 2;
     this.ty = this.insetTop + (H - this.h * this.z) / 2;
@@ -1006,7 +1067,7 @@ export class Viewer2D {
       /* no panel info: the whole width */
     }
     const W = full - right;
-    const H = (this.el.clientHeight || 600) - this.insetTop;
+    const H = (this.el.clientHeight || 600) - this.insetTop - this.bottomPx();
     const rw = Math.max(r[2] - r[0], this.w * 0.03);
     const rh = Math.max(r[3] - r[1], this.h * 0.03);
     const fitZ = Math.min(W / this.w, H / this.h);
@@ -1026,6 +1087,42 @@ export class Viewer2D {
     this.declutterSoon();
   }
 
+  /** UX pass 2a minor 4: a one-room tag ('Multi-Purpose Hall · 247.73 m²') beside its outline ran off the viewer's
+   *  right edge on guided step 1 (a big room framed edge to edge). Per view: right of the outline when it fits, else left
+   *  of it, else inside the room against its right edge. Positions from the final tx / z (the stage is still animating). */
+  private placeBeside() {
+    const z = this.z || 1;
+    const W = this.el.clientWidth || 800;
+    let right = 0;
+    try {
+      right = Math.max(0, this.insetRight());
+    } catch {
+      /* the whole width */
+    }
+    const maxX = W - right - 8;
+    for (const t of this.evLayer.querySelectorAll<SVGGElement>("g.ev g.vtag-beside")) {
+      const s = t.querySelector<SVGGElement>(".vtag-s");
+      const xr = Number(t.dataset.xr), xl = Number(t.dataset.xl), y = Number(t.dataset.y);
+      if (!s || !Number.isFinite(xr) || !Number.isFinite(xl) || !Number.isFinite(y)) continue;
+      const w = Number(s.dataset.w ?? 60);
+      const half = (20 + w) / 2, off = (8 + w) / 2;
+      const rEdge = this.tx + z * (xr + off) + half;
+      const lEdge = this.tx + z * (xl - off) - half;
+      const side = rEdge <= maxX ? "r" : lEdge >= 8 ? "l" : "in";
+      if (t.dataset.side === side) continue;
+      t.dataset.side = side;
+      const k = side === "r" ? 1 : -1;
+      t.setAttribute("transform", `translate(${side === "l" ? xl : xr} ${y})`);
+      const lead = s.querySelector("line"), rect = s.querySelector("rect"), text = s.querySelector("text");
+      lead?.setAttribute("x1", String(-6 * k));
+      lead?.setAttribute("x2", String(14 * k));
+      lead?.setAttribute("visibility", side === "in" ? "hidden" : "visible");
+      rect?.setAttribute("x", String(side === "r" ? 14 : -(14 + w)));
+      text?.setAttribute("x", String(k * (14 + w / 2)));
+      t.querySelector(":scope > g.pin")?.setAttribute("transform", `translate(${7 * k} 0)`);
+    }
+  }
+
   private declutterRaf = 0;
   private declutterSoon() {
     if (this.declutterRaf) return;
@@ -1039,6 +1136,7 @@ export class Viewer2D {
    *  big rooms' tags first and hide any tag that would overlap one already shown (a hidden tag shows on hover, and
    *  comes back when zooming in gives it room). */
   declutterTags() {
+    this.placeBeside();
     const tags = [...this.evLayer.querySelectorAll<SVGGElement>("g.ev g.vtag")];
     if (!tags.length) return;
     const z = this.z || 1;

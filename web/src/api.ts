@@ -144,7 +144,7 @@ export const benchmark = () => fetch("/api/bench").then((r) => (r.ok ? r.json() 
 /** Room outlines around evidence boxes (flood fill on the drawing, web/server/room_shape.py; estimates, CPU only). */
 export interface RoomShape { i: number; poly: [number, number][] | null; area?: number; closing_px?: number; fit?: number | null; method?: string }
 /** items[].scale_n: the drawing's 1:N on a vector PDF: the wall-line tracer (door swings closed at the doorway) runs first */
-export const roomShapes = (path: string, page: number, space: string, items: { i: number; bbox: number[]; others?: [number, number][]; scale_n?: number }[]) =>
+export const roomShapes = (path: string, page: number, space: string, items: { i: number; bbox: number[]; others?: [number, number][]; scale_n?: number; px_per_m?: number }[]) =>
   call<{ shapes: RoomShape[]; space: "pdf_pt" | "image_px" }>("/api/shapes", {
     method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ path, page, space, items }),
   });
@@ -189,13 +189,53 @@ export const barScale = (path: string) => {
   return barMemo.get(path)!;
 };
 
+/** A picture's scale from what is printed on it, when no scale bar is read (GET /api/picscale, web/server/pic_scale.py:
+ *  the printed 1:N + the sheet size its dimension strings fit; AFCEC A-2: 1" = 40'-0" on Tabloid). null if none (yet). */
+export type PicScale = { px_per_m: number; n?: number | null; printed?: string; paper?: string; dpi?: number | null; how?: string };
+export const picScale = (path: string): Promise<PicScale | null> =>
+  call<PicScale & { ok?: boolean }>(`/api/picscale?path=${encodeURIComponent(path)}`)
+    .then((r) => (r.ok && Number(r.px_per_m) > 0 ? r : null)).catch(() => null);
+
 /** 'This floor at a glance' (captain 21:14): F2's finished takeoff of a sheet, summarised (GET /api/glance). */
 export type GlanceRow = { i: number; section: string; item: string; quantity: string; unit: string; value: number | string | null; status: string; confidence?: number; evidence?: Evidence[]; assumptions?: string[]; method?: string };
 export type Glance = { ok: boolean; why?: string; scale?: string; scale_source?: string; rooms?: number; rooms_labelled?: number; area_m2?: number;
-  types?: { type: string; n: number; m2: number; rows: number[] }[]; doors?: { value: number; conf?: number; row: number } | null;
-  windows?: { value: number; conf?: number; row: number } | null; skirting_m?: number; skirting_rooms?: number; unread?: number; rows?: GlanceRow[] };
-export const glance = (path: string, page = 0): Promise<Glance> =>
-  call<Glance>(`/api/glance?path=${encodeURIComponent(path)}&page=${page}`).catch(() => ({ ok: false, why: "unavailable" }));
+  types?: { type: string; n: number; m2: number; rows: number[] }[];
+  doors?: { value: number; conf?: number; row: number; method?: string; sets?: boolean; leaves?: number; source?: string } | null;
+  windows?: { value: number; conf?: number; row: number; method?: string } | null; skirting_m?: number; skirting_rooms?: number; unread?: number;
+  review?: { row: number; item: string; quantity: string; value: number; unit: string; conf: number }[]; sheet?: string; rows?: GlanceRow[];
+  /** F2's summary (t2): the area unit, the sheet's printed total when no rooms were measured, skirting without wet rooms */
+  unit?: string; printed_total?: { value: number; unit: string; rule?: string } | null; skirting_dry_m?: number | null; wet_rooms?: number | null;
+  /** F2 22:29: the sheet's printed area table by space type, and whether the types add up to its printed total */
+  printed_types?: { type: string; value: number; unit: string; rows: number[] }[];
+  printed_check?: { label: string; value: number; sum: number | null; agree: boolean; diff_pct: number | null } | null };
+/** The takeoff as an Excel file (F2's writer; each row names the sheet). */
+export const glanceXlsxUrl = (path: string, page = 0) => `/api/glance/xlsx?path=${encodeURIComponent(path)}&page=${page}`;
+/** F2 23:52: takeoff fixes are per visitor: the browser's id (F7's corrections / T3's project plug-in set window.stoaVisitor). */
+const visitorId = (): string => {
+  const ok = (v: unknown): v is string => typeof v === "string" && /^[A-Za-z0-9_-]{8,64}$/.test(v);
+  const w = (window as unknown as { stoaVisitor?: string }).stoaVisitor;
+  if (ok(w)) return w;
+  try { const v = localStorage.getItem("stoa.visitor"); return ok(v) ? v : ""; } catch { return ""; }
+};
+/** T3 00:58: an uploaded set's sheets with the role T3's project feature read for each (GET /api/feat/project/<upload
+ *  id>: 'Floor plan', 'Section' …, from the title block / own text), keyed 'file#page'. Empty when the API does not
+ *  serve the feature or the upload is not a project yet. */
+export const sheetRoles = (uploadId: string): Promise<Map<string, { role: string; level: string }>> => {
+  const v = visitorId();
+  return call<{ sheets?: { file?: string; page?: number; kind?: string; role?: string; level?: string }[] }>(`/api/feat/project/${encodeURIComponent(uploadId)}${v ? `?visitor=${v}` : ""}`)
+    .then((p) => new Map((p.sheets ?? []).filter((s) => s.file)
+      .map((s) => [`${s.file}#${s.page ?? 0}`, { role: s.role && s.kind && !/^(unknown|drawing)$/.test(s.kind) ? String(s.role) : "", level: String(s.level ?? "") }] as [string, { role: string; level: string }])))
+    .catch(() => new Map<string, { role: string; level: string }>());
+};
+export const glance = (path: string, page = 0): Promise<Glance> => {
+  const v = visitorId();
+  return call<Glance>(`/api/glance?path=${encodeURIComponent(path)}&page=${page}${v ? `&visitor=${v}` : ""}`).catch(() => ({ ok: false, why: "unavailable" }));
+};
+/** A picture's printed words with their places (GET /api/piclabels: its CACHED text layer, never a new reading), in
+ *  image_px; [] when not read yet. For the right-click selection on picture sheets (UX 23:51). */
+export const picLabels = (path: string): Promise<{ at: [number, number]; text: string; box?: number[] }[]> =>
+  call<{ ok?: boolean; items?: { at: [number, number]; text: string; box?: number[] }[] }>(`/api/piclabels?path=${encodeURIComponent(path)}`)
+    .then((r) => (r.ok && Array.isArray(r.items) ? r.items : [])).catch(() => []);
 
 /** Is an upload's text still being read by the warm-up (QA 20:32)? false when unknown (older middleware, a dataset file). */
 export const warming = (path: string): Promise<boolean> =>

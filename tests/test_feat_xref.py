@@ -406,3 +406,291 @@ def test_reconcile_doors_numbered_after_their_room(tmp_path):
     assert sorted(u["key"] for u in door["untagged"]) == ["20.2A", "3.07A", "5.00A"]
     tag = next(r for r in xref.page_refs(str(p), 0) if r.kind == "tag" and r.text == "7.04")
     assert tag.target_page == 1 and "7.04A, 7.04B" in tag.target_view and tag.subject == "door"
+    # F8 c7: a door attribute asked on the plan hops to the schedule AND frames the asked row, also for a dotted number
+    # (the asked-key regex stopped at the '7' of '7.04B', so the panel could not frame the row)
+    h = xref.follow_plan(str(p), 0, "What is the width of door 7.04B?")
+    assert h is not None and h.mode == "auto" and h.to_page == 1 and h.to_bbox is not None
+    assert "row 7.04B" in h.why and h.to_bbox[0] > 450                # the right-hand table's row (x 500), not 7.04A's (x 100)
+
+
+def test_a_copy_must_match_inside_the_drawing_not_just_the_title_block():
+    """HAER C3 / C6 (two different scanned sheets) both print 'HAER No. HI-76' (read as the number) and register on 36
+    title-block / border labels, only 3 inside the drawing; true copies (DfE scan / scanned PDF vs the PDF) match 24-102."""
+    assert not xref._registers_as_copy({"inliers": 36, "of": 88, "inner": 3, "rms": 15.7})
+    assert xref._registers_as_copy({"inliers": 49, "of": 60, "inner": 24, "rms": 3.0})
+    assert not xref._registers_as_copy({"a": 1.0, "b": 0.0, "tx": 0, "ty": 0, "inliers": 0, "of": 0, "frame": True})
+    assert not xref._registers_as_copy(None)
+
+
+def test_resolve_styled_upload(tmp_path, monkeypatch):
+    """A picture uploaded with a drawing style is 'upload/<id>/<style>/<name>', stored under '<id>/data/<style>/<name>'
+    (web/mock/stoaApi.ts uploadAbs): every F8 route must read it (it was a 400, so no References / report on pictures)."""
+    up = tmp_path / "uploads"
+    (up / "658c668d2885" / "data" / "cubicasa5k").mkdir(parents=True)
+    (up / "658c668d2885" / "data" / "cubicasa5k" / "plan.png").write_bytes(b"x")
+    (up / "9515704c1a92").mkdir()
+    (up / "9515704c1a92" / "plan.png").write_bytes(b"x")
+    monkeypatch.setenv("STOA_UPLOADS", str(up))
+    assert xref.resolve_path("upload/658c668d2885/cubicasa5k/plan.png").endswith("658c668d2885/data/cubicasa5k/plan.png")
+    assert xref.resolve_path("upload/9515704c1a92/plan.png").endswith("9515704c1a92/plan.png")
+    for bad in ("upload/658c668d2885/data/cubicasa5k/plan.png", "upload/658c668d2885/../x.png", "upload/658c668d2885/.env",
+                "upload/658c668d2885/Bad Style/plan.png"):
+        with pytest.raises((ValueError, FileNotFoundError)):
+            xref.resolve_path(bad)
+
+
+def test_schedule_rows_id_column_and_cased_openings(tmp_path):
+    """DR 21:57 + X1 22:49: the row keys come from the column whose header names the door id, not a 'ROOM NUMBER' column
+    left of it; sub-module ids '9A.1A' and a stray '1z' row stay in the column; 'CASED OPENING' rows are flagged."""
+    import pymupdf
+
+    f = tmp_path / "A-601.pdf"
+    doc = pymupdf.open()
+    pg = doc.new_page(width=1224, height=792)
+    pg.insert_text((100, 90), "DOOR SCHEDULE", fontsize=14)
+    for x, t in ((100, "ROOM NUMBER"), (200, "DOOR NO."), (300, "WIDTH"), (380, "REMARKS")):
+        pg.insert_text((x, 120), t, fontsize=8)
+    rows = [("101", "1.01A", "3' - 0\"", ""), ("102", "1.02A", "3' - 0\"", "CASED OPENING"), ("103", "1z", "3' - 0\"", ""),
+            ("104", "9A.1A", "3' - 0\"", ""), ("105", "9A.2A", "6' - 0\"", ""), ("106", "10.01A", "3' - 0\"", "")]
+    for i, (room, door, w, rem) in enumerate(rows):
+        y = 140 + 16 * i
+        pg.insert_text((100, y), room, fontsize=8)
+        pg.insert_text((200, y), door, fontsize=8)
+        pg.insert_text((300, y), w, fontsize=8)
+        if rem:
+            pg.insert_text((380, y), rem, fontsize=8)
+    pg.insert_text((1100, 760), "A-601", fontsize=24)
+    doc.save(f)
+    got = xref.schedule_rows(str(f), 0)
+    assert [r["key"] for r in got] == ["1.01A", "1.02A", "1z", "9A.1A", "9A.2A", "10.01A"]
+    assert {r["kind"] for r in got} == {"door"}
+    assert [r["key"] for r in got if r.get("opening_only")] == ["1.02A"]
+
+
+def test_size_words_hop_only_for_a_numbered_door(tmp_path):
+    """F8 c7: 'How tall is door 7.04A?' reads the schedule row (d31: 8 / 8 door attributes right after the hop, 1 / 8
+    asked on the plan); 'how wide is the door into the kitchen' / 'how many doors are 3 feet wide' stay on the plan."""
+    doc = pymupdf.open()
+    for num, title in [("A-103", "SUPPORT - FLOOR PLAN"), ("A-602", "DOOR SCHEDULE")]:
+        pg = doc.new_page(width=1224, height=792)
+        pg.insert_text((1100, 600), title, fontsize=10)
+        pg.insert_text((1100, 760), num, fontsize=24)
+        if num == "A-602":
+            pg.insert_text((100, 180), "DOOR SCHEDULE", fontsize=9)
+            for i, k in enumerate(["7.04A", "7.04B", "104B"]):
+                pg.insert_text((100, 200 + 12 * i), k, fontsize=8)
+                pg.insert_text((160, 200 + 12 * i), "3' - 0\"", fontsize=8)
+    p = tmp_path / "set.pdf"
+    doc.save(p)
+    for q, row in [("How tall is door 7.04A?", "7.04A"), ("How wide is door 104B?", "104B"), ("How high is door no. 7.04B?", "7.04B")]:
+        h = xref.follow_plan(str(p), 0, q)
+        assert h is not None and h.mode == "auto" and h.to_page == 1 and f"row {row}" in h.why, q
+    # asked on the schedule in its column's word ('tall' read the WIDTH on d31: 3'-0" @0.65, gold 7'-0")
+    assert xref.follow_plan(str(p), 0, "How tall is door 7.04A?").question == "What is the height of door 7.04A?"
+    assert xref.follow_plan(str(p), 0, "What is the width of door 104B?").question == "What is the width of door 104B?"
+    for q in ["How wide is the door into the kitchen?", "How many doors are 3 feet wide?", "How wide is the corridor?"]:
+        assert xref.follow_plan(str(p), 0, q) is None, q
+    # F8 c9: asked ON the schedule (AW A-601 'What size is door 104S?' -> HEIGHT x THICKNESS @0.85 from the reader): a
+    # same-page plan with the named row (the browser asks here and reads the row); not for unnamed / unknown doors
+    h = xref.follow_plan(str(p), 1, "How tall is door 7.04A?")
+    assert h is not None and h.mode == "auto" and h.from_page == 1 and h.to_page == 1 and h.to_row["key"] == "7.04A"
+    assert "(the sheet on screen)" in h.why and "refers to it" not in h.why
+    for q, col in [("What size is door 7.04B?", "size"), ("What is the width of door 104B?", "width")]:
+        h = xref.follow_plan(str(p), 1, q)
+        assert h is not None and h.to_page == 1 and (h.to_row["asked"] or {}).get("column", col) == col, q
+    # F8 c10: the size word belongs to a ROOM the door only locates (AW-28: the door's 3'-0" x 7'-0" was put over the
+    # reader's answer at 0.8): no hop, from the plan or on the schedule; a room's own door is still a door
+    for q in ["What size is the room next to door 7.04A?", "How tall is the room behind door 104B?",
+              "What is the ceiling height of the room behind door 7.04B?", "How big is the space behind door #104B?"]:
+        for page in (0, 1):
+            assert xref.follow_plan(str(p), page, q) is None, (q, page)
+    for q, row in [("How tall is the storage room's door 104B?", "104B"), ("What is the width of the room door 7.04A?", "7.04A")]:
+        h = xref.follow_plan(str(p), 0, q)
+        assert h is not None and h.to_row and h.to_row["key"] == row, q
+    for q in ["How wide is door 999Z?", "How wide is the door into the kitchen?", "How many doors are 3 feet wide?"]:
+        assert xref.follow_plan(str(p), 1, q) is None, q
+
+
+def _node22() -> str | None:
+    import re
+    import shutil
+    import subprocess
+
+    node = shutil.which("node")
+    if not node:
+        return None
+    try:
+        v = subprocess.run([node, "--version"], capture_output=True, text=True, timeout=10).stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        return None
+    m = re.match(r"v(\d+)\.(\d+)", v)
+    return node if m and (int(m[1]), int(m[2])) >= (22, 18) else None
+
+
+@pytest.mark.skipif(_node22() is None, reason="needs Node >= 22.18 (type stripping)")
+def test_row_mark_node_tests():
+    """After a hop to a schedule, the answer's mark sits on the row the question names (web/src/features/xref/rowmark.ts)."""
+    import subprocess
+
+    root = Path(__file__).resolve().parents[1]
+    test = root / "web" / "src" / "features" / "xref" / "rowmark.test.ts"
+    r = subprocess.run([_node22(), "--test", str(test)], capture_output=True, text=True, timeout=120, cwd=root)
+    assert r.returncode == 0, r.stdout[-4000:] + r.stderr[-2000:]
+    assert "ℹ fail 0" in r.stdout
+
+
+def test_hop_carries_the_named_rows_cells(tmp_path):
+    """The hop returns the asked row's printed cells (same space as to_bbox) for the web's row mark."""
+    doc = pymupdf.open()
+    for num, title in [("A-103", "SUPPORT - FLOOR PLAN"), ("A-602", "DOOR SCHEDULE")]:
+        pg = doc.new_page(width=1224, height=792)
+        pg.insert_text((1100, 600), title, fontsize=10)
+        pg.insert_text((1100, 760), num, fontsize=24)
+        if num == "A-602":
+            pg.insert_text((100, 180), "DOOR SCHEDULE", fontsize=9)
+            pg.insert_text((160, 191), "Width", fontsize=7)
+            pg.insert_text((220, 191), "Height", fontsize=7)
+            for i, (k, h) in enumerate([("7.04A", "7' - 0\""), ("7.04B", "6' - 8\""), ("7.05A", "7' - 0\"")]):
+                pg.insert_text((100, 200 + 12 * i), k, fontsize=8)
+                pg.insert_text((160, 200 + 12 * i), "3' - 0\"", fontsize=8)
+                pg.insert_text((220, 200 + 12 * i), h, fontsize=8)
+    p = tmp_path / "set.pdf"
+    doc.save(p)
+    h = xref.follow_plan(str(p), 0, "How tall is door 7.04B?")
+    assert h is not None and h.to_row and h.to_row["key"] == "7.04B"
+    assert [c["text"] for c in h.to_row["cells"]] == ["7.04B", "3' - 0\"", "6' - 8\""]
+    assert h.as_dict()["to_row"]["cells"][2]["bbox"][0] > 200
+    # the cell under the asked column's heading (AW A-601: the reader took THICKNESS for 'height of door 104S')
+    assert h.to_row["asked"]["column"] == "height" and h.to_row["asked"]["text"] == "6' - 8\""
+    w = xref.follow_plan(str(p), 0, "What is the width of door 7.04B?").to_row["asked"]
+    assert w["text"] == "3' - 0\"" and w["header"] == "Width"
+    # F8 c8: a door SIZE = the width and height cells of the row ('3' - 0" x 6' - 8"'), both or nothing
+    for q in ["What are the width and height of door 7.04B?", "What size is door 7.04B?",
+              "What are the dimensions of door 7.04B?", "How big is door 7.04B?"]:
+        h = xref.follow_plan(str(p), 0, q)
+        assert h is not None and h.to_page == 1, q
+        a = h.to_row["asked"]
+        assert a["column"] == "size" and a["text"] == "3' - 0\" x 6' - 8\"", q
+        assert [x["column"] for x in a["parts"]] == ["width", "height"] and a["parts"][1]["bbox"][0] > 200, q
+    assert xref.follow_plan(str(p), 0, "How big is door 7.04B?").question == "What is the size of door 7.04B?"
+    assert xref.follow_plan(str(p), 0, "What are the width, height and thickness of door 7.04B?").to_row["asked"] is None
+    # a size question about the doors in general is not one row's size
+    assert (xref.follow_plan(str(p), 0, "What size are the doors?") or xref.Hop(0, None, 0, None, None, "")).to_row is None
+
+
+def test_room_area_questions_stay_on_the_plan(tmp_path):
+    """F8 c7: on AW-28 (156 sheets) 'What is the size of the largest room?' hopped to the A-601 room finish schedule;
+    an area is measured on the plan. Room ATTRIBUTES (ceiling height, finish counts) still hop."""
+    doc = pymupdf.open()
+    for num, title in [("A-101", "FLOOR PLAN"), ("A-601", "ROOM FINISH SCHEDULE")]:
+        pg = doc.new_page(width=1224, height=792)
+        pg.insert_text((1100, 600), title, fontsize=10)
+        pg.insert_text((1100, 760), num, fontsize=24)
+        if num == "A-601":
+            pg.insert_text((100, 180), "ROOM FINISH SCHEDULE", fontsize=9)
+            for i, (k, n) in enumerate([("101", "PUMP ROOM"), ("102", "CONTROL ROOM"), ("103", "TOILET")]):
+                pg.insert_text((100, 200 + 12 * i), k, fontsize=8)
+                pg.insert_text((140, 200 + 12 * i), n, fontsize=8)
+    p = tmp_path / "set.pdf"
+    doc.save(p)
+    for q in ["What is the size of the largest room?", "What size are the rooms on this floor?",
+              "What is the total floor area of the rooms with a VCT floor finish?"]:
+        assert xref.follow_plan(str(p), 0, q) is None, q
+    for q in ["What is the ceiling height in the control room?", "How many rooms have a floor finish of VCT?"]:
+        h = xref.follow_plan(str(p), 0, q)
+        assert h is not None and h.to_page == 1, q
+
+
+def test_window_schedule_attributes(tmp_path):
+    """F8 c8: none of our 36 multi-page sets has a WINDOW schedule (only 'DOOR AND WINDOW DETAILS'), so the window side of
+    the hop is checked here: width / height / size of a numbered window read from its row; 'What type is window W1?'
+    hops too (a type named for one numbered opening); a plan count stays on the plan."""
+    doc = pymupdf.open()
+    for num, title in [("A-101", "FLOOR PLAN"), ("A-602", "WINDOW SCHEDULE")]:
+        pg = doc.new_page(width=1224, height=792)
+        pg.insert_text((1100, 600), title, fontsize=10)
+        pg.insert_text((1100, 760), num, fontsize=24)
+        if num == "A-602":
+            pg.insert_text((100, 180), "WINDOW SCHEDULE", fontsize=9)
+            for x, h in [(100, "MARK"), (160, "WIDTH"), (220, "HEIGHT"), (280, "TYPE")]:
+                pg.insert_text((x, 191), h, fontsize=7)
+            for i, (k, w, h) in enumerate([("W1", "3' - 0\"", "4' - 0\""), ("W2", "4' - 0\"", "5' - 0\""),
+                                           ("W3", "2' - 0\"", "2' - 0\"")]):
+                for x, t in [(100, k), (160, w), (220, h), (280, "FIXED")]:
+                    pg.insert_text((x, 200 + 12 * i), t, fontsize=8)
+    p = tmp_path / "set.pdf"
+    doc.save(p)
+    assert {(r["key"], r["kind"]) for r in xref.schedule_rows(str(p), 1)} == {("W1", "window"), ("W2", "window"), ("W3", "window")}
+    h = xref.follow_plan(str(p), 0, "How wide is window W2?")
+    assert h.to_page == 1 and h.question == "What is the width of window W2?" and h.to_row["asked"]["text"] == "4' - 0\""
+    assert xref.follow_plan(str(p), 0, "What size is window W2?").to_row["asked"]["text"] == "4' - 0\" x 5' - 0\""
+    assert xref.follow_plan(str(p), 0, "What is the height of window W3?").to_row["asked"]["text"] == "2' - 0\""
+    t = xref.follow_plan(str(p), 0, "What type is window W1?")
+    assert t is not None and t.to_page == 1 and t.to_row["key"] == "W1" and t.to_row["asked"] is None
+    assert xref.follow_plan(str(p), 0, "How many windows are on this floor plan?") is None
+    # head / jamb / sill details are schedule columns (AW-28 A-601: 3/3 right on the schedule, 0/3 from the cover page)
+    for q in ["What is the sill detail of window W2?", "Which head detail does window W1 use?", "jamb detail for window W3"]:
+        d = xref.follow_plan(str(p), 0, q)
+        assert d is not None and d.to_page == 1 and d.to_row["key"] in q, q
+
+
+def test_door_named_by_its_room(tmp_path):
+    """F8 c8 (AW-28 A-601: ROOM FINISH + DOOR SCHEDULE on one sheet): 'the door to the mech room' = room 104 'MECH. ROOM'
+    -> door 104S (door numbers carry the room number); 'the door into room 102' -> 102S, not the room row. Two doors for
+    one room, an unknown room or a count: no row (the reader picks)."""
+    doc = pymupdf.open()
+    for num, title in [("A-101", "FLOOR PLAN"), ("A-601", "DOOR SCHEDULE")]:
+        pg = doc.new_page(width=1224, height=792)
+        pg.insert_text((1100, 600), title, fontsize=10)
+        pg.insert_text((1100, 760), num, fontsize=24)
+        if num == "A-601":
+            pg.insert_text((100, 100), "ROOM FINISH SCHEDULE", fontsize=9)
+            for i, (k, n) in enumerate([("102", "CONTROL ROOM VCT. RB GWB"), ("104", "MECH. ROOM CONC. EXP."),
+                                        ("105", "STORAGE VCT. RB")]):
+                pg.insert_text((100, 120 + 12 * i), k, fontsize=8)
+                pg.insert_text((140, 120 + 12 * i), n, fontsize=8)
+            pg.insert_text((100, 300), "DOOR SCHEDULE", fontsize=9)
+            for x, h in [(100, "DOOR NO."), (160, "WIDTH"), (220, "HEIGHT")]:
+                pg.insert_text((x, 311), h, fontsize=7)
+            for i, (k, w) in enumerate([("102S", "2' - 10\""), ("104S", "3' - 0\""), ("105A", "3' - 0\""),
+                                        ("105B", "6' - 0\"")]):
+                for x, t in [(100, k), (160, w), (220, "7' - 0\"")]:
+                    pg.insert_text((x, 320 + 12 * i), t, fontsize=8)
+    p = tmp_path / "set.pdf"
+    doc.save(p)
+    h = xref.follow_plan(str(p), 0, "What is the height of the door to the mech room?")
+    assert h is not None and h.to_page == 1 and h.to_row["key"] == "104S" and h.to_row["asked"]["text"] == "7' - 0\""
+    assert "door of room 104 MECH. ROOM is door 104S" in h.why
+    w = xref.follow_plan(str(p), 0, "What is the width of the door into room 102?")
+    assert w.to_row["key"] == "102S" and w.to_row["asked"]["text"] == "2' - 10\""
+    assert xref.follow_plan(str(p), 0, "What is the width of the door into the control room?").to_row["key"] == "102S"
+    assert xref.follow_plan(str(p), 0, "What is the width of the door to the storage room?").to_row is None  # 105A + 105B
+    assert xref.follow_plan(str(p), 0, "What is the width of the door to the boiler room?").to_row is None
+    c = xref.follow_plan(str(p), 0, "How many doors does the door schedule list for the mech room?")
+    assert c is None or c.to_row is None
+
+
+def test_titles_without_the_project_line():
+    """F8 c8: (1) UX P2b-5, the OCR of Stoa's M-101A picture titled the sheet 'RESSURIZED HYDRANT OMAHA DISTRICT FUELING
+    SYSTEM TYPE III' (the project's name, printed bigger in the title block): the drawing title 'PIPING PLAN' wins.
+    (2) AW-28: 37 of 156 titles started with the site address '1616 CAPITAL AVE. OMAHA, NE 68102': cut when shared."""
+    L = xref._Line
+    W, H = 2000.0, 1300.0
+    lines = [L("M-101A", 30, (1850, 1200, 1960, 1235), (1850, 1200, 1960, 1235), (1, 0)),
+             L("RESSURIZED HYDRANT", 20, (1760, 1000, 1960, 1022), (1760, 1000, 1960, 1022), (1, 0)),
+             L("OMAHA DISTRICT", 20, (1760, 1026, 1960, 1048), (1760, 1026, 1960, 1048), (1, 0)),
+             L("FUELING SYSTEM TYPE III", 20, (1760, 1052, 1960, 1074), (1760, 1052, 1960, 1074), (1, 0)),
+             L("PIPING PLAN", 14, (1760, 1120, 1880, 1136), (1760, 1120, 1880, 1136), (1, 0))]
+    e = xref._sheet_from(lines, W, H)
+    assert e.number == "M-101A" and e.title == "PIPING PLAN"
+    # a title with a drawing word stays as read
+    lines[4] = L("SCALE BAR", 14, (1760, 1120, 1880, 1136), (1760, 1120, 1880, 1136), (1, 0))
+    assert "DISTRICT" in (xref._sheet_from(lines, W, H).title or "")      # nothing better: unchanged
+    out = [xref.SheetEntry(page=i, number=f"C{i}", title=t) for i, t in enumerate(
+        ["1616 CAPITAL AVE. OMAHA, NE 68102 ABBREVIATIONS", "1616 CAPITAL AVE. OMAHA, NE 68102 ELECTRICAL LEGEND",
+         "1616 CAPITAL AVE. OMAHA, NE 68102 TRUCK OFFLOAD DETAIL", "PIPING PLAN", "ENLARGED FLOOR PLAN AREA A",
+         "ENLARGED FLOOR PLAN AREA B", "ENLARGED FLOOR PLAN AREA C", "1616 CAPITAL AVE. OMAHA, NE 68102"])]
+    xref._strip_shared_prefix(out)
+    assert [e.title for e in out] == ["ABBREVIATIONS", "ELECTRICAL LEGEND", "TRUCK OFFLOAD DETAIL", "PIPING PLAN",
+                                      "ENLARGED FLOOR PLAN AREA A", "ENLARGED FLOOR PLAN AREA B",
+                                      "ENLARGED FLOOR PLAN AREA C", "1616 CAPITAL AVE. OMAHA, NE 68102"]

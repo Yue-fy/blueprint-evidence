@@ -59,55 +59,91 @@ export function clayify(mat: THREE.Material, glass = false, furniture = false, r
 // room's NAME only (IFC LongName / Name, the plan's printed label), in English, German, French, Italian, Estonian
 // (Maleva is in Tallinn), Finnish and Swedish. A name we do not know is 'other' — never a guessed type.
 
-export type RoomType = "living" | "bedroom" | "kitchen" | "wet" | "circulation" | "storage" | "other";
+export type RoomType = "living" | "bedroom" | "kitchen" | "wet" | "circulation" | "storage" | "office" | "teaching" | "sport"
+  | "outdoor" | "other";
 
-/** Muted, low-saturation floor tints (light and dark canvas use the same tints: the model itself stays light). */
-export const ROOM_TYPES: { key: RoomType; label: string; hex: string }[] = [
-  { key: "living", label: "Living", hex: "#e3d3b6" },
-  { key: "bedroom", label: "Bedroom", hex: "#d6d0e4" },
-  { key: "kitchen", label: "Kitchen", hex: "#ecc9b0" },
-  { key: "wet", label: "Bath · WC · sauna · laundry", hex: "#bfdcdc" },
-  { key: "circulation", label: "Hall · corridor · stair", hex: "#d9e2cf" },
-  { key: "storage", label: "Storage · technical", hex: "#cfcdc8" },
-  { key: "other", label: "Other", hex: "#ebe9e5" },
+/** Muted, low-saturation floor tints (light and dark canvas use the same tints: the model itself stays light). Names and
+ * colours are the 2D 'This floor at a glance' card's groups (F2's sheet_summary types, main.ts GLANCE_HEX), so the card,
+ * the plan and the 3D say the same thing (UX M5, 23:30): bedrooms and living rooms are ONE group there, so here too.
+ * `one` names a single room (hover tip, picked room), `hint` lists what the group holds (legend tooltip). Balconies
+ * are 3D-only (the glance card has no such group). */
+export const ROOM_TYPES: { key: RoomType; label: string; one: string; hint: string; hex: string }[] = [
+  { key: "living", label: "Bedrooms and living", one: "bedroom / living room", hint: "bedrooms, living rooms, dwellings", hex: "#e3d3b6" },
+  { key: "kitchen", label: "Kitchen and dining", one: "kitchen / dining", hint: "kitchens, dining rooms, canteens", hex: "#ecc9b0" },
+  { key: "wet", label: "Wet rooms", one: "wet room", hint: "bathrooms, WCs, showers, saunas, laundries, changing rooms", hex: "#bfdcdc" },
+  { key: "circulation", label: "Circulation", one: "circulation", hint: "halls, corridors, lobbies, stairs, lifts", hex: "#d9e2cf" },
+  { key: "storage", label: "Storage and plant", one: "storage / plant", hint: "stores, technical and plant rooms", hex: "#cfcdc8" },
+  { key: "office", label: "Staff and offices", one: "office / staff room", hint: "offices, meeting and staff rooms", hex: "#e2c3d0" },
+  { key: "teaching", label: "Teaching", one: "teaching room", hint: "classrooms, labs, workshops", hex: "#e6d58f" },
+  { key: "sport", label: "Halls and sport", one: "hall / sport", hint: "sports and assembly halls", hex: "#bccbe6" },
+  { key: "outdoor", label: "Balconies and terraces", one: "balcony / terrace", hint: "balconies, terraces, loggias", hex: "#dde3e6" },
+  { key: "other", label: "Other rooms", one: "other", hint: "names we do not know: never a guessed type", hex: "#ebe9e5" },
 ];
-export const ROOM_HEX = Object.fromEntries(ROOM_TYPES.map((t) => [t.key, t.hex])) as Record<RoomType, string>;
+export const ROOM_HEX = { ...Object.fromEntries(ROOM_TYPES.map((t) => [t.key, t.hex])), bedroom: "#e3d3b6" } as Record<RoomType, string>;
+/** A single room's type in words ('wet room'), for hover tips and a picked room's props. */
+export const roomTypeOne = (t: RoomType) => ROOM_TYPES.find((x) => x.key === t)?.one ?? "other";
 
 // Words on a normalised name (lower case, accents removed: köök → kook, küche → kuche, õ → o). Each word must start a
-// word of the name (no match inside a longer word, except where a trailing * allows a longer ending).
+// word of the name (no match inside a longer word, except where a trailing * allows a longer ending); digits count as
+// breaks, so level codes read ('0GARAJE', '1IZQ-HAB3'). Order matters: the first type with a matching word wins.
 const ROOM_WORDS: [RoomType, string[]][] = [
   ["wet", ["wc", "w.c", "inva-wc", "bad", "bader", "badezimmer", "du", "dusche*", "dusch*", "bath*", "shower*", "toilet*", "toilette*",
     "lavatory", "washroom*", "restroom*", "sauna*", "saun", "leiliruum", "laundry", "waschkuche", "waschraum", "pesukoda", "pesuruum",
     "pesuh*", "tualett*", "vannituba", "vannitoba", "kph", "kh", "ph", "khh", "kylpyhuone*", "pesuhuone*", "kodinhoitohuone*",
-    "sanitar*", "bagno", "doccia", "bain", "salle de bain*", "salle d'eau", "douche", "badrum", "tvattstuga", "lazienka"]],
-  ["circulation", ["korridor*", "koridor*", "corridor*", "hallway*", "flur", "gang", "diele", "vorplatz", "eingang*",
-    "entree", "entrance*", "entrance hall", "stair hall", "lift hall", "foyer", "fuajee*", "esik", "eeskoda", "lobby", "stair*", "trepp*", "trepikoda", "treppenhaus", "lift*",
-    "elevator*", "aufzug", "porras*", "porrashuone*", "kaytava*", "eteinen", "tuulikaappi", "landing", "vestibule", "vestibul",
-    "disimpegno", "ingresso", "corridoio", "scala", "degagement", "palier", "escalier", "passage", "hallen", "trapphus", "farstu"]],
+    "sanitar*", "sanitair", "bagno", "doccia", "bain", "salle de bain*", "salle d'eau", "douche*", "badrum", "tvattstuga", "lazienka",
+    "kleedkamer*", "kleedruimte*", "changing*", "umkleide*", "riietusruum*", "pukuhuone*", "ban", "bano*", "aseo*", "wasruimte",
+    "omklaedning*", "koristus*"]], // koristusruum (cleaning room) is a wet room on F2's takeoff / the glance card
+  ["circulation", ["korridor*", "koridor*", "corridor*", "hallway*", "flur", "fluchtflur*", "gang", "diele", "vorplatz", "vorraum*", "vorr",
+    "eingang*", "entree", "entrance*", "entrance hall", "stair hall", "lift hall", "foyer", "fuajee*", "esik", "eeskoda", "lobby",
+    "stair*", "trepp*", "trepikoda", "treppenhaus", "lift*", "elevator*", "aufzug", "porras*", "porrashuone*", "kaytava*", "eteinen",
+    "tuulikaappi", "landing", "vestibule", "vestibul", "disimpegno", "ingresso", "corridoio", "scala", "degagement", "palier",
+    "escalier", "passage", "hallen", "trapphus", "farstu", "wait*", "vest.", "rellano*", "portal", "ramp*", "rampe", "gang", "gangen", "hal", "overloop",
+    "trappenhuis", "dist", "distribuidor*", "pasillo*", "vestibulo*", "recibidor*", "komunikacja", "comunication", "klatka*"]],
   ["storage", ["abiruum", "abstell*", "storage", "store", "stores", "storeroom*", "closet", "cupboard", "ripostiglio", "reduit", "keller*",
     "cellar", "cave", "cantina", "estrich", "varasto*", "vaatehuone*", "panipaik*", "sahver", "pantry", "server*", "tehno*",
-    "tehniline*", "technik*", "technical", "mechanical", "mech", "plant room", "boiler*", "heizung*", "soojussolm", "veem.solm",
-    "veemootja*", "el.kilp", "elektri*", "elec*", "ventilatsioon*", "ventilation", "iv-kamber", "shaft", "schacht", "gaine",
-    "koristus*", "janitor", "cleaning", "liikumisvahendid", "utility", "ict", "tekn*", "lvi*", "garage", "garaaz*", "autotalli",
-    "forrad", "kallare"]],
-  ["kitchen", ["kook", "teekook", "kitchen*", "kuche", "kueche", "kochen", "cuisine", "cucina", "keittio*", "kok", "kuchnia"]],
+    "tehniline*", "technik*", "haustechnik*", "technical", "mechanical", "mech", "plant room", "boiler*", "heiz*", "soojussolm",
+    "veem.solm", "veemootja*", "el.kilp", "elektri*", "elec*", "ventilatsioon*", "ventilation", "iv-kamber", "shaft", "schacht",
+    "gaine", "janitor*", "jan.", "jan cl*", "cleaner*", "cleaning", "liikumisvahendid", "utility", "ict", "comm", "comms", "tekn*",
+    "lvi*", "garage", "garaaz*", "garaje", "autotalli", "stellplatz*", "parking", "forrad", "kallare", "lager*", "hausanschluss*",
+    "rlt*", "nshv", "mull*", "trash", "stor.", "sto.", "putz*", "berging*", "toestellenberging", "kast", "werkkast", "cv ruimte", "cv-ruimte", "meterkast", "trastero*",
+    "attic*", "dachboden", "zolder", "ullakko*", "pooning"]],
+  ["kitchen", ["kook", "teekook", "kitchen*", "kuche", "kueche", "kochen", "cuisine", "cucina", "keittio*", "kok", "kuchnia", "keuken",
+    "cocina*", "coc", "cafeteria", "canteen", "mensa", "kantine", "ruokala", "sookla", "servery", "kitchenette*", "teekuche"]],
   ["living", ["elutuba", "living*", "wohnen", "wohnzimmer", "wohn", "salon", "sejour", "soggiorno", "olohuone*", "family room",
-    "lounge", "dining", "essen", "sook*", "ruokailu*", "pranzo", "oleskelu*", "vardagsrum", "matsal", "wohnkuche", "wohnen/essen"]],
+    "lounge", "dining", "essen", "sook*", "ruokailu*", "pranzo", "oleskelu*", "vardagsrum", "matsal", "wohnkuche", "wohnen/essen",
+    "woonkamer", "eetkamer", "sal", "estar", "comedor*", "salon-comedor", "uhistegevus*"]],
   ["bedroom", ["magamistuba", "magamis*", "bedroom*", "schlafzimmer", "schlafen", "zimmer", "kinderzimmer", "chambre", "camera",
-    "makuuhuone*", "mh", "sovrum", "sypialnia", "dormitorio", "guest room", "master bedroom"]],
+    "makuuhuone*", "mh", "sovrum", "sypialnia", "dormitorio", "guest room", "master bedroom", "slaapkamer*", "hab", "habitacion*",
+    "dorm", "dorms"]],
+  ["office", ["office*", "buro*", "buero*", "gruppenburo*", "gruppenbuero*", "einzelburo*", "doppelburo*", "teamburo*", "arbeitsraum",
+    "arbeitszimmer", "sekretariat*", "secretar*", "meeting*", "conference*", "konferenz*", "besprechung*", "sitzung*", "reception*",
+    "empfang*", "admin*", "staff*", "personal", "personali*", "kontor*", "toimisto*", "neuvottelu*", "tyohuone*", "kanslia",
+    "kabinet*", "kabinett*", "noupidamis*", "juhataja*", "direktor*", "director*", "valveruum", "hooldustootaja*", "sots",
+    "workspace*", "workstation*", "conf", "conf.", "break room", "breakroom", "work room", "workroom", "open office", "kantoor*", "spreekkamer*", "vergader*", "oficina*",
+    "despacho", "bureau", "ufficio", "cubicle*", "interview*", "consult*", "head teacher", "headteacher*", "deputy"]],
+  ["teaching", ["class", "classroom*", "classes", "klass", "klassi*", "klassen*", "klassenzimmer", "arvutiklass", "oppeklass*",
+    "ringiruum", "seminar*", "lecture*", "horsaal*", "lehrsaal*", "labor", "labor*", "laboratory*", "laboratorio*", "lab", "labs",
+    "teaching", "tutorial*", "library", "bibliothek*", "biblioteek*", "bibliotheek", "kirjasto*", "luokka*", "opetus*",
+    "unterricht*", "lokaal", "leslokaal", "klaslokaal", "aula de", "aula clase", "learning*", "study room", "group room", "lrc",
+    "music room", "art room", "science*", "werkraum*", "humanitaar*"]],
+  ["sport", ["gym*", "sports hall", "sport*", "turnhalle*", "turnhal", "spordisaal*", "liikumissaal*", "liikuntasali*", "kuntosali*",
+    "voimistelusali*", "juhlasali*", "saal", "assembly*", "auditorium*", "veranstaltung*", "mehrzweck*", "multi-purpose*",
+    "multipurpose*", "multi purpose*", "main hall", "school hall", "fitness*", "theatre", "theater", "zaal", "sporthal"]],
+  ["outdoor", ["balcon*", "balkon*", "balcony", "terrace*", "terrass*", "terras", "terraza*", "terrazza*", "loggia*", "patio", "veranda*",
+    "rodu", "parveke*", "terassi*", "porch", "lanai", "dachterrasse*", "dakterras"]],
 ];
-const ROOM_RE: [RoomType, RegExp][] = ROOM_WORDS.map(([k, ws]) => [k, new RegExp(`(^|[^a-z0-9])(${ws.map((w) =>
+const ROOM_RE: [RoomType, RegExp][] = ROOM_WORDS.map(([k, ws]) => [k, new RegExp(`(^|[^a-z])(${ws.map((w) =>
   w.endsWith("*") ? `${esc(w.slice(0, -1))}[a-z]*` : esc(w)).join("|")})(?![a-z])`)]);
 function esc(s: string) { return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"); }
 
 /** What a room is for, from its name ('ELUTUBA+KÖÖK' → living: the first part of a combined name that we know). */
 export function roomType(...names: (string | null | undefined)[]): RoomType {
   for (const raw of names) {
-    const n = String(raw ?? "").normalize("NFD").replace(/[̀-ͯ]/g, "").toLowerCase().trim();
+    const n = String(raw ?? "").normalize("NFD").replace(/[̀-ͯ]/g, "").toLowerCase().replace(/æ/g, "ae").replace(/ø/g, "o").replace(/ß/g, "ss").trim();
     if (!n) continue;
     if (n === "hall" || n === "halli") return "circulation"; // a lone 'Hall' at home; 'Sports hall' / 'Main hall' stay other
     for (const part of n.split(/[+&]|\s\/\s|,/)) {
-      for (const [k, re] of ROOM_RE) if (re.test(part)) return k;
+      for (const [k, re] of ROOM_RE) if (re.test(part)) return k === "bedroom" ? "living" : k; // one group, as on the glance card
     }
   }
   return "other";
@@ -127,6 +163,18 @@ export function setLook(m: LookMode) {
   for (const f of lookListeners) f(m);
 }
 export function onLook(f: (m: LookMode) => void) { lookListeners.add(f); }
+
+/** A key light that follows the camera (W7 c2): from above, behind and to the left of the viewer, so the walls facing
+ * the camera are always lit warm off-white and the side walls get a soft shade (with a fixed sun, the walls of a model
+ * seen from its shaded side came out mid-grey: Duplex exploded). In the default view it is close to the old fixed sun. */
+export function keyLight(sun: THREE.DirectionalLight, camera: THREE.Camera, target: THREE.Vector3) {
+  const v = camera.position.clone().sub(target);
+  const vh = new THREE.Vector3(v.x, 0, v.z);
+  if (vh.lengthSq() < 1e-8) vh.set(0, 0, 1); // straight down: any side
+  vh.normalize();
+  const right = new THREE.Vector3(-vh.z, 0, vh.x).negate(); // the camera's right, on the ground
+  sun.position.copy(vh.addScaledVector(right, -0.5)).add(new THREE.Vector3(0, 1.0, 0)).normalize().multiplyScalar(100);
+}
 
 /** A soft fresnel rim on a highlight material: its silhouette glows a lighter accent, cheap on every frame. */
 export function rimGlow(mat: THREE.MeshLambertMaterial, strength = 0.9) {
@@ -257,7 +305,18 @@ void main() {
     this.groundMat.color.set(dark ? 0x3a3a3c : 0xffffff);
     this.groundMat.opacity = dark ? 0.18 : 0.75;
     this.shadowMat.color.set(dark ? 0x000000 : 0x1b2433);
-    this.shadowMat.opacity = dark ? 0.8 : 0.62;
+    this.dark = dark;
+    this.shadowMat.opacity = (dark ? 0.8 : 0.62) * this.shadowK;
+    this.refined = false;
+  }
+
+  private dark = false;
+  private shadowK = 1;
+  /** The contact shadow's strength (1 = as built; W7 c3: exploded floors float, so their shadow is softer: the whole
+   * stack's footprint under KIT Institute read as a heavy dark slab). */
+  setShadowStrength(k: number) {
+    this.shadowK = k;
+    this.shadowMat.opacity = (this.dark ? 0.8 : 0.62) * k;
     this.refined = false;
   }
 
@@ -455,7 +514,7 @@ void main() {
 // types this model / floor really has, with counts), or the area ramp of an area answer; 'Rooms | Clay'; and, on a
 // model with several floors, 'Explode floors'.
 
-export interface LegendRow { key: string; label: string; hex: string; n: number }
+export interface LegendRow { key: string; label: string; hex: string; n: number; hint?: string }
 export interface AreaRamp { min: number; max: number; title: string }
 
 /** light → deep blue (RANK_HEX's ends): an area ramp for 'biggest room' / 'rooms by size' answers */
@@ -463,7 +522,19 @@ export const AREA_LO = new THREE.Color("#dbe9fb");
 export const AREA_HI = new THREE.Color("#0040a8");
 export function areaColor(a: number, min: number, max: number): THREE.Color {
   const k = max > min ? Math.max(0, Math.min(1, (a - min) / (max - min))) : 1;
-  return AREA_LO.clone().lerp(AREA_HI, Math.pow(k, 0.8));
+  // mixed in sRGB like the legend's CSS gradient (a linear-light mix greys the middle: 22 of 2–31 m² came out #7587c2)
+  return AREA_LO.clone().convertLinearToSRGB().lerp(AREA_HI.clone().convertLinearToSRGB(), Math.pow(k, 0.8)).convertSRGBToLinear();
+}
+
+/** A legend row clicked (one room type in focus): that type's floors in a deeper shade of their own hue (same family as
+ * the swatch, clearly stronger), every other floor almost white. Linear colours, ready for a vertex colour attribute. */
+const SPOT_DIM = new THREE.Color("#f2f1ee");
+export function spotColor(type: RoomType, on: boolean): THREE.Color {
+  const c = new THREE.Color(ROOM_HEX[type]);
+  if (!on) return c.lerp(SPOT_DIM, 0.82);
+  const hsl = { h: 0, s: 0, l: 0 };
+  c.getHSL(hsl, THREE.SRGBColorSpace); // in sRGB (what the eye sees), not the linear working space
+  return c.setHSL(hsl.h, Math.min(0.36, hsl.s * 1.5 + 0.06), Math.max(0.52, hsl.l * 0.76), THREE.SRGBColorSpace);
 }
 
 export class LookPanel {
@@ -472,6 +543,8 @@ export class LookPanel {
   private explodeBtn: HTMLButtonElement;
   private segBtns: HTMLButtonElement[] = [];
   onExplode: (on: boolean) => void = () => {};
+  /** a legend row clicked: that room type in focus (null = all types again) */
+  onType: (key: RoomType | null) => void = () => {};
   private exploded = false;
 
   constructor(host: HTMLElement) {
@@ -504,6 +577,13 @@ export class LookPanel {
     row.append(seg, this.explodeBtn);
     this.el.append(this.legend, row);
     host.append(this.el);
+    // a room-type row lights that type (click again: all types); the card never lets a click reach the model
+    this.legend.addEventListener("click", (e) => {
+      const b = (e.target as HTMLElement).closest<HTMLButtonElement>("button.look3d-item");
+      if (!b) return; // W7 c4: also while faded (an answer lit): the viewer lets the answer's 3D highlight go (UX S-M6)
+      this.onType(b.getAttribute("aria-pressed") === "true" ? null : (b.dataset.key as RoomType));
+    });
+    this.legend.addEventListener("pointerdown", (e) => e.stopPropagation());
     const sync = () => this.segBtns.forEach((b) => b.setAttribute("aria-pressed", String(b.dataset.look === getLook())));
     onLook(sync);
     sync();
@@ -518,8 +598,9 @@ export class LookPanel {
     if (fire) this.onExplode(on);
   }
 
-  /** Room-type rows (null = none), or an area ramp (wins when given); `note` = a muted line under the rows. */
-  setLegend(rows: LegendRow[] | null, ramp: AreaRamp | null = null, note = "") {
+  /** Room-type rows (null = none), or an area ramp (wins when given); `note` = a muted line under the rows; `focus` =
+   * the room type lit from the legend (its row pressed, the others dimmed). Rows are buttons: a click lights the type. */
+  setLegend(rows: LegendRow[] | null, ramp: AreaRamp | null = null, note = "", focus: string | null = null) {
     const fmt = (v: number) => (v >= 100 ? Math.round(v).toLocaleString("en-US") : v.toFixed(1));
     if (ramp) {
       this.legend.innerHTML = `<div class="look3d-title">${escHtml(ramp.title)}</div>
@@ -529,12 +610,17 @@ export class LookPanel {
       return;
     }
     if (!rows?.length) {
-      this.legend.innerHTML = "";
-      this.legend.hidden = true;
+      // a note alone (W7 c3: a model without rooms says so instead of an empty 'Rooms' card)
+      this.legend.innerHTML = note ? `<div class="look3d-note">${escHtml(note)}</div>` : "";
+      this.legend.classList.remove("focused");
+      this.legend.hidden = !note;
       return;
     }
-    this.legend.innerHTML = rows.map((r) => `<div class="look3d-item"><i style="background:${r.hex}"></i><span>${escHtml(r.label)}</span><b>${r.n}</b></div>`).join("")
+    const tip = (r: LegendRow) => (r.key === focus ? "Show all room types again" : `Light all ${r.label.toLowerCase()}${r.hint ? ` (${r.hint})` : ""}`);
+    this.legend.innerHTML = rows.map((r) => `<button type="button" class="look3d-item" data-key="${escHtml(r.key)}" aria-pressed="${r.key === focus}"
+        title="${escHtml(tip(r))}"><i style="background:${r.hex}"></i><span>${escHtml(r.label)}</span><b>${r.n}</b></button>`).join("")
       + (note ? `<div class="look3d-note">${escHtml(note)}</div>` : "");
+    this.legend.classList.toggle("focused", !!focus);
     this.legend.hidden = false;
   }
 }

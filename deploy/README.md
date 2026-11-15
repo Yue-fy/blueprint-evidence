@@ -43,6 +43,12 @@ tail -f $JUNCTION_SHARED/logs/watchdog.log    # 'watchdog start …', then 'chec
 kill <pid from the 'watchdog start pid N' line>   # stop the watchdog; the services keep running
 ```
 
+**Judging day (P1, 15 Nov 00:50; RL 00:15):** stoa/llm.py caps Gemini at `GEMINI_MAX_CALLS_PER_DAY` (default 200) per
+`STOA_AGENT`, and the demo's `captain-demo` agent made 161 calls on Saturday. The frozen `watchdog.demo.conf` lines for
+`api` and `web` (both start answer processes) set `STOA_AGENT=captain-demo STOA_GEMINI_TEAM_CAP=1150` but not this
+variable, so a revived API is capped at 200 too. At the final swap, add `GEMINI_MAX_CALLS_PER_DAY=<n>` to the demo's
+own start command AND to those two conf lines (then restart the watchdog), or keep 200 on purpose.
+
 Tested on throwaway ports (14 Nov): started services from nothing; a killed API back in ~30 s; a hung server (accepts,
 never replies) declared dead after 3 failed checks, stopped and restarted; a slow (1.5 s) and a 404 server left alone;
 the exact demo lines (`api`, `web`) started on spare ports answer like :8100 / :5180; a probe logged `FAIL http=500`
@@ -54,6 +60,16 @@ then CHECK that the gate (not something else) owns the port: `curl -s http://127
 `{"gate": "ok", ...}`, and only then `tailscale funnel --bg --https=10000 http://127.0.0.1:8190` (443 / 8443 on this box
 are used by another project; never `tailscale funnel reset`). The gate used :8140 until 18:10 on 14 Nov; V1's door
 detector (no password) listens there now, so an old command would have published it. Tested through it: browser sign-in, uploads, a 12 MB IFC byte-exact, /api.
+
+**Login page at the final swap (UX NEW-5, 15 Nov 00:53):** the gate running on :8190 since 14 Nov 20:44 (pid 3749088,
+started from `junction-wt/demo/deploy`, i.e. demo code 1eedc72b) still shows the OLD page ('Blueprints Talk', green
+button, 'Team Hannah Family · Junction 2026'). The new page ('B · Blueprint Evidence', the app's blue + Inter, a visible
+'Password' label, 'enter the password you were given', empty submit 400 'Enter the password.') is P1 a1d2f55b, in
+d31 / d32 and in night once S0 merges d31. A Python process keeps the code it started with, so it shows only after the
+gate is restarted from the final demo worktree: `kill 3749088`, then from `junction-wt/demo/deploy` (same command as
+before) `python gate.py --upstream http://127.0.0.1:5180 --port 8190 --password-file ~/.stoa_gate`, and check
+`curl -s http://127.0.0.1:8190/__gate/health` and `curl -s http://127.0.0.1:8190/__gate/login | grep -o '<title>[^<]*'`
+('Blueprint Evidence: sign in'). Agents never restart it (captain's demo).
 
 ## 1. Batch answers (what Stoa can run on their hidden set)
 
@@ -97,11 +113,12 @@ answer):
 | PDF, several pages | answered from the page `pick_page` picks (sheet number / quoted storey in the title, else most drawing); evidence on that page | 2-page sets 93.3%, plan on page 3 100%; right storey sheet 455/455 |
 | PDF, scanned (image-only page) | page rendered to PNG at the scan's resolution → image readers; evidence back in PDF points | = the PNG: Swiss scan 55%, CubiCasa 75% |
 | PNG / JPG | pipeline as is | CubiCasa JPG 76.7% |
+| TIFF / WebP / BMP / GIF, 16-bit grey PNG, transparent PNG | read from an 8-bit PNG copy in `$STOA_CACHE/formats` (first page; 16-bit greys SCALED, Pillow would clip them to white; transparent background on white), same pixels, evidence on the uploaded file; `STOA_PICTURE_PNG=0` = off | Stoa sheet as 16-bit PNG / TIFF: greys kept (mean 247.9 = the RGB copy; before 250.8-253.2) |
 | IFC | pipeline as is (IFC reader) | 96.7%, 56 MB models 100% |
 | DXF | dxf reader; other layer names (AIA `A-DOOR`, German `Tür`, …) read through a renamed copy; no role layer → conf ≤ 0.2 + "missing" | Swiss 96.7%; AIA names 100%; PDF + renamed DXF 98.9% (`up_fmt5`) |
 | SVG from IfcConvert (`class="Ifc…"`) | `svg_ifc` (counts by IFC class, room areas, wall lengths); other questions → as a vector PDF | 80.0% (354 dev sheets: areas 96.1%) |
 | SVG, other | converted to a vector PDF (paths + text kept) | = the PDF (Swiss 100%); text drawn as outlines: low confidence + "export with text" |
-| DWG | LibreDWG `dwg2dxf` (team box: `~/.local/bin`, 0.14) / ODA File Converter → `<stem>.dwg.dxf`, converter artefacts repaired (UTF-8 text, aligned text at 0,0) → dxf reader | 100% (`up_fmt6`, 60 rows); Revit DWGs convert in 1–10 s; no converter: "save as DXF or print to PDF" |
+| DWG | LibreDWG `dwg2dxf` (team box: `~/.local/bin`, 0.14) / ODA File Converter → `<stem>.dwg.dxf`, converter artefacts repaired (UTF-8 text, aligned text at 0,0, a UTF-8 character cut between MTEXT chunks) → dxf reader | 100% (`up_fmt6`, 60 rows); Revit DWGs convert in 1–10 s; no converter: "save as DXF or print to PDF" |
 | HEIC / HEIF (iPhone) | → upright JPEG with `pillow-heif` (`uv pip install -e .[formats]`; in the team venv) | = the JPG (3/3); no decoder: "export as JPEG" |
 | PDF no PDF reader can read (text as outlines, no scale; not an IFC-exported sheet) | `upload` renders the page (200 dpi without a text layer, else 150) → image readers; evidence in PDF points; conf ≤ 0.5 | X1 wild set 34.8 → 44.6%; slow: p50 ~17 s on those files |
 
@@ -192,9 +209,25 @@ summary (`cost per 1k: GPU $… API $… CPU $…`, and `rates` in the summary J
   (> 30k tokens, > 6 calls, or > $0.003 of hosted calls, e.g. Gemini Pro or OCR of a whole scan), with a one-line
   reason. In `answer` rows (`cost.tier`), `ask`, and the eval summary (`cost tiers:` line, `cost_tier3`).
   Dev (S0 run a0fc): cheap 67% (acc 93%), in-between 33% (82%), expensive 0%.
+- **One-time file readings** (Sat 23:58): a picture's or scan's text layer (VLM tiles or OCR) is read once per file
+  and shared by every question about it. Readers wrap it in `stoa.cost.file_reading()`, so it still counts in the
+  totals above (a warm run costs what a cold run costs) and is also recorded as `prep_<field>`
+  (`prep_llm_calls`, `prep_cpu_seconds`, …). The tier is the question's OWN work (`stoa.cost.question_part`); the
+  file's reading is named in the tier's reason and in `file_reading`. `breakdown()` gives `prep_usd` and
+  `question_usd`, and the eval line adds "of which one-time file readings $X". Example: 6 questions on Stoa's DfE PNG
+  cost $2.59 per 1k, of which $2.50 is that sheet's text layer; on 15 scanned-sheet questions, $29.13 of $29.86 is the
+  scans' OCR.
 
 ## Known gaps / not tested here
 
+- Transparent-background PNGs (F6 15 Nov 01:17) are read on white on every path since night-P1 8d9bec57 (the web
+  flattens at upload; `normalize.prepare` reads the CLI / API path's from a flattened copy). Older builds: flatten first.
+- DXF with every entity on layer 0 (no layer names): 1/30 on the CLI path, 3/30 through the web's drawn sheet
+  (`results/splits/up_fmt4web.jsonl`), all at confidence <= 0.2. Not fixed on purpose: the DXF reader's fixture rules
+  are the dataset rendering's vertex counts, so geometric role guessing would fit the probe, not a real layer-less DXF.
+- Searchable scans (a scanned page with a scanner's invisible OCR layer) are read as scans since d32 (X1's rule;
+  STOA_SCAN_OCR_LAYER=0 = old behaviour). In API mode that means Gemini Flash OCR tiles for the page (30-130 calls),
+  where the old route used the layer's (often junk) text for free: count it against GEMINI_MAX_CALLS_PER_DAY.
 - Multi-page PDFs are answered from ONE page: a question about the whole set ("how many doors in the building?" on a
   set of storey sheets) is answered from the page picked, not summed over pages.
 - DWG: the probe DWGs were written by LibreDWG itself (dxf2dwg); AutoCAD-written DWGs are only checked to convert
@@ -210,5 +243,12 @@ summary (`cost per 1k: GPU $… API $… CPU $…`, and `rates` in the summary J
   without them it falls back to its precomputed counts (not in the image) or abstains.
 - Precomputed caches (W1 IFC index / KG, raster text layers) are not in the image; they are rebuilt on first use
   (first IFC question on a model takes longer).
+- **Gemini calls per picture (P1 15 Nov 00:45).** The image has no CPU OCR engine (O1's PP-OCR runs in its own env on
+  the team box: `stoa.ocr.available()` is False in the container), so in API mode a new picture's text layer is read
+  as VLM tiles by Gemini Flash: 30-130 calls ONCE per picture (Stoa's DfE PNG: 130; cached by content afterwards).
+  With the default `GEMINI_MAX_CALLS_PER_DAY=200` that is 1-6 new pictures a day before every hosted step refuses
+  ('Gemini daily call cap reached'; the deterministic readers still answer). For a judging day set it explicitly:
+  `GEMINI_MAX_CALLS_PER_DAY=<n> PROJECT=… deploy/cloudrun.sh` (passed through), or the line in `~/stoa.env` for
+  `vm.sh`, within Google's no-abuse rule. The team box's own demo is capped the same way per `STOA_AGENT` (RL 00:15).
 - The web app's Accuracy report reads `$JUNCTION_SHARED/results/leaderboard.jsonl` (`STOA_LEADERBOARD`), which is
   not in the image; mount one if the demo should show it.

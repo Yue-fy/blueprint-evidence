@@ -235,3 +235,56 @@ def test_finnish_how_big_is_not_a_count():
     assert question_op("Kuinka suuri on keittiön lattiapinta-ala?") == ("none", [])
     assert question_op("Kuinka monta keittiötä?") == ("single", ["kitchen"])
     assert question_op("Kunika monta makuuhuonetta on?") == ("single", ["bedroom"])
+
+
+def _bays(drop=None, shift=0.0, total_x=None, n=11):
+    """A grid of n 7,200 bays (k = 0.02 px per mm) with the overall '79,200' under it; drop = the bay whose string the
+    OCR missed; shift moves the strings after the hole (a hole too narrow / wide for one bay)."""
+    k, x0, y = 0.02, 100.0, 400.0
+    segs = [("7,200", 7200)] * n
+    row = _row(y, segs, x0, k, h=12)
+    if drop is not None:
+        row = row[:drop] + [(t, [b[0] + shift, b[1], b[2] + shift, b[3]]) for t, b in row[drop + 1:]]
+    cx = total_x if total_x is not None else x0 + 7200 * n * k / 2
+    return _tl(row + [("79,200", [cx - 15, y + 14, cx + 15, y + 26])], size=(2000, 1000))
+
+
+def test_gap_one_unread_bay_string():
+    q = "What is the overall length of the main school building from west to east?"
+    a = CH.overall_answer("x.png", q, _bays())
+    assert a.value == 79.2 and a.confidence == CH.VERIFIED_CONF  # strict: all 11 read
+    tl = _bays(drop=3)
+    assert not [p for p in CH.verified(tl) if p.axis == "row"]
+    a = CH.overall_answer("x.png", q, tl)
+    assert (a.value, a.unit) == (79.2, "m") and a.confidence == CH.GAP_CONF
+    assert any("not read" in m for m in a.missing)
+    assert len([e for e in a.evidence if "chain segment" in e.note]) == 10  # the inferred string is not evidence
+    assert "[7,200 not read]" in a.trace[0]
+
+
+def test_gap_refused_when_hole_does_not_fit_or_total_off_centre():
+    q = "What is the overall length of the building from west to east?"
+    assert CH.overall_answer("x.png", q, _bays(drop=3, shift=-60.0)) is None  # hole ~half a bay: not one missing string
+    assert CH.overall_answer("x.png", q, _bays(drop=3, total_x=300.0)) is None  # total not over the chain's middle
+    assert CH.overall_answer("x.png", q, _bays(drop=0)) is None  # an END string missing: not an interior hole
+
+
+def test_gap_kill_switch(monkeypatch):
+    monkeypatch.setattr(CH, "CHAIN_GAP", False)
+    assert CH.overall_answer("x.png", "How long is the building from west to east?", _bays(drop=3)) is None
+
+
+def test_gap_non_uniform_mm_chain_labels_the_hole_in_mm():
+    k = 0.03  # px per mm
+    segs = [("3450", 3450), ("600", 600), ("3600", 3600), ("600", 600), ("3750", 3750), ("6050", 6050),
+            ("2200", 2200), ("2550", 2550)]
+    row = _row(300, segs, 100, k, h=12)
+    del row[5]  # '6050' not read
+    cx = 100 + sum(v for _, v in segs) * k / 2
+    tl = _tl(row + [("27 000", [cx - 20, 320, cx + 20, 332])], size=(1200, 900))  # not the sum (22 800): no hole fits
+    assert CH.overall_answer("x.png", "How long is the building from west to east, overall?", tl) is None
+    tot = sum(v for _, v in segs) / 1000
+    tl = _tl(row + [(f"{round(tot * 1000)}", [cx - 20, 320, cx + 20, 332])], size=(1200, 900))
+    a = CH.overall_answer("x.png", "How long is the building from west to east, overall?", tl)
+    assert a.value == round(tot, 3) and a.confidence == CH.GAP_CONF
+    assert "[6050 not read]" in a.trace[0]

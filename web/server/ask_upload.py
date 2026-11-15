@@ -18,6 +18,7 @@ from __future__ import annotations
 import contextlib
 import json
 import os
+import re
 import sys
 import time
 from pathlib import Path
@@ -186,7 +187,8 @@ def ask_context(ctx):
 
 def answer(req: dict) -> dict:
     """F7 'learn from corrections' (stoa/features/corrections.py, night-F7): wraps the answer; it passes through untouched
-    unless STOA_FEATURES has 'corrections' or the request carries solver_args.learn. Without the module: the plain one."""
+    unless the request carries solver_args.learn (the web plugin opts in; since night-F7 24dbc04 the STOA_FEATURES flag
+    alone no longer applies corrections, so visitors never inherit each other's). Without the module: the plain one."""
     root = str(Path(__file__).resolve().parents[2])
     if root not in sys.path:
         sys.path.insert(0, root)
@@ -195,6 +197,53 @@ def answer(req: dict) -> dict:
     except Exception:  # noqa: BLE001 (not on this tree, or broken: never block the answer)
         return _answer(req)
     return wrap_upload(_answer, req)
+
+
+# T2 00:4x (captain 00:31, audit RECHECK-0026 new problem #1): where the data went is what the NETWORK saw, not only
+# which steps say they ran. A Gemini request whose reply missed the 25 s budget leaves no step credit and no cost, so
+# data_used said 'local' and the card '🔒 Stayed on our server' (2 of 9 default-mode answers, Stoa's M-101A FP among
+# them). Every provider netguard observed is added to data_used (trace line + field) and counted in api_calls.
+_NET_PROVIDERS = (("relay", ("forwards outside",)), ("gemini", ("googleapis.com", "generativelanguage")),
+                  ("nvidia", ("nvidia.com",)), ("verda", ("verda",)))
+_BARE_ADDR = re.compile(r"^\[?[0-9a-f.:]+\]?:\d+$", re.I)
+
+
+def _net_providers(seen: list[str]) -> list[str]:
+    """'generativelanguage.googleapis.com' -> gemini, '…nvidia.com…' -> nvidia, '…verda…' -> verda, a forwarding port
+    of this machine -> relay, any other outside host -> hosted. A bare 'address:port' is the connect that follows a
+    named lookup, so it counts (as 'hosted') only when no host was named."""
+    out: list[str] = []
+    bare = False
+    for h in seen:
+        hl = h.lower()
+        name = next((p for p, keys in _NET_PROVIDERS if any(k in hl for k in keys)), None)
+        if name is None and _BARE_ADDR.match(hl.strip()):
+            bare = True
+            continue
+        name = name or "hosted"
+        if name not in out:
+            out.append(name)
+    if bare and not any(p != "relay" for p in out):
+        out.append("hosted")
+    return out
+
+
+def _network_is_the_truth(ans: Answer, seen: list[str]) -> None:
+    provs = _net_providers(seen)
+    if not provs:
+        return
+    i = next((j for j, t in enumerate(ans.trace) if str(t).startswith("data_used:")), None)
+    rest = str(ans.trace[i]).split(":", 1)[1].strip() if i is not None else "local"
+    have = {t for t in re.split(r"[\s,;+()]+", rest.lower()) if t}
+    add = [p for p in provs if p not in have]
+    if add:
+        line = f"data_used: {rest}, {', '.join(add)}"
+        ans.trace = [*ans.trace[:i], line, *ans.trace[i + 1:]] if i is not None else [*ans.trace, line]
+    if isinstance(ans.data_used, list):
+        ans.data_used = [*ans.data_used, *[p for p in provs if p not in ans.data_used]]
+    calls = len([p for p in provs if p != "relay"])  # a forwarding detector is not a hosted API call
+    if calls and (ans.cost.api_calls or 0) < calls:
+        ans.cost.api_calls = calls
 
 
 def _answer(req: dict) -> dict:
@@ -238,8 +287,20 @@ def _answer(req: dict) -> dict:
             raise SystemExit(f"private mode: '{solver_name}' calls a hosted model; switch private mode off to use it")
         solver = get_solver(solver_name, **solver_args)
         t0 = time.perf_counter()
+        # T2 21:21: which outside hosts this answer really reached (stoa.netguard.watch, feature-detected: not on every
+        # tree), so the card's 'where your data went' is checked against the network, not only the solver's own words
+        try:
+            from stoa import netguard as _ng
+        except Exception:  # noqa: BLE001
+            _ng = None
+        if _ng is not None and hasattr(_ng, "blocked"):
+            try:
+                _ng.blocked(clear=True)  # count only this answer's refusals
+            except Exception:  # noqa: BLE001
+                pass
+        net = _ng.watch() if _ng is not None and hasattr(_ng, "watch") else contextlib.nullcontext(None)
         with CostMeter() as meter, page_on_screen(abs_path, req.get("page")) as on_page, privacy(private, eu) as priv, \
-                ask_context(req.get("context")) as ctx_line:
+                ask_context(req.get("context")) as ctx_line, net as hosts:
             solve, ctx = solver.solve, req.get("context")
             # F1 region ask (stoa/features/region.py): a drawn box / lasso (>= 3 points) scopes the question; a 2-point
             # region is a LINE to measure in G1's context shape (KNOWLEDGE 20:27), so it stays with the pipeline
@@ -263,6 +324,24 @@ def _answer(req: dict) -> dict:
             ans.trace = [f"data: {priv}", *ans.trace]
         if ctx_line:
             ans.trace = [ctx_line, *ans.trace]
+        try:
+            refused = _ng.blocked(clear=True) if _ng is not None and hasattr(_ng, "blocked") else []
+            if refused:
+                ans.trace = [*ans.trace, f"private mode: {len(refused)} outside connection(s) refused ({', '.join(dict.fromkeys(map(str, refused)))})"]
+                # T2 cycle 7 (H 01:30): a reader private mode kept off (it forwards page images outside) is named on the
+                # card, not left as an unexplained guess (stoa.netguard.kept_off; older netguard: nothing)
+                for m in (_ng.kept_off(refused) if hasattr(_ng, "kept_off") else []):
+                    if m not in (ans.missing or []):
+                        ans.missing = [*(ans.missing or []), m]
+            seen = sorted(dict.fromkeys(map(str, hosts or [])))
+            if seen:
+                ans.trace = [*ans.trace, "network: this answer reached " + ", ".join(seen)]
+                used = next((str(t) for t in ans.trace if str(t).startswith("data_used:")), "")
+                if used and used.split(":", 1)[1].strip() == "local":
+                    ans.trace = [*ans.trace, f"data_used says local but the network saw {', '.join(seen)}"]
+                _network_is_the_truth(ans, seen)
+        except Exception as e:  # noqa: BLE001  (a check, never the answer's problem)
+            print(f"netguard: {e}", file=sys.stderr)
         out = ans.model_dump()
         name, folder = Path(abs_path).name, Path(abs_path).parent
         vdir = virtual.rsplit("/", 1)[0]

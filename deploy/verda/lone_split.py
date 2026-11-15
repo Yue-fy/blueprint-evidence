@@ -18,7 +18,10 @@ COST = {"cubicasa5k": 1.0, "swiss_dwellings": 0.5, "ifc_models": 1.0, "ifc_bench
 sd = Path(os.environ["JUNCTION_SHARED"]) / "results" / "splits"
 root = Path(os.environ.get("NEUTRAL_ROOT", "/root/work/neutral"))
 out, n = Path(sys.argv[1]), int(sys.argv[2])
-sealed = {json.loads(l)["group"] for l in open(sd / "test.jsonl") if l.strip()}
+# test.jsonl is not shipped to instances (V1 cycle 9): the rows below come from train / dev / unused only, which are
+# split by drawing, so no sealed row can appear; the filter only matters where test.jsonl exists
+tf = sd / "test.jsonl"
+sealed = {json.loads(l)["group"] for l in open(tf) if l.strip()} if tf.exists() else set()
 # FULL rows (question + answer + unit + type): a row with only a qid is joined with questions.jsonl by the eval,
 # which restores the DATASET path and silently measures the path-based run (V1 15:35, as S0's make_upload_probe says)
 qs = {q.qid: q for q in load_questions()}

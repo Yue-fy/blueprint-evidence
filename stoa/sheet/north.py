@@ -225,6 +225,21 @@ def _image_arrow(path: str, layer=None) -> dict:
                 near.append((i, bb))
         if not near:
             continue
+        # the symbol = the heaviest cluster of nearby parts (a scanned dashed circle is many arcs); a stray line
+        # fragment elsewhere in the zone must not stretch the symbol's box over the label (X1's AFCEC A-2 scans)
+        groups: list[list] = []
+        for q in near:
+            hit = [g for g in groups if any(max(0, max(q[1][0], o[1][0]) - min(q[1][2], o[1][2]),
+                                                max(q[1][1], o[1][1]) - min(q[1][3], o[1][3])) <= 0.6 * h for o in g)]
+            merged = [q] + [o for g in hit for o in g]
+            groups = [g for g in groups if g not in hit] + [merged]
+        def _gap(g):   # an arrow sits right next to its label: the nearest cluster, the heavier one on a tie
+            gx0, gy0 = min(o[1][0] for o in g), min(o[1][1] for o in g)
+            gx1, gy1 = max(o[1][2] for o in g), max(o[1][3] for o in g)
+            d = max(0, max(gx0, lb[0]) - min(gx1, lb[2]), max(gy0, lb[1]) - min(gy1, lb[3]))
+            return (round(d / (0.5 * h)), -sum(int(stats[k][4]) for k, _b in g))
+
+        near = min(groups, key=_gap)
         ux0, uy0 = min(q[1][0] for q in near), min(q[1][1] for q in near)
         ux1, uy1 = max(q[1][2] for q in near), max(q[1][3] for q in near)
         sc = ((ux0 + ux1) / 2, (uy0 + uy1) / 2)

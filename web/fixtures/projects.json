@@ -1,55 +1,54 @@
 [
   {
-    "id": "dfe-school",
-    "name": "Special school, ground floor",
-    "place": "Department for Education, UK (fictitious site)",
+    "id": "swiss",
+    "name": "Apartment floor",
+    "place": "Switzerland",
     "facts": [
-      "Stoa's example sheet",
-      "1:200 with scale bar",
-      "line CAD, room labels"
+      "4 apartments",
+      "36 doors",
+      "341 m² of rooms"
     ],
-    "contents": "Level 00 floor plan (Stoa's sheet) + Level 01",
+    "contents": "1 floor plan (2nd floor) + 3D made from it",
     "sheets": [
       {
-        "label": "Level 00",
-        "path": "examples/dfe-special-school-plan-level00.png"
-      },
-      {
-        "label": "Level 01",
-        "path": "examples/SEN-DFE-XX-01-D-X-0202-Special_School_Plan_Level_01-A-C01.pdf"
+        "label": "2nd floor",
+        "path": "data/swiss_dwellings/site1000_bldg2082_floor9385.pdf"
       }
     ],
     "chips": [
-      "What is the floor area of the Multi-Purpose Hall?",
-      "How many metres of skirting does the Laundry need, door openings excluded?",
-      "How many doors does the Kitchen have?",
-      "What is the total area of all Secondary Classrooms?"
+      "How big is apartment B?",
+      "How many doors on this floor?",
+      "How long is the corridor of apartment B?"
     ],
-    "credit": "Drawing: Department for Education (UK), Open Government Licence v3.0",
-    "kind": "floor"
+    "credit": "Drawing: Swiss Dwellings v3.0.0 (Archilyse AG), rendered by us, CC BY 4.0",
+    "kind": "floor",
+    "level": "simple"
   },
   {
-    "id": "dfe-scan",
-    "name": "Special school, scanned print",
-    "place": "The same sheet, printed and scanned",
-    "badge": "scan",
+    "id": "afcec-dorm",
+    "name": "Enlisted dormitory, second floor",
+    "place": "US Air Force Civil Engineer Center · sheet A-2",
     "facts": [
-      "scanned print (200 dpi)",
-      "no text layer"
+      "Stoa's example sheet",
+      "1\" = 40'-0\" · feet and inches",
+      "colour legend + area tables"
     ],
-    "contents": "1 scanned floor plan",
+    "contents": "1 floor plan",
     "sheets": [
       {
-        "label": "Level 00 (scan)",
-        "path": "examples/dfe-school-scan.png"
+        "label": "A-2 Second floor",
+        "path": "examples/afcec-dormitory-A-2-second-floor.png"
       }
     ],
     "chips": [
-      "What is the area of the Laundry?",
-      "How many metres of skirting does the Laundry need?"
+      "What is the total circulation area?",
+      "How many dorm rooms are on this floor?",
+      "How long is the building?",
+      "What is the total area of the west wing?"
     ],
-    "credit": "Drawing: Department for Education (UK), Open Government Licence v3.0; print and scan simulated by us",
-    "kind": "scan"
+    "credit": "Drawing: Air Force Civil Engineer Center (DAF dormitory SD drawings, 2026), US federal work, public",
+    "kind": "floor",
+    "level": "simple"
   },
   {
     "id": "usace-s100f",
@@ -69,11 +68,12 @@
     ],
     "chips": [
       "What is the area of the 150 mm slab (D13 @ 300)?",
-      "What is the slab area of each type?",
+      "What is the total slab area?",
       "What is the overall length of the foundation?"
     ],
     "credit": "Drawing: US Army Corps of Engineers, AW 078-24-33, public domain",
-    "kind": "structural"
+    "kind": "structural",
+    "level": "medium"
   },
   {
     "id": "usace-m101a",
@@ -94,33 +94,60 @@
     "chips": [
       "How many check valves (CV) are shown?",
       "What size is the suction header?",
-      "How many pumps are there?"
+      "How many fuel pumps (FP) are shown?"
     ],
     "credit": "Drawing: US Army Corps of Engineers, AW 078-24-28, public domain",
-    "kind": "piping"
+    "kind": "piping",
+    "level": "medium"
   },
   {
-    "id": "afcec-dorm",
-    "name": "Enlisted dormitory, second floor",
-    "place": "US Air Force Civil Engineer Center · sheet A-2",
+    "id": "dfe-school",
+    "name": "Special school",
+    "place": "Department for Education, UK (fictitious site)",
     "facts": [
       "Stoa's example sheet",
-      "1\" = 40'-0\" · feet and inches",
-      "colour legend + area tables"
+      "two floors + a scanned print",
+      "1:200 with scale bar"
     ],
-    "contents": "1 floor plan",
+    "contents": "Level 00 (Stoa's sheet), Level 01 and a scanned print of Level 00",
     "sheets": [
       {
-        "label": "A-2 Second floor",
-        "path": "examples/afcec-dormitory-A-2-second-floor.png"
+        "label": "Level 00",
+        "path": "examples/dfe-special-school-plan-level00.png"
+      },
+      {
+        "label": "Level 01",
+        "path": "examples/SEN-DFE-XX-01-D-X-0202-Special_School_Plan_Level_01-A-C01.pdf",
+        "chips": [
+          "What is the floor area of the Music Room?",
+          "What is the total area of all Secondary Classrooms?",
+          "How many doors are on this floor?",
+          "How big is the Staff Social Room?"
+        ]
+      },
+      {
+        "label": "Level 00 · scanned print",
+        "path": "examples/dfe-school-scan.png",
+        "badge": "scan",
+        "chips": [
+          "What is the area of the Laundry?",
+          "How many metres of skirting does the Laundry need?"
+        ],
+        "copy_of": "examples/dfe-special-school-plan-level00.png"
       }
     ],
     "chips": [
-      "How many dorm rooms are on this floor?",
-      "What is the total circulation area?"
+      "What is the floor area of the Multi-Purpose Hall?",
+      "How many metres of skirting does the Laundry need, door openings excluded?",
+      "How many doors does the Laundry have?",
+      "What is the total area of all Secondary Classrooms?"
     ],
-    "credit": "Drawing: Air Force Civil Engineer Center (DAF dormitory SD drawings, 2026), US federal work, public",
-    "kind": "floor"
+    "credit": "Drawings: Department for Education (UK), Open Government Licence v3.0; print and scan of Level 00 simulated by us",
+    "kind": "floor",
+    "level": "complex",
+    "aliases": [
+      "dfe-scan"
+    ]
   },
   {
     "id": "esplanades",
@@ -139,19 +166,39 @@
       },
       {
         "label": "Floor 2",
-        "path": "data/ifc_models/bsc-esplanades_1807-ep-ar-v18_plan-02-2-korrus.pdf"
+        "path": "data/ifc_models/bsc-esplanades_1807-ep-ar-v18_plan-02-2-korrus.pdf",
+        "chips": [
+          "How many doors are on this floor?",
+          "How many rooms are on each floor?",
+          "How many windows are on this floor?"
+        ]
       },
       {
         "label": "Floor 3",
-        "path": "data/ifc_models/bsc-esplanades_1807-ep-ar-v18_plan-03-3-korrus.pdf"
+        "path": "data/ifc_models/bsc-esplanades_1807-ep-ar-v18_plan-03-3-korrus.pdf",
+        "chips": [
+          "How many doors are on this floor?",
+          "How many rooms are on each floor?",
+          "How many windows are on this floor?"
+        ]
       },
       {
         "label": "Floor 4",
-        "path": "data/ifc_models/bsc-esplanades_1807-ep-ar-v18_plan-04-4-korrus.pdf"
+        "path": "data/ifc_models/bsc-esplanades_1807-ep-ar-v18_plan-04-4-korrus.pdf",
+        "chips": [
+          "How many doors are on this floor?",
+          "How many rooms are on each floor?",
+          "How many windows are on this floor?"
+        ]
       },
       {
         "label": "Floor 5",
-        "path": "data/ifc_models/bsc-esplanades_1807-ep-ar-v18_plan-05-5-korrus.pdf"
+        "path": "data/ifc_models/bsc-esplanades_1807-ep-ar-v18_plan-05-5-korrus.pdf",
+        "chips": [
+          "How many doors are on this floor?",
+          "How many rooms are on each floor?",
+          "How many windows are on this floor?"
+        ]
       },
       {
         "label": "3D model",
@@ -161,55 +208,11 @@
     "chips": [
       "How big is room 119?",
       "How many doors are on this floor?",
-      "How many rooms are on each floor?"
+      "How many rooms are on each floor?",
+      "How many windows are on this floor?"
     ],
     "credit": "Drawings and model: Esplan (esplan.ee), CC BY 4.0",
-    "kind": "building"
-  },
-  {
-    "id": "swiss",
-    "name": "Apartment floor",
-    "place": "Switzerland",
-    "facts": [
-      "4 apartments",
-      "36 doors",
-      "341 m² of rooms"
-    ],
-    "contents": "1 floor plan (2nd floor) + 3D made from it",
-    "sheets": [
-      {
-        "label": "2nd floor",
-        "path": "data/swiss_dwellings/site1000_bldg2082_floor9385.pdf"
-      }
-    ],
-    "chips": [
-      "How big is apartment B?",
-      "How many doors on this floor?",
-      "Which rooms open onto the corridor of apartment B?",
-      "Wie viele Türen und Fenster sind insgesamt auf diesem Grundriss eingezeichnet?"
-    ],
-    "credit": "Drawing: Swiss Dwellings v3.0.0 (Archilyse AG), rendered by us, CC BY 4.0",
-    "kind": "floor"
-  },
-  {
-    "id": "sports",
-    "name": "Xcel Sports Complex",
-    "place": "Wisconsin, US",
-    "facts": [
-      "24 drawing sheets",
-      "door & finish schedules"
-    ],
-    "contents": "door schedule sheet",
-    "sheets": [
-      {
-        "label": "Door schedule (A-801)",
-        "path": "data/opening_design/Sports_Complex/Sheets - Current Set/A-801 - Door and Finish Schedules & Wall Types.pdf"
-      }
-    ],
-    "chips": [
-      "How many doors are in the door schedule?"
-    ],
-    "credit": "Drawings: OpeningDesign and the project team in the title block, CC BY-SA 4.0",
-    "kind": "schedule"
+    "kind": "building",
+    "level": "complex"
   }
 ]

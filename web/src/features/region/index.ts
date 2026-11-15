@@ -10,6 +10,9 @@
  * the feature's button / menu item / overlay; the normal flow is untouched.
  */
 import { registerFeature, type DrawingPt, type FeatureApi } from "../registry";
+import { measureRoomOutline, measureSheetShown, setMeasureHost } from "../../measure";
+import type { Answer } from "../../types";
+import { installFloorAsk } from "./floor";
 
 type Mode = "box" | "lasso";
 
@@ -23,7 +26,7 @@ const EXACT: Record<string, string> = {
 const isOutlineQ = (q: string) => /\bof this outline\b/i.test(q);
 const SUGGEST: { label: string; q: string }[] = [
   { label: "Area of this outline (measure it)", q: OUTLINE_Q },
-  { label: "Baseboard along this outline (door gaps deducted)", q: BASE_Q },
+  { label: "Skirting along this outline (door gaps deducted)", q: BASE_Q },
   { label: "How many doors in this area?", q: "How many doors are in this area?" },
   { label: "How many windows in this area?", q: "How many windows are in this area?" },
   { label: "Total area of the rooms in here", q: "What is the total area of the rooms in this area?" },
@@ -34,6 +37,9 @@ const css = (el: HTMLElement, s: Partial<CSSStyleDeclaration>) => Object.assign(
 const ACCENT = "var(--accent, #0a84ff)";
 
 registerFeature("region", (api: FeatureApi) => {
+  // the ONE Measure tool (web/src/measure.ts, captain 21:42) shows a measurement as an answer card through this feature
+  setMeasureHost({ showAnswer: (a, q) => api.showAnswer(a, q) });
+  installFloorAsk(api); // 3D: 'Ask about a floor' (prompts/F1.md 'select floor')
   const ov = api.addOverlay2D("region");
   let mode: Mode = "box";
   let capture: HTMLDivElement | null = null;
@@ -118,10 +124,12 @@ registerFeature("region", (api: FeatureApi) => {
     pop?.remove();
     pop = null;
   };
+  let pressedFn = () => {};
   const stop = () => {
     capture?.remove();
     hint?.remove();
     capture = hint = null;
+    pressedFn();
   };
   const clearAll = () => {
     stop();
@@ -129,7 +137,19 @@ registerFeature("region", (api: FeatureApi) => {
     drawn = null;
     regionQ = "";
     ov.clear();
+    pressedFn();
   };
+  // the Measure tool's 'Clear all' (web/src/measure.ts, scope 'all') and the viewer's global 'Clear marks' (W5, no
+  // detail): every mark on the sheet goes, the area drawn here too. Measure's 'Cancel shape' keeps it.
+  // captain 01:18: W5's global 'Start over' (window 'stoa:reset'): everything this feature drew or opened goes
+  window.addEventListener("stoa:reset", () => {
+    clearAll();
+    mode = "box";
+  });
+  window.addEventListener("stoa:clear-marks", (e) => {
+    const scope = (e as CustomEvent).detail?.scope;
+    if (scope === "all" || scope === undefined) clearAll();
+  });
 
   const ask = async (q: string) => {
     if (!drawn || !q.trim()) return;
@@ -201,15 +221,32 @@ registerFeature("region", (api: FeatureApi) => {
     document.body.append(p);
     pop = p;
     const r = p.getBoundingClientRect();
-    css(p, {
-      left: `${Math.max(16, Math.min(x + 12, window.innerWidth - r.width - 16))}px`,
-      top: `${Math.max(16, Math.min(y + 12, window.innerHeight - r.height - 16))}px`,
-    });
+    let left = Math.max(16, Math.min(x + 12, window.innerWidth - r.width - 16));
+    const top = Math.max(16, Math.min(y + 12, window.innerHeight - r.height - 16));
+    // UX M9: never on top of an open side panel (takeoff tabs, trust map …): left of the leftmost one it would cover
+    try {
+      const panels = [...document.querySelectorAll<HTMLElement>("#featPanels .feat-panel")]
+        .filter((el) => !el.hidden && el.offsetWidth > 0 && !el.closest("[hidden]"))
+        .map((el) => el.getBoundingClientRect())
+        .filter((b) => left < b.right && left + r.width > b.left && top < b.bottom && top + r.height > b.top);
+      if (panels.length) {
+        const edge = Math.min(...panels.map((b) => b.left)) - r.width - 12;
+        if (edge >= 16) left = edge;
+      }
+    } catch {
+      /* keep the first place */
+    }
+    css(p, { left: `${left}px`, top: `${top}px` });
     inp.focus();
   };
 
   const start = () => {
     clearAll();
+    try {
+      window.dispatchEvent(new CustomEvent("stoa:tool", { detail: { name: "region" } })); // the Measure tool closes
+    } catch {
+      /* nobody listening */
+    }
     const v = document.getElementById("v2d");
     if (!v || api.view() === "3d") return;
     const r = v.getBoundingClientRect();
@@ -317,12 +354,53 @@ registerFeature("region", (api: FeatureApi) => {
     document.body.append(cap, hn);
     capture = cap;
     hint = hn;
+    pressedFn();
   };
+
+  // UX S-M4: a right-click INSIDE the area drawn here = this area's own questions (the popover again), never a second
+  // menu under it; outside it the viewer's menu opens and this popover goes (one menu at a time). Window capture runs
+  // before the registry's document listener.
+  const inDrawn = (x: number, y: number) => {
+    if (!drawn || drawn.file !== api.file()?.path || drawn.page !== api.page()) return false;
+    const q = toDrawing(x, y);
+    if (!q) return false;
+    let inside = false;
+    const P = drawn.poly;
+    for (let i = 0, j = P.length - 1; i < P.length; j = i++) {
+      if ((P[i][1] > q[1]) !== (P[j][1] > q[1]) && q[0] < ((P[j][0] - P[i][0]) * (q[1] - P[i][1])) / (P[j][1] - P[i][1]) + P[i][0]) inside = !inside;
+    }
+    return inside;
+  };
+  window.addEventListener("contextmenu", (e) => {
+    if (capture || !drawn || document.querySelector(".measure.on")) return;
+    const v = document.getElementById("v2d");
+    if (!v || !v.contains(e.target as Node)) return;
+    if (inDrawn(e.clientX, e.clientY)) {
+      e.preventDefault();
+      e.stopImmediatePropagation();
+      showPop(e.clientX, e.clientY);
+    } else closePop();
+  }, true);
+  // UX S-M4 / S-m6: the toolbar button looks pressed while its box is being drawn or is on the sheet
+  const pressed = () => {
+    const b = document.querySelector<HTMLElement>('.feat-btn[data-feature="region"][data-id="region"]');
+    if (!b) return;
+    const on = !!capture || !!drawn;
+    b.classList.toggle("on", on);
+    b.setAttribute("aria-pressed", String(on));
+    b.style.boxShadow = on ? "inset 0 0 0 2px var(--accent, #0a84ff)" : "";
+  };
+  pressedFn = pressed;
 
   document.addEventListener("keydown", (e) => {
     if (e.key !== "Escape") return;
     if (capture) stop();
     else if (pop) closePop();
+    else if (drawn && !(e.target instanceof HTMLElement && /^(INPUT|TEXTAREA|SELECT)$/.test(e.target.tagName))) clearAll(); // UX M9
+  });
+  // UX M9: another tool on the sheet (the Measure tool) takes over: the drawn area goes
+  window.addEventListener("stoa:tool", (e) => {
+    if ((e as CustomEvent).detail?.name !== "region") clearAll();
   });
   window.addEventListener("resize", () => {
     if (capture) start();
@@ -336,98 +414,98 @@ registerFeature("region", (api: FeatureApi) => {
     id: "region", label: "Ask about an area here…", order: 30,
     when: (ctx) => !!ctx.file && ctx.view !== "3d" && !!ctx.point, run: () => start(),
   });
-  api.onDrawing(() => clearAll());
+  api.onDrawing((f, page) => {
+    clearAll();
+    // UX S-M8: Measure keeps the shape of the sheet left and brings back this sheet's
+    if (f?.path) measureSheetShown(f.path, page || 0);
+  });
+  // captain 23:47: on a room selected by right-click (W5's selection: ctx.selection {type: 'room', polygon?, label?};
+  // until it lands, the room the pointer is in), 'Edit outline' = Measure → Area holding that room's outline (drag /
+  // add / delete corners), 'Trace it yourself' = Measure → Area empty with the outline dashed (magnetic on pictures)
+  type SelRoom = { poly: [number, number][] | null; name: string };
+  const selRoom = (ctx: Parameters<Parameters<FeatureApi["addContextMenuItem"]>[0]["when"]>[0]): SelRoom | null => {
+    if (!ctx.file || ctx.view === "3d" || !ctx.point) return null;
+    const sel = (ctx as unknown as { selection?: { type?: string; polygon?: unknown; label?: string; name?: string } }).selection;
+    if (sel && sel.type && sel.type !== "room") return null; // a door / tag / wall is selected: not ours
+    const poly = sel && Array.isArray(sel.polygon) && sel.polygon.length >= 3 && sel.polygon.every((q) => Array.isArray(q) && q.length >= 2)
+      ? (sel.polygon as number[][]).map((q) => [Number(q[0]), Number(q[1])] as [number, number]) : null;
+    const name = String(sel?.name ?? sel?.label ?? ctx.room?.name ?? "").replace(/\s*·.*$/, "").trim();
+    if (!sel && !ctx.room) return null;
+    return { poly, name };
+  };
+  api.addContextMenuItem({
+    id: "edit-outline", label: "Edit outline", order: 26,
+    when: (ctx) => !!selRoom(ctx),
+    run: (ctx) => { const r = selRoom(ctx); if (r) void measureRoomOutline("edit", r.poly, ctx.point ? [ctx.point[0], ctx.point[1]] : null, r.name); },
+  });
+  api.addContextMenuItem({
+    id: "trace-yourself", label: "Trace it yourself", order: 27,
+    when: (ctx) => !!selRoom(ctx),
+    run: (ctx) => { const r = selRoom(ctx); if (r) void measureRoomOutline("trace", r.poly, ctx.point ? [ctx.point[0], ctx.point[1]] : null, r.name); },
+  });
   // captain 20:08 (audit fix #4): when an AREA answer is unsure (scans: room tracing crossed into the next room), offer
   // the visitor's own outline as the fallback: one click starts the lasso; the outline is measured at the sheet scale
-  let offer: HTMLDivElement | null = null;
-  const dropOffer = () => {
-    offer?.remove();
-    offer = null;
-  };
-  const showOffer = (sameRegion = false, base = false) => {
-    dropOffer();
-    const v = document.getElementById("v2d");
-    if (!v) return;
-    const r = v.getBoundingClientRect();
-    const o = document.createElement("div");
-    o.className = "feat-region-offer";
-    css(o, {
-      position: "fixed", left: `${r.left + r.width / 2}px`, top: `${r.bottom - 64}px`, transform: "translateX(-50%)",
-      zIndex: "54", background: "var(--surface, #fff)", color: "var(--text, #111)", borderRadius: "999px",
-      boxShadow: "0 8px 24px rgba(0,0,0,.18)", padding: "6px 6px 6px 14px", font: "13px/1.2 system-ui, sans-serif",
-      display: "flex", gap: "8px", alignItems: "center", whiteSpace: "nowrap", maxWidth: "calc(100vw - 32px)",
-    });
-    const t = document.createElement("span");
-    t.textContent = sameRegion
-      ? "Unsure reading. Measure your outline instead (drag its corners onto the walls)."
-      : base
-        ? "Check this skirting: draw a box around the room. We snap it to the walls and deduct the door gaps."
-        : "Not the right room? Draw its outline and we measure it.";
-    const b = document.createElement("button");
-    b.type = "button";
-    b.textContent = sameRegion ? "📐 Measure outline" : "✎ Draw outline";
-    css(b, { border: "0", borderRadius: "999px", padding: "6px 12px", background: ACCENT, color: "#fff", cursor: "pointer", font: "inherit" });
-    b.addEventListener("click", () => {
-      dropOffer();
-      if (sameRegion && drawn) {
-        void ask(base ? BASE_Q : OUTLINE_Q);
-        return;
-      }
-      mode = base ? "box" : "lasso"; // rooms are mostly rectangles: a box snaps onto all four walls
-      start();
-    });
-    const x = document.createElement("button");
-    x.type = "button";
-    x.textContent = "✕";
-    x.title = "Dismiss";
-    css(x, { border: "0", background: "none", cursor: "pointer", font: "inherit", padding: "4px 6px", color: "inherit" });
-    x.addEventListener("click", dropOffer);
-    o.append(t, b, x);
-    document.body.append(o);
-    offer = o;
-  };
-  api.onDrawing(() => dropOffer());
-  /** After an outline answer: the other measure of the SAME outline in one click (area -> baseboard, baseboard -> area). */
-  const showFollow = (label: string, q: string) => {
-    showOffer(true);
-    const o = offer;
-    if (!o) return;
-    const [t, b] = [o.querySelector("span"), o.querySelector("button")];
-    if (t) t.textContent = "Same outline:";
-    if (b) {
-      const nb = b.cloneNode(false) as HTMLButtonElement; // drop showOffer's click handler
-      nb.textContent = label;
-      nb.addEventListener("click", () => {
-        dropOffer();
-        if (drawn) void ask(q);
-      });
-      b.replaceWith(nb);
-    }
-  };
-  api.onAnswer((a, q) => {
-    dropOffer();
-    const unit = String(a.unit ?? "").toLowerCase();
-    const isArea = unit === "m2" || unit === "m²" || unit === "ft2" || unit === "sf";
-    const unsure = (a.confidence ?? 0) < 0.5 || a.value == null;
-    // a skirting / baseboard length the pipeline is unsure of (scans: 0/4 in the 19:51 audit): the visitor's own outline
-    const isBase = /\b(?:skirting|baseboards?|base\s*boards?)\b/i.test(q) && /^(m|ft|lf|metres?|meters?)?$/i.test(unit);
+  // UX M4 / M20 (23:39): these offers live IN the answer card (card actions), never as a floating toast over the
+  // Measure button; and only for one room, not for a whole floor / building / a list of rooms.
+  const WHOLE = /\b(?:total|gross|net internal|overall|whole|entire|all|combined|together|sum|every)\b|\b(?:ground|first|second|third|upper|lower|basement|top) (?:floor|level|storey|story)\b(?!\s*(?:room|hall|space))|\b(?:of|on|in) (?:the|this|that) (?:building|storey|story|apartment|flat|house|dwelling|school|floor|level)\b(?!\s*(?:'s|room|hall|space|area|plan))|\b(?:rooms|classrooms|bedrooms|bathrooms|offices|toilets|spaces|corridors|halls)\b/i;
+  const areaUnit = (a: Answer) => ["m2", "m²", "ft2", "sf", "sq ft"].includes(String(a.unit ?? "").toLowerCase());
+  const baseQ = (a: Answer, q: string) => /\b(?:skirting|baseboards?|base\s*boards?)\b/i.test(q) && /^(m|ft|lf|metres?|meters?)?$/i.test(String(a.unit ?? "").toLowerCase());
+  /** which offer this answer gets: 'room' (draw the room's outline), 'base' (box the room for its skirting), 'mine' (the
+   *  drawn region's own reading is unsure: measure the outline instead), or null */
+  const offerFor = (a: Answer, q: string): "room" | "base" | "mine" | null => {
+    if (api.view() === "3d") return null;
+    const qq = q.trim();
+    const isBase = baseQ(a, qq);
     // a traced skirting tops out at 'best estimate' (0.5) even when it is wrong (DfE hall 51.78 vs 50.4): offer the check there too
-    const baseUnsure = isBase && ((a.confidence ?? 0) <= 0.5 || a.value == null);
-    if (((isArea && unsure) || baseUnsure) && api.view() !== "3d") {
-      if (drawn && q.trim() === regionQ && !isOutlineQ(regionQ)) showOffer(true, isBase); // the region's own reading is unsure
-      else if (q.trim() !== regionQ) showOffer(false, isBase);
-    }
+    const unsure = isBase ? (a.confidence ?? 0) <= 0.5 || a.value == null : areaUnit(a) && ((a.confidence ?? 0) < 0.5 || a.value == null);
+    if (!unsure) return null;
+    if (drawn && qq === regionQ) return isOutlineQ(regionQ) ? null : "mine";
+    if (WHOLE.test(qq)) return null;
+    // W5 01:21 (UX 00:14): ONE check prompt per answer: the card's own 'Check it yourself' wins when it is shown
+    if (document.body.hasAttribute("data-card-check")) return null;
+    return isBase ? "base" : "room";
+  };
+  api.addCardAction({
+    id: "region-room", icon: "✎", label: "Not the right room? Draw its outline", order: 20,
+    title: "Click round the room (or drag a lasso): we measure your outline at the sheet's scale",
+    when: (a, q) => offerFor(a, q) === "room",
+    run: () => { mode = "lasso"; start(); },
+  });
+  api.addCardAction({
+    id: "region-base", icon: "✎", label: "Check this skirting: box the room", order: 20,
+    title: "Drag a box round the room: we snap it to the walls and deduct the door gaps",
+    when: (a, q) => offerFor(a, q) === "base",
+    run: () => { mode = "box"; start(); }, // rooms are mostly rectangles: a box snaps onto all four walls
+  });
+  api.addCardAction({
+    id: "region-mine", icon: "📐", label: "Unsure: measure your outline instead", order: 20,
+    title: "Measure the area you drew (drag its corners onto the walls first)",
+    when: (a, q) => offerFor(a, q) === "mine",
+    run: (a, q) => { if (drawn) void ask(baseQ(a, q) ? BASE_Q : OUTLINE_Q); },
+  });
+  // after an outline answer: the other measure of the SAME outline in one click (area -> skirting, skirting -> area)
+  const followOf = (a: Answer, q: string) =>
+    !!drawn && q.trim() === regionQ && a.solver === "region/outline" && a.value != null && isOutlineQ(regionQ) && api.view() !== "3d";
+  api.addCardAction({
+    id: "region-follow-base", icon: "📏", label: "Skirting along this outline", order: 21,
+    title: "The same outline: its perimeter minus the door gaps",
+    when: (a, q) => followOf(a, q) && !/baseboard|skirting/i.test(regionQ),
+    run: () => { if (drawn) void ask(EXACT[BASE_Q]); },
+  });
+  api.addCardAction({
+    id: "region-follow-area", icon: "📐", label: "Area of this outline", order: 21,
+    title: "The same outline: its area at the sheet's scale",
+    when: (a, q) => followOf(a, q) && /baseboard|skirting/i.test(regionQ),
+    run: () => { if (drawn) void ask(EXACT[OUTLINE_Q]); },
+  });
+  api.onAnswer((a, q) => {
     if (drawn && q.trim() === regionQ) {
       // the server moved the drawn sides onto the wall faces: show (and edit) that outline from now on
       const e0 = a.solver === "region/outline" ? a.evidence?.[0] : undefined;
       const sp = e0?.polygon as number[][] | null | undefined;
       if (sp && sp.length >= 3 && /on the wall faces/.test(e0?.note ?? "")) drawn.poly = sp.map((p) => [p[0], p[1]] as DrawingPt);
-      drawOutline(drawn.poly); // our answer: keep the outline
-      if (a.solver === "region/outline" && a.value != null && isOutlineQ(regionQ) && api.view() !== "3d") {
-        // the snapped outline is measured 'as drawn' from now on (it already sits on the walls)
-        if (/baseboard|skirting/i.test(regionQ)) showFollow("📐 Area of this outline", EXACT[OUTLINE_Q]);
-        else showFollow("📏 Baseboard along it (door gaps deducted)", EXACT[BASE_Q]);
-      }
+      drawOutline(drawn.poly); // our answer: keep the outline (the card's 'Skirting along this outline' / 'Area of this
+      // outline' measure the snapped outline 'as drawn' from now on: it already sits on the walls)
     }
     else if (drawn && q.trim() !== regionQ) {
       drawn = null; // another question: the region no longer applies

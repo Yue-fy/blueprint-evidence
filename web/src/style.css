@@ -299,6 +299,11 @@ select, input[type="search"], textarea { border: 1px solid var(--line); border-r
 .pick b { display: block; margin-bottom: 4px; }
 .pick div { display: grid; grid-template-columns: 70px 1fr; gap: 6px; color: var(--ink); word-break: break-all; }
 .pick span { color: var(--muted); }
+.pick .pick-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.pick .pick-head b { margin: 0; word-break: normal; }
+.pick .pick-x { flex: none; width: 28px; height: 28px; border: 0; border-radius: 50%; background: var(--bg); color: var(--ink); font-size: 16px; line-height: 26px; cursor: pointer; padding: 0; }
+.pick .pick-x:hover, .pick .pick-x:focus-visible { background: var(--accent); color: #fff; outline: none; }
+@media (hover: none) { .pick .pick-x { width: 40px; height: 40px; line-height: 38px; } }
 
 /* knowledge graph (linked sources) + credit */
 .linked { background: var(--cfff-bg); border-top: 1px solid var(--line); min-height: 0; min-width: 0; overflow: hidden; }
@@ -1129,6 +1134,9 @@ body .v2d-overlay .ev .pin circle { fill: var(--accent); }
 body[data-view="customer"] #main { grid-template-rows: auto minmax(0, 1fr) auto; }
 body[data-view="customer"] #views { grid-row: 2; padding-top: 0; }
 body[data-view="customer"] .credit { grid-row: 3; }
+/* UX minor 5: the credit wraps (at most 2 lines) instead of cutting '… CC BY-NC 4.0, demo use only' off */
+body[data-view="customer"] .credit { white-space: normal; overflow: hidden; text-overflow: clip; line-height: 1.35;
+  display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; }
 body[data-view="customer"] #tourNote { grid-row: 1; }
 /* D28 measured lines (length answers): a bold accent line with round caps */
 .v2d-overlay .ev polyline.eline { fill: none; stroke: var(--accent); stroke-width: 4px; stroke-linecap: round; stroke-linejoin: round; vector-effect: non-scaling-stroke; pointer-events: none; filter: drop-shadow(0 0 3px rgba(0, 113, 227, .45)); }
@@ -1276,7 +1284,7 @@ body[data-view="customer"] #ask textarea, body[data-view="customer"].answered #a
 .zoomctl svg { width: 20px; height: 20px; }
 body[data-view="expert"] .zoomctl { bottom: 44px; }
 /* page control for multi-page PDFs (bottom centre of the drawing) */
-.pagectl { position: absolute; left: 50%; bottom: 14px; transform: translateX(-50%); z-index: 6; display: flex; align-items: center; gap: 4px; padding: 4px;
+.pagectl { position: absolute; left: 50%; bottom: 72px; transform: translateX(-50%); z-index: 6; display: flex; align-items: center; gap: 4px; padding: 4px;
   border-radius: 999px; background: var(--glass); -webkit-backdrop-filter: saturate(180%) blur(20px); backdrop-filter: saturate(180%) blur(20px); box-shadow: var(--shadow); border: 1px solid var(--line); font-size: 14px; }
 .pagectl span { padding: 0 8px; color: var(--muted); white-space: nowrap; }
 .pagectl b { color: var(--ink); }
@@ -1447,10 +1455,16 @@ body[data-view="customer"] #tourNote:not(:empty) { position: absolute; left: 50%
   background: rgba(29, 29, 31, 0.84); -webkit-backdrop-filter: saturate(180%) blur(20px); backdrop-filter: saturate(180%) blur(20px);
   color: #f5f5f7; font-size: 15px; line-height: 1.45; box-shadow: var(--shadow-lift); pointer-events: none; }
 body[data-view="customer"] #tourNote b { color: #ffb48a; }
-body[data-view="customer"].bench-open #tourNote { display: none; }
+/* UX pass 2a NEW-13: the accuracy step keeps its caption (at the bottom, over the report) and drops the last drawing's credit */
+/* UX 02:27: ... in the empty left column under 'How we measured it', not over the chart's bar labels */
+body[data-view="customer"].bench-open #tourNote:not(:empty) { position: fixed; top: auto; bottom: 32px; left: 32px; transform: none;
+  width: auto; max-width: min(412px, calc(36vw - 40px)); }
+body.bench-open #credit { visibility: hidden; }
 @media (max-width: 1100px) { body[data-view="customer"] #tourNote:not(:empty) { max-width: calc(100% - 300px); font-size: 14px; } }
 /* side by side: the plan pane's zoom buttons sit at the centre, so the caption goes under the 3D pane */
-body[data-view="customer"] #main:has(#views[data-mode="split"]) #tourNote:not(:empty) { left: 75%; max-width: calc(50% - 56px); }
+body[data-view="customer"]:not(.bench-open) #main:has(#views[data-mode="split"]) #tourNote:not(:empty) { left: 75%; max-width: calc(50% - 56px); }
+/* (W5 c28: tour step 6 leaves Side by side on, and this 2-ID rule beat the report's caption rule above: step 7's caption
+   sat bottom-right over the chart's 99 % / 100 % bar labels; :not(.bench-open) hands it back to the left column) */
 /* a long number ('40.71 × 16.70', '1,234,567') stays on one line in the answer card */
 body[data-view="customer"] .hero-value .big.long { font-size: 52px; letter-spacing: -0.02em; white-space: nowrap; }
 
@@ -1487,7 +1501,17 @@ body[data-view="customer"] .hero-value .big.xlong { font-size: 40px; letter-spac
 .bc-built { margin: 18px 0 0; font-size: 12.5px; color: var(--muted); text-align: center; letter-spacing: 0.01em; }
 
 /* --- feature plug-ins (src/features/registry.ts): toolbar, side panel, right-click menu ----------------------------- */
-.feat-bar { position: absolute; left: 12px; bottom: 68px; z-index: 6; display: flex; flex-wrap: wrap; gap: 8px; max-width: 60%; }
+/* UX pass 2a NEW-6: ONE tool row at the bottom-left: Measure, then the plug-in pills beside it (--mw = Measure's width,
+   set by main.ts placeToolRow); with Measure's panel open the pills sit above it (--mb). A narrow pane (side by side):
+   icons only, the name stays in the tooltip. */
+.feat-bar { position: absolute; left: calc(12px + var(--mw, 0px)); bottom: calc(12px + var(--mb, 0px)); z-index: 6; display: flex; flex-wrap: wrap; gap: 8px; max-width: calc(100% - 100px - var(--mw, 0px)); }
+.pane.narrow > .feat-bar .feat-btn:not(.feat-more) > span:not(.feat-ic) { display: none; }
+.pane.narrow > .feat-bar .feat-more > span:not(.feat-caret) { font-size: 0; }
+.pane.narrow > .feat-bar .feat-more > span:not(.feat-caret)::before { content: "More"; font-size: 15px; }
+.pane.narrow > .feat-bar .feat-btn { padding: 0 14px; }
+.pane.narrow > .measure .m-open { padding: 0 14px; }
+.pane.narrow > .measure .m-open > span { display: none; }
+/* the page / sheet control sits above that tool row (it was in the middle of it: pass 2a NEW-6) */
 .feat-bar[hidden] { display: none; }
 .feat-btn { display: inline-flex; align-items: center; gap: 6px; min-height: 44px; padding: 0 16px; border: 0; border-radius: 999px; background: var(--glass);
   -webkit-backdrop-filter: saturate(180%) blur(20px); backdrop-filter: saturate(180%) blur(20px); box-shadow: var(--shadow); color: var(--ink); font: inherit;
@@ -1504,10 +1528,34 @@ body[data-view="customer"] .hero-value .big.xlong { font-size: 40px; letter-spac
 .feat-panel[hidden] { display: none; }
 .feat-panel header { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 14px 16px 10px 20px; border-bottom: 1px solid var(--line); }
 .feat-panel h3 { margin: 0; font-size: 17px; font-weight: 600; letter-spacing: -0.01em; color: var(--ink); }
+/* one sheet, several tabs (captain 21:51: Takeoff = Quantities · Conventions · Order list · Check list) */
+.feat-tabs { display: flex; flex: 0 0 auto; gap: 2px; margin: 10px 16px 0; padding: 2px; border-radius: 999px; background: var(--fill); overflow-x: auto; overflow-y: hidden; scrollbar-width: none; }
+.feat-tabs[hidden] { display: none; }
+.feat-tabs::-webkit-scrollbar { display: none; }
+.feat-tabs button { flex: 1 0 auto; min-height: 36px; padding: 6px 9px; border: 0; border-radius: 999px; background: transparent; color: var(--ink); font: inherit;
+  font-size: 13px; font-weight: 500; white-space: nowrap; cursor: pointer; }
+.feat-tabs button:hover:not(.on) { background: var(--fill-2); }
+.feat-tabs button.on { background: var(--cfff-bg); font-weight: 600; box-shadow: 0 3px 8px rgba(0, 0, 0, .12), 0 3px 1px rgba(0, 0, 0, .04); }
+.feat-panel.tab-switch { animation: none; }
+@media (hover: none) { .feat-tabs button { min-height: 44px; } }
+/* at most 3 pills on the drawing; the rest under 'More tools ▾' (QA 21:47) */
+.feat-btn.feat-folded { display: none; }
+.feat-caret { font-size: 11px; color: var(--muted); margin-left: -2px; }
+.feat-more-menu button { display: flex; align-items: center; gap: 10px; }
+.feat-more-menu button.warn::after { content: "⚠"; margin-left: auto; color: #b25000; font-size: 13px; }
+.feat-more-menu button:hover .feat-ic, .feat-more-menu button:focus-visible .feat-ic { color: #fff; }
+/* features' buttons on the answer card (F8 'Report') */
+.hero-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 10px; }
+.hero-act { display: inline-flex; align-items: center; gap: 6px; min-height: 36px; padding: 0 14px; border: 0; border-radius: 999px; background: var(--fill);
+  color: var(--accent); font: inherit; font-size: 14px; font-weight: 600; cursor: pointer; transition: transform .15s ease-out; }
+.hero-act:hover { background: var(--fill-2); }
+.hero-act:active { transform: scale(.98); }
+.hero-act .feat-ic { width: 16px; height: 16px; }
+@media (hover: none) { .hero-act { min-height: 44px; } }
 .feat-x { width: 36px; height: 36px; border: 0; border-radius: 50%; background: var(--fill); color: var(--muted); font-size: 14px; cursor: pointer; }
 .feat-x:hover { background: var(--fill-2); color: var(--ink); }
 .feat-body { padding: 16px 20px 20px; overflow: auto; font-size: 15px; color: var(--ink); }
-.feat-menu { position: fixed; z-index: 50; min-width: 220px; max-width: 320px; padding: 6px; border-radius: 14px; background: var(--glass);
+.feat-menu { position: fixed; z-index: 62; min-width: 220px; max-width: 320px; padding: 6px; border-radius: 14px; background: var(--glass);
   -webkit-backdrop-filter: saturate(180%) blur(20px); backdrop-filter: saturate(180%) blur(20px); box-shadow: 0 10px 36px rgba(0, 0, 0, .18); border: 1px solid var(--line);
   animation: feat-in .18s ease-out; }
 .feat-menu-head { padding: 8px 12px 6px; font-size: 12px; font-weight: 600; letter-spacing: .02em; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
@@ -1543,7 +1591,18 @@ body[data-view="customer"] .hero-value .big.xlong { font-size: 40px; letter-spac
 .glance { margin-top: 16px; padding: 18px 20px; border-radius: 18px; background: var(--panel); box-shadow: 0 1px 2px rgba(0, 0, 0, .04), 0 4px 24px rgba(0, 0, 0, .05); display: flex; flex-direction: column; gap: 10px; }
 .glance[hidden] { display: none; }
 .gl-head { display: flex; flex-wrap: wrap; align-items: baseline; gap: 8px; font-size: 17px; color: var(--ink); }
-.gl-scale { font-size: 13px; color: var(--muted); }
+.gl-sheet { font-size: 13px; color: var(--muted); }
+.gl-scale { margin: -4px 0 0; font-size: 13px; color: var(--muted); display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 10px; }
+.gl-check { border: 0; background: none; padding: 0; color: var(--accent); font: inherit; font-size: 13px; cursor: pointer; }
+.gl-check:hover { text-decoration: underline; }
+.gl-dot { display: inline-block; width: 10px; height: 10px; border-radius: 50%; margin-right: 8px; vertical-align: 0; box-shadow: inset 0 0 0 1px rgba(0, 0, 0, .12); }
+.gl-dot.gl-rv { background: transparent; box-shadow: inset 0 0 0 1.5px var(--orange, #ff9f0a); }
+a.hs-btn.gl-xlsx { text-decoration: none; display: inline-flex; align-items: center; }
+.gl-actions .hs-btn.quiet { background: none; color: var(--muted); }
+/* a room coloured by its type (glance card): the outline and the pin take the type's tint */
+.v2d-overlay .ev.tinted polygon.shape.room { fill: color-mix(in srgb, var(--tint) 78%, transparent); stroke: color-mix(in srgb, var(--tint) 45%, #1d1d1f); stroke-width: 1.8; }
+.v2d-overlay .ev.tinted.hot polygon.shape.room, .v2d-overlay .ev.tinted.sel polygon.shape.room { fill: color-mix(in srgb, var(--tint) 92%, #1d1d1f); stroke: var(--accent); stroke-width: 3; }
+body .v2d-overlay .ev.tinted .pin circle { fill: color-mix(in srgb, var(--tint) 40%, #1d1d1f); }
 .gl-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; }
 .gl-line { display: flex; width: 100%; justify-content: space-between; align-items: baseline; gap: 12px; min-height: 40px; padding: 8px 10px; border: 0; border-radius: 10px;
   background: transparent; color: var(--ink); font: inherit; font-size: 15px; text-align: left; cursor: pointer; }
@@ -1552,3 +1611,196 @@ body[data-view="customer"] .hero-value .big.xlong { font-size: 40px; letter-spac
 .gl-line small { color: var(--muted); font-size: 12px; }
 .gl-foot, .gl-none { margin: 0; font-size: 13px; color: var(--muted); }
 .gl-actions { display: flex; flex-wrap: wrap; gap: 8px; }
+
+/* G1 21:24 click-a-room prompt: the next click on the plan names the room */
+#v2d.pick-room, #v2d.pick-room * { cursor: crosshair !important; }
+.hero-rival.click-room { border-left: 3px solid var(--accent); }
+/* G1 21:24: the searched area of a count (a facade strip): dashed, faint, under the items, never a click target */
+.v2d-overlay .ev.searched rect { fill: rgba(0, 113, 227, .04) !important; stroke: var(--accent) !important; stroke-width: 1.5 !important; stroke-dasharray: 3 7; pointer-events: none; }
+.v2d-overlay .ev.searched .pin { display: none; }
+.hw-searched { display: flex; align-items: center; gap: 6px; }
+.lg.searched { display: inline-block; width: 18px; height: 10px; border: 1.5px dashed var(--accent); border-radius: 2px; background: rgba(0, 113, 227, .05); }
+.hero-notes { margin-top: 8px; display: flex; flex-direction: column; gap: 2px; }
+.hero-note { font-size: 13px; line-height: 1.4; color: var(--muted); }
+.m-err { font-size: 12px; color: var(--muted); margin-top: 2px; }
+.stale-note { z-index: 90; } .stale-note div { margin-top: 10px; }
+.gl-line.gl-static { cursor: default; } .gl-line.gl-static:hover { background: none; }
+/* captain 21:39: ONE status line (confidence + cross-check + support), wraps; cost neutral grey and concrete */
+.hero-badges .conf { white-space: normal; border-radius: 14px; line-height: 1.35; align-items: baseline; }
+.hero-badges .conf::before { flex: none; transform: translateY(-1px); }
+.hero-badges .conf small { font-weight: 500; opacity: .85; }
+.hero-badges .conf.st-ok { background: var(--ok-soft); color: var(--ok); }
+.hero-badges .conf.st-warn { background: var(--warn-soft); color: var(--warn); }
+.hero-badges .conf.st-bad { background: rgba(255, 59, 48, .1); color: #c9302c; }
+.hero-badges .tier, .hero-badges .tier b { color: var(--muted); font-weight: 500; }
+.hero-badges .tier .tier-dots i.on { background: var(--muted) !important; }
+
+/* captain 21:39 (2): one room's value tag beside its outline with a short leader */
+.v2d-overlay .vtag-beside .vtag-lead { stroke: var(--accent); stroke-width: 2; vector-effect: non-scaling-stroke; }
+.hero-badges .tier { white-space: nowrap; }
+
+/* RL 21:54: a sample whose drawing is not on this server says so on its card (never a silent click) */
+.proj-card .pc-err { display: block; margin-top: 8px; font-size: 13px; color: var(--warn, #b25e00); }
+.proj-card.no-thumb .pc-thumb { background: var(--fill, #f0f0f2); }
+/* the one status pill wraps inside the card (inline-flex kept its long suffix on one line, cut at the card edge) */
+.hero-badges .conf { display: inline-block; max-width: 100%; box-sizing: border-box; }
+.hero-badges .conf::before { display: inline-block; margin-right: 6px; vertical-align: 1px; }
+.hero-badges .conf.st-ok::before { background: var(--ok) !important; }
+.hero-badges .conf.st-warn::before { background: var(--warn) !important; }
+.hero-badges .conf.st-bad::before { background: #c9302c !important; }
+
+/* captain 22:17: five main cards; the rest under a collapsed 'More examples' row */
+.more-examples { margin-top: 28px; }
+.more-examples > summary { display: inline-flex; align-items: center; gap: 8px; min-height: 44px; padding: 0 18px; border-radius: 999px; background: var(--fill);
+  color: var(--ink); font-size: 15px; font-weight: 600; cursor: pointer; list-style: none; user-select: none; }
+.more-examples > summary::-webkit-details-marker { display: none; }
+.more-examples > summary::after { content: "›"; font-size: 18px; color: var(--muted); transition: transform .2s ease-out; }
+.more-examples[open] > summary::after { transform: rotate(90deg); }
+.more-examples > summary:hover { background: var(--fill-2); }
+.more-examples > .proj-grid { margin-top: 18px; }
+@media (prefers-reduced-motion: reduce) { .more-examples > summary::after { transition: none; } }
+.feat-menu button.feat-menu-more { color: var(--accent); font-weight: 600; }
+/* captain 23:47: the right-click selection — accent outline + soft glow on the drawing, a small label with × above it */
+.feat-sel { pointer-events: none; }
+.feat-sel .feat-sel-halo { fill: none; stroke: var(--accent); stroke-opacity: .22; stroke-linejoin: round; }
+.feat-sel .feat-sel-under { fill: none; stroke: #fff; stroke-opacity: .9; stroke-linejoin: round; }
+.feat-sel .feat-sel-line { fill: var(--accent); fill-opacity: .10; stroke: var(--accent); stroke-linejoin: round; stroke-linecap: round; }
+.feat-sel[data-type="door"] .feat-sel-line, .feat-sel[data-type="window"] .feat-sel-line, .feat-sel[data-type="symbol"] .feat-sel-line { fill-opacity: .16; }
+.feat-sel-tag { position: fixed; z-index: 45; transform: translate(-50%, calc(-100% - 8px)); display: inline-flex; align-items: center; gap: 4px;
+  max-width: min(360px, 80vw); padding: 4px 4px 4px 12px; border-radius: 999px; background: var(--ink); color: var(--bg); font-size: 13px; font-weight: 600;
+  line-height: 20px; box-shadow: 0 4px 16px rgba(0,0,0,.18); white-space: nowrap; pointer-events: auto; animation: featSelIn .18s ease-out; }
+.feat-sel-tag > span { overflow: hidden; text-overflow: ellipsis; font-variant-numeric: tabular-nums; }
+.feat-sel-tag > button { flex: none; width: 24px; height: 24px; border: 0; border-radius: 50%; background: color-mix(in srgb, var(--bg) 22%, transparent); color: var(--bg); font: inherit;
+  font-size: 16px; line-height: 22px; cursor: pointer; padding: 0; }
+.feat-sel-tag > button:hover, .feat-sel-tag > button:focus-visible { background: color-mix(in srgb, var(--bg) 40%, transparent); outline: none; }
+.feat-sel-tag.finding { padding: 4px 12px; background: var(--glass, rgba(255,255,255,.85)); color: var(--ink); font-weight: 500; backdrop-filter: saturate(180%) blur(20px);
+  -webkit-backdrop-filter: saturate(180%) blur(20px); pointer-events: none; }
+.feat-menu-head.pending { color: var(--accent); }
+.feat-menu button.feat-menu-clear { margin-top: 4px; border-top: 1px solid var(--hairline, rgba(0,0,0,.08)); border-radius: 0 0 9px 9px; color: var(--muted); }
+@media (hover: none) { .feat-sel-tag > button { width: 36px; height: 36px; line-height: 34px; } }
+.feat-sel-tag[data-align="left"] { transform: translate(0, calc(-100% - 8px)); }
+.feat-sel-tag[data-align="right"] { transform: translate(-100%, calc(-100% - 8px)); }
+.feat-menu:focus, .feat-menu:focus-visible { outline: none; box-shadow: 0 10px 34px rgba(0, 0, 0, 0.16) !important; border-radius: 14px; }
+.feat-sel-tag[data-pos="below"] { transform: translate(-50%, 8px); }
+.feat-sel-tag[data-pos="below"][data-align="left"] { transform: translate(0, 8px); }
+.feat-sel-tag[data-pos="below"][data-align="right"] { transform: translate(-100%, 8px); }
+@keyframes featSelIn { from { opacity: 0; } to { opacity: 1; } }
+@media (prefers-reduced-motion: reduce) { .feat-sel-tag { animation: none; } }
+/* the glance card's actions (W7 22:26: 'Export to Excel' looked like a native button): pills like the card's others */
+.gl-actions .hs-btn { display: inline-flex; align-items: center; min-height: 40px; padding: 0 16px; border: 0; border-radius: 999px; background: var(--fill);
+  color: var(--accent); font: inherit; font-size: 14px; font-weight: 600; text-decoration: none; cursor: pointer; transition: transform .15s ease-out; }
+.gl-actions .hs-btn:hover { background: var(--fill-2); }
+.gl-actions .hs-btn:active { transform: scale(.98); }
+.gl-actions .hs-btn.primary { background: var(--accent); color: #fff; }
+.gl-actions .hs-btn.quiet { background: none; color: var(--muted); padding: 0 10px; }
+@media (hover: none) { .gl-actions .hs-btn { min-height: 44px; } }
+/* the desktop page on a phone (W7 22:00: 'Private' sat on top of 'Blueprint Evidence' at 393 px): the name shrinks
+   first, the presenter's 'Guided demo' goes (the phone page has its own flow) */
+@media (max-width: 600px) {
+  .topbar { gap: 8px; }
+  .topbar #tourBtn { display: none; }
+  .topbar .tb-name { overflow: hidden; }
+  .topbar h1 { overflow: hidden; text-overflow: ellipsis; font-size: 15px !important; }
+  .topbar .brand-right { flex-shrink: 0; }
+  .topbar .priv-toggle, .topbar .view-toggle { font-size: 13px; padding-left: 6px; padding-right: 6px; }
+}
+
+/* captain 22:56: ONE even grid of six samples, simple → complex (3 × 2 on a laptop, 2 × 3 on a tablet, 1 column on a
+   phone), each card with a small difficulty tag */
+.proj-grid.six { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+@media (max-width: 1000px) { .proj-grid.six { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+@media (max-width: 640px) { .proj-grid.six { grid-template-columns: 1fr; } }
+.pc-level { display: inline-block; margin-left: 8px; padding: 1px 9px; border-radius: 999px; font-size: 11.5px; font-weight: 600;
+  letter-spacing: .01em; text-transform: none; vertical-align: 1px; }
+.pc-level.lv-simple { background: rgba(52, 199, 89, .15); color: #1b6f31; }
+.pc-level.lv-medium { background: rgba(255, 159, 10, .17); color: #7a4a00; }
+.pc-level.lv-complex { background: rgba(0, 113, 227, .12); color: #0055aa; }
+@media (prefers-color-scheme: dark) {
+  .pc-level.lv-simple { background: rgba(48, 209, 88, .2); color: #7ee29a; }
+  .pc-level.lv-medium { background: rgba(255, 159, 10, .2); color: #ffc66b; }
+  .pc-level.lv-complex { background: rgba(10, 132, 255, .22); color: #8cc4ff; }
+}
+/* captain 22:56: 'Clear marks' in the viewer's zoom stack; pressed = marks hidden (click shows them again) */
+.zoomctl [data-zoom="clear"] svg { width: 20px; height: 20px; }
+.zoomctl [data-zoom="clear"].on { color: var(--accent); background: var(--accent-soft, rgba(0, 113, 227, .14)); }
+/* F2 23:14: plug-in pills over a model opened alone sit top-left (W7's 3D legend card owns the bottom-left) */
+#pane3d > .feat-bar { top: 72px; bottom: auto; max-width: calc(100% - 100px); }
+/* UX 23:30 M16: the guided demo's caption sits under the floating Plan / 3D bar (it covered the tool pills at the bottom)
+   and has an × to end the demo */
+body[data-view="customer"] #tourNote:not(:empty) { top: 76px; bottom: auto; }
+#tourNote .tour-x { pointer-events: auto; margin-left: 12px; width: 28px; height: 28px; border: 0; border-radius: 999px; background: rgba(255, 255, 255, .16);
+  color: inherit; font-size: 18px; line-height: 1; cursor: pointer; vertical-align: middle; }
+#tourNote .tour-x:hover { background: rgba(255, 255, 255, .28); }
+/* UX pass 2a NEW-7: a file of a dropped set that is not a drawing */
+.hero-intro .intro-skip { margin: 8px 0 0; font-size: 13px; color: var(--muted, #6e6e73); }
+
+/* captain 01:16: what is marked, said where the eye is: a chip at the top of the viewer ('46 doors marked · Hide ×',
+   'Kitchen selected ×', then 'Show 46 doors'); hidden in the expert view */
+.marks-chip { position: absolute; left: 50%; top: 76px; transform: translateX(-50%); z-index: 30; display: flex; align-items: center; gap: 10px;
+  padding: 6px 6px 6px 16px; border-radius: 999px; background: rgba(29, 29, 31, .86); color: #fff; font-size: 14px; line-height: 1.2;
+  box-shadow: 0 4px 18px rgba(0, 0, 0, .18); -webkit-backdrop-filter: blur(12px); backdrop-filter: blur(12px); max-width: calc(100% - 140px); white-space: nowrap; }
+.marks-chip[hidden] { display: none; }
+.marks-chip .mc-what { overflow: hidden; text-overflow: ellipsis; }
+.marks-chip .mc-btn { min-height: 32px; padding: 0 12px; border: 0; border-radius: 999px; background: rgba(255, 255, 255, .16); color: #fff; font: inherit;
+  font-weight: 600; cursor: pointer; display: inline-flex; align-items: center; gap: 6px; white-space: nowrap; }
+.marks-chip .mc-btn:hover { background: rgba(255, 255, 255, .26); }
+.marks-chip .mc-btn:focus-visible { outline: 3px solid var(--accent); outline-offset: 2px; }
+.marks-chip kbd { font-family: inherit; font-size: 11px; font-weight: 500; padding: 2px 5px; border-radius: 4px; background: rgba(255, 255, 255, .18); color: rgba(255, 255, 255, .85); }
+.marks-chip:has(.mc-show) { padding: 4px; background: var(--cfff-bg); border: 1px solid var(--line); }
+.marks-chip .mc-show { background: transparent; color: var(--accent); }
+.marks-chip .mc-show:hover { background: var(--fill-2); }
+body[data-view="expert"] .marks-chip { display: none; }
+@media (prefers-reduced-motion: no-preference) { .marks-chip:not([hidden]) { animation: mcIn .2s ease-out; } }
+@keyframes mcIn { from { opacity: 0; transform: translate(-50%, -4px); } to { opacity: 1; transform: translate(-50%, 0); } }
+/* captain 01:16 (3): the eraser has a TEXT label: a pill left of the zoom stack's foot (it moves with the stack) */
+.zoomctl { overflow: visible; }
+.zoomctl > button:first-child { border-radius: 14px 14px 0 0; }
+.zoomctl > button[data-zoom="fit"] { border-radius: 0 0 14px 14px; }
+.zoomctl > button[data-zoom="clear"] { position: absolute; right: calc(100% + 10px); bottom: -1px; width: auto; height: 44px; padding: 0 14px 0 12px;
+  display: inline-flex; align-items: center; gap: 6px; border: 1px solid var(--line); border-radius: 999px; background: var(--glass);
+  -webkit-backdrop-filter: saturate(180%) blur(20px); backdrop-filter: saturate(180%) blur(20px); box-shadow: var(--shadow); font-size: 14px; font-weight: 500; white-space: nowrap; }
+.zoomctl > button[data-zoom="clear"]:hover { background: var(--fill-2); }
+.zoomctl .zc-lbl { font-size: 14px; }
+body[data-view="expert"] .zoomctl .zc-lbl { display: none; }
+/* captain 01:18: Start over, by the case title */
+.proj-head .start-over { grid-column: 2; justify-self: start; margin-top: 6px; min-height: 32px; padding: 0 12px; border: 0; border-radius: 999px;
+  background: var(--fill-2); color: var(--accent); font: inherit; font-size: 13px; font-weight: 500; cursor: pointer; }
+.proj-head .start-over:hover { background: var(--fill); }
+.proj-head .so-ask { grid-column: 1 / -1; margin-top: 10px; padding: 12px 14px; border-radius: 14px; background: var(--cfff-bg); border: 1px solid var(--line); box-shadow: var(--shadow); font-size: 14px; }
+.proj-head .so-ask p { margin: 0 0 10px; }
+.proj-head .so-row { display: flex; flex-wrap: wrap; gap: 8px; }
+.pane.narrow .zoomctl .zc-lbl { display: none; }
+.pane.narrow .zoomctl > button[data-zoom="clear"] { padding: 0 12px; }
+body[data-view="customer"] #pane2d > .feat-bar { max-width: var(--fbroom, calc(100% - 250px - var(--mw, 0px))); }
+/* UX C-14: plain steps first in 'How we worked it out' (customer view), the technical card folded under them */
+.card .why-steps { margin: 4px 0 12px; padding-left: 22px; display: grid; gap: 8px; font-size: 15px; line-height: 1.45; color: var(--ink); }
+.card .why-steps li::marker { color: var(--accent); font-weight: 600; }
+.card .why-tech { border-top: 1px solid var(--line); padding-top: 8px; }
+.card .why-tech > summary { cursor: pointer; color: var(--muted); font-size: 13px; padding: 6px 0; }
+/* UX C-12 (dark mode): a hovered / pressed tool pill used a TRANSLUCENT fill, which over the white paper read light grey
+   under near-white text; in dark mode the floating controls' hover fill is opaque */
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) .feat-btn:hover, :root:not([data-theme="light"]) .feat-btn:focus-visible,
+  :root:not([data-theme="light"]) .zoomctl button:hover, :root:not([data-theme="light"]) .zoomctl > button[data-zoom="clear"]:hover,
+  :root:not([data-theme="light"]) .pagectl button:hover:not(:disabled) { background: rgba(72, 72, 74, .96); }
+  :root:not([data-theme="light"]) .feat-btn, :root:not([data-theme="light"]) .zoomctl > button[data-zoom="clear"] { background: rgba(44, 44, 46, .9); }
+}
+/* UX C-4: 'Your drawings (this visit)' on the landing */
+.my-uploads { margin: 8px 0 28px; }
+.my-uploads h2 small { font-size: 15px; font-weight: 500; color: var(--muted); }
+.my-uploads .mu-row { display: flex; flex-wrap: wrap; gap: 10px; }
+.my-uploads .mu-item { display: inline-flex; align-items: center; gap: 8px; min-height: 44px; padding: 0 16px; border: 1px solid var(--line); border-radius: 999px;
+  background: var(--panel, #fff); color: var(--ink); font: inherit; font-size: 15px; cursor: pointer; max-width: 360px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.my-uploads .mu-item:hover { border-color: var(--accent); }
+.my-uploads .mu-ic { color: var(--accent); }
+/* UX SO-9: the Start over question in the app's own pills (they were system buttons) */
+.proj-head .so-btn { min-height: 36px; padding: 0 14px; border: 0; border-radius: 999px; background: var(--fill-2); color: var(--ink); font: inherit; font-size: 14px; cursor: pointer; }
+.proj-head .so-btn.primary { background: var(--accent); color: #fff; }
+.proj-head .so-btn.quiet { background: transparent; color: var(--muted); }
+.proj-head .so-btn:hover { filter: brightness(.96); }
+/* UX C-10: a scanned print of another sheet says so in its glance */
+.glance .gl-copy { margin: 8px 0 4px; padding: 8px 12px; border-radius: 12px; background: var(--accent-soft, rgba(0, 113, 227, .1)); font-size: 14px; line-height: 1.4; }
+/* UX 02:27: a top bar wider than the viewer (Maleva's 6 sheets at 1280 px) tightens, then its sheet tabs scroll (main.ts fitToolbar) */
+body[data-view="customer"] #toolbar.tight .seg button { padding-left: 9px; padding-right: 9px; }
+body[data-view="customer"] #toolbar.tighter > #sheetTabs { flex: 1 1 auto; min-width: 0; overflow-x: auto; overflow-y: hidden; scrollbar-width: thin; }
+body[data-view="customer"] #toolbar.tighter > #sheetTabs button { flex: 0 0 auto; }

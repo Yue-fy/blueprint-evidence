@@ -87,8 +87,32 @@ def paper_of_image(path: str, texts: list[str]) -> tuple[float, str] | None:
     src = (int(m.group(1)), int(m.group(2))) if m else _sidecar_src_size(path, size) or size
     hit = paper_from_pixels(src, texts)
     if hit is None:
-        return None
+        pdf = _scan_source(path)  # a scanned PDF's render: the scan's own pixels (paper_of_scan step 1)
+        got = paper_of_scan(pdf, size, texts, use_page=False) if pdf else None
+        return got[:2] if got else None
     return hit[0] * size[0] / src[0], hit[1]
+
+
+def _scan_source(path: str) -> str | None:
+    """The scanned PDF that normalize.scan_png rendered to `path` (its '<render>.json' sidecar, else '<stem>.pdf' next to
+    '<stem>.scan.png'); None for any other image or with STOA_SCAN_PAPER=0."""
+    import json
+    import os
+
+    if os.environ.get("STOA_SCAN_PAPER", "1") == "0":
+        return None
+    try:
+        pdf = json.loads(Path(f"{path}.json").read_text()).get("scan_pdf")
+        if pdf and Path(pdf).is_file():
+            return str(pdf)
+    except (OSError, ValueError, AttributeError):
+        pass
+    name = Path(path).name
+    if name.endswith(".scan.png"):
+        sib = Path(path).with_name(name[: -len(".scan.png")] + ".pdf")
+        if sib.is_file():
+            return str(sib)
+    return None
 
 
 def _sidecar_src_size(path: str, size: tuple[int, int]) -> tuple[int, int] | None:
@@ -106,6 +130,85 @@ def _sidecar_src_size(path: str, size: tuple[int, int]) -> tuple[int, int] | Non
     if 0 < f < 1 and abs(w * f - size[0]) <= 1.5 and abs(h * f - size[1]) <= 1.5:
         return w, h
     return None
+
+
+SCAN_PAGE_TOL = 0.01  # a scanned PDF's page within 1 % of a standard sheet on both sides
+SCAN_DPI_TOL = 0.005  # its image's pixels per page inch within 0.5 % of a usual scan resolution
+_ISO = re.compile(r"^A\d$")
+
+
+def _page_sheet(width_pt: float, height_pt: float, tol: float = SCAN_PAGE_TOL) -> str | None:
+    """The standard sheet (ISO A or US ANSI / ARCH / Letter / Tabloid) a PDF page is, both sides within tol."""
+    a, b = sorted((width_pt / 72 * 25.4, height_pt / 72 * 25.4))
+    for name, (w, h) in PAPER_MM.items():
+        if abs(a - w) <= tol * w and abs(b - h) <= tol * h:
+            return name
+    return None
+
+
+def _names_size(name: str, texts: list[str]) -> bool:
+    """Stricter than _named: the text says it is a SHEET SIZE ('ISO A1', '@ A1', 'A1 size', 'sheet size: A1', 'ANSI D'),
+    so a lone 'A2' grid / detail reference (S-100F prints one next to its 'ISO A1') does not count."""
+    n = re.escape(name).replace(r"\ ", r"\s*")
+    if _ISO.match(name):
+        rx = re.compile(rf"\biso\s*{n}\b|@\s*{n}\b|\b{n}\s*(?:size|sheet|paper)\b|"
+                        rf"\b(?:sheet|paper)\s*(?:size)?\s*:?\s*{n}\b", re.I)
+    else:
+        rx = re.compile(rf"\b{n}\b", re.I)
+    return any(rx.search(t or "") for t in texts)
+
+
+def paper_of_scan(pdf: str, size: tuple[int, int], texts: list[str],
+                  use_page: bool = True) -> tuple[float, str, str] | None:
+    """(dpi of the render `size`, sheet, how) for page 0 of a SCANNED PDF that normalize.scan_png rendered to an image of
+    `size` px (P1 22:40, d29 scan_dev: 4 of X1's scanned Stoa sheets were never traced: the render is untagged on
+    purpose and shrunk to 6000 px, so its own pixel size is no export size; 13 rows got raster guesses instead).
+    (1) The page image's OWN pixel size at a usual scan resolution, confirmed by the sheet size it prints (the
+        paper_from_pixels rule: 6800 x 4400 px + 'ANSI D' -> 200 dpi; 6623 x 4678 + 'ISO A1' -> A1 at 200 dpi). This also
+        finds an A1 drawing scanned from an A3 print (4961 x 3508 = A3 @300 = A1 @150 + 'A1' printed -> A1).
+    (2) use_page: else the PDF page's own size when it is a standard sheet, the image fills it (>= 95 %), its pixels per
+        page inch are a usual scan resolution on both sides, and the sheet names no OTHER paper of the same family
+        (an 'A1' title block on an A3 page = a reduced copy: its printed 1:N is for A1, so no guess). Weaker than (1):
+        a reduced copy that prints no size is taken at the page's size (as for a vector PDF page).
+    None when neither holds (no usable image, a custom page size)."""
+    import pymupdf
+
+    try:
+        with pymupdf.open(pdf) as d:
+            pg = d[0]
+            pw, ph = pg.rect.width, pg.rect.height
+            best, img, rect = 0.0, None, None
+            for im in pg.get_images(full=True):
+                for r in pg.get_image_rects(im[0]):
+                    cover = (r & pg.rect).get_area() / max(pg.rect.get_area(), 1e-9)
+                    if cover > best:
+                        best, img, rect = cover, (int(im[2]), int(im[3])), r
+    except Exception:  # noqa: BLE001
+        return None
+    if img is None or best < 0.5 or not pw or not ph or rect.width <= 0 or rect.height <= 0:
+        return None
+    zoom = max(size) / max(pw, ph)  # render px per page pt (scan_png renders the whole page)
+    # image px per page pt where it is drawn (an image drawn rotated swaps its sides)
+    iw, ih = img if (img[0] >= img[1]) == (rect.width >= rect.height) else (img[1], img[0])
+    px_x, px_y = iw / rect.width, ih / rect.height
+    hit = paper_from_pixels(img, texts)
+    if hit is not None:
+        f = zoom / ((px_x + px_y) / 2)  # render px per image px
+        return (hit[0] * f, hit[1], f"from the scan's own pixel size ({img[0]} x {img[1]} = {hit[1]} at "
+                                    f"{hit[0]:.0f} dpi) and the sheet size it prints")
+    if not use_page:
+        return None
+    sheet = _page_sheet(pw, ph)
+    if sheet is None or best < 0.95:
+        return None
+    dx, dy = px_x * 72, px_y * 72
+    if abs(dx - dy) > SCAN_DPI_TOL * dx or not any(abs(dx - s) <= SCAN_DPI_TOL * s for s in EXPORT_DPI):
+        return None
+    iso = bool(_ISO.match(sheet))
+    if any(bool(_ISO.match(n)) == iso and n != sheet and n not in _ALIAS and _names_size(n, texts) for n in PAPER_MM):
+        return None
+    return (72 * zoom, sheet, f"from the scanned PDF's page size ({sheet}, scanned at {dx:.0f} dpi; taken as the "
+                              f"drawing's own paper: on a reduced copy the measured sizes scale with it)")
 
 
 BAR_SNAP_TOL = 0.03  # the bar's sheet within 3 % of a standard paper on both sides -> that paper's exact dpi

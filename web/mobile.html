@@ -7,12 +7,12 @@
   <meta name="theme-color" content="#000000" media="(prefers-color-scheme: dark)" />
   <meta name="apple-mobile-web-app-capable" content="yes" />
   <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%231d1d1f'/%3E%3Ctext x='16' y='22' font-family='-apple-system,Arial' font-size='18' font-weight='700' fill='%23fff' text-anchor='middle'%3ES%3C/text%3E%3C/svg%3E" />
-  <title>Stoa · Ask a plan</title>
+  <title>Blueprint Evidence · Ask a plan</title>
 </head>
 <body data-view="customer" class="m" data-step="pick">
   <header class="m-top">
-    <div class="m-logo" aria-hidden="true">S</div>
-    <div class="m-brand"><b>Ask a plan</b><small>photo → question → answer on the drawing</small></div>
+    <div class="m-logo" aria-hidden="true">B</div>
+    <div class="m-brand"><b>Blueprint Evidence</b><small>Ask a plan</small></div>
     <button id="privBtn" class="priv-toggle m-priv" type="button" role="switch" aria-checked="false" title="Private mode: your photo never leaves our server (no Gemini or NVIDIA steps)"><span class="sw" aria-hidden="true"></span>Private</button>
     <a class="m-desk" href="./">Full view</a>
   </header>
@@ -29,17 +29,27 @@
         <h2>Take a photo of a drawing</h2>
         <p>Then ask how big a room is, how long a wall is, or the total floor area. The answer is drawn on your photo.</p>
         <label class="m-btn primary huge"><input id="cam" type="file" accept="image/*" capture="environment" />
-          <span class="m-ico" aria-hidden="true">📷</span> Take a photo</label>
+          <svg class="m-ico" viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 8h3l1.8-2.5h6.4L17 8h3a1 1 0 0 1 1 1v9a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1V9a1 1 0 0 1 1-1z"/><circle cx="12" cy="13.2" r="3.6"/></svg> Take a photo</label>
         <label class="m-btn"><input id="pickf" type="file" accept="image/*,.pdf,application/pdf" /> Choose a photo or PDF</label>
+      </div>
+      <!-- UX M13: the booth's main action stays in reach under the cases (sticky at the bottom; hidden once the card above is in view) -->
+      <div id="photoBar" class="m-photobar">
+        <label class="m-btn primary"><input id="cam2" type="file" accept="image/*" capture="environment" /><svg class="m-ico" viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 8h3l1.8-2.5h6.4L17 8h3a1 1 0 0 1 1 1v9a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1V9a1 1 0 0 1 1-1z"/><circle cx="12" cy="13.2" r="3.6"/></svg> Take a photo</label>
+        <label class="m-btn"><input id="pickf2" type="file" accept="image/*,.pdf,application/pdf" />Choose a file</label>
       </div>
     </section>
 
     <section id="stage" class="m-stage">
-      <div id="photo" class="m-photo" aria-label="your drawing: pinch to zoom, double-tap to zoom in"></div>
+      <div id="marksChip" class="marks-chip" hidden></div>
+      <div id="photo" class="m-photo" aria-label="your drawing: tap a room to measure it, hold for more; pinch to zoom, double-tap to zoom in"></div>
       <div id="progress" class="m-progress" hidden></div>
       <div id="toolBar" class="m-toolbar" hidden>
         <span id="toolHint"></span>
         <button type="button" class="m-btn small" id="toolDone">Done</button>
+      </div>
+      <div id="pressMenu" class="m-sheet m-press" role="menu" hidden>
+        <div class="m-press-h"><b id="pressH"></b><button type="button" class="m-press-x" id="pressX" aria-label="Close">✕</button></div>
+        <div id="pressItems" class="m-press-items"></div>
       </div>
       <div id="scaleSheet" class="m-sheet" hidden>
         <form id="scaleForm">
@@ -55,6 +65,7 @@
       <div class="m-stagebar">
         <button type="button" class="m-btn small ghost" id="retake">New photo</button>
         <span id="stageNote" class="m-note"></span>
+        <button type="button" class="m-btn small ghost" id="delMine" hidden title="Delete your file from our server, with the readings made from it">Delete file</button>
         <span id="pager" class="m-pager" hidden><button type="button" class="m-btn small ghost" id="pgPrev" aria-label="Previous page">‹</button><button type="button" class="m-pgn" id="pgN" aria-label="Go to page"></button><button type="button" class="m-btn small ghost" id="pgNext" aria-label="Next page">›</button></span>
         <button type="button" class="m-btn small ghost" id="fit">Whole sheet</button>
       </div>
@@ -64,11 +75,12 @@
       <div id="caseSheets" class="m-sheets" hidden></div>
       <div id="chips" class="m-chips"></div>
       <form id="askForm" class="m-askrow">
-        <input id="q" type="text" enterkeyhint="send" autocomplete="off" placeholder="Ask about this drawing…" aria-label="your question" />
-        <button type="button" id="mic" class="m-mic" aria-label="speak your question" title="Speak your question">🎤</button>
+        <input id="q" type="text" enterkeyhint="send" autocomplete="off" placeholder="Your question…" aria-label="your question" />
+        <button type="button" id="mic" class="m-mic" aria-label="speak your question" title="Speak your question"><svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="3" width="6" height="11" rx="3"/><path d="M5.5 11a6.5 6.5 0 0 0 13 0M12 17.5V21M8.5 21h7"/></svg></button>
         <button type="submit" class="m-btn primary small" id="send">Ask</button>
       </form>
       <button type="button" class="m-btn ghost small" id="cancel" hidden>Cancel</button>
+      <div id="touchHint" class="m-touchhint">Or tap a room on the drawing to measure it; hold your finger on it for more.</div>
       <div id="caseNote" class="m-casenote" hidden></div>
     </section>
 

@@ -4,10 +4,11 @@
  * where it comes from, the time it saves, and the drawing-vs-model differences of the project. Everything technical
  * (solvers, cost in tokens, trace, benchmark) stays one click away: "How we worked it out" and the Expert view.
  */
-import { agentAsks, crossChecks, fmtValue, setAnswer, unitLabel, type SetRow } from "./card";
+import { agentAsks, crossChecks, fmtValue, pxless, quietEstimate, setAnswer, unitLabel, type SetRow } from "./card";
 import { dataLineHtml } from "./governance";
 import { manualTime } from "./manual-time";
 import { floorName, PROJECTS, projectOf, type Project } from "./projects";
+import { floorName as storeyWords } from "./floornames";
 import type { Answer, Kg } from "./types";
 
 const esc = (s: unknown) => String(s ?? "").replace(/[&<>"']/g, (c) => `&#${c.charCodeAt(0)};`);
@@ -41,13 +42,13 @@ export function landingHtml(privacyPanel = false): string {
     const s = p.sheets.find((x) => /\.(pdf|png|jpe?g)$/i.test(x.path));
     const ifc = p.sheets.find((x) => /\.ifc$/i.test(x.path));
     // a model-only project: its 3D snapshot once someone has opened it (main.ts tileSnapshot), else the cube
-    return s ? `<span class="pc-thumb"><img src="/api/thumb?path=${encodeURIComponent(s.path)}" alt="" loading="lazy" onerror="this.remove()"></span>`
+    return s ? `<span class="pc-thumb"><img src="/api/thumb?path=${encodeURIComponent(s.path)}" alt="" loading="lazy" onerror="this.closest('.proj-card')?.classList.add('no-thumb'); this.remove()"></span>`
       : `<span class="pc-thumb ph"><svg viewBox="0 0 64 64" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"><path d="M32 8 54 20v24L32 56 10 44V20z"/><path d="M10 20l22 12 22-12M32 32v24"/></svg>${
         ifc ? `<img class="snap" src="/api/thumb?path=${encodeURIComponent(ifc.path)}" alt="" loading="lazy" onerror="this.remove()">` : ""}</span>`;
   };
   const card = (p: Project) => `<button type="button" class="proj-card" data-project="${esc(p.id)}">
       ${thumb(p)}
-      <span class="pc-kind">${esc(KIND_LABEL[p.kind])}</span>
+      <span class="pc-kind">${esc(KIND_LABEL[p.kind])}${p.level ? `<span class="pc-level lv-${p.level}">${esc(LEVEL_LABEL[p.level])}</span>` : ""}</span>
       <span class="pc-name">${esc(p.name)}</span>
       <span class="pc-place">${esc(p.place)}</span>
       <span class="pc-facts">${p.facts.slice(0, 2).map(esc).join(" · ")}</span>
@@ -65,16 +66,25 @@ export function landingHtml(privacyPanel = false): string {
       <div class="dz-sub">A floor plan or sheet as PDF, a scan or a phone photo of a print, a 3D building model or a CAD drawing <span class="dz-fmt">(PDF, JPG, PNG, HEIC, IFC, DWG, DXF, SVG)</span></div>
       <span class="dz-btn">Choose files</span>
       <div class="dz-more">Then ask in your own words, in any language: areas, lengths, counts.
-        A plan dropped with its 3D model or CAD file is read together.</div>
+        A plan dropped with its 3D model or CAD file is read together. A whole building? Drop all its sheets at once:
+        each one is labelled with its floor.</div>
       <div class="dz-status" id="landStatus" hidden></div>
     </section>
     <h2>Or explore a sample project.</h2>
-    <div class="proj-grid">${PROJECTS.map(card).join("")}
-    </div>
+    <div class="proj-grid six">${PROJECTS.filter((p) => !p.more).slice(0, 6).map(card).join("")}</div>
     ${__HAS_MOBILE__ ? `<p class="landing-phone"><a href="./mobile.html">On a phone? Open the phone page</a></p>` : ""}
-    <p class="landing-foot">Your files are stored on this server only, in a temporary folder${privacyPanel ? ", until you press ‘Delete my files’ (privacy panel)" : ""}. They are read by our own readers and models running here; when an answer is unsure and Private is off, one page image, the question and the proposed answer may go to Google Gemini or NVIDIA Nemotron — each answer says where its data went. With <b>Private</b> on, nothing leaves this server: every outside model is switched off while it answers. Sample drawings and models are public (credits under each project). Answers point to where they come from on the drawing (or say when they could not), so you can check them.</p>
+    <p class="landing-foot">Your files are stored on this server only, in a temporary folder${privacyPanel ? ", until you press ‘Delete my files’ (privacy panel)" : ""}. They are read by our own readers and models running here; when an answer is unsure and Private is off, images of the page, the question, the proposed answer and text read from the sheet may go to Google Gemini or NVIDIA Nemotron — each answer says where its data went. With <b>Private</b> on, nothing leaves this server: every outside model is switched off while it answers. Sample drawings and models are public (credits under each project). Answers point to where they come from on the drawing (or say when they could not), so you can check them.</p>
   </div>`;
 }
+/** captain 22:56: one even grid of 6 samples, simple → complex, each with a small difficulty tag (no 'More examples'
+ *  row; F5's revision pair stays reachable by its link ?features=revcompare&revdemo=dfe630) */
+const LEVEL_LABEL: Record<NonNullable<Project["level"]>, string> = { simple: "Simple", medium: "Medium", complex: "Complex" };
+/** W7 23:28: a model's storey name as the 3D labels say it ('Solaio interrato' → 'Basement (Solaio interrato)', '0_Piano
+ *  terra' → 'Ground floor (0_Piano terra)'); names it does not know stay as they are ('Level 2'). */
+const storeyLabel = (n: string) => {
+  const w = storeyWords(n);
+  return w === n ? n : `${w} (${n})`;
+};
 const KIND_LABEL: Record<Project["kind"], string> = {
   building: "Building · drawings + 3D", model: "Building · 3D model", floor: "Floor plan", schedule: "Drawing set", plan: "Floor plan", historic: "Historic drawing",
   scan: "Floor plan · scanned print", structural: "Foundation and slab plan", piping: "Piping plan",
@@ -168,7 +178,39 @@ export function levelRead(a: Answer): string {
   return "";
 }
 
-export function implausible(a: Answer, question: string, sheet?: { m2: number; diag: number }): "" | "echo" | "too big" | "level" {
+/** The pipeline's own size check on the SHOWN number ('size check: 1274 is the sheet's printed 'Overall GIFA …' (a gross /
+ *  target total), not the asked room(s)'; '7200 is printed … a dimension in mm (7.2 m), not an area'; '… larger than the
+ *  whole sheet …') in a site engineer's words, or ''. QA 22:54 r17: EFA scans showed '≈ 1,274 m² · Rough guess' for the
+ *  sports hall while the check already said it is the sheet's GIFA. Only when the check's number is the answer's value
+ *  (a later step may have replaced it). */
+export function sizeCheck(a: Answer): string {
+  const v = typeof a.value === "number" ? a.value : typeof a.value === "string" && /^\s*[\d.,]+\s*$/.test(a.value) ? Number(a.value.replace(/,/g, "")) : NaN;
+  if (!Number.isFinite(v)) return "";
+  for (const t of (a.trace ?? []).map(String)) {
+    const m = t.match(/^size check:\s*([\d.,]+)\s*(.*)$/i);
+    if (!m || Math.abs(Number(m[1].replace(/,/g, "")) - v) > 0.005 * Math.max(Math.abs(v), 1)) continue;
+    const w = m[2];
+    const g = w.match(/printed '([^']{2,60})'\s*\(a gross \/ target total\)/i);
+    if (g) return `the sheet's printed ‘${g[1].replace(/[\s:=]*[\d.,]+\s*(?:m2|m²|sq ?m|sf|sq ?ft|ft2|ft²)?\s*$/i, "").replace(/[\s:=]+$/, "").trim()}’ total, not the area you asked about`;
+    const d = w.match(/dimension in mm \(([\d.]+) m\)/i);
+    if (d) return `a dimension printed in millimetres (${d[1]} m), not an area`;
+    if (/larger than the whole sheet/i.test(w)) return "more than the whole sheet covers at its printed scale";
+  }
+  return "";
+}
+
+/** Gemini's own visual estimate when the hybrid step kept ours ('Gemini 3.1 Pro cross-check: its estimate 415.0 m2;
+ *  NEITHER reading is measured'), as one sentence, or ''. */
+function geminiGuess(a: Answer): string {
+  for (const t of (a.trace ?? []).map(String)) {
+    const m = t.match(/(Gemini[\w .-]*?)\s*cross-check:\s*its estimate\s+([\d.,]+)\s*(m2|m²|ft2|ft²|sf|m|ft)\b/i);
+    if (m && Number(m[2].replace(/,/g, "")) > 0)
+      return ` ${m[1].trim()} estimated about ${Number(m[2].replace(/,/g, "")).toLocaleString("en", { maximumFractionDigits: 0 })} ${unitLabel(m[3])} by eye (not measured).`;
+  }
+  return "";
+}
+
+export function implausible(a: Answer, question: string, sheet?: { m2: number; diag: number }): "" | "echo" | "too big" | "level" | "checked" {
   const v = typeof a.value === "number" ? a.value : typeof a.value === "string" && /^\s*[\d.,]+\s*$/.test(a.value) ? Number(a.value.replace(/,/g, "")) : NaN;
   if (!Number.isFinite(v)) return "";
   const u = String(a.unit ?? "").trim();
@@ -176,6 +218,8 @@ export function implausible(a: Answer, question: string, sheet?: { m2: number; d
   if (!u && new RegExp(`(?<![\\d.,])${raw.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}(?![\\d.,]*\\d)`).test(question)) return "echo";
   // a level / elevation printed on the sheet is never an area or a length, however sure the reader was
   if (/^(m2|m²|sq ?m|ft2|ft²|sf|sq ?ft|m|mm|ft|feet)$/i.test(u) && levelRead(a)) return "level";
+  // the pipeline's own size check already says the number is not the asked thing (a sheet total, a mm dimension)
+  if (sizeCheck(a)) return "checked";
   // a whole-building / several-floor question can exceed one sheet; so can a confident answer from a model or schedule
   if (!sheet || !(sheet.m2 > 0) || (a.confidence ?? 0) >= 0.5 || a.intent?.scope === "model"
     || /\b(building|buildings|floors|storeys|levels|model|site|project|gebäude|rakennu\w*)\b/i.test(question)
@@ -218,6 +262,9 @@ export function rivalReading(a: Answer): Rival | null {
     const m = l.match(/\bGemini [\d.]+ \w+ estimated\s+([\d.,]+)\s*(\S*)/i);
     if (!m) continue;
     const v = Number(m[1].replace(/,/g, ""));
+    // UX 23:30 B1/B2: 0 m², or a picture guess beside our measured outline of the same room → only in the details
+    const check = (a.trace ?? []).map(String).find((t) => /Gemini[^:]*cross-check:\s*its estimate/i.test(t)) ?? "";
+    if (Number.isFinite(v) && quietEstimate(a, v, check)) continue;
     if (Number.isFinite(v) && !close(v)) return { kind: "gemini", value: v, unit: m[2] || String(a.unit ?? ""), who: "Gemini 3.1 Pro" };
   }
   return secondReading(a);
@@ -240,6 +287,9 @@ export function clarifyOf(a: Answer): Clarify | null {
     }));
     return { ask: String(c.ask ?? "Which one do you mean?"), why: String(c.why ?? ""), options, ...(c.click ? { click: String(c.click) } : {}) };
   }
+  // G1 21:24: 'Which room is the skirting for?' with no options and click 'room' = a click-a-room prompt, not 'no answer'
+  if (c && Array.isArray(c.options) && !c.options.length && String(c.click ?? "") === "room")
+    return { ask: String(c.ask ?? "Which room do you mean?"), why: String(c.why ?? ""), options: [], click: "room" };
   const line = (a.trace ?? []).map(String).find((l) => /^clarify: /.test(l));
   if (!line) return null;
   // the options are the LAST '( … )' whose content is 'label: number unit | …' (the ask may hold parentheses too)
@@ -413,6 +463,64 @@ export function printedReading(a: Answer): string {
   return "";
 }
 
+/** An area worked out from two PRINTED dimension strings (captain 00:31: S-100F PNG '150 mm slab' = 6200 × 9950 mm =
+ *  61.69 m², read by Gemini and confirmed by our text layer; the slab reader's '9950 x 6200 mm = 61.69 m²'): the
+ *  dimensions as printed ('6,200 × 9,950 mm'), else ''. No drawing scale plays a part in such a number. */
+export function printedDims(a: Answer): string {
+  if (typeof a.value !== "number" || !Number.isFinite(a.value) || a.value <= 0) return "";
+  const v = a.value;
+  const u = String(a.unit ?? "").toLowerCase();
+  const fmt = (x: string) => Number(x.replace(/,/g, "")).toLocaleString("en");
+  const fits = (x: number, y: number, unit: string) => {
+    const k = unit === "mm" ? 1e-6 : unit === "cm" ? 1e-4 : 1;
+    const area = x * y * k * (unit === "ft" && /^(m2|m²|sq ?m)$/.test(u) ? 0.09290304 : 1);
+    return Math.abs(area - v) <= 0.01 * v;
+  };
+  const texts = [...(a.assumptions ?? []), ...(a.evidence ?? []).map((e) => e.note ?? ""), ...(a.trace ?? []).map(String)];
+  for (const t of texts) {
+    const m = t.match(/(\d[\d,]*(?:\.\d+)?)\s*[x×]\s*(\d[\d,]*(?:\.\d+)?)\s*(mm|cm|m|ft)\b/i);
+    if (!m || !/printed|dimension|=\s*[\d,.]+\s*(m²|m2|ft²|sf)/i.test(t)) continue;
+    const x = Number(m[1].replace(/,/g, "")), y = Number(m[2].replace(/,/g, ""));
+    if (fits(x, y, m[3].toLowerCase())) return `${fmt(m[1])} × ${fmt(m[2])} ${m[3].toLowerCase()}`;
+  }
+  // two marked dimension strings whose product is the answer ('printed dimension 6200 (…)', 'dimension 9950 mm (printed …)')
+  const dims = (a.evidence ?? []).map((e) => (e.note ?? "").match(/^(?:printed dimension|dimension)\s+(\d[\d,]*(?:\.\d+)?)\s*(mm|cm|m)?\b/i)).filter(Boolean) as RegExpMatchArray[];
+  for (let i = 0; i < dims.length; i++) for (let j = i + 1; j < dims.length; j++) {
+    const unit = (dims[i][2] ?? dims[j][2] ?? "mm").toLowerCase();
+    if (fits(Number(dims[i][1].replace(/,/g, "")), Number(dims[j][1].replace(/,/g, "")), unit)) return `${fmt(dims[i][1])} × ${fmt(dims[j][1])} ${unit}`;
+  }
+  return "";
+}
+
+/** A structural sheet (slab / foundation / framing plan): what the answer is about or what it marked says so. */
+export const isStructural = (a: Answer) =>
+  /^(slab|footing|foundation|pile|beam|column|rebar)s?$/i.test(String(a.intent?.target ?? ""))
+  || /\b(slab-on-grade|slabs? on grade|footings?|foundation plan|pile caps?|grade beams?|rebar|reinforcement)\b|\bD\d{2}\s*@\s*\d{3}\b/i.test((a.evidence ?? []).map((e) => e.note ?? "").join(" "));
+
+/** UX P2b-3: a piping / plumbing / fuel sheet (M-101A 'Hydrant fueling system, piping plan' was 'Floor plan image'):
+ *  its reader, its target or what it marked says so. */
+export const isPiping = (a: Answer) =>
+  /\/(piping|piping_img|pipe_runs)\b/.test(String(a.solver ?? ""))
+  || /^(valve|pump|pipe|header|hydrant|fitting|strainer)s?$/i.test(String(a.intent?.target ?? ""))
+  || /\b(check valves?|gate valves?|pipe size|suction header|discharge header|piping|hydrant|fuel pumps?)\b/i.test((a.evidence ?? []).map((e) => e.note ?? "").join(" "));
+
+/** A total of printed figures (E1's area_table: 'West Wing Circulation = 914 SF (printed area table, …)' × 4 = 4,470 SF):
+ *  how many marked printed values add up to the answer (±0.5 %, SF ↔ m² too), else 0. No scale plays a part then. */
+export function printedSum(a: Answer): number {
+  if (typeof a.value !== "number" || !Number.isFinite(a.value) || !a.value) return 0;
+  let n = 0, sum = 0, sumM2 = 0;
+  for (const e of a.evidence ?? []) {
+    const m = String(e.note ?? "").match(/(\d[\d,]*(?:\.\d+)?)\s*(SF|sq\.?\s*ft|ft²|ft2|m²|m2|sqm)\s*\(printed\b/i);
+    if (!m) continue;
+    const x = Number(m[1].replace(/,/g, ""));
+    n++;
+    sum += x;
+    sumM2 += /^(sf|sq|ft)/i.test(m[2]) ? x * 0.09290304 : x;
+  }
+  const v = Math.abs(a.value);
+  return n >= 2 && (Math.abs(sum - v) <= 0.005 * v || Math.abs(sumM2 - v) <= 0.01 * v) ? n : 0;
+}
+
 export function needsMeasuring(a: Answer, question: string, file = "", sheet?: { m2: number; diag: number }): boolean {
   const task = a.intent?.task;
   if (a.value === null || a.value === undefined || typeof a.value === "boolean") return false;
@@ -422,7 +530,7 @@ export function needsMeasuring(a: Answer, question: string, file = "", sheet?: {
   if (!qty && (task === "count" || a.unit === "count" || /^\s*how many\b/i.test(question))) return false;
   if (!(qty || task === "area" || task === "length" || SIZE_Q.test(question))) return false;
   const bad = implausible(a, question, sheet);
-  if (bad === "level" || (bad && (a.confidence ?? 0) < 0.9)) return true;
+  if (bad === "level" || bad === "checked" || (bad && (a.confidence ?? 0) < 0.9)) return true;
   if (printedReading(a)) return false; // read off the print (a table total, a room tag): no scale, nothing to measure
   const measured = (a.evidence ?? []).some((e) => e.bbox || e.polygon || e.polyline || e.ifc_guid);
   // a sentence with no number ('Not specified', 'The floor plan does not provide dimensions …': the image reader P1 runs
@@ -443,14 +551,22 @@ export function needsMeasuring(a: Answer, question: string, file = "", sheet?: {
  *  reader's unmarked guess. */
 export const readerGuess = (a: Answer) => /(^|\/)prior$/.test(String(a.solver ?? "")) ? "typical" : "unmarked";
 
+// (the split applies to the WHOLE string: until 22:55 it split only the last literal, so the Set held single letters,
+// every word was a 'room phrase' and a room missing from the sheet matched any label with 'the' / 'area' in it — F1
+// 22:51: 'Music Room' traced the title block's 'intent of the Department for Education's …')
 const Q_STOP = new Set(("how big large wide long tall high deep far much is are was the a an of in on at to for what whats what's which " +
   "area size width length floor total dimensions dimension room rooms space this that drawing plan house building " +
-  "square metres meters feet m2 sqm please tell me do does it its there".split(" ")));
+  "square metres meters feet m2 sqm please tell me do does it its there " +
+  // other words of the question that never name a room (they matched notes / legends when the room is not printed)
+  "many need needs have has skirting baseboard baseboards perimeter excluded excluding included including openings " +
+  "opening deducted linear shown drawn count number").split(" ").filter(Boolean));
 
 /** The room the question names, as compact phrases for a label search ('How big is the lounge?' → ['lounge'];
  *  'What's the area of bedroom 2?' → ['bedroom2', 'bedroom']): word runs without question words, longest first. */
 export function roomPhrases(question: string): string[] {
-  const words = question.toLowerCase().normalize("NFKD").replace(/[\u0300-\u036f]/g, "").split(/[^\p{L}\p{N}']+/u)
+  // 'room 119' / 'space 2.05' stay one phrase ('room119', as printed on a 'Room 119' label): 'room' alone is a stop word
+  const words = question.toLowerCase().normalize("NFKD").replace(/[\u0300-\u036f]/g, "").replace(/\b(room|space|unit)\s+(?=\d)/g, "$1")
+    .split(/[^\p{L}\p{N}']+/u)
     .map((w) => w.replace(/'s$|'/g, "")).filter(Boolean);
   const runs: string[][] = [];
   let cur: string[] = [];
@@ -471,8 +587,19 @@ export function roomPhrases(question: string): string[] {
   return [...out].sort((a, b) => b.length - a.length);
 }
 
+/** F1 00:58 (UX M23): a region answer whose box holds ONE room ('1 room in your box: Multi-Purpose Hall 247.73 m²')
+ *  names that room ('floor area of the Multi-Purpose Hall, in the area you drew'). Several rooms: unchanged. */
+function regionRoom(a: Answer): string {
+  const s0 = String(a.assumptions?.[0] ?? "");
+  const one = s0.match(/^1 room in your (?:box|area|outline):\s*(.+?)\s+[\d.,]+\s*(?:m²|m2|ft²|sf|sq ?ft)\b/i)?.[1];
+  return (one ?? "").replace(/[.;,]+$/, "").trim();
+}
+
 /** Where the answer applies, in words: "on floor 2", "in the whole building", "on this floor". */
 function wherePhrase(a: Answer, ctx: HeroCtx): string {
+  // T3 00:58: a project total over several buildings says where itself ('in both buildings', 'in all 3 buildings')
+  const own = (a as { where?: unknown }).where;
+  if (typeof own === "string" && own.trim()) return own.trim();
   // F1's region ask: the visitor drew a box / outline on the sheet ('region/labels', 'region/area_tags', 'region/outline')
   if (/^region\//.test(String(a.solver ?? ""))) return /\/outline$/.test(String(a.solver)) ? "inside your outline" : "in the area you drew";
   const st = a.intent?.filters?.storey;
@@ -482,6 +609,51 @@ function wherePhrase(a: Answer, ctx: HeroCtx): string {
   if (/\.ifc$/i.test(ctx.file)) return "in the 3D model";
   if (/^floor \d|floor$/i.test(label)) return `on ${label.toLowerCase().replace(/^(\d)/, "the $1")}`;
   return /\.(png|jpe?g|pdf)$/i.test(ctx.file) ? "on this drawing" : "";
+}
+
+/** UX C-14 (Stoa scores the REASONING): 'How we worked it out' in the customer view starts with 3–6 plain steps — what
+ *  was read, how the thing was found, where it is marked, what checked it, what was assumed, the answer — instead of the
+ *  raw trace (solver ids, JSON, tokens: those stay under 'Technical details' and in the expert view). */
+export function plainSteps(a: Answer, o: { kind?: string; scale?: string; model?: boolean; checks?: string[] }): string[] {
+  const clean = (t: string) => t
+    .replace(/\{[^{}]*\}/g, "")
+    .replace(/\((?:[a-z0-9_]+\/)+[a-z0-9_]+[^)]*\)/gi, "")
+    .replace(/\b(?:pipeline|stoa)\/[a-z0-9_/]+/gi, "")
+    .replace(/\s@\s?0?\.\d+/g, "").replace(/\bp\s?=\s?0?\.\d+/g, "")
+    .replace(/\b[\d,]+\s?tok(?:ens)?\b/gi, "").replace(/^hybrid routing\s*\([^)]*\):\s*/i, "")
+    .replace(/\b[a-z0-9]+(?:_[a-z0-9]+)+\b\s?/g, "").replace(/\s{2,}/g, " ").replace(/\s+([,.;:])/g, "$1").trim();
+  const solver = String(a.solver ?? "");
+  const lines = [...(a.trace ?? []), ...(a.evidence ?? []).map((e) => e.note ?? "")].map(String).join("\n");
+  const steps: string[] = [];
+  const kind = (o.kind ?? "").replace(/\s*·.*$/, "");
+  steps.push(o.model ? "Opened the 3D building model and its floors." : `Read the drawing${kind && !/not recognised/i.test(kind) ? ` (${kind.toLowerCase()})` : ""}${o.scale ? `, scale ${o.scale}` : ""}.`);
+  const how = /^measure\//.test(solver) ? "Measured from the outline you drew on the drawing."
+    : /^region\//.test(solver) ? "Looked only inside the area you drew."
+    : solver === "takeoff" ? "Took the number from this sheet's takeoff (every room traced once)."
+    : /\bifc\b/i.test(solver) || (o.model && (a.evidence ?? []).some((e) => e.ifc_guid)) ? "Counted and measured the elements in the 3D model itself."
+    : /dxf/i.test(solver) ? "Took the room outlines from the drawing's CAD file."
+    : /schedule/i.test(solver) ? "Read the rows of the schedule table printed on the sheet."
+    : /area_tags|printed|pdf_text|label_count|textqa/i.test(solver) || /printed (area|table|value)|as printed/i.test(lines) ? "Read the figures printed on the drawing and checked their places."
+    : /openings|door_detect|detector|symbol/i.test(solver) ? "Found the door and window symbols on the plan."
+    : /plan_rooms|line_rooms|lineplan|vector|walls?/i.test(solver) || /traced|wall lines|outline/i.test(lines) ? "Found the room by its printed name and traced the walls around it on the drawing's own lines."
+    : /raster|cc5k|cubicasa/i.test(solver) || /CubiCasa5K/i.test(lines) ? "Found the rooms in the picture with a pretrained floor-plan model (CubiCasa5K)."
+    : /vlm|gemini|nemotron|agent/i.test(solver) ? "Asked an AI model to read the sheet, then placed its reading on the drawing."
+    : "Read the drawing's own lines and text.";
+  steps.push(how);
+  const k = (a.evidence ?? []).filter((e) => e.bbox || e.ifc_guid || e.polygon).length;
+  if (k) steps.push(`Marked ${k === 1 ? "the place it comes from" : `the ${k} places it comes from`} on the ${o.model ? "model" : "drawing"}: click one to zoom to it.`);
+  // the card's own re-measure line first ('Re-measured from the outline's own corner points: … agrees ✓'), then the
+  // readers' cross-checks with a verdict
+  const rank = (t: string) => (/✓|agree/i.test(t) ? 0 : /✗|apart|disagree/i.test(t) ? 1 : 2);
+  const checks = [...(o.checks ?? []), ...(a.trace ?? []).map(String).filter((t) => /cross-?check|re-measured|agrees|✓|✗/i.test(t) && !/^data_used|^network/i.test(t))]
+    .map(clean).filter((t) => t.length > 8).sort((x, y) => rank(x) - rank(y));
+  if (checks.length) steps.push(`Checked it: ${checks[0].replace(/^cross-?check:\s*/i, "")}`);
+  const as = (a.assumptions ?? []).map(String).map(clean).filter((t) => t.length > 6)[0];
+  if (as) steps.push(`Assumed: ${as.replace(/^assum(?:ed|ption):\s*/i, "")}`);
+  const unit = a.unit && a.unit !== "count" ? ` ${String(a.unit).replace(/^m2$/, "m²").replace(/^ft2$/, "ft²")}` : "";
+  const val = typeof a.value === "number" ? a.value.toLocaleString("en", { maximumFractionDigits: 2 }) : a.value === null || a.value === undefined ? "" : String(a.value).slice(0, 80);
+  if (val) steps.push(`Answer: ${val}${unit} — ${confidenceWords(a.confidence ?? 0).word.toLowerCase()}.`);
+  return steps.slice(0, 6).map((t) => (t.length > 260 ? `${t.slice(0, 257)}…` : t));
 }
 
 /** Big value + one plain sentence. Yes/no answers lead with Yes / No. */
@@ -626,10 +798,29 @@ function headline(a: Answer, ctx: HeroCtx): { big: string; unit: string; sentenc
   const notDrawn = ctx.question.match(/how many (\w+) on '?([^'?]+?)'? are in the (?:3D )?model but not drawn/i);
   if (notDrawn) return { big: fmtValue(a), unit: "", sentence: `${notDrawn[1]} on ${floorName(notDrawn[2])} are in the 3D model but not drawn on the plan` };
   if (a.unit === "count" || (!a.unit && Number.isInteger(v))) {
+    // W5 c28: 'How many doors does the Kitchen have?' parsed as count:kitchen (Private-mode DfE answer) read '≈ 2 kitchens
+    // on this drawing': when the parsed target is the HOLDER of the question, the asked object is the noun before 'does'
+    const held = ctx.question.match(/\bhow many\s+([\p{L}][\p{L}' ()-]{1,40}?)\s+(?:does|do|did)\s+(?:the\s+)?(.{2,40}?)\s+(?:have|has|contain|got)\b/iu);
+    const tw = t.toLowerCase().replace(/_/g, " ").replace(/s$/, "");
+    if (held && tw && !/^(unknown|element)$/.test(tw) && held[2].toLowerCase().includes(tw) && !held[1].toLowerCase().includes(tw)) {
+      const obj = Number(v) === 1 ? held[1].toLowerCase().replace(/(?<!s)s$/, "") : held[1].toLowerCase();
+      const numbered = /^(room|apartment|flat|unit|floor|level|storey)\s+\S*\d/i.test(held[2]);
+      return { big: fmtValue(a), unit: "", sentence: `${obj} of ${numbered ? "" : "the "}${calm(held[2])}` };
+    }
     const parts = (a.plan?.parts ?? []).map((x) => NOUN[x]?.[1] ?? "").filter(Boolean);
+    // UX 23:30 M7: no known noun for the target ('check valves (CV)'): the question's own object, as asked
+    const qNoun = ctx.question.match(/\bhow many\s+(.{3,50}?)\s+(?:are|is|do|does|can|were|have|has|on|in|appear|exist|shown|drawn|there)\b/i)?.[1]?.trim() ?? "";
+    // T3 00:4x: a generic target ('room' / 'space') never hides the question's own, more specific room word
+    // ('How many classrooms are there?' → '11 classrooms', not '11 rooms')
+    const specific = /^(room|space)s?$/i.test(t) && /^[\p{L}' -]*\b\p{L}*(rooms?|halls?|offices?|toilets?|stores?|kitchens?|bathrooms?|bedrooms?|classrooms?|wcs?|corridors?|labs?|studios?|suites?)$/iu.test(qNoun)
+      && !/^(rooms?|spaces?)$/i.test(qNoun);
     const noun = parts.length > 1 ? `${parts.slice(0, -1).join(", ")} and ${parts[parts.length - 1]}${a.plan?.op === "sum" ? " together" : ""}`
-      : n ? n[Number(v) === 1 ? 0 : 1] : "";
+      : specific ? (Number(v) === 1 ? qNoun.toLowerCase().replace(/(?<!s)s$/, "") : qNoun.toLowerCase())
+      : n ? n[Number(v) === 1 ? 0 : 1] : qNoun && !/^(of|the|times?)\b/i.test(qNoun) ? qNoun : "";
     if (!noun && a.intent?.task !== "count") return { big: fmtValue(a), unit: "", sentence: "" }; // a year, an id
+    // the reader counted inside one room ('room scope in 'Multi-Purpose Hall''): 'doors of the Multi-Purpose Hall' (T3 21:28)
+    const sr = scopedRoom(a);
+    if (noun && sr) return { big: fmtValue(a), unit: "", sentence: `${noun} of the ${calm(sr)}` };
     return { big: fmtValue(a), unit: "", sentence: [noun, where].filter(Boolean).join(" ") };
   }
   if (unit === "€" || unit === "$") return { big: `${unit}${fmtValue(a)}`, unit: "", sentence: costSentence(ctx.question) };
@@ -637,7 +828,7 @@ function headline(a: Answer, ctx: HeroCtx): { big: string; unit: string; sentenc
   if (a.solver === "takeoff" && a.assumptions?.[0]) return { big: fmtValue(a), unit, sentence: String(a.assumptions[0]) };
   // F1's region ask: 'area inside your outline' / 'floor area of the rooms in the area you drew' (not '… on this drawing')
   if (/^region\//.test(String(a.solver ?? "")) && /^(m2|m²|sq ?m|ft2|ft²|sf|sq ?ft)$/i.test(String(a.unit ?? "")))
-    return { big: fmtValue(a), unit, sentence: /\/outline$/.test(String(a.solver)) ? "area inside your outline" : `floor area of the rooms ${where}` };
+    return { big: fmtValue(a), unit, sentence: /\/outline$/.test(String(a.solver)) ? "area inside your outline" : regionRoom(a) ? `floor area of the ${calm(regionRoom(a))}, ${where}` : `floor area of the rooms ${where}` };
   // the room as asked ("How big is room 119?" → "room 119"), its name from the evidence when there is one ("KORIDOR")
   const asked = ctx.question.match(/\broom\s+'?([\w.()-]*\d[\w.()-]*)'?/i)?.[1];
   const named = (a.evidence ?? []).length && (a.evidence ?? []).every((e) => e.note === a.evidence[0].note)
@@ -651,9 +842,13 @@ function headline(a: Answer, ctx: HeroCtx): { big: string; unit: string; sentenc
   // one room named in every note ('Comms Room: 16.68 m² traced at 1:100', E1's line-plan reader; "'OFFICE SPACE' outline
   // traced …") that the question also names: 'floor area of the comms room', not '… on this drawing'
   const ev0 = (a.evidence ?? [])[0]?.note ?? "";
-  const noteRoom = ev0.match(/^'?([\p{L}][\p{L}\d .\/-]{1,40}?)'?(?::\s*(?:long side |short side |width |length |skirting |perimeter )?[\d.,]+\s*m|\s+outline\b)/u)?.[1]?.trim();
+  const noteRoom = ev0.match(/^'?([\p{L}][\p{L}\d .\/-]{1,40}?)'?(?::\s*(?:long side |short side |width |length |skirting |perimeter )?[\d.,]+\s*(?:m|ft)|\s+outline\b)/u)?.[1]?.trim();
   const named2 = !room && !apt && !several && noteRoom && roomPhrases(ctx.question).some((ph) => noteRoom.toLowerCase().replace(/[^\p{L}\p{N}]/gu, "").includes(ph))
     ? `the ${noteRoom.toLowerCase()}` : "";
+  // UX 23:30 M7: a total over several rooms of that name ('all Secondary Classrooms', 8 outlines) is not 'the secondary
+  // classroom': 'the 8 secondary classrooms together'
+  const plural = (w: string) => (/s$/.test(w) ? w : /(ch|sh|x)$/.test(w) ? `${w}es` : `${w}s`);
+  const namedMany = named2 && a.intent?.task === "area" && rooms > 1 ? `the ${rooms} ${plural(noteRoom!.toLowerCase())} together` : "";
   // a room's printed label read as text ('Text: Ncoic Office / 2.05 / 81 SF (view …)', 'Text: Conference/ / Classroom /
   // 2.01 / 536 SF'): the name = the parts before the first number, in the question's own casing ('NCOIC Office')
   const printedRoom = (() => {
@@ -706,10 +901,29 @@ function headline(a: Answer, ctx: HeroCtx): { big: string; unit: string; sentenc
     }
     if (/\btotal\b/i.test(ctx.question)) return { big: fmtValue(a), unit, sentence: "total slab area, to the slab edges" };
   }
-  const what = a.intent?.task === "area" ? (room ? `floor area of ${room}` : apt ? `floor area of ${apt}` : several ? `floor area of ${several}` : named2 ? `floor area of ${named2}` : "floor area")
-    : a.intent?.task === "length" ? (named2 ? `length of ${named2}` : "length") : a.intent?.task === "volume" ? "volume" : "";
+  // UX 23:30 M7: nothing named by the readers: the asked object ('area of the 150 mm slab (D13 @ 300)', 'total
+  // circulation area'), not a bare 'floor area on this drawing'
+  const askedObj = ctx.question.match(/\b(?:area|size|footprint) of (?:the |all (?:the )?)?(.{3,60}?)\s*(?:\?|$|,|\s+on this\b|\s+in this\b)/i)?.[1]?.trim();
+  const askedArea = ctx.question.match(/^\s*what(?:'s| is) the ((?:total |overall |net |gross )?[\p{L} -]{2,40}? area)\s*(?:\?|$|\s+on\b|\s+of this\b)/iu)?.[1]?.trim();
+  const askedLen = ctx.question.match(/\bhow (long|wide|tall|high|deep) is (?:the )?(.{3,60}?)\s*(?:\?|$)/i);
+  // QA 23:53: several rooms marked does not make the value their SUM: 'How big is the classroom?' = 51.74, the MEAN of 6
+  // (and after a pick, one of them): 'together' only when the marked areas add up to the value
+  const evAreas = (a.evidence ?? []).map((e) => Number(String(e.note ?? "").match(/(\d[\d,]*(?:\.\d+)?)\s*(?:m²|m2)(?!\w)/i)?.[1]?.replace(/,/g, "")))
+    .filter((x) => Number.isFinite(x) && x > 0);
+  const valN = typeof a.value === "number" ? a.value : NaN;
+  const sumA = evAreas.reduce((t, x) => t + x, 0);
+  const agg = evAreas.length < 2 || !Number.isFinite(valN) ? "together" : Math.abs(sumA - valN) <= 0.01 * valN ? "together"
+    : Math.abs(sumA / evAreas.length - valN) <= 0.01 * valN ? "average" : "one";
+  const manyWhat = (phrase: string) => {
+    const p = phrase.replace(/ together$/, "").replace(/^(?!the )/, "the ");
+    return agg === "average" ? `average floor area of ${p}` : agg === "one" ? `floor area of one of ${p}` : `floor area of ${p} together`;
+  };
+  const what = a.intent?.task === "area" ? (room ? `floor area of ${room}` : apt ? `floor area of ${apt}` : several ? manyWhat(several) : namedMany ? manyWhat(namedMany) : named2 ? `floor area of ${named2}`
+      : askedObj && !/^(this|the) (drawing|plan|sheet|floor)$/i.test(askedObj) ? `area of the ${askedObj}` : askedArea && !/^(floor|total floor) area$/i.test(askedArea) ? askedArea.toLowerCase() : "floor area")
+    : a.intent?.task === "length" ? (named2 ? `length of ${named2}` : askedLen ? `${LEN_WORD[askedLen[1].toLowerCase()] ?? "length"} of the ${askedLen[2]}` : "length") : a.intent?.task === "volume" ? "volume" : "";
   return { big: fmtValue(a), unit, sentence: [what, where].filter(Boolean).join(" ") };
 }
+const LEN_WORD: Record<string, string> = { long: "length", wide: "width", tall: "height", high: "height", deep: "depth" };
 /** skirting / baseboard questions (Stoa kind 2): a length of wall face minus openings */
 const SKIRT_Q = /\b(skirting|base ?boards?|sockelleiste\w*|jalkalista\w*|plinth)\b/i;
 const plainify = (s: string) => swissRooms(s).replace(/'?(\d+)\.korrus'?/g, (_, n) => `floor ${n}`).replace(/\bstorey\b/g, "floor").replace(/\bIFC model\b/g, "3D model").replace(/\bplan draws\b/g, "the drawing shows")
@@ -742,7 +956,11 @@ function agreement(a: Answer, file: string): { ok: boolean; text: string; detail
     }
     return { ok: true, text: "2 independent methods agree", detail: hit.slice(0, 300), which: /gemini/i.test(hit) ? "our reading and Gemini's" : "two readings" };
   }
-  const bad = xs.find((x) => !x.ok);
+  // UX P2b-14: Maleva windows 'Our reading 55 · second reading 52' in red, though the ✓ line says why the plan draws 52
+  // (3 windows lie wholly above / below its 1.2 m cut plane): a plan-vs-model difference that a ✓ line explains is not
+  // a disagreement
+  const explained = xs.some((x) => x.ok && /\b(cut plane|section plane|not drawn|above\/below|wholly above|entirely above)\b/i.test(x.text));
+  const bad = xs.find((x) => !x.ok && !(explained && /\b(plan drawing shows|plan draws|differs by)\b/i.test(x.text)));
   if (bad) return { ok: false, text: "Two sources disagree: check the marked spots", detail: bad.text };
   const t = xs[0].text;
   const sheet = /\.(pdf|png|jpe?g)$/i.test(file);
@@ -863,16 +1081,24 @@ export function listAnswer(a: Answer, currentFile = ""): { head: string; rows: S
 }
 
 export function heroHtml(a: Answer, ctx: HeroCtx): string {
+  // a question that needs a room first (G1's clarify, click 'room'): the question back, not 'No answer'
+  const cr = a.value === null || a.value === undefined ? clarifyOf(a) : null;
+  if (cr && !cr.options.length && cr.click === "room")
+    return `<div class="hero-value"><span class="big name">Which room?</span></div>
+    <div class="hero-sentence">${esc(cr.ask)}${cr.why ? ` ${esc(cr.why)}` : ""}</div>`;
   if (needsMeasuring(a, ctx.question, ctx.file, ctx.sheet)) return measureFirstHtml(a, ctx);
   const h = headline(a, ctx);
   const ag = agreement(a, ctx.file);
   let c = a.value === null ? { cls: "none", word: "No answer", hint: "" } : confidenceWords(a.confidence ?? 0);
+  // F1 / captain AUDIT 00:31 (a): the visitor's own outline or line (or a Suggest they accepted) is theirs, not checked
+  // by us: never 'Fairly sure'
+  if (/^measure\/(area|length)/.test(a.solver ?? "")) c = { cls: "est", word: /^suggested outline/i.test(String(a.trace?.[0] ?? "")) ? "Suggested outline" : a.solver === "measure/length" ? "Your line" : "Your outline", hint: "not checked" };
   // two methods that agree are not a 'rough guess … not found on the drawing', whatever the calibrated number says
   if (ag?.ok && c.cls.includes("guess")) c = { cls: "est", word: "Best estimate", hint: "" };
   const conv = conventionOf(a, ctx.question);
   // the convention line already says it: don't repeat a reader's 'Convention: …' as the assumption
   // a printed figure read off the sheet is not 'NOT MEASURED: … visual estimate' (the solver's words for any Gemini reading)
-  const assumption = c.cls.startsWith("est") ? plainAssumption((a.assumptions ?? []).find((x) => !/^\s*convention\s*:/i.test(x)
+  const assumption = c.cls.startsWith("est") && a.solver !== "takeoff" ? plainAssumption((a.assumptions ?? []).find((x) => !/^\s*convention\s*:/i.test(x)
     && !(/^NOT MEASURED\b|^read by gemini/i.test(x) && printedReading(a))) ?? "") : "";
   // AUDIT 19:51 (3): the time the visitor waited (the request's round trip, queueing included); the solver's own time
   // only for a re-render without a request (a choice, a scale change)
@@ -943,14 +1169,11 @@ export function heroHtml(a: Answer, ctx: HeroCtx): string {
     ${h.next?.length ? `<div class="hero-next">${h.nextLabel === "" ? "" : "<span>Next:</span> "}${h.next.map(esc).join(" &nbsp;·&nbsp; ")}</div>` : ""}
     ${text}${setRows}
     <div class="hero-badges">
-      <span class="conf ${c.cls}" title="Our calibrated confidence: ${Math.round((a.confidence ?? 0) * 100)} %">${esc(c.word)}</span>${c.hint ? `<span class="conf-hint">${esc(c.hint)}</span>` : ""}
-      ${ag ? `<span class="agree ${ag.ok ? "ok" : "bad"}" title="${esc(ag.detail)}">${ag.ok ? "" : "⚠ "}${esc(ag.text)}${ag.which ? `<small> · ${esc(ag.which)}</small>` : ""}</span>` : ""}
+      ${statusHtml(a, c, ag)}
       ${tierHtml(a)}
-      ${secondOpinions(a)}
     </div>
-    ${supportHtml(a, esc)}
-    ${conv ? `<div class="hero-conv" title="How we measure or count this kind of question (our convention; the other value is in 'How we worked it out')"><b>Convention:</b> ${esc(conv.text)}${conv.alt ? ` <span class="hc-alt">· other way: ${esc(conv.alt)}</span>` : ""}</div>` : ""}
-    ${assumption ? `<div class="hero-assume">Assumed: ${esc(assumption)}</div>` : ""}
+    ${scopeHtml(a, ctx.question, conv)}
+    ${assumption ? `<div class="hero-assume">Assumed: ${esc(pxless(assumption))}</div>` : ""}
     ${unnamedAlt(a)}
     <div class="hero-value-strip" title="Manual time is our rough estimate for this kind of question (${esc(mt.work)}), not a measurement">
       <span>Answered in <b>${wall < 1 ? `${Math.max(0.1, wall).toFixed(1)} s` : `${wall.toFixed(1)} s`}</b></span>
@@ -958,10 +1181,11 @@ export function heroHtml(a: Answer, ctx: HeroCtx): string {
       ${dataLineHtml(a, esc)}
     </div>
     ${ctx.groups && ctx.groups.length > 1 ? `<div class="hero-where"><div class="hw-title">Where it comes from · by floor</div>
-      ${ctx.groups.map((g, k) => `<button type="button" class="hw-item" data-floor="${k}"><span class="num pin-badge">${k + 1}</span><span class="lbl">${esc(g.label)} · <b>${g.guids.length}</b> ${esc(targetNoun(a.intent?.target, g.guids.length))}</span></button>`).join("")}
+      ${ctx.groups.map((g, k) => `<button type="button" class="hw-item" data-floor="${k}"><span class="num pin-badge">${k + 1}</span><span class="lbl">${esc(storeyLabel(g.label))} · <b>${g.guids.length}</b> ${esc(targetNoun(a.intent?.target, g.guids.length))}</span></button>`).join("")}
       <div class="hw-more">every one lit in the 3D model; pick a floor to see only that floor</div></div>`
     : shown.length ? `<div class="hero-where${ctx.rank ? " ranked" : ""}"><div class="hw-title">Where it comes from${ctx.rank ? rankLegendHtml(Math.min(ctx.rank.length, 5)) : ""}</div>
       ${shown.map((i, k) => `<button type="button" class="hw-item" data-ev="${i}"><span class="num pin-badge${ctx.rank && ctx.rank.indexOf(i) >= 0 ? ` rk${ctx.rank.indexOf(i) + 1}` : ""}">${k + 1}</span><span class="lbl">${esc(place(i))} · ${esc(label(i))}${atSpot(i) > 1 ? ` <span class="stack-tag" title="${atSpot(i)} items drawn at this one spot">×${atSpot(i)}</span>` : ""}${approx.has(i) ? ` <span class="approx-tag" title="Traced or recognised on the drawing: the place and outline are approximate">approximate</span>` : ""}</span></button>`).join("")}
+      ${ev.some(isSearchedArea) ? `<div class="hw-more hw-searched"><span class="lg searched"></span>Searched: ${esc(String(ev.find(isSearchedArea)!.note).replace(/^\s*searched area\s*:?\s*/i, ""))}</div>` : ""}
       ${shown.some((i) => approx.has(i)) ? `<div class="hw-legend"><span class="lgi"><span class="lg exact"></span>exact place</span><span class="lgi"><span class="lg approx"></span>approximate (traced or recognised, not exact)</span></div>` : ""}
       ${more > 0 ? `<div class="hw-more">+ ${more} more, all marked ${/\.ifc$/i.test(ctx.file) || !ev.some((e) => e.bbox && e.file === ctx.file)
         || ev.some((e) => e.ifc_guid && !(e.bbox && e.file === ctx.file) && !ev.some((x) => x.ifc_guid === e.ifc_guid && x.bbox && x.file === ctx.file))
@@ -1000,6 +1224,74 @@ export function conventionOf(a: Answer, q: string): { text: string; alt?: string
   return text ? { text, alt: altText } : null;
 }
 
+/** The one room a reader limited its count / length to, from its own trace ('room scope in 'Multi-Purpose Hall'',
+ *  '6 doors (9 leaves) in 'Multi-Purpose Hall''); never guessed from the question. */
+export function scopedRoom(a: Answer): string {
+  for (const l of [...(a.trace ?? []), ...(a.assumptions ?? [])].map(String)) {
+    const m = l.match(/\broom scope in '([^']{2,60})'/i) ?? l.match(/\b\d+ (?:doors?|windows?|openings?)(?: \(\d+ leaves?\))? in '([^']{2,60})'/i);
+    if (m) return m[1];
+  }
+  return "";
+}
+
+/** ONE 'Scope' line per answer (captain 21:13 (5), estimators distrust unclear scope: gross / net, sets / leaves, this
+ *  room / the whole sheet): the reader's own Includes / Excludes (Answer.includes / .excludes, or lines starting with
+ *  'Includes:' / 'Excludes:', the shape W6's phone card reads too), else the convention in a few words, plus what the
+ *  reader actually did ('1 door opening deducted (0.83 m)', '6 sets · 9 leaves', 'Multi-Purpose Hall only'). The full
+ *  convention stays in the tooltip and under 'How we worked it out'. */
+export function scopeOf(a: Answer, q: string, conv: { text: string; alt?: string } | null): { line: string; alt?: string; full: string } | null {
+  if (a.value === null || a.value === undefined || typeof a.value === "boolean") return null;
+  const lines = [...(a.assumptions ?? []), ...(a.trace ?? [])].map(String);
+  const field = (x: unknown): string[] => (Array.isArray(x) ? x.map(String) : x ? [String(x)] : []);
+  const ax = a as unknown as { includes?: unknown; excludes?: unknown };
+  const strip = (l: string) => l.replace(/^\s*(?:\[[\w/ -]+\]\s*)?(includes?|excludes?)\s*:\s*/i, "").trim();
+  const inc = field(ax.includes).concat(field(ax.includes).length ? [] : lines.filter((l) => /^\s*(?:\[[\w/ -]+\]\s*)?includes?\s*:/i.test(l)).map(strip));
+  const exc = field(ax.excludes).concat(field(ax.excludes).length ? [] : lines.filter((l) => /^\s*(?:\[[\w/ -]+\]\s*)?excludes?\s*:/i.test(l)).map(strip));
+  const parts: string[] = [];
+  const ct = conv?.text ?? "";
+  const skirting = /\b(base ?boards?|skirting|plinth|sockelleiste|jalkalista)\b/i.test(q) || /baseboard|skirting/i.test(ct);
+  // what the reader did (numbers from its own trace / evidence)
+  const op = lines.map((l) => l.match(/perimeter ([\d.]+) m\s*[−-]\s*(\d+) opening\(s\) ([\d.]+) m/)).find(Boolean);
+  const evOps = (a.evidence ?? []).map((e) => String(e.note ?? "").match(/door opening ([\d.]+) m \(deducted\)/)).filter(Boolean) as RegExpMatchArray[];
+  const opN = op ? Number(op[2]) : evOps.length;
+  const opW = op ? Number(op[3]) : evOps.reduce((x, m) => x + Number(m[1]), 0);
+  const leaves = lines.map((l) => l.match(/\b(\d+) doors? \((\d+) leaves?\)/)).find(Boolean);
+  const room = scopedRoom(a);
+  if (skirting) {
+    parts.push("Net to the inner wall face");
+    if (opN > 0 && !wholeOutline(a, q)) parts.push(`${opN} door opening${opN > 1 ? "s" : ""} deducted (${opW.toFixed(2)} m)`);
+    else if (/NOT deducted/.test(ct)) parts.push("door openings not deducted");
+    else if (/minus the door openings|minus door openings/.test(ct)) parts.push("door openings deducted");
+  } else if (/double door/i.test(ct) && (/\bschedule\b/i.test(q) || /\bschedule\b/i.test(String(a.solver ?? "")))) {
+    // W6 22:34: a count of the door SCHEDULE's rows is not a count of drawn door sets
+    parts.push("Rows of the door schedule (each listed door once)");
+  } else if (/double door/i.test(ct)) {
+    parts.push(leaves ? `${leaves[1]} door set${leaves[1] === "1" ? "" : "s"} · ${leaves[2]} leaves` : "Door sets");
+    parts.push("a double door = 1 set, 2 leaves");
+    // doors AND windows asked together (W6 22:34: the windows half was dropped)
+    if (/window units/i.test(ct)) parts.push("windows: units drawn in the walls");
+  } else if (/net internal area|inner face of the walls/i.test(ct)) parts.push("Net internal area, to the inner wall face");
+  else if (ct) {
+    // a reader's own bracketed notes are plumbing, not scope (W6 22:34: '(tag family from abbreviation in the question)')
+    const t = ct.replace(/\s*\([^()]*\b(abbreviation|in the question|parsed|regex|solver|reader|fallback|heuristic)\b[^()]*\)/gi, "").trim();
+    if (t) parts.push(t.charAt(0).toUpperCase() + t.slice(1));
+  }
+  if (inc.length) parts.push(`Includes ${inc.join("; ")}`);
+  if (exc.length) parts.push(`Excludes ${exc.join("; ")}`);
+  if (room) parts.push(`${calm(room)} only`);
+  else if ((a.unit === "count" || a.intent?.task === "count") && /\.(pdf|png|jpe?g)$/i.test(String(a.evidence?.[0]?.file ?? "")) && !roomPhrases(q).length && parts.length) parts.push("whole sheet");
+  if (!parts.length) return null;
+  const line = parts.join(" · ");
+  return { line: line.length > 170 ? `${line.slice(0, 168)}…` : line, alt: conv?.alt, full: [ct, ...inc.map((x) => `Includes: ${x}`), ...exc.map((x) => `Excludes: ${x}`)].filter(Boolean).join("\n") };
+}
+
+function scopeHtml(a: Answer, q: string, conv: { text: string; alt?: string } | null): string {
+  const s = scopeOf(a, q, conv);
+  if (!s) return "";
+  const tip = s.full ? `How it was measured or counted: ${s.full}` : "What this number includes and leaves out";
+  return `<div class="hero-conv hero-scope" title="${esc(tip)}"><b>Scope:</b> ${esc(s.line)}${s.alt ? ` <span class="hc-alt">· other way: ${esc(s.alt)}</span>` : ""}</div>`;
+}
+
 /** A reader's first assumption in a site engineer's words (the full text stays under 'How we worked it out'). */
 function plainAssumption(t: string): string {
   if (/^read from \d+ printed text group/i.test(t)) return "read from the printed text on the drawing (the marked tag)";
@@ -1023,13 +1315,15 @@ function measureFirstHtml(a: Answer, ctx: HeroCtx): string {
       : `read off a picture of the drawing without marking where — not measured yet`
     : bad === "echo" ? `The reading found only ‘${String(a.value).trim()}’, the number in your question, not the ${length ? "length" : "area"}.`
     : bad === "level" ? `The reading took ‘${levelRead(a)}’ — a level printed on the drawing, not ${length ? "a length" : "an area"} — so it is not shown as the answer.`
+    : bad === "checked" ? `The reading took ${typeof a.value === "number" ? a.value.toLocaleString("en", { maximumFractionDigits: 2 }) : String(a.value)} ${unitLabel(a.unit) || ""} — ${sizeCheck(a)} — so it is not shown as the answer.${geminiGuess(a)}`.replace(/\s+—/, " —")
     : bad === "too big" ? `The reading gave ${typeof a.value === "number" ? a.value.toLocaleString("en", { maximumFractionDigits: 0 }) : String(a.value)} ${unitLabel(a.unit) || ""}, more than the whole sheet covers at its scale (about ${Math.round(length ? ctx.sheet!.diag : ctx.sheet!.m2).toLocaleString("en")} ${length ? "m" : "m²"}), so it is not shown as the answer.`
     : `We could not measure this on the drawing yet.`;
   return `
     <div class="hero-value">${big ? `<span class="big guess-val">≈ ${esc(big)}</span><span class="unit">${esc(unit)}</span>` : `<span class="big name">${ctx.scaleKnown || bad ? "Not found" : "Scale unknown"}</span>`}</div>
     <div class="hero-sentence">${esc(sentence)}</div>
     <div class="hero-badges"><span class="conf est guess" title="Nothing on this drawing gave the ${length ? "length" : "area"} yet${big ? ": the number is our usual guess (see 'How we worked it out')" : ""}">${big ? "Rough guess" : "No number yet"}</span>${ctx.scaleKnown ? "" : SCALE_PILL}${tierHtml(a)}</div>
-    ${conv ? `<div class="hero-conv"><b>Convention:</b> ${esc(conv.text)}</div>` : ""}`;
+    <div class="hero-value-strip">${dataLineHtml(a, esc)}</div>
+    ${conv ? `<div class="hero-conv"><b>Scope:</b> ${esc(conv.text.charAt(0).toUpperCase() + conv.text.slice(1))}</div>` : ""}`;
 }
 
 /** Next to an area / length number whose drawing scale is unknown or only estimated (captain 14:39): one tap opens the
@@ -1075,17 +1369,110 @@ function secondOpinions(a: Answer): string {
   return out.join("");
 }
 
+/** ONE status line (captain 21:39: 'Our guess', a red 'Two sources disagree', a green 'The marked outline gives this
+ *  number' and a blue 'unsure' on one scanned-print answer were four mixed signals): the confidence words, merged with
+ *  the cross-check (agree -> green; a second reading with its own number beyond tolerance -> red WITH both values; a
+ *  disagreement without a number -> orange 'check the marked spots'), plus the support state and second opinions as a
+ *  short suffix. Keeps the .conf class (F4 reads .hero-badges .conf). */
+function statusHtml(a: Answer, c: { cls: string; word: string; hint: string }, ag: { ok: boolean; text: string; detail: string; which?: string } | null): string {
+  const sup = supportOf(a);
+  const t = (a.trace ?? []).map(String);
+  const ops: string[] = [];
+  // F8 02:35: 'planned 0 step(s) … reached no answer (… unavailable …); answer kept' (no key, Private mode, cap spent) is
+  // NOT a Gemini check: only the two outcomes where Gemini reached a value count
+  if (t.some((l) => /Gemini 3\.1 Pro planned\b/.test(l) && /same value|not better supported/i.test(l) && !/unavailable|reached no answer|needs \$GEMINI|planned 0 step/i.test(l))) ops.push("checked by Gemini");
+  if (t.some((l) => /(Second opinion \(NVIDIA Nemotron|verifier Nemotron\b)[^:]*\)?:\s*agrees?\b/i.test(l))) ops.push("Nemotron agrees");
+  const ps = printedSum(a);
+  const supWord = ps ? `the sum of ${ps} printed values` : sup?.state === "supported" ? "the marked text / outline gives it" : sup?.state === "approximate" ? "outline traced, approximate" : "";
+  // T1 22:20, measured on 5,308 upload answers: how often answers marked like this were right
+  const measured = sup?.state === "supported" ? "On our upload tests, answers marked like this were right 3 times in 4 (9 in 10 when also fairly sure)."
+    : sup?.state === "approximate" ? "On our upload tests, answers marked 'approximate' were right about 4 times in 10: check the marks."
+    : sup?.state === "unlocated" ? "On our upload tests, answers we could not locate on the drawing were right about 1 time in 6." : "";
+  const tip = [`Our calibrated confidence: ${Math.round((a.confidence ?? 0) * 100)} %`, ag?.detail, sup?.why, measured, ...secondOpinionTitles(a)].filter(Boolean).join("\n");
+  let cls = c.cls, main = c.word, tail: string[] = [];
+  if (ag?.ok && !samePicture(a, c, ag)) {
+    cls = `${c.cls} st-ok`;
+    tail = ["2 independent methods agree", ...(ag.which ? [ag.which] : [])];
+  } else if (ag?.ok) {
+    // M1 21:47: a green 'agree' on a scan answer 20 % off — two readings of ONE picture share its outline and scale, so
+    // their agreement does not lift a best estimate: said plainly, no green
+    tail = ["a second reading of this picture agrees — check the marked spots"];
+  } else if (ag && !ag.ok) {
+    const v = typeof a.value === "number" ? a.value : NaN;
+    const other = otherReading(ag.detail, v);
+    if (other !== null && Number.isFinite(v) && v !== 0) {
+      const pct = Math.round((Math.abs(other - v) / Math.abs(v)) * 100);
+      const u = unitLabel(a.unit) ? ` ${unitLabel(a.unit)}` : "";
+      cls = "st-bad";
+      main = `Our reading ${fmtNum(v)}${u} · second reading ${fmtNum(other)}${u}: ${pct} % apart`;
+      tail = ["check the marked spots"];
+    } else {
+      cls = `${c.cls} st-warn`;
+      tail = ["two readings differ: check the marked spots"];
+    }
+  } else if (c.hint) tail = [c.hint];
+  if (supWord && !(ag && !ag.ok)) tail.push(supWord);
+  tail.push(...ops);
+  return `<span class="conf ${cls}" title="${esc(tip)}">${esc(main)}${tail.length ? `<small> · ${esc(tail.join(" · "))}</small>` : ""}</span>`;
+}
+/** An agreement that does not count as independent: under 'Fairly sure', between two readings of the same picture (a
+ *  scan / image, not a vector PDF), and not with another source (3D model, CAD file, schedule). */
+function samePicture(a: Answer, c: { cls: string }, ag: { which?: string }): boolean {
+  if (!c.cls.startsWith("est")) return false;
+  if (/3D model|CAD file|schedule/i.test(ag.which ?? "")) return false;
+  const files = (a.evidence ?? []).map((e) => String(e.file ?? "")).filter(Boolean);
+  const space = (a.evidence ?? []).map((e) => String((e as { bbox_space?: string }).bbox_space ?? ""));
+  return files.some((f) => /\.(png|jpe?g|tiff?|webp|heic)$/i.test(f)) || space.includes("image_px")
+    || (a.trace ?? []).some((l) => /\b(scan(ned)?|raster|photo)\b/i.test(String(l)) && /recogni[sz]ed as|read as|picture/i.test(String(l)));
+}
+const fmtNum = (v: number) => v.toLocaleString("en", { maximumFractionDigits: Math.abs(v) >= 100 ? 0 : 2 });
+/** The other reading's number in a cross-check text ('raster 6.40 m2 vs 7.12', 'its estimate 40.0 m2'): the first
+ *  number that is not the shown value (within 0.5 %) and not wildly off scale, else null. */
+function otherReading(detail: string, v: number): number | null {
+  for (const m of String(detail ?? "").matchAll(/(?<![\w.])(\d[\d,]*(?:\.\d+)?)/g)) {
+    const x = Number(m[1].replace(/,/g, ""));
+    if (!Number.isFinite(x) || x === 0) continue;
+    if (Number.isFinite(v) && Math.abs(x - v) <= Math.abs(v) * 0.005) continue;
+    if (Number.isFinite(v) && (x < Math.abs(v) * 0.2 || x > Math.abs(v) * 5)) continue; // a page number, a scale, a row count
+    return x;
+  }
+  return null;
+}
+function secondOpinionTitles(a: Answer): string[] {
+  return (a.trace ?? []).map(String).filter((l) => /Gemini 3\.1 Pro planned\b|Second opinion \(NVIDIA Nemotron|verifier Nemotron\b/.test(l)).map((l) => l.slice(0, 200));
+}
+
 /** Stoa judges cost on three tiers, not in dollars: cheap = rules on the drawing's own geometry and text (CPU only),
  *  in-between = a local AI model on our GPU, expensive = a hosted AI model (Gemini, Nemotron). From Answer.cost. */
+/** P1 23:33: Answer.cost may carry prep_* fields = the part spent reading the WHOLE FILE once (its text layer: 130 of
+ *  '132 calls' on a warm DfE answer), shared by every question on it; the plain fields stay totals. The tier and the
+ *  counts are this question's own work; the one-time reading is named in the tooltip. */
+function prepNote(a: Answer): string {
+  const c = (a.cost ?? {}) as Record<string, number>;
+  const k = Number(c.prep_llm_calls ?? 0) || 0, api = Number(c.prep_api_calls ?? 0) || 0;
+  return k + api > 0 ? ` + a one-time reading of this file (${k + api} model call${k + api > 1 ? "s" : ""}, done once, shared by every question on it)` : "";
+}
+/** This question's hosted-model spend in US$ (Gemini's reported cost, else list price per M tokens), 0 when none. */
+function hostedUsd(a: Answer): number {
+  const c = (a.cost ?? {}) as Record<string, number>;
+  const n = (k: string) => Math.max(0, (Number(c[k] ?? 0) || 0) - (Number(c[`prep_${k}`] ?? 0) || 0));
+  return n("gemini_usd") || n("usd") || (n("api_tokens_in") * 2 + n("api_tokens_out") * 12) / 1e6; // Gemini 3.1 Pro list price
+}
+export const usdWords = (usd: number) => (usd > 0 ? `≈ $${usd < 0.01 ? usd.toFixed(3) : usd.toFixed(2)}` : "");
+/** UX M17 / pass 2a NEW-4: ONE cost wording for the desktop card and the phone (it imports this): the tier first, then
+ *  the concrete spend: 'Cheap · no AI', 'In-between · our GPU', 'Hosted AI · ≈ $0.01' (was 'Expensive' in red on the
+ *  phone next to the desktop's '≈ $0.01 · 2 Gemini calls' for the same answer). */
 export function costTier(a: Answer): { tier: "cheap" | "mid" | "high"; word: string; why: string } {
   const c = (a.cost ?? {}) as Record<string, number>;
-  const n = (k: string) => Number(c[k] ?? 0) || 0;
-  if (n("api_calls") > 0 || n("api_tokens_in") > 0 || n("gemini_usd") > 0)
-    return { tier: "high", word: "Expensive", why: `a hosted AI model was called (${n("api_calls") || 1} call${n("api_calls") > 1 ? "s" : ""})` };
+  const n = (k: string) => Math.max(0, (Number(c[k] ?? 0) || 0) - (Number(c[`prep_${k}`] ?? 0) || 0));
+  if (n("api_calls") > 0 || n("api_tokens_in") > 0 || n("gemini_usd") > 0) {
+    const usd = usdWords(hostedUsd(a));
+    return { tier: "high", word: `Hosted AI${usd ? ` · ${usd}` : ""}`, why: `top cost tier: a hosted AI model was called (${n("api_calls") || 1} call${n("api_calls") > 1 ? "s" : ""})` };
+  }
   // a vision call or a long prompt is real GPU work; a one-line text check (~150 tokens, ~0.01 GPU s) is not
   if (n("gpu_seconds") > 0.25 || n("llm_tokens_in") > 600)
-    return { tier: "mid", word: "In-between", why: `a local AI model on our own GPU read the drawing${n("llm_calls") ? ` (${n("llm_calls")} call${n("llm_calls") > 1 ? "s" : ""})` : ""}` };
-  return { tier: "cheap", word: "Cheap", why: `rules on the drawing's own lines and text, on a normal CPU${n("llm_calls") ? ` (plus a one-line check by a small local language model, ${n("llm_tokens_in")} tokens)` : ", no AI model"}` };
+    return { tier: "mid", word: "In-between · our GPU", why: `middle cost tier: a local AI model on our own GPU read the drawing${n("llm_calls") ? ` (${n("llm_calls")} call${n("llm_calls") > 1 ? "s" : ""})` : ""}` };
+  return { tier: "cheap", word: "Cheap · no AI", why: `lowest cost tier: rules on the drawing's own lines and text, on a normal CPU${n("llm_calls") ? ` (plus a one-line check by a small local language model, ${n("llm_tokens_in")} tokens)` : ", no AI model"}` };
 }
 function tierHtml(a: Answer): string {
   const t = costTier(a);
@@ -1093,7 +1480,14 @@ function tierHtml(a: Answer): string {
   // a replay from the answer cache did no work this time (QA 19:11: 'Cost: expensive' on a 0.8 s cached replay): the tier
   // is what the first answer cost, said as such
   const again = !!a.cached && t.tier !== "cheap";
-  return `<span class="tier t-${t.tier}" title="Cost tier: ${esc(t.why)}${again ? ". This time it came from our answer cache: no new model calls" : ""}"><span class="tier-dots">${[1, 2, 3].map((k) => `<i class="${k <= dots ? "on" : ""}"></i>`).join("")}</span>Cost: <b>${t.word.toLowerCase()}</b>${again ? " <small>(first time; now cached)</small>" : ""}</span>`;
+  // captain 21:39 (4): neutral grey and concrete ('≈ $0.004 · 1 Gemini call'), not a red 'expensive'
+  const c = (a.cost ?? {}) as Record<string, number>;
+  const n = (k: string) => Math.max(0, (Number(c[k] ?? 0) || 0) - (Number(c[`prep_${k}`] ?? 0) || 0));
+  const calls = n("api_calls");
+  const who = (a.trace ?? []).some((l) => /gemini/i.test(String(l))) || n("gemini_usd") > 0 ? "Gemini" : "hosted model";
+  // the tier's own words (shared with the phone), then the calls in small type
+  const more = t.tier === "high" ? `${calls || 1} ${who} call${calls > 1 ? "s" : ""}` : t.tier === "mid" && n("llm_calls") ? `${n("llm_calls")} call${n("llm_calls") > 1 ? "s" : ""}` : "";
+  return `<span class="tier t-${t.tier}" title="Cost: ${esc(t.why)}${esc(prepNote(a))}${again ? ". This time it came from our answer cache: no new model calls" : ""}"><span class="tier-dots">${[1, 2, 3].map((k) => `<i class="${k <= dots ? "on" : ""}"></i>`).join("")}</span>Cost: <b>${esc(t.word)}</b>${more ? ` <small>· ${esc(more)}</small>` : ""}${again ? " <small>(cached)</small>" : ""}</span>`;
 }
 
 /** Evidence placed by image recognition (a detector box, a segmented region, a door swing found in pixels, an element
@@ -1138,11 +1532,13 @@ export function numbered(ev: Answer["evidence"], max = 5, spread = false): numbe
   return chosen.map((k) => all[k]);
 }
 
+/** G1 21:24: a count's 'searched area: the west facade of …' box (exact=false) is where we looked, not an item. */
+export const isSearchedArea = (e: Answer["evidence"][number]) => /^\s*searched area\b/i.test(e.note ?? "");
 function numberedAll(ev: Answer["evidence"], max: number): number[] {
   const out: number[] = [];
   const seen = new Set<string>();
   ev.forEach((e, i) => {
-    if (out.length >= max || !(e.bbox || e.ifc_guid)) return;
+    if (out.length >= max || !(e.bbox || e.ifc_guid) || isSearchedArea(e)) return;
     const k = e.ifc_guid ?? `${e.file}|${(e.bbox ?? []).join(",")}`;
     if (seen.has(k)) return;
     // a 2D box and its element's GlobalId are the same thing: number the box (it is what the plan shows)
@@ -1217,7 +1613,7 @@ const KIND_BY_SOLVER: Record<string, string> = {
   area_tags: "Floor plan with room area tags", // G1: Revit/CAD room tags 'U123 - 680 SF'
 };
 
-export function recognitionOf(a: Answer, file: string, opts: { sheet?: string; scale?: string } = {}): Recognition | null {
+export function recognitionOf(a: Answer, file: string, opts: { sheet?: string; scale?: string; structural?: boolean; piping?: boolean } = {}): Recognition | null {
   const t = (a.trace ?? []).map(String);
   const all = [...t, ...(a.assumptions ?? [])].join("\n");
   // G1 (night-G1 40e975d): the first trace line is 'recognised: {"kind","label","confidence","scale","scale_source",
@@ -1250,7 +1646,11 @@ export function recognitionOf(a: Answer, file: string, opts: { sheet?: string; s
     const pages = Number(g.pages ?? 1);
     const pg = g.page != null && pages > 1 ? `page ${Number(g.page) + 1} of ${pages}` : page;
     const sc = g.scale ? `${String(g.scale).replace(/\s+/g, "")}${/estimat|guess|assum/i.test(String(g.scale_source ?? "")) ? " (estimated)" : ""}` : undefined;
-    return { kind: cap(String(KIND_WORDS[String(g.kind)] ?? g.label ?? g.kind)), storey: about ? storey : g.storey ? cap(floorName(String(g.storey))) : storey,
+    let kind = cap(String(KIND_WORDS[String(g.kind)] ?? g.label ?? g.kind));
+    // captain 00:31: a 1:50 foundation / slab plan is not a 'Floor plan image'
+    if ((opts.structural || isStructural(a)) && /floor plan|plan image|drawing sheet|plan render/i.test(kind)) kind = "Structural sheet (slab / foundation plan)";
+    else if ((opts.piping || isPiping(a)) && /floor plan|plan image|drawing sheet|plan render/i.test(kind)) kind = "Piping plan";
+    return { kind, storey: about ? storey : g.storey ? cap(floorName(String(g.storey))) : storey,
       scale: opts.scale ?? sc, page: pg, conf: Number.isFinite(c) ? c : undefined };
   }
   let s = String(a.solver ?? "").split("/").pop() ?? "";

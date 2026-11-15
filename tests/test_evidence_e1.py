@@ -702,6 +702,28 @@ def test_lineplan_counts_rooms_by_their_printed_labels(tmp_path):
     assert answer(g, "How many risers does the main staircase have?") is None
 
 
+
+def test_lineplan_counts_only_the_rooms_labelled_exactly_as_asked(tmp_path, monkeypatch):
+    # D1 01:3x (DfE Secondary L00): 'How many rooms labelled 'Accessible Toilet'' counted every toilet-kind label
+    # ('Toilets', 'Toilet' too): 11 vs 5
+    import pymupdf
+
+    from stoa.evidence import lineplan as LP
+
+    f = str(tmp_path / "school.pdf")
+    doc = pymupdf.open()
+    pg = doc.new_page(width=600, height=400)
+    for x, y, t in [(60, 80, "Accessible Toilet"), (220, 80, "Accessible Toilet"), (380, 80, "Toilets"),
+                    (60, 220, "Toilet"), (220, 220, "Toilet"), (380, 220, "Staff Toilet"), (500, 300, "Kitchen")]:
+        pg.insert_text((x, y), t, fontsize=8)
+    doc.save(f)
+    assert LP.answer(f, "How many rooms labelled 'Accessible Toilet' are there on this plan?").value == 2
+    assert LP.answer(f, "How many rooms labelled 'Toilet' are there on this plan?").value == 2
+    assert LP.answer(f, "How many rooms labelled 'Toilets' are there on this plan?").value == 1
+    assert LP.answer(f, "How many toilets are there?").value == 6  # a type question still counts every toilet label
+    monkeypatch.setattr(LP, "COUNT_EXACT", False)
+    assert LP.answer(f, "How many rooms labelled 'Toilet' are there on this plan?").value == 6
+
 def test_counted_elements_at_one_spot_say_so():
     from stoa.contract import Answer, Evidence
     from stoa.evidence.shapes import mark_stacked
@@ -786,7 +808,8 @@ def test_printed_area_table_answers_totals_types_and_wings(tmp_path):
     table = [("WEST WING DORMITORY =", "6,095 SF"), ("WEST WING CIRCULATION =", "914 SF"),
              ("TOTAL WEST WING =", "7,009 SF"), ("NORTH WING DORMITORY =", "6,285 SF"),
              ("NORTH WING CIRCULATION =", "1,403 SF"), ("TOTAL NORTH WING =", "7,688 SF"),
-             ("COMMON SPACE =", "2,911 SF"), ("TOTAL SECOND FLOOR =", "17,608 SF")]
+             ("COMMON SPACE =", "2,911 SF"), ("EXTERIOR STAIR (1/2 SF) =", "381 SF"),
+             ("TOTAL SECOND FLOOR =", "17,608 SF")]
     for i, (lab, val) in enumerate(table):
         pg.insert_text((60, 60 + 14 * i), lab, fontsize=8)
         pg.insert_text((240, 60 + 14 * i), val, fontsize=8)
@@ -794,9 +817,14 @@ def test_printed_area_table_answers_totals_types_and_wings(tmp_path):
     pg.insert_text((400, 310), "250 SF", fontsize=8)  # a stacked room tag: not a table row
     doc.save(f)
     rs = rows(f)
-    assert len(rs) == 8 and ("TOTAL WEST WING", 7009.0, "ft2") == rs[2][:3]
+    assert len(rs) == 9 and ("TOTAL WEST WING", 7009.0, "ft2") == rs[2][:3]
     a = answer(f, "What is the total area of the second floor in square metres?")
     assert a is not None and a.unit == "m2" and abs(a.value - 17608 * 0.09290304) < 0.01 and a.evidence[0].exact
+    # T1 21:57: a sheet reference '(sheet A-2)' made '2' the subject and picked 'EXTERIOR STAIR (1/2 SF)'
+    for q in ("What is the total area of the second floor in square metres? (sheet A-2)",
+              "What is the total area of the second floor on drawing A-2, in m²?"):
+        s2 = answer(f, q)
+        assert s2 is not None and abs(s2.value - 17608 * 0.09290304) < 0.01, (q, s2)
     b = answer(f, "What is the total dormitory area across both wings?")
     assert b is not None and b.value == 6095 + 6285 and len(b.evidence) == 2
     assert answer(f, "How many square feet of circulation does the north wing have?").value == 1403
@@ -1358,3 +1386,644 @@ def test_semicircle_door_swing_with_its_leaf_closes_the_doorway(tmp_path, monkey
     L._dist.cache_clear()
     r2 = L.measure_room(f, 0, (180, 175), 100)
     assert r2 is None or r2["area_m2"] < 0.975 * full or r2["area_m2"] > 1.2 * full, (r2 and r2["area_m2"], full)
+
+
+def test_labels_drawn_upwards_stack_in_their_own_reading_frame(tmp_path):
+    """A sheet plotted with /Rotate 90 (D1's AF module plans): every label runs upwards in page space and the second
+    line of 'Sports Program' / 'Manager Office' sits to its RIGHT in page x. Both lines are one label."""
+    import pymupdf
+
+    from stoa.evidence.lineplan import answer, labels
+    from stoa.evidence.linework import PT_TO_M_AT_1
+
+    f = str(tmp_path / "rot.pdf")
+    doc = pymupdf.open()
+    pg = doc.new_page(width=600, height=400)
+    sh = pg.new_shape()
+    for a, b in [((100, 100), (400, 100)), ((100, 250), (400, 250)), ((100, 100), (100, 250)),
+                 ((400, 100), (400, 250)), ((300, 100), (300, 250))]:
+        sh.draw_line(a, b)
+    sh.finish(color=(0, 0, 0), width=1.0)
+    sh.commit()
+    pg.insert_text((180, 215), "SPORTS PROGRAM", fontsize=7, rotate=90)
+    pg.insert_text((189, 215), "MANAGER OFFICE", fontsize=7, rotate=90)
+    pg.insert_text((350, 200), "STORE", fontsize=7, rotate=90)
+    pg.insert_text((450, 380), "SCALE 1:100", fontsize=8)
+    doc.save(f)
+    labs = labels(f)
+    assert [lab["text"] for lab in labs if "SPORTS" in lab["text"]] == ["SPORTS PROGRAM MANAGER OFFICE"], labs
+    lab = next(lab for lab in labs if "SPORTS" in lab["text"])
+    assert 170 <= lab["pt"][0] <= 195 and 120 <= lab["pt"][1] <= 220  # the box is back in page space
+    k = 100 * PT_TO_M_AT_1
+    a = answer(f, "What is the area of the sports program manager office?")
+    assert a is not None and abs(a.value / (200 * 150 * k * k) - 1) <= 0.03, a
+
+
+def _two_view_sheet(path, rcp_room):
+    """One office drawn twice, US module-set style: '… - FLOOR PLAN' (closed 200 x 150 pt room) and '… - RCP' to its
+    right, whose walls are `rcp_room` ('open': one wall missing, no closed room; 'small': the tag sits in a 60 x 150 pt
+    room). Both views print the tag 'OFFICE'."""
+    import pymupdf
+
+    doc = pymupdf.open()
+    pg = doc.new_page(width=800, height=400)
+    sh = pg.new_shape()
+    segs = [((100, 100), (300, 100)), ((100, 250), (300, 250)), ((100, 100), (100, 250)), ((300, 100), (300, 250))]
+    if rcp_room == "open":
+        segs += [((450, 100), (650, 100)), ((450, 250), (650, 250)), ((450, 100), (450, 250))]
+    else:
+        segs += [((450, 100), (650, 100)), ((450, 250), (650, 250)), ((450, 100), (450, 250)), ((650, 100), (650, 250)),
+                 ((520, 100), (520, 250)), ((580, 100), (580, 250))]
+    for a, b in segs:
+        sh.draw_line(a, b)
+    sh.finish(color=(0, 0, 0), width=1.0)
+    sh.commit()
+    pg.insert_text((185, 178), "OFFICE", fontsize=7)
+    pg.insert_text((535, 178), "OFFICE", fontsize=7)
+    pg.insert_text((100, 290), "MODULE 01 - FLOOR PLAN", fontsize=8)
+    pg.insert_text((450, 290), "MODULE 01 - RCP", fontsize=8)
+    pg.insert_text((600, 380), "SCALE 1:100", fontsize=8)
+    doc.save(path)
+
+
+def test_a_room_tag_repeated_in_the_rcp_is_measured_in_the_floor_plan(tmp_path):
+    from stoa.evidence.lineplan import answer, floor_plan_labels, labels
+    from stoa.evidence.linework import PT_TO_M_AT_1
+
+    k = 100 * PT_TO_M_AT_1
+    f = str(tmp_path / "open.pdf")
+    _two_view_sheet(f, "open")
+    labs = labels(f)
+    kept = [lab["text"] for lab in floor_plan_labels(f, 0, labs)]
+    assert [t for t in (lab["text"] for lab in labs) if t == "OFFICE"] == ["OFFICE", "OFFICE"] and kept.count("OFFICE") == 1
+    a = answer(f, "What is the area of the office?")  # the RCP copy does not trace: it no longer blocks the answer
+    assert a is not None and abs(a.value / (200 * 150 * k * k) - 1) <= 0.03, a
+    g = str(tmp_path / "small.pdf")
+    _two_view_sheet(g, "small")
+    assert answer(g, "What is the area of the office?") is None  # the twin traces to a different size: no answer
+
+
+def test_room_grows_to_the_middle_of_a_thick_wall_line_on_a_big_sheet(tmp_path, monkeypatch):
+    """AF module plans (34 x 22 in sheet -> 1.74 px/pt): the room's face is a 1.26 pt line with grey poché behind it.
+    _dist's uint8 truncation adds a one-pixel ring to every line, so without RING_FIX the room stops ~0.6 px short per
+    side (Flight Sergeant 117.5 vs 120 sq ft); with it the trace reaches the line's middle."""
+    import pymupdf
+
+    from stoa.evidence import linework as L
+
+    f = str(tmp_path / "big.pdf")
+    doc = pymupdf.open()
+    pg = doc.new_page(width=2448, height=1584)
+    x0, y0, x1, y1 = 500.0, 500.0, 584.3, 614.78
+    sh = pg.new_shape()
+    for r in [(x0 - 3.7, y0 - 3.7, x1 + 3.7, y0), (x0 - 3.7, y1, x1 + 3.7, y1 + 3.7),
+              (x0 - 3.7, y0, x0, y1), (x1, y0, x1 + 3.7, y1)]:
+        sh.draw_rect(pymupdf.Rect(*r))
+    sh.finish(color=None, fill=(0.38, 0.38, 0.38), width=0)
+    sh.draw_rect(pymupdf.Rect(x0, y0, x1, y1))
+    sh.finish(color=(0, 0, 0), width=1.26)
+    sh.commit()
+    pg.insert_text((520, 560), "OFFICE", fontsize=7)
+    doc.save(f)
+    k = 100 * L.PT_TO_M_AT_1
+    true = (x1 - x0) * (y1 - y0) * k * k
+    got = {}
+    monkeypatch.setattr(L, "FACE_SNAP", False)  # the pixel reading itself (the face snap would answer the exact faces)
+    for on in (False, True):
+        monkeypatch.setattr(L, "RING_FIX", on)
+        L._dist.cache_clear() if hasattr(L._dist, "cache_clear") else None
+        m = L.measure_room(f, 0, (542, 557), 100.0, tag_box=(520, 553, 545, 561))
+        assert m is not None
+        got[on] = m["area_m2"] / true - 1
+    # the centre pixel counts whole: +-half a pixel per side either way (-1.1 % -> +1.06 % here at 1.74 px/pt); on the
+    # real AF sheets the Revit schedule sits ~0.5 % above the inner-face geometry, and the fix lands on it (120.0 / 120)
+    assert got[False] < -0.008 and 0 < got[True] <= 0.015, got
+
+
+def test_face_snap_answers_the_vector_wall_faces_of_a_solid_wall_room(tmp_path, monkeypatch):
+    """D1 cycle 8: DfE-style solid walls (black fills + a 0.6 pt outline on every fill edge) at 1:200 on an A2 page. The
+    pixel reading counts its boundary pixels whole and grows into the fill (+1-3 % on 3-13 m2 rooms); the snap puts every
+    side on the fill edge = the CAD wall face, whatever the pixel grid."""
+    import pymupdf
+
+    from stoa.evidence import linework as L
+
+    f = str(tmp_path / "dfe.pdf")
+    doc = pymupdf.open()
+    pg = doc.new_page(width=1684, height=1191)
+    x0, y0, x1, y1 = 600.13, 400.37, 651.29, 437.91  # 3.61 x 2.65 m at 1:200
+    sh = pg.new_shape()
+    for r in [(x0 - 2.1, y0 - 2.1, x1 + 2.1, y0), (x0 - 2.1, y1, x1 + 2.1, y1 + 2.1),
+              (x0 - 2.1, y0, x0, y1), (x1, y0, x1 + 2.1, y1)]:
+        sh.draw_rect(pymupdf.Rect(*r))
+    sh.finish(color=(0, 0, 0), fill=(0, 0, 0), width=0.6)
+    sh.commit()
+    pg.insert_text((610, 420), "Store", fontsize=4)
+    doc.save(f)
+    k = 200 * L.PT_TO_M_AT_1
+    true = (x1 - x0) * (y1 - y0) * k * k
+    got = {}
+    for on in (False, True):
+        monkeypatch.setattr(L, "FACE_SNAP", on)
+        m = L.measure_room(f, 0, (615, 419), 200.0, tag_box=(609, 416, 622, 421))
+        assert m is not None
+        got[on] = m["area_m2"] / true - 1
+    assert abs(got[True]) <= 0.002, got
+    assert abs(got[True]) < abs(got[False]), got
+
+
+def test_a_capital_letter_after_the_room_name_picks_among_tied_labels():
+    from stoa.evidence.lineplan import _match_labels, _words
+
+    labs = [{"text": t, "words": _words(t)} for t in ["Classroom Area A", "Classroom Area B", "Group Exercise B"]]
+    assert [x["text"] for x in _match_labels(labs, "How many square feet is the Classroom Area B?")] == ["Classroom Area B"]
+    assert [x["text"] for x in _match_labels(labs, "What is the area of Group Exercise B and the lobby?")] == \
+        ["Group Exercise B"]
+    assert len(_match_labels(labs, "How big is a classroom area?")) == 2  # the article 'a' picks nothing
+
+
+def test_slab_named_by_its_bar_mark_alone_or_in_finnish():
+    """X1 21:26 rephrase probe on S-100F: 'the D13 slab' read '13' as a thickness and also matched a rebar note;
+    'maanvaraisen laatan' (genitive) did not count as a slab question."""
+    from stoa.evidence.slabs import _SLAB_Q, _pick
+
+    b = (0, 0, 1, 1)
+    cs = (("150 SLAB-ON-GRADE W/ D13 @ 300", 150, ("D13",), (300,), b),
+          ("2 - D13 X 1200 @ 100 O.C. AT 150 BELOW T.O. SLAB", None, ("D13",), (100,), b),
+          ("300 SLAB-ON-GRADE W/ D16 @ 300 TOP FACE", 300, ("D16",), (300,), b),
+          ("300 SLAB-ON- GRADE W/ D22", 300, ("D22",), (), b))
+    assert _pick(cs, "What is the area of the D13 slab?") is cs[0]
+    assert _pick(cs, "What is the area of the D16 slab?") is cs[2]
+    assert _pick(cs, "What is the area of the 300 mm slab?") is None  # two 300 mm types
+    assert _SLAB_Q.search("Mikä on 150 mm maanvaraisen laatan (D13 @ 300) pinta-ala?")
+
+
+def _counter_sheet(path):
+    """AFCEE A-101 Break Room in miniature (X1 sl-243..248): a 4 x 3 m room at 1:100 with grey wall fills, a 1.4 m OPEN
+    entrance in its top wall, drawn twice ('… - FLOOR PLAN' with a 0.6 m deep kitchen counter of thin lines along its
+    left wall, '… - RCP' without). The counter cuts the floor plan's line trace; the walls alone do not."""
+    import pymupdf
+
+    from stoa.evidence.linework import PT_TO_M_AT_1
+
+    u = 1 / (100 * PT_TO_M_AT_1)
+    t = 0.15 * u
+    doc = pymupdf.open()
+    pg = doc.new_page(width=900, height=420)
+    sh = pg.new_shape()
+    for ox in (100, 500):
+        x0, y0, x1, y1 = ox, 100, ox + 4 * u, 100 + 3 * u
+        for r in [(x0 - t, y0 - t, x0 + 1.0 * u, y0), (x0 + 2.4 * u, y0 - t, x1 + t, y0), (x0 - t, y1, x1 + t, y1 + t),
+                  (x0 - t, y0, x0, y1), (x1, y0, x1 + t, y1)]:
+            sh.draw_rect(pymupdf.Rect(*r))  # one fill path per wall piece, as Revit exports them
+            sh.finish(color=None, fill=(0.38, 0.38, 0.38), width=0)
+    sh.draw_rect(pymupdf.Rect(100, 100 + 0.2 * u, 100 + 0.6 * u, 100 + 3 * u))  # the counter (floor plan only)
+    sh.draw_line((100 + 0.1 * u, 100 + 1.0 * u), (100 + 0.5 * u, 100 + 1.0 * u))  # sink edge
+    sh.finish(color=(0, 0, 0), width=0.3)
+    sh.commit()
+    for ox in (100, 500):
+        pg.insert_text((ox + 2.0 * u, 100 + 1.6 * u), "BREAK ROOM", fontsize=7)
+    pg.insert_text((100, 260), "MODULE 02 - FLOOR PLAN", fontsize=8)
+    pg.insert_text((500, 260), "MODULE 02 - RCP", fontsize=8)
+    pg.insert_text((700, 400), "SCALE 1:100", fontsize=8)
+    doc.save(path)
+
+
+def test_furniture_in_the_floor_plan_only_room_traced_from_its_walls(tmp_path):
+    """X1 22:05: the floor-plan trace stopped at the counter (9.48 m²) while the RCP twin traced the room (11.53), so
+    the twin check abstained on every Break Room question. Both traced from the WALLS (fills + bridged openings): they
+    agree -> area / perimeter of the room; its open entrance measured jamb to jamb; skirting with condition sentences."""
+    from stoa.evidence.lineplan import _rooms_text, answer
+
+    f = str(tmp_path / "break.pdf")
+    _counter_sheet(f)
+    a = answer(f, "What is the area of the Break Room?")
+    assert a is not None and abs(a.value / 12.0 - 1) <= 0.03, a
+    assert any("WALLS only" in x for x in a.assumptions)
+    p = answer(f, "What is the perimeter of the Break Room?")
+    assert p is not None and abs(p.value / 14.0 - 1) <= 0.03, p
+    o = answer(f, "How wide is the opening into the Break Room from the corridor?")
+    assert o is not None and abs(o.value - 1.4) <= 0.06, o
+    q = ("How many metres of skirting do we need for the Break Room? No skirting across the open entrance, and leave "
+         "the store out.")
+    assert _rooms_text(q) == "How many metres of skirting do we need for the Break Room?"
+    s = answer(f, q)
+    assert s is not None and abs(s.value - (14.0 - 1.4)) <= 0.3, s
+
+
+def test_area_table_row_read_twice_by_ocr_counts_once():
+    """T1 21:59: on the AFCEC PNG one printed row came back twice from OCR ('G DORMITORY = 6,095 SF' and, from an
+    overlapping tile, 'G DORMITORY = 5 SF'); the sum over the wings took both (18,477 from 4 rows)."""
+    from stoa.evidence.areatable import _pair
+
+    h = (1, 0)
+    lines = [("WEST WING DORMITORY =", (100, 100, 400, 120), h), ("6,095 SF", (420, 100, 520, 120), h),
+             ("G DORMITORY =", (100, 200, 400, 220), h), ("6,092 SF", (420, 200, 520, 220), h),
+             ("G DORMITORY =", (101, 201, 400, 219), h), ("5 SF", (490, 201, 521, 219), h),
+             ("NORTH WING DORMITORY =", (100, 300, 400, 320), h), ("6,285 SF", (420, 300, 520, 320), h)]
+    rs = _pair(lines, left_only=True)
+    assert sorted(r[1] for r in rs) == [6092, 6095, 6285], rs
+
+
+def test_area_table_on_a_scan_with_a_titled_table_and_split_equals(tmp_path, monkeypatch):
+    """D1 21:52 (HAER hi0822 sheet C3, a real scan): 'CATCHMENT AREA:' over RAINSHED #43 / #241, GROUND CATCHMENT GC1 /
+    GC2 and TOTAL; OCR splits the '=' off ('= 266,035 SQ FT', a lone '=' item). Rows pair, the title makes every row a
+    catchment, plurals fold, 'ground catchment' is not the ground floor."""
+    from types import SimpleNamespace as NS
+
+    from stoa.evidence import areatable as A
+
+    raw = [("CATCHMENT AREA:", (375, 18, 509, 34)), ("RAINSHED #43", (408, 41, 521, 60)), ("=", (607, 45, 622, 57)),
+           ("40,228 SQ FT", (633, 41, 741, 59)), ("RAINSHED #241", (409, 57, 531, 76)), ("=", (607, 62, 621, 73)),
+           ("45,929 SQ FT", (634, 57, 742, 76)), ("GROUND CÄTCHMENT GC1 = 128,878 SQ FT", (409, 73, 743, 92)),
+           ("GROUND CATCHMENT GC2", (409, 90, 591, 108)), ("=", (589, 92, 611, 104)), ("51,000 SQ FT", (632, 90, 742, 108)),
+           ("TOTAL", (540, 116, 588, 133)), ("= 266,035 SQ FT", (599, 114, 742, 132))]
+    layer = NS(items=[NS(text=t, box=b) for t, b in raw], size=(3000, 2000))
+    rs = A._pair(A._item_lines(raw), left_only=True)
+    assert [r[1] for r in rs] == [40228, 45929, 128878, 51000, 266035], rs
+    img = tmp_path / "scan.png"
+    img.write_bytes(b"x")
+    monkeypatch.setattr(A, "image_rows", lambda path: rs)
+    monkeypatch.setattr(A, "_cached_layer", lambda path: layer)
+    for q, gold in [("What is the total catchment area?", 266035), ("What is the area of ground catchment GC1?", 128878),
+                    ("What is the combined area of the two ground catchments?", 179878),
+                    ("What is the combined area of the rainsheds?", 86157),
+                    ("What is the catchment area of building 241?", 45929)]:
+        a = A.answer(str(img), q)
+        assert a is not None and a.value == gold, (q, a)
+
+
+def test_slab_area_from_printed_chains_plus_a_pocket_round_the_corner(tmp_path):
+    """Captain 22:40 / Ziying S-100F D16 ('Read the dimensions; do not trace'): the main rectangle comes from printed
+    CHAINS on both axes (5500 + 5500 by 4000 + 4000), a landing drawn in its corner is not a void, and the pocket beyond
+    the main rectangle is snapped to its printed ticks (1750 by 150 unprinted + 2200) -> main + pocket, with the main
+    rectangle alone stated as the alternative ('without the stair pocket' answers it)."""
+    import pymupdf
+
+    from stoa.evidence import slabs
+    from stoa.evidence.linework import PT_TO_M_AT_1
+
+    f = str(tmp_path / "sog.pdf")
+    k = 1000 * 50 * PT_TO_M_AT_1  # mm per pt at 1:50
+    x0, y0 = 150.0, 150.0
+    W, H, P, PH, S = 11000 / k, 8000 / k, 1750 / k, 2350 / k, 150 / k
+    doc = pymupdf.open()
+    pg = doc.new_page(width=1190, height=842)
+    sh = pg.new_shape()
+    out = [(x0, y0), (x0 + W + P, y0), (x0 + W + P, y0 + PH), (x0 + W, y0 + PH), (x0 + W, y0 + H), (x0, y0 + H)]
+    sh.draw_polyline(out + [out[0]])
+    sh.finish(color=(0, 0, 0), width=1.0, closePath=True)
+    sh.draw_rect(pymupdf.Rect(x0, y0 + H - 3000 / k, x0 + 1000 / k, y0 + H))  # a landing in the corner
+    sh.finish(color=(0, 0, 0), width=0.5)
+
+    def chain(ticks, at, horiz):
+        for a, b in zip(ticks, ticks[1:]):
+            sh.draw_line((a, at), (b, at)) if horiz else sh.draw_line((at, a), (at, b))
+        for t in ticks:
+            sh.draw_line((t, at - 3), (t, at + 3)) if horiz else sh.draw_line((at - 3, t), (at + 3, t))
+    chain([x0, x0 + W / 2, x0 + W], y0 + H + 25, True)
+    chain([y0, y0 + H / 2, y0 + H], x0 - 25, False)
+    chain([x0 + W, x0 + W + P], y0 - 25, True)
+    chain([y0 + S, y0 + PH], x0 + W + P + 25, False)
+    sh.finish(color=(0, 0, 0), width=0.25, closePath=False)
+    sh.commit()
+    for x in (x0 + W / 4, x0 + 3 * W / 4):
+        pg.insert_text((x - 8, y0 + H + 22), "5500", fontsize=6)
+    for y in (y0 + H / 4, y0 + 3 * H / 4):
+        pg.insert_text((x0 - 28, y + 8), "4000", fontsize=6, rotate=90)
+    pg.insert_text((x0 + W + P / 2 - 8, y0 - 28), "1750", fontsize=6)
+    pg.insert_text((x0 + W + P + 22, y0 + S + (PH - S) / 2 + 8), "2200", fontsize=6, rotate=90)
+    pg.insert_text((x0 + W / 2, y0 + H / 2), "300 SLAB-ON-GRADE W/ D16 @ 300", fontsize=6)
+    pg.insert_text((900, 800), "SCALE 1:50", fontsize=8)
+    doc.save(f)
+    a = slabs.answer(f, "What is the area of the 300 SLAB-ON-GRADE W/ D16 @ 300?")
+    want = 11000 * 8000 / 1e6 + 1750 * 2350 / 1e6
+    assert a is not None and abs(a.value - want) <= 0.02, (a and a.value, a and a.trace)
+    assert any("it is 88.0 m²" in s for s in a.assumptions), a.assumptions
+    notes = [e.note for e in a.evidence]
+    assert sum(n.startswith("dimension ") for n in notes) == 6 and any("2200 printed + 150 measured" in n for n in notes)
+    b = slabs.answer(f, "What is the area of the D16 slab without the stair pocket?")
+    assert b is not None and b.value == 88.0
+
+
+def test_ocr_chains_place_printed_numbers_by_their_spacing(tmp_path):
+    """Traced pictures lose their dimension lines: a printed chain is recovered from the OCR'd numbers alone, since
+    each number sits mid-segment (5800 -> 7400 centres (5800 + 7400) / 2 apart at 1:50). A lone number or one at the
+    wrong spacing is not chained; vertical chains are found too."""
+    import pymupdf
+
+    from stoa.evidence import slabs
+    from stoa.evidence.linework import PT_TO_M_AT_1
+
+    f = str(tmp_path / "plan.s6000.vec6.pdf")
+    k = 1000 * 50 * PT_TO_M_AT_1
+    doc = pymupdf.open()
+    pg = doc.new_page(width=1600, height=1200)
+    x, y = 100.0, 100.0
+    for v in (5800, 7400, 6300):  # a horizontal chain
+        c = x + v / 2 / k
+        pg.insert_text((c - 8, y), str(v), fontsize=6, render_mode=3)
+        x += v / k
+    pg.insert_text((900, y), "4000", fontsize=6, render_mode=3)  # same line, wrong spacing
+    yy = 300.0
+    for v in (5500, 5500):  # a vertical chain
+        c = yy + v / 2 / k
+        pg.insert_text((1300, c + 2), str(v), fontsize=6, render_mode=3)
+        yy += v / k
+    pg.insert_text((700, 900), "1234", fontsize=6, render_mode=3)  # alone
+    doc.save(f)
+    ch = slabs._ocr_chains(f, 0, 50.0)
+    hs = sorted((d for d in ch if d[1] == "h"), key=lambda d: d[2])
+    vs = sorted((d for d in ch if d[1] == "v"), key=lambda d: d[2])
+    assert [d[0] for d in hs] == [5800, 7400, 6300], ch
+    assert abs((hs[-1][3] - hs[0][2]) * k - 19500) <= 150 and hs[0][3] == hs[1][2]
+    assert [d[0] for d in vs] == [5500, 5500] and abs((vs[-1][3] - vs[0][2]) * k - 11000) <= 150
+    assert all(d[7] == "ocr" for d in ch) and not any(d[0] in (4000, 1234) for d in ch)
+
+
+def test_all_rooms_labelled_a_quoted_name_take_that_exact_label():
+    """D1 23:11 (DfE GA plans): 'all rooms labelled 'Toilet'' = the rooms whose label IS 'Toilet', not 'Toilets' /
+    'Accessible Toilet'; 'Sports Store' is not 'Sports Equipment Store'; a plural fold only when nothing is exact."""
+    from stoa.evidence import lineplan as LP
+
+    def lab(t):
+        return {"text": t, "words": [w.lower() for w in t.split()]}
+    labs = [lab("Toilet"), lab("TOILET"), lab("Toilets"), lab("Accessible Toilet"), lab("Sports Store"),
+            lab("Sports Equipment Store"), lab("Cloakrooms")]
+    hit, name, fold = LP._exact_labels(labs, "What is the total floor area of all rooms labelled 'Toilet' on this plan?")
+    assert [h["text"] for h in hit] == ["Toilet", "TOILET"] and name == "toilet" and not fold
+    hit, _n, _f = LP._exact_labels(labs, "Total area of all rooms named Sports Store?")
+    assert [h["text"] for h in hit] == ["Sports Store"]
+    hit, _n, fold = LP._exact_labels(labs, "What is the total floor area of all rooms labelled 'Cloakroom'?")
+    assert [h["text"] for h in hit] == ["Cloakrooms"] and fold
+    assert LP._exact_labels(labs, "What is the total floor area of all the toilets?") is None
+
+
+def test_a_different_qualifier_before_the_same_room_noun_is_another_room():
+    """X1 23:20 (EFA superblock PNG, whose OCR lost 'Sports Hall'): 'the sports hall' must not take the label 'Main Hall
+    Void Above'; 'the hall', 'the main hall' and 'Main Hall skirting' still match it."""
+    from stoa.evidence import lineplan as LP
+
+    labs = [{"text": "Main Hall Void Above", "words": ["main", "hall", "void", "above"]}]
+    assert LP._match_labels(labs, "How wide is the sports hall?") == []
+    assert LP._match_labels(labs, "What is the floor area of the dining hall?") == []
+    for q in ("How big is the hall?", "What is the floor area of the main hall?",
+              "How many metres of skirting go around the walls of the Main Hall?"):
+        assert LP._match_labels(labs, q) == labs, q
+
+
+def test_the_four_infants_classrooms_are_the_four_rooms_labelled_infants():
+    """X1 sl-309 (EFA primary GF): 'the total floor area of the four Infants classrooms' -- labelled 'Infants' (x4) next
+    to 'Infants WC' (x2): without the room-type noun the asked word names exactly the counted 4."""
+    from stoa.evidence import lineplan as LP
+
+    def lab(t):
+        return {"text": t, "words": [w.lower() for w in t.split() if len(w) >= 3]}
+    labs = [lab("Infants")] * 4 + [lab("Infants WC")] * 2 + [lab("Juniors")] * 3
+    got = LP._counted_labels(labs, "What is the total floor area of the four Infants classrooms?")
+    assert got is not None and len(got) == 4 and all(g["text"] == "Infants" for g in got)
+    assert LP._counted_labels(labs, "What is the total floor area of the three Infants classrooms?") is None
+    assert LP._counted_labels(labs, "What is the floor area of the four Infants classrooms?") is None  # no total
+
+
+def test_wide_gap_dash_runs_must_be_regular():
+    """Traced dashes (c13): gaps of 4.5-4.8 pt between 4.8-5 pt dashes are a printed dash pattern (EFA primary PNG grid
+    line); a scan-broken solid line with uneven pieces and gaps above 4 pt is not (only its <= 4 pt parts are judged)."""
+    from stoa.evidence.linework import _regular_runs
+
+    dash = [(i * 9.6, i * 9.6 + 4.9, i) for i in range(8)]  # 4.9 pt dashes, 4.7 pt gaps
+    assert _regular_runs(dash, 6) == [dash]
+    xs, broken = 0.0, []
+    for i, (ln, gp) in enumerate([(1.0, 5.5), (7.5, 1.0), (2.0, 5.8), (6.0, 0.8), (1.5, 4.5), (7.0, 1.2), (3.0, 5.0)]):
+        broken.append((xs, xs + ln, i))
+        xs += ln + gp
+    assert _regular_runs(broken, 6) == []
+    tight = [(i * 6.0, i * 6.0 + 3.0, i) for i in range(7)]  # 3 pt gaps: as before, whatever the regularity
+    assert _regular_runs(tight, 6) == [tight]
+
+
+def test_a_label_named_in_the_question_is_summed_whatever_the_wording():
+    """D1 23:52 (dfe26 wording probe 15 -> 36 / 54) / H 23:51: the label whose own words all occur, in order, in the
+    question names the rooms ('do', 'have', 'add up', 'eight' need not be in the label); a plural, all / every or a
+    number makes it a total; a count that disagrees with the labels, a wing / side word or 'except' -> None."""
+    from stoa.evidence import lineplan as LP
+
+    def lab(t):
+        return {"text": t, "words": [w.lower() for w in t.split() if len(w) >= 3]}
+    labs = [lab("Group Room")] * 5 + [lab("Hall")] + [lab("Specialist Science Laboratory")] * 3 + \
+        [lab("Maths 1"), lab("Maths 2"), lab("Maths 3"), lab("Maths SWR"), lab("Math St.")]
+    for q in ("What is the combined floor area of the Group Rooms?",
+              "How much floor area do all the Group Rooms have together?",
+              "What is the total area of the five Group Rooms on this plan?"):
+        got = LP._phrase_sum(labs, q)
+        assert got is not None and len(got[0]) == 5, q
+    got = LP._phrase_sum(labs, "What is the combined floor area of the Specialist Science Laboratories?")
+    assert got is not None and len(got[0]) == 3  # 'laboratories' folds to 'laboratory'
+    assert LP._phrase_sum(labs, "What is the total area of the four Group Rooms?") is None  # 5 on the sheet
+    assert LP._phrase_sum(labs, "What is the combined area of the Group Rooms in the east wing?") is None
+    assert LP._phrase_sum(labs, "Total area of the Group Rooms except the hall?") is None
+    assert LP._phrase_sum(labs, "What is the area of the Group Room?") is None  # one room, no plural
+    got = LP._phrase_sum(labs, "Total floor area of the maths classrooms?")  # X1 sl-123: numbered rooms only
+    assert got is not None and sorted(g["text"] for g in got[0]) == ["Maths 1", "Maths 2", "Maths 3"]
+    assert LP._UNIT_TAIL.sub("?", "Sum of the floor areas of all Secondary Classrooms, in m²") == \
+        "Sum of the floor areas of all Secondary Classrooms?"
+    assert LP._AREA_Q.search("Add up the floor areas of every room")
+
+
+def test_slab_wordings_areas_and_how_many_square_metres():
+    """H 23:51 (e)-(g): 'Sum of all slab areas?' and 'How many m² is the … slab' are area questions; 'How many slab
+    panels' stays a count."""
+    import re
+
+    from stoa.evidence import slabs as S
+
+    assert S._AREA_Q.search("Sum of all slab areas?")
+    assert not re.search(S._HOWMANY_NOT_AREA, "How many m² is the 300 mm slab-on-grade with D16 @ 300?", re.I)
+    assert re.search(S._HOWMANY_NOT_AREA, "How many panels does the slab have?", re.I)
+
+
+def test_traced_copies_without_fills_skip_the_all_lines_variant():
+    """D1 23:45: on a picture traced into lines (no fills) grey furniture closes rooms in 'all'; a vector PDF keeps it."""
+    import numpy as np
+
+    from stoa.evidence import linework as L
+
+    st = [(np.zeros((2, 2), np.int32), 0.5, True)] * 25 + [(np.zeros((2, 2), np.int32), 0.3, False)]
+    assert L._variants({"strokes": st, "fills": [], "traced": True})[0] == "dark"
+    assert L._variants({"strokes": st, "fills": [], "traced": False})[:2] == ["all", "dark"]
+    assert L._variants({"strokes": st, "fills": [object()], "traced": True})[:2] == ["all", "dark"]
+
+
+def test_area_table_wordings_space_whole_floor_and_counting(monkeypatch):
+    """H 23:51 (h)/(i), X1 22:22: 'Total circulation space?', 'the circulation area on this floor' (no 'total') sum the
+    circulation rows; 'the total common area …, counting its circulation and utility space' = TOTAL COMMON SPACE; a wing
+    named still picks its row."""
+    from stoa.evidence import areatable as A
+
+    b = (0, 0, 1, 1)
+    rs = (("WEST WING DORMITORY", 6095.0, "ft2", b), ("WEST WING CIRCULATION", 914.0, "ft2", b),
+          ("TOTAL WEST WING", 7009.0, "ft2", b), ("NORTH WING CIRCULATION", 1403.0, "ft2", b),
+          ("TOTAL NORTH WING", 7688.0, "ft2", b), ("COMMON SPACE", 2911.0, "ft2", b),
+          ("COMMON SPACE CIRCULATION", 1240.0, "ft2", b), ("UTILITY", 328.0, "ft2", b),
+          ("TOTAL COMMON SPACE", 4479.0, "ft2", b))
+    monkeypatch.setattr(A, "rows", lambda pdf, page=0: rs)
+    monkeypatch.setattr(A, "_table_title", lambda *a, **k: set())
+
+    def val(q):
+        a = A.answer("x.pdf", q)
+        return a and a.value
+    assert val("Total circulation space?") == 3557.0
+    assert val("What is the circulation area on this floor?") == 3557.0
+    assert val("How much circulation area is there?") == 3557.0
+    assert val("What's the total common area on this floor, counting its circulation and utility space?") == 4479.0
+    assert val("common space total incl circulation") == 4479.0
+    assert val("What is the circulation area of the north wing?") == 1403.0
+    assert val("What space is next to the stair?") is None
+
+
+def test_thin_filled_strips_and_rings_are_lines_not_walls():
+    """X1 23:20 (EFA superblock Sports Hall): court markings drawn as 0.3-0.4 pt filled strips and even-odd rings are
+    lines; a 1.4 pt wall strip and a filled column stay walls."""
+    from stoa.evidence import linework as L
+
+    strip = [(550.6, 157.1), (656.9, 157.1), (656.9, 157.4), (550.6, 157.4), (550.6, 157.1)]
+    assert L._thin_strip(strip) is not None
+    wall = [(100, 100), (200, 100), (200, 101.4), (100, 101.4), (100, 100)]
+    assert L._thin_strip(wall) is None
+    col = [(0, 0), (17, 0), (17, 17), (0, 17), (0, 0)]
+    assert L._thin_strip(col) is None
+    outer = [(550.6, 88.8), (656.9, 88.8), (656.9, 294.2), (550.6, 294.2), (550.6, 88.8)]
+    inner = [(551.0, 89.1), (656.5, 89.1), (656.5, 293.8), (551.0, 293.8), (551.0, 89.1)]
+    r = L._thin_ring([outer, inner])
+    assert r is not None and r[1] < 0.5
+    thick_in = [(552.6, 90.8), (654.9, 90.8), (654.9, 292.2), (552.6, 292.2), (552.6, 90.8)]  # a 2 pt wall ring
+    assert L._thin_ring([outer, thick_in]) is None
+
+
+def test_traced_copy_falls_back_to_all_lines_when_no_other_set_closes_the_room(tmp_path, monkeypatch):
+    """M1 00:45: the DfE L00 SCAN copy closes the Multi-Purpose Hall only in 'all' (grey-ish traced walls); with 'all'
+    dropped on traced copies (_variants) the hall was lost -> 'all' comes back as a fallback."""
+    import pymupdf
+
+    from stoa.evidence import linework as L
+
+    f = str(tmp_path / "grey.pdf")
+    doc = pymupdf.open()
+    pg = doc.new_page(width=842, height=595)
+    sh = pg.new_shape()
+    sh.draw_rect(pymupdf.Rect(300, 200, 400, 270))
+    sh.finish(color=(0.6, 0.6, 0.6), width=0.5)  # not 'dark': only the 'all' line set holds the room
+    sh.draw_line((10, 10), (11, 10))
+    sh.finish(color=(0, 0, 0), width=0.5)
+    sh.commit()
+    pg.insert_text((330, 240), "HALL", fontsize=6)
+    doc.save(f)
+    monkeypatch.setattr(L, "_variants", lambda pg: ["dark"])  # as on a traced copy without fills
+    got = {}
+    for on in (False, True):
+        monkeypatch.setattr(L, "TRACED_ALL_FALLBACK", on)
+        m = L.measure_room(f, 0, (340, 238), 100.0)
+        got[on] = m and m["area_m2"]
+    assert got[False] is None
+    k = 100 * L.PT_TO_M_AT_1
+    assert got[True] and abs(got[True] / (100 * 70 * k * k) - 1) < 0.03, got
+
+
+def test_ocr_confusions_in_scan_labels_still_name_the_room():
+    """X1 00:27: the scan's 'Main Hail' is the question's main hall (it lost to 'Maini', a prefix hit with no miss);
+    'Sport Ha!!' reads 'sport hall'. Different words are not folded together."""
+    from stoa.evidence import lineplan as LP
+
+    labs = [{"text": t, "words": LP._label_words(t), "bbox": [0, 0, 1, 1], "pt": (0, 0)}
+            for t in ("Maini", "Main Hail", "Small Group")]
+    assert [lab["text"] for lab in LP._match_labels(labs, "How long is the main hall?")] == ["Main Hail"]
+    assert LP._label_words("Sport Ha!!") == ["sport", "hall"]
+    assert LP._same("hall", "hail") and LP._same("office", "offlce") and not LP._same("hall", "half")
+    assert not LP._same("main", "mail") and not LP._same("store", "stone")
+
+
+def test_a_room_traced_as_a_pocket_round_its_label_is_flagged():
+    """X1 00:00 / 00:27: scan copies traced 'Sport Ha!!' as a 3.8 x 2.0 m cell round the words (594 m² hall)."""
+    from stoa.evidence import lineplan as LP
+
+    lab = (595.0, 186.0, 619.0, 193.0)
+    assert LP._pocket([594.0, 182.0, 621.0, 196.0], lab, "Sport Ha!!", "the sports hall", 6.2)
+    assert LP._pocket([0, 0, 300, 200], (100, 90, 130, 97), "Main Hail", "the main hall", 4.8)  # small for a main hall
+    assert LP._pocket([0, 0, 300, 200], (100, 90, 130, 97), "Main Hail", "the main hall", 180.0) is None
+    assert LP._pocket([0, 0, 40, 40], (10, 15, 30, 21), "Store", "the store", 1.1) is None  # a small room, a small label
+    assert LP._pocket([0, 0, 40, 40], (10, 15, 30, 21), "Hall", "the hall", 3.0) is None  # a hallway may be small
+
+
+def test_scale_words_say_when_the_page_is_a_reduced_copy(monkeypatch):
+    """F8 00:27: an A1 sheet printed '1:200 @ A1' on an A3 page reads 1:400 on the page; the card must not call
+    1:400 'printed'."""
+    from stoa.evidence import lineplan as LP
+    from stoa.evidence import linework as L
+
+    monkeypatch.setattr(L, "text_lines", lambda pdf, page=0: (("SCALE 1:200 @ A1", (0, 0, 1, 1)),))
+    assert LP._scale_words("/x.pdf", 0, 400.0) == "scale: 1:400 on this page (the sheet prints 1:200 at its full paper size)"
+    assert LP._scale_words("/x.pdf", 0, 200.0) == "scale: 1:200 printed on the sheet"
+
+
+def test_abbreviated_room_labels_match_spelled_out_questions_as_a_fallback():
+    """X1 01:05: 'BED 2' is the question's 'bedroom 2', 'LDRY' its laundry -- but only when no label holds the words as
+    written (Level 11 prints 'COMMS ROOM' and a 'COMMUNICATION ROOM' monitor label: 'the comms room' is the former)."""
+    from stoa.evidence import lineplan as LP
+
+    def labs(*ts):
+        return [{"text": t, "words": LP._label_words(t), "bbox": [0, 0, 1, 1], "pt": (0, 0)} for t in ts]
+
+    def names(ls, q):
+        return [lab["text"] for lab in LP._match_labels(ls, q)]
+
+    assert names(labs("BED 1", "BED 2", "KITCH", "LDRY"), "How big is bedroom 2?") == ["BED 2"]
+    assert names(labs("BED 1", "BED 2", "KITCH", "LDRY"), "What is the area of the laundry?") == ["LDRY"]
+    assert names(labs("COMMUNICATION ROOM", "COMMS ROOM"), "How big is the comms room?") == ["COMMS ROOM"]
+    assert names(labs("Bedroom 1", "BED STORE"), "How big is bedroom 1?") == ["Bedroom 1"]
+
+
+def test_text_evidence_marks_the_value_in_the_row_the_question_names(monkeypatch):
+    """F8 01:12: 'What is the height of door 7.04A?' on a door schedule -> the 7'-0" in row 7.04A, not the first 7'-0"
+    (row 1.01A, nearest the HEIGHT header)."""
+    from stoa.evidence import textground as TG
+
+    words = (
+        (100, 40, 130, 48, "HEIGHT"),
+        (20, 60, 45, 68, "1.01A"), (100, 60, 125, 68, "7'-0\""),
+        (20, 80, 45, 88, "2.03"), (100, 80, 125, 88, "6'-8\""),
+        (20, 300, 45, 308, "7.04A"), (100, 300, 125, 308, "7'-0\""),
+    )
+    monkeypatch.setattr(TG, "_pages", lambda pdf: (words,))
+    ev = TG.ground("/x/sched.pdf", "What is the height of door 7.04A?", "7'-0\"")
+    assert ev and ev[0].bbox[1] == 300 and "row of '7.04A'" in ev[0].note, ev
+    monkeypatch.setattr(TG, "ROW_KEY", False)
+    ev = TG.ground("/x/sched.pdf", "What is the height of door 7.04A?", "7'-0\"")
+    assert ev and ev[0].bbox[1] == 60
+
+
+def test_skirting_leaves_out_door_recesses_and_slits_of_a_traced_outline():
+    # D1 00:46 / F2 01:38 (Stoa's DfE PNG): outlined walls let the room run into each door recess up to the wall's
+    # OUTER face; the jambs are no skirting (Ziying's convention). A deep alcove with no door keeps its skirting.
+    from shapely.geometry import LineString, Point
+
+    from stoa.evidence import lineplan as LP
+
+    mpp = 0.05  # m per pt
+    u = 1 / mpp  # pt per m
+    # 10 x 8 m room; bottom wall: a 1.0 m door recess 0.3 m deep at x 2..3; a 0.6 m deep slit (0.1 m wide) at x 6;
+    # top wall: a 1.5 m wide, 1.5 m deep alcove at x 4..5.5 (no door: part of the room)
+    pts = [(0, 0), (4, 0), (4, -1.5), (5.5, -1.5), (5.5, 0), (10, 0), (10, 8), (6.05, 8), (6.05, 8.6), (5.95, 8.6),
+           (5.95, 8), (3, 8), (3, 8.3), (2, 8.3), (2, 8), (0, 8), (0, 0)]
+    ring = LineString([(x * u, y * u) for x, y in pts])
+    door = ((3 * u, 8.3 * u), (2 * u, 8.3 * u), 1.0)
+    full = ring.length * mpp
+    # skirting runs = the outline without the door's outer chord
+    s_a, s_b = ring.project(Point(door[0])), ring.project(Point(door[1]))
+    from shapely.ops import substring
+
+    runs = [list(substring(ring, 0, s_a).coords), list(substring(ring, s_b, ring.length).coords)]
+    per_cut, sk_cut, why = LP._recess_cut(ring, [door], runs, mpp)
+    assert abs(per_cut - (0.6 + 1.2 - 0.1)) < 0.08, (per_cut, why)  # two 0.3 m jambs + the slit's 2 x 0.6 m sides
+    assert abs(sk_cut - (0.6 + 1.2)) < 0.12, (sk_cut, why)
+    assert full - per_cut > 2 * (10 + 8) + 3.0 - 0.1  # the alcove's 2 x 1.5 m sides stay
+    assert any("recess" in w for _, w in why) and any(w == "slit" for _, w in why)

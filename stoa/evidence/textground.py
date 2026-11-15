@@ -79,6 +79,22 @@ def _keywords(question: str, values: list[str]) -> list[str]:
     return list(dict.fromkeys(t for t in toks if t not in _STOP and t not in vals))
 
 
+ROW_KEY = bool(int(__import__("os").environ.get("E1_ROW_KEY", "1")))
+
+
+def _row_keys(question: str, values: list[str]) -> list[str]:
+    """Codes the question names that a schedule prints as a row key: '7.04A', 'D12', 'W-03', '1.01' (a digit plus a
+    letter or a dot / dash; not the answer itself)."""
+    vals = {_clean(v) for v in values}
+    out = []
+    for t in re.findall(r"(?<![\w.])[A-Za-z]{0,3}-?\d+(?:[.\-]\d+)*[A-Za-z]?(?![\w])", question):
+        c = _clean(t)
+        if c in vals or not re.search(r"\d", c) or not (re.search(r"[a-z]", c) or re.search(r"\d[.\-]\d", c)):
+            continue
+        out.append(c)
+    return list(dict.fromkeys(out))
+
+
 def _clean(w: str) -> str:
     return w.strip(".,;:()[]{}\"'").lower()
 
@@ -200,11 +216,31 @@ def ground(path: str, question: str, value, unit: str | None = None) -> list[Evi
         pass
     best = None  # (dist, page, box, value, kw)
     n_hits = 0
+    keys = _row_keys(question, values) if ROW_KEY else []
+    in_row = None  # (dist, page, box, value, key): a value hit on the same printed line as a row key the question names
     for pi, words in enumerate(pages):
         hits = _hits(words, values)
         n_hits += len(hits)
         if not hits:
             continue
+        for key in keys:
+            kb = [w for w in words if _clean(w[4]) == key]
+            if not 1 <= len(kb) <= 3:
+                continue  # a key printed many times is no row key
+            for box, v in hits:
+                for w in kb:
+                    # the row runs along the text: horizontal words share a y band (key left of the value); a schedule
+                    # plotted rotated (tall, narrow word boxes: MFC A-602) shares an x band, key either side
+                    rot = (w[3] - w[1]) > 1.5 * (w[2] - w[0])
+                    a0, a1, b0, b1 = (0, 2, 1, 3) if rot else (1, 3, 0, 2)
+                    t = max(box[a1] - box[a0], 1e-6)  # the text's height across the line
+                    if abs((w[a0] + w[a1]) / 2 - (box[a0] + box[a1]) / 2) > 0.6 * t:
+                        continue
+                    if not rot and w[2] > box[0] + 0.5 * t:
+                        continue
+                    dx = max(box[b0] - w[b1], w[b0] - box[b1], 0.0)
+                    if in_row is None or dx < in_row[0]:
+                        in_row = (dx, pi, box, v, w[4])
         kw_boxes = [(w, k) for w in words for k in kws if _clean(w[4]).startswith(k[:6])]
         for box, v in hits:
             cx, cy = (box[0] + box[2]) / 2, (box[1] + box[3]) / 2
@@ -212,6 +248,15 @@ def ground(path: str, question: str, value, unit: str | None = None) -> list[Evi
                 d = ((cx - (w[0] + w[2]) / 2) ** 2 + (cy - (w[1] + w[3]) / 2) ** 2) ** 0.5
                 if best is None or d < best[0]:
                     best = (d, pi, box, v, k)
+    if in_row is not None:
+        # F8 01:12: 'What is the height of door 7.04A?' -> the 7'-0" in 7.04A's schedule row, not the first 7'-0" on the
+        # sheet (row 1.01A) that happened to sit nearest the word 'height' (the column header)
+        _d, pi, box, v, key = in_row
+        return [Evidence(file=path, page=pi if space == "pdf_pt" else None, bbox=[round(x, 2) for x in box],
+                         bbox_space=space, exact=False,
+                         note=f"'{v}' printed here, in the row of '{key}' (text search on the sheet; {n_hits} place(s) "
+                              "print it; check it is the column the answer means)")]
+
     def distinctive(v: str) -> bool:  # a string that is unlikely to be printed by chance
         return bool(re.search(r"[^\W\d_]", v) and re.search(r"\d", v)) or len(v.split()) >= 2 or len(v) >= 6
 

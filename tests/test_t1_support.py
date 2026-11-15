@@ -98,6 +98,11 @@ def test_guard_leaves_good_citations_alone():
     a = Answer(value=14.5, unit="m2", confidence=0.75, evidence=ev, solver="pipeline/raster")
     assert S.citation_guard("What is the area of the kitchen?", a).confidence == 0.75
     assert S.final_guard("What is the area of the kitchen?", a).value == 14.5
+    # T1 c3: a number with no area unit next to it is 'approximate' (it may be a dimension or a room number: 19 wrong
+    # vs 1 right in the c3 replay); value and confidence are untouched
+    assert S.support_state("What is the area of the kitchen?", a)["state"] == "approximate"
+    ev = [Evidence(file="x.png", page=0, bbox=[1, 2, 3, 4], bbox_space="image_px", note="text 'KITCHEN 14,5 m²'")]
+    a = Answer(value=14.5, unit="m2", confidence=0.75, evidence=ev, solver="pipeline/raster")
     assert S.support_state("What is the area of the kitchen?", a)["state"] == "supported"
 
 
@@ -272,3 +277,21 @@ def test_shape_check_makes_the_citation_unlocated():
                         "the answer is in ft2)"])
     st = support_state("How long is the meeting room?", a)
     assert st["state"] == "unlocated" and "asks for a length" in st["why"]
+
+
+def test_count_from_one_mark_per_item_is_not_rejected_by_a_width_literal():
+    """sched6 sl-249: 'According to the door schedule, how many doors does the support module have?' = 6 (right),
+    six marked rows; the only literal '6' is a width (6' - 0")."""
+    from stoa.trust.support import citation_guard, final_guard
+
+    rows = ["7.00A; Width: 10' - 0\"", "7.01A; Width: 3' - 0\"", "7.02A; Width: 3' - 0\"", "7.03A; Width: 6' - 0\"",
+            "7.04A; Width: 6' - 0\"", "7.04B; Width: 10' - 0\""]
+    a = Answer(value=6, unit="count", confidence=0.3, solver="pipeline/pdf_text",
+               evidence=[Evidence(file="s.pdf", page=0, bbox=[1, 1 + 10 * i, 9, 9 + 10 * i],
+                                  note=f"text: table row: Door Number: {r}") for i, r in enumerate(rows)])
+    q = "According to the door schedule, how many doors does the support module have?"
+    assert final_guard(q, citation_guard(q, a.model_copy(deep=True))).value == 6
+    # with fewer marks than the count, the literal check still runs
+    b = a.model_copy(deep=True)
+    b.evidence = b.evidence[3:4]
+    assert final_guard(q, citation_guard(q, b)).value is None

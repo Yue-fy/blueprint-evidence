@@ -26,7 +26,17 @@ _COUNT = re.compile(
     r"laske(?:kaa)?|r[äa]kna|z[äa]hle)\b", re.I)
 # P1 13:16: 'PROVIDER CUBICLES (1D16)' (a room name) made an area question a volume one -> word boundaries
 _VOLUME = re.compile(r"(m³|\bm3\b|\bcubic\b|\bvolumes?\b|\bvolumen\b|tilavuus|\bmaht|rumfang|\bvolym)", re.I)
-_AREA = re.compile(r"(m²|\bm2\b|ft²|\bft2\b|sq\.? ?ft|square (?:feet|foot|met)|\barea\b|\b(?:sum|add up|total)(?: of)? (?:all )?the (?:\w+ )?areas\b|fl[aä]che|pinta-ala|"
+_AREA = re.compile(r"(m²|\bm2\b|ft²|\bft2\b|sq\.? ?ft|square (?:feet|foot|met)|\barea\b|\bfootprint\b|"
+                   # G1 c11 (X1 rp-062): FI 'Paljonko asuntolatilaa …' = how much dormitory SPACE (an area, not a count)
+                   r"\bpaljonko\b[^?]*tilaa\b|"
+                   # X1 rephrase set (rp-002 / rp-097): 'How much floor space does the laundry take up?', 'module 01 total
+                   # sf', 'Sum up all the room areas …' were text questions
+                   r"\bfloor\s?space\b|\bhow much (?:usable |living |office )?space\b|\bsquare footage\b|"
+                   r"\b(?:total|in|net|gross)\s+(?:sf|sq\.?\s?m|sqm)\b|\b(?:sum|add|adding)\b[^?]*\b(?:room|floor)\s+areas\b|\bplan area\b|\b(?:sum|add up|total)(?: of)? (?:all )?the (?:\w+ )?areas\b|fl[aä]che|pinta-ala|"
+                   # E1 / P1 00:19 (S-100F PNG 'Sum of all slab areas?' -> text, raster 1e8; 'Total circulation space?')
+                   r"\b(?<!including )(?![^?]*\b(?:breakdown|distribution|between|by (?:type|level|storey|floor|room))\b)"
+                   r"(?:(?:sum|add(?:ed)? up|total|combined)\b[^?,]{0,40}\bareas\b|"
+                   r"(?:total|combined)\s+(?:[\w-]+\s+){0,3}space\b)|"
                    r"surface|superficie|\bareal|oppervlakte|p[oõ]randapind|\bpind\b|powierzchnia|yta\b|"
                    # Q 04:13/04:18: "how big is the room 'Hall (0.1)'" was a text question -> ifc's count at 0.97
                    r"\bhow (?:big|large)\b|\bwhat(?:'s| is)? (?:the )?size\b|\bsize of\b|\bwie gro(?:ß|ss)\b|"
@@ -231,6 +241,15 @@ def modifiers(question: str) -> list[str]:
     outside = re.sub(r"\([^)]*\)", " ", q2)
     outside = re.sub(r"[^,;?(]*\bexcluded\b", " ", outside)
     t_out = {t for t in targets_mentioned(outside) if t not in _GENERIC}
+    skirt = bool(_SKIRTING.search(q2))
+    if skirt:
+        # X1 21:26 rp-055 / rp-091 'How much baseboard … for the laundry, leaving out the door?' / '… if we skip the
+        # doorway?': the excluded doors ARE the skirting convention (perimeter - openings), not a second object class
+        # or a 'rest' operator -> the room readers answer (agent-first gave 9.77 / 7.41 vs plan_rooms 10.13 / 7.0)
+        t_out -= {"door", "opening", "window"}
+        if "rest" in ops and re.search(r"\b(?:leaving out|apart from|besides|other than)\s+(?:the\s+|any\s+|all\s+)?"
+                                       r"(?:doors?|door ?ways?|openings?|door openings?)\b", q2):
+            ops.remove("rest")
     n_out = len(t_out)
     n_in = max([len({t for t in targets_mentioned(m) if t not in _GENERIC} - t_out)
                 for m in re.findall(r"\(([^)]*)\)", q2)] or [0])
@@ -292,6 +311,8 @@ _QTY_AFTER_COUNT = re.compile(
     r"\b(?:how many|how much|wie viele?|wieviel\w*|combien de|quant[ie]|hoeveel|hur m[aå]nga|kuinka (?:monta|paljon)|"
     r"ile|hvor mange|cu[aá]nt[oa]s)\s+(?:of\s+)?(?:(?:linear|lineal|running|lin\.)\s+)?(?P<u>cubic (?:metres|meters|feet|foot)|m³|m3\b|kubikmeter\w*|"
     r"square (?:metres|meters|feet|foot)|sq\.? ?(?:ft|m)\b|m²|m2\b|ft²|ft2\b|quadratmeter\w*|qm\b|quadratfu(?:ß|ss)|"
+    # T1 (H 23:44, AFCEC 'How many SF of dormitory space does the west wing have?' -> vlm_lora 6092 COUNT @0.75)
+    r"[gn]?s\.?f\.?(?![a-z\d\-])|sqft\b|sqm\b|"
     r"m[eè]tres? carr[ée]s|pieds? carr[ée]s|metri quadr\w*|piedi quadr\w*|vierkante (?:meter|voet)\w*|"
     r"kvadratmeter\w*|neli[öo]\w*|metres|meters|feet|foot|ft\b|meter\b|metern?\b|fu(?:ß|ss)\b|m[eè]tres?\b|pieds\b|"
     r"metri\b|piedi\b|metri[äa]\b|metres? of|lf\b|l\.f\.)", re.I)
@@ -299,10 +320,10 @@ _QTY_AFTER_COUNT = re.compile(
 
 def _qty_unit(u: str) -> tuple[str, str]:
     u = u.lower()
-    feet = bool(re.search(r"feet|foot|ft|fu(?:ß|ss)|pied|piedi|voet|^l\.?f\.?$", u))
+    feet = bool(re.search(r"feet|foot|ft|fu(?:ß|ss)|pied|piedi|voet|^l\.?f\.?$|^[gn]?s\.?f\.?$", u))
     if re.search(r"cubic|³|m3|kubik", u):
         return "volume", "ft3" if feet else "m3"
-    if re.search(r"square|sq|²|m2|ft2|quadrat|qm|carr|quadr|vierkant|kvadrat|neli", u):
+    if re.search(r"square|sq|²|m2|ft2|quadrat|qm|carr|quadr|vierkant|kvadrat|neli|^[gn]?s\.?f\.?$", u):
         return "area", "ft2" if feet else "m2"
     return "length", "ft" if feet else "m"
 

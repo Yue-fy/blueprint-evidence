@@ -17,6 +17,7 @@ OCR engine: the VLM by default; STOA_TEXT_ENGINE=ocr|auto reads the layer with P
 from __future__ import annotations
 
 import concurrent.futures as cf
+import contextlib
 import contextvars
 import difflib
 import json
@@ -279,6 +280,11 @@ def _pdf_lines(png: Path, pdf: Path) -> "TextLayer | None":
         if doc.page_count != 1:
             return None  # which page the render shows is not known
         pg = doc[0]
+        if os.environ.get("STOA_JUNK_OCR", "1") != "0":
+            from stoa.formats.normalize import junk_ocr_layer
+
+            if junk_ocr_layer(pg):
+                return None  # X1 c13: a scanner's junk OCR layer -> OCR / VLM read the scan
         with Image.open(png) as im:
             W, H = im.size
         rect = pg.rect  # the displayed (rotated) page
@@ -342,7 +348,7 @@ def text_layer(path: str, backend: str = "local", tile: int = 1100, upscale_to: 
                     # OCR that landed meanwhile -> 41 of 91 values changed between a cold and a warm run of the same
                     # files. The layer that answered first stays this file's layer (memory + a '.layer' note on disk).
                     v = _vlm_layer(path, backend, tile, upscale_to, max_tokens, workers)
-                    _set_sticky(path, f"OCR {str(e)[:80]}")
+                    _set_sticky(path, str(e)[:90])
                     _mem[gkey] = v
                     return v
             else:
@@ -509,11 +515,14 @@ def _vlm_cached(path: str, backend: str = "local", tile: int = 1100) -> bool:
 
 
 def _richness(tl: TextLayer) -> int:
-    """Dictionary words (>= 4 letters) in a layer, or its line count without a word list."""
+    """Dictionary words (>= 4 letters) in a layer, or its line count without a word list. An OCR layer whose lines
+    stoa.ocr.sheet_vocab respelled is judged on its lines AS READ (O1 c14: the repair added 5 words to X1's sc-347 scan
+    and flipped the 'cached VLM layer is richer' choice to the OCR layer: 78.23 -> 37.8 @0.75)."""
     from stoa.ocr import quality
 
-    r = quality.dict_share(i.text for i in tl.items)
-    return round(r[0] * r[1]) if r is not None else len(tl.items)
+    items = getattr(tl, "read_items", None) or tl.items
+    r = quality.dict_share(i.text for i in items)
+    return round(r[0] * r[1]) if r is not None else len(items)
 
 
 def gate_pending(path: str) -> bool:
@@ -539,7 +548,11 @@ def _vlm_layer(path: str, backend: str, tile: int, upscale_to: int, max_tokens: 
     key = f"{path}{file_tag(path)}|{backend}|{tile}|{_api_mode()}"  # (a server may overwrite one upload path with a new plan)
     with _glock:
         lk = _locks.setdefault(key, threading.Lock())
-    with lk:
+    try:  # P1 (X1 23:27): the layer is read once per FILE; its cost is marked prep_* (stoa.cost.file_reading)
+        from stoa.cost import file_reading
+    except ImportError:
+        file_reading = contextlib.nullcontext
+    with lk, file_reading():
         if key in _mem and _cache_on():  # read earlier in this process (another question on the same drawing): paid
             return _mem[key]
         f = _disk_key(path, tile, backend)

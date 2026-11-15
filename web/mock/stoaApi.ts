@@ -466,7 +466,7 @@ function unsupported(name: string, ext: string): string {
   const fix: Record<string, string> = { ".dwg": "save it as DXF or print it to PDF", ".rvt": "export it as IFC", ".skp": "export it as IFC or print a plan to PDF",
     ".heic": "share it as JPG (iPhone: Settings › Camera › Formats › Most Compatible)", ".heif": "share it as JPG", ".zip": "unzip it and drop the drawings",
   };
-  return `${name} is ${kinds[ext] ?? `a ${ext ? ext.slice(1).toUpperCase() : "file without type"} file`}, which we cannot read yet: ${fix[ext] ?? "print or export it to PDF"} and drop it again. We read PDF, PNG, JPG (photos too), IFC and DXF.`;
+  return `${name} is ${kinds[ext] ?? `a ${ext ? ext.slice(1).toUpperCase() : "file without type"} file`}, which we cannot read yet: ${fix[ext] ?? "print or export it to PDF"} and drop it again. We read PDF, JPG, PNG (photos too), IFC, DXF and SVG${ext === ".dwg" || ext === ".heic" || ext === ".heif" ? "" : ", and HEIC photos and DWG drawings where this server can convert them"}.`;
 }
 const UPLOAD_MAX = 200 << 20;
 const isUpload = (p: string | null | undefined) => !!p && p.startsWith("upload/");
@@ -483,7 +483,7 @@ function uploadAbs(virtual: string): string | null {
 /** An upload's FileInfo. Files uploaded TOGETHER share one folder (a "set", e.g. plan.pdf + model.ifc): a sheet then
  * lists the model as its ".ifc" sibling (same stem, or the only .ifc in the folder: the rule stoa.data.ifc_model_for
  * applies, F 749e5c3), so the pipeline answers from the model and the browser opens 2D + 3D side by side. */
-const DERIVED = /\.(p\d+\.pdf|scan\.png|svg-v\d+\.pdf|roles\.dxf|r\d{2,3}\.png|vec\d+\.pdf)$/i; // + P1 night 5fc4653: <stem>.r150.png / .r200.png = the page read as a picture
+const DERIVED = /\.(p\d+\.pdf|scan\.png|photo\.png|svg-v\d+\.pdf|roles\.dxf|r\d{2,3}\.png|vec\d+\.pdf|full\.(?:png|jpe?g))$/i; // + .photo.png = O1's deskewed copy of a phone photo (F2 22:46) // + .full.<ext> = the original before the 6,000 px shrink (normalize_upload.py) // + P1 night 5fc4653: <stem>.r150.png / .r200.png = the page read as a picture
 function uploadInfo(virtual: string, extra: Record<string, unknown> = {}) {
   const ext = path.extname(virtual).toLowerCase();
   const parts = virtual.split("/");
@@ -740,6 +740,19 @@ function askUpload(b: { path: string; question?: string; solver?: string; solver
   });
   uploadAnswers.set(key, p);
   p.catch(() => uploadAnswers.delete(key));
+  // F4 23:22: a first reading that itself says to ask again (the readers still measure in the background: upload.py
+  // 'readers finish in the background', P1 'still being measured … ask again in about a minute') is never kept, so the
+  // visitor who asks again gets the finished reading, not the same guess (cached: true)
+  p.then((a) => {
+    const miss = ((a.missing as unknown[] | undefined) ?? []).map(String).join(" ");
+    const trace = ((a.trace as unknown[] | undefined) ?? []).map(String);
+    if (/still being measured|ask again in (?:about )?a minute/i.test(miss)
+      || trace.some((t) => /readers finish in the background/i.test(t))) uploadAnswers.delete(key);
+    // F4 00:08: an unsure reading made while the door / window finder was busy (stoa/solvers/openings.py _DET_NOTE) is
+    // not kept either: asked again a minute later it gets the finder's count (AFCEC north wing 12 @0.1 vs 34-36)
+    else if (Number(a.confidence ?? 0) < 0.5 && /detector service is busy|detector did not answer|detector budget is spent/i.test(`${miss} ${trace.join(" ")}`))
+      uploadAnswers.delete(key);
+  }, () => {});
   return p;
 }
 /** Knowledge graph of an upload: W1's stoa.kg.links on the absolute path (a sheet uploaded with its model is
@@ -901,6 +914,58 @@ async function handleDoorScale(res: http.ServerResponse, rel: string, page: numb
   }
   send(res, 200, await doorCache.get(key)!, "disk");
 }
+/** A picture's scale from what is printed on it when no scale bar is read (web/server/pic_scale.py: stoa's image_scale,
+ * else F2's paper_by_dims — the standard sheet whose printed 1:N makes the drawing's dimension strings as long as their
+ * drawn lines; QA 22:33: AFCEC A-2 prints 1" = 40'-0" and the card said 'No scale found'). Reads only an already read
+ * text layer (~1-2 s). GET /api/picscale?path= -> {ok, px_per_m, n, printed, paper, dpi, how}. Cached per file once ok. */
+const PIC_SCALE = path.resolve(__dirname, "../server/pic_scale.py");
+const picScaleCache = new Map<string, Promise<Record<string, unknown>>>();
+/** a catalogue case's upload path → the example file it was copied from (UX pass 2a NEW-3: the 6,000 px copy of
+ *  M-101A no longer fits 'ANSI D at 300 dpi'; pic_scale.py reads the original and carries the scale over) */
+const caseOriginal = new Map<string, string>();
+async function handlePicScale(res: http.ServerResponse, rel: string) {
+  const abs = isUpload(rel) ? uploadAbs(rel) : safeAbs(rel);
+  if (!abs || !/\.(png|jpe?g)$/i.test(abs)) return send(res, 200, { ok: false, why: "not a picture" }, "disk");
+  if (!picScaleCache.has(abs)) {
+    const orig = caseOriginal.get(rel);
+    const job = new Promise<Record<string, unknown>>((resolve) => {
+      execFile(PY, ["-W", "ignore", PIC_SCALE, abs, ...(orig ? [orig] : [])], { cwd: KG_REPO, timeout: 90_000, maxBuffer: 1 << 20, env: pyEnv() }, (err, stdout) => {
+        try {
+          resolve(JSON.parse(String(stdout).trim().split("\n").slice(-1)[0]));
+        } catch {
+          resolve({ ok: false, why: err ? "could not read the picture" : "unreadable" });
+        }
+      });
+    });
+    picScaleCache.set(abs, job);
+    // not read yet (the upload's text warm-up still running): ask again next time
+    void job.then((r) => { if (!r.ok) picScaleCache.delete(abs); });
+  }
+  send(res, 200, await picScaleCache.get(abs)!, "disk");
+}
+/** UX 23:51: a picture's printed text with its place (web/server/pic_labels.py: the CACHED text layer only, never a new
+ *  OCR / VLM reading), so a right-click on a picture knows the room label or tag under the pointer as on a PDF.
+ *  GET /api/piclabels?path= -> {ok, items: [{at, text, box}]} (image_px). Not read yet: asked again next time. */
+const PIC_LABELS = path.resolve(__dirname, "../server/pic_labels.py");
+const picLabelCache = new Map<string, Promise<Record<string, unknown>>>();
+async function handlePicLabels(res: http.ServerResponse, rel: string) {
+  const abs = isUpload(rel) ? uploadAbs(rel) : safeAbs(rel);
+  if (!abs || !/\.(png|jpe?g)$/i.test(abs)) return send(res, 200, { ok: false, why: "not a picture" }, "disk");
+  if (!picLabelCache.has(abs)) {
+    const job = new Promise<Record<string, unknown>>((resolve) => {
+      execFile(PY, ["-W", "ignore", PIC_LABELS, abs], { cwd: KG_REPO, timeout: 30_000, maxBuffer: 8 << 20, env: pyEnv() }, (err, stdout) => {
+        try {
+          resolve(JSON.parse(String(stdout).trim().split("\n").slice(-1)[0]));
+        } catch {
+          resolve({ ok: false, why: err ? "could not read the picture's text" : "unreadable" });
+        }
+      });
+    });
+    picLabelCache.set(abs, job);
+    void job.then((r) => { if (!r.ok) picLabelCache.delete(abs); });
+  }
+  send(res, 200, await picLabelCache.get(abs)!, "disk");
+}
 /** Requests about an uploaded file, answered here (never forwarded: the API would refuse the path). */
 /** The catalogue's example sheets (captain 21:02: Stoa's own sheets as project cards). A sheet path in
  *  fixtures/projects.json that is not data/… or upload/… names a file found by its base name in the example folders
@@ -926,6 +991,23 @@ function exampleAbs(v: string): string | null {
   return null;
 }
 const caseOpen = new Map<string, Promise<Record<string, unknown>>>();
+/** T2 22:5x: after the privacy plug-in's 'Delete my files' (POST /feat/privacy/delete, answered by the API) removed an
+ * upload's folder, forget what THIS server keeps in memory about it: the questions and answers (uploadAnswers), its
+ * knowledge graph, room shapes, door scale, sheet list, and thumbnail jobs whose file is gone (so a re-upload of the
+ * same file is read again, not served from memory). Only when the folder is really gone (an example sheet is kept by
+ * the API and stays cached here). Returns how many entries were dropped. */
+function forgetUpload(reqBody: Buffer): number {
+  let ref = "";
+  try { ref = String((JSON.parse(reqBody.toString() || "{}") as { upload?: unknown }).upload ?? ""); } catch { return 0; }
+  const id = ref.match(/^(?:upload\/)?([0-9a-f]{12})(?:\/|$)/)?.[1];
+  if (!id || fs.existsSync(path.join(UPLOADS, id))) return 0;
+  const virtual = `upload/${id}/`, abs = path.join(UPLOADS, id) + path.sep;
+  let n = 0;
+  for (const m of [uploadAnswers, uploadKgCache, shapeCache, doorCache, sheetCache, picScaleCache, picLabelCache] as Map<string, unknown>[])
+    for (const k of [...m.keys()]) if (k.includes(virtual) || k.includes(abs)) { m.delete(k); n++; }
+  for (const k of [...thumbJobs.keys()]) if (!fs.existsSync(k)) { thumbJobs.delete(k); n++; }
+  return n;
+}
 
 async function handleUpload(req: Connect.IncomingMessage, res: http.ServerResponse, route: string, url: URL): Promise<boolean> {
   if (route === "/case" && req.method === "POST") {
@@ -936,7 +1018,9 @@ async function handleUpload(req: Connect.IncomingMessage, res: http.ServerRespon
     const key = `${v}|${priv}|${eu}`;
     if (!caseOpen.has(key)) caseOpen.set(key, saveUpload(path.basename(abs), fs.readFileSync(abs), "", false, priv, eu) as Promise<Record<string, unknown>>);
     try {
-      send(res, 200, { ...(await caseOpen.get(key)!), catalogue: v }, "disk");
+      const info = await caseOpen.get(key)!;
+      if (typeof info?.path === "string") caseOriginal.set(info.path, abs); // pic_scale reads the full-size original (NEW-3)
+      send(res, 200, { ...info, catalogue: v }, "disk");
     } catch (e) {
       caseOpen.delete(key);
       send(res, (e as { status?: number }).status ?? 500, { detail: (e as Error).message }, "disk");
@@ -1072,6 +1156,8 @@ async function handle(req: Connect.IncomingMessage, res: http.ServerResponse, ne
     if (route === "/m/pdfscale" && req.method === "GET") return send(res, 200, { ok: false, why: "printed-scale endpoint not on this tree" }, "disk");
     if (route === "/shapes" && req.method === "POST") return void (await handleShapes(req, res));
     if (route === "/doorscale" && req.method === "GET") return void (await handleDoorScale(res, url.searchParams.get("path") ?? "", Number(url.searchParams.get("page") ?? 0) || 0));
+    if (route === "/picscale" && req.method === "GET") return void (await handlePicScale(res, url.searchParams.get("path") ?? ""));
+    if (route === "/piclabels" && req.method === "GET") return void (await handlePicLabels(res, url.searchParams.get("path") ?? ""));
     // QA 20:32: is this upload's text still being read (stoa.formats.warm)? The intro says 'Reading the scale…' meanwhile,
     // not 'No scale found', and reads the scale again the moment the warm-up ends. GET /api/warming?path= -> {warming}
     if (route === "/warming" && req.method === "GET") {
@@ -1087,13 +1173,34 @@ async function handle(req: Connect.IncomingMessage, res: http.ServerResponse, ne
       const abs = isUpload(rel) ? uploadAbs(rel) : safeAbs(rel);
       if (!abs || !/\.(pdf|png|jpe?g)$/i.test(abs)) return void send(res, 200, { ok: false, why: "not a 2D sheet we have" }, "disk");
       const page = String(Math.max(0, Math.min(999, parseInt(url.searchParams.get("page") ?? "0", 10) || 0)));
-      return void execFile(PY, [path.resolve(__dirname, "../server/glance.py"), abs, page, rel], { cwd: KG_REPO, timeout: 60_000, maxBuffer: 16 << 20 },
+      // F2 23:52: takeoff fixes are per visitor — the browser's id, so a visitor's own Measure fixes show in their glance
+      const vis = url.searchParams.get("visitor") ?? "";
+      const env = /^[A-Za-z0-9_-]{8,64}$/.test(vis) ? pyEnv({ STOA_GLANCE_VISITOR: vis }) : process.env;
+      return void execFile(PY, [path.resolve(__dirname, "../server/glance.py"), abs, page, rel], { cwd: KG_REPO, timeout: 60_000, maxBuffer: 16 << 20, env },
         (err, out) => {
           try {
             send(res, 200, JSON.parse(String(out).trim().split("\n").pop()!), "disk");
           } catch {
             send(res, 200, { ok: false, why: String(err?.message ?? "glance failed").slice(0, 200) }, "disk");
           }
+        });
+    }
+    // the same takeoff as an Excel file (F2's to_xlsx; each row names the sheet): GET /api/glance/xlsx?path=&page=
+    if (route === "/glance/xlsx" && req.method === "GET") {
+      const rel = url.searchParams.get("path") ?? "";
+      const abs = isUpload(rel) ? uploadAbs(rel) : safeAbs(rel);
+      if (!abs || !/\.(pdf|png|jpe?g)$/i.test(abs)) return void send(res, 404, { error: "not a 2D sheet we have" }, "none");
+      const page = String(Math.max(0, Math.min(999, parseInt(url.searchParams.get("page") ?? "0", 10) || 0)));
+      const out = path.join(os.tmpdir(), `stoa-glance-${process.pid}-${Date.now()}.xlsx`);
+      return void execFile(PY, [path.resolve(__dirname, "../server/glance.py"), abs, page, rel, out], { cwd: KG_REPO, timeout: 60_000 },
+        (_err, so) => {
+          let r: { ok?: boolean; why?: string } = {};
+          try { r = JSON.parse(String(so).trim().split("\n").pop()!); } catch { /* below */ }
+          if (!r.ok || !fs.existsSync(out)) return void send(res, 404, { error: r.why ?? "no takeoff of this sheet yet" }, "none");
+          const stem = path.basename(rel).replace(/\.\w+$/, "").replace(/[^A-Za-z0-9_.-]+/g, "_").slice(0, 60) || "sheet";
+          res.writeHead(200, { "content-type": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            "content-disposition": `attachment; filename="${stem}-takeoff.xlsx"`, "cache-control": "no-store" });
+          fs.createReadStream(out).on("close", () => fs.unlink(out, () => undefined)).pipe(res);
         });
     }
     if (route === "/sheets" && req.method === "GET") return void (await handleSheets(res, url.searchParams.get("path") ?? ""));
@@ -1132,6 +1239,12 @@ async function handle(req: Connect.IncomingMessage, res: http.ServerResponse, ne
             assumptions: [], missing: ["hosted model busy (rate limit): ask again in a minute"],
             cost: { llm_tokens_in: 0, llm_tokens_out: 0, gpu_seconds: 0, api_calls: 1, llm_calls: 0, wall_seconds: HOSTED_WAIT_MS / 1000 } }, "live");
       }
+    }
+    if (live && route === "/feat/privacy/delete" && req.method === "POST" && live.status === 200) {
+      try { // T2: say what this server forgot from memory too (the privacy panel shows it)
+        const out = JSON.parse(live.body.toString()) as Record<string, unknown>;
+        return send(res, 200, { ...out, forgotten_in_memory: forgetUpload(body) }, "live");
+      } catch { /* fall through: pass the API's body on unchanged */ }
     }
     const optional = ["/questions", "/kg", "/files", "/health"].includes(route);
     if (live && route === "/kg" && live.status === 200) {

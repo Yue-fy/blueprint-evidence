@@ -36,6 +36,11 @@ _Q = re.compile(r"\bhow many\s+(?:\w+\s+){0,2}?(doors?|windows?|door\s*ways?|doo
 _SKIP = re.compile(r"\b(double|pairs?|single|swing|sliding|bi-?fold|revolving|types?|kinds?|fire|rated|automatic|"
                    r"exterior|external|interior|internal|glazed|wider|narrower|width|schedule|tag|leaves|leaf|open\w*|"
                    r"skylights?|roof|clerestory|elevation|facade|façade|section)\b", re.I)
+# DR 22:22 (X1 22:05, DfE 'How many cupboard doors are drawn on the plan?' gold 13 -> 83 = every door): a KIND of door
+# named right before 'door(s)' is a class the detector cannot tell apart ('doors in the store' is a scope, not a kind)
+_KIND_DOOR = re.compile(r"\b(?:cupboard|cubicle|store|storage|wc|toilet|stall|closet|wardrobe|cabinet|louv(?:re|er)e?d|"
+                        r"folding|overhead|roll-?up|coiling|garage|access|pocket|barn|french|patio|entrance|entry|"
+                        r"front|back|main|emergency|escape|exit|security|steel|timber|wooden|glass)\s+doors?\b", re.I)
 _TITLE = re.compile(r"\b(PLAN|RCP|AXON\w*|ELEVATION|SECTION|DETAIL|GRUNDRISS|POHJA|PLAN DE|PIANTA|PLATTEGROND)\b", re.I)
 _STOP = set("""how many doors door windows window doorways doorway are there is in on the a an does do have has of this
 that these those plan plans sheet drawing drawn shown show total altogether all count number what which inside within
@@ -200,7 +205,7 @@ class DoorDetect(BaseSolver):
         m = _Q.search(question)
         if not m:
             return self.abstain("not a 'how many doors / windows' question")
-        if _SKIP.search(question):
+        if _SKIP.search(question) or _KIND_DOOR.search(question):
             return self.abstain("door / window TYPES or a qualifier the symbol detector cannot tell apart")
         want = "window" if "window" in (m.group(1) or m.group(2) or m.group(3) or "").lower() else "door"
         p = str(abspath(path))

@@ -3,10 +3,32 @@
 // answered on the drawing (and page) on screen through the app's own ask (private mode, the reader the visitor
 // chose and the server's cache all apply), Show opens one answer with its evidence like a typed question.
 import { sheetLabels } from "../../api";
+import { projectOf } from "../../projects";
 import type { Answer } from "../../types";
 import { registerFeature, type FeatureApi } from "../registry";
+import { autoWhy, cardNote, checkKind, crossCheck, printedAnswer, type Glance } from "./crosscheck";
 import { mountBatch, type BatchFile } from "./panel";
+import { parseText, questionLike } from "./parse";
 import { HttpError, type AskFn } from "./runner";
+
+/** This sheet's finished takeoff, summarised (W5's GET /api/glance = 'This floor at a glance': reads F2's result, never
+ *  starts one). One request per drawing | page feeds the list and the card note; none yet → asked again after a minute. */
+type GlanceEnt = { at: number; g: Glance | null; p: Promise<Glance | null> | null };
+const glances = new Map<string, GlanceEnt>();
+export function glanceFetch(path: string, page: number): Promise<Glance | null> {
+  const k = `${path}|${page}`;
+  const e = glances.get(k);
+  if (e && (e.g || e.p || Date.now() - e.at < 60_000)) return e.p ?? Promise.resolve(e.g);
+  const ent: GlanceEnt = { at: Date.now(), g: e?.g ?? null, p: null };
+  glances.set(k, ent);
+  const p = fetch(`/api/glance?path=${encodeURIComponent(path)}&page=${page}`)
+    .then((r) => (r.ok ? r.json() : null))
+    .then((g: Glance | null) => (ent.g = g && g.ok ? g : null), () => null);
+  ent.p = p;
+  void p.finally(() => { ent.p = null; ent.at = Date.now(); });
+  return p;
+}
+const glanceNow = (path: string, page: number) => glances.get(`${path}|${page}`)?.g ?? null;
 
 /** api.askWith(…, {show: false}) as the queue's ask: its errors carry the HTTP status at the start of the message
  *  ('503 Service Unavailable'), which the queue's retry rule needs; Stop lets the queue move on at once (the server
@@ -66,6 +88,17 @@ registerFeature("batch", (api) => {
         open: (path, page) => (page !== undefined && api.file()?.path === path ? api.openPage(page) : api.openFile(path, page)),
         // a list's 'sheet' column names pages of a set: the sheet index the page picker uses (cached per file)
         sheets: (path) => sheetLabels(path),
+        // UX C-7: the sheet tab the app shows for the drawing on screen ('Level 00' on a sample's tabs), else none
+        sheetTitle: (path) => {
+          if (api.file()?.path !== path) return null;
+          const on = document.querySelector<HTMLElement>("#sheetTabs button.on");
+          return on?.textContent?.replace(/\s+/g, " ").trim() || null;
+        },
+        // UX P2b-4: a catalogue case (or a sample opened from its card) by its card's name ('Apartment floor'), never a
+        // dataset file id; the visitor's own uploads keep their file name (projectOf skips them)
+        caseTitle: (path) => projectOf(path)?.name ?? null,
+        // UX M19: this sheet's finished takeoff (W5's glance: reads F2's result, never starts one)
+        glance: (path, page) => glanceFetch(path, page),
         // the card's number as shown (W5's takeoff reads the same: takeoff.ts updateShown); the card may replace the
         // reader's guess with a room it traced and measured, or a number at the visitor's scale
         readCard: () => {
@@ -110,6 +143,11 @@ registerFeature("batch", (api) => {
       });
     },
   });
+  // W5's global 'Start over' (window 'stoa:reset', captain 01:18): the list, its saved copies and the panel go
+  window.addEventListener("stoa:reset", () => {
+    handle?.reset();
+    panel.close();
+  });
   api.addToolbarButton({
     id: "batch",
     label: "Many questions",
@@ -120,7 +158,34 @@ registerFeature("batch", (api) => {
   });
   api.onDrawing((f) => {
     if (f) seen.set(f.path, named(f.path, f.title));
+    if (f) void glanceFetch(f.path, api.page()); // ready before the first answer: the card note reads it synchronously
     handle?.refresh();
+  });
+  // UX M19 on the ANSWER CARD too: a whole-sheet question (total floor area, rooms, doors, windows, the largest room;
+  // en / fi / de / sv) gets one line comparing its answer with this sheet's finished takeoff, the numbers of 'This floor
+  // at a glance' beside it ('This sheet's takeoff measured it room by room: 1,717.2 m² net … (this answer +480 %). This
+  // answer is only a guess.' / '✓ Agrees with this sheet's takeoff: …'). Nothing when the sheet has no finished takeoff.
+  api.addAnswerNote((a, q) => {
+    const f = api.file();
+    const kind = f ? checkKind(q) : null;
+    if (!f || !kind || a.value === undefined) return null;
+    const g = glanceNow(f.path, api.page());
+    if (!g) { void glanceFetch(f.path, api.page()); return null; }
+    const x = crossCheck(kind, a, g);
+    return x ? cardNote(x, autoWhy(x, { guess: false, confidence: a.confidence, value: a.value, printed: printedAnswer(a) })) : null;
+  });
+  // several questions in the page's own question box (pasted from a mail or a sheet): each is answered on its own in
+  // the list, the card shows the first one. Only when at least two lines are questions of their own (end in '?' or
+  // start with a question word): one question over two lines, or one with a note under it, is asked as typed.
+  // (parse.ts questionLike: a question mark, a question word, or a quantity phrase / instruction as test lists write them)
+  api.beforeAsk((question) => {
+    if (!/\n/.test(question.trim())) return null;
+    const qs = parseText(question);
+    if (qs.length < 2 || qs.filter((x) => questionLike(x.q)).length < 2) return null;
+    if (!panel.isOpen()) panel.open();
+    const first = handle?.askList(question) ?? null;
+    if (first) api.setQuestion(qs[0].q);
+    return first;
   });
   // after Show the visitor may change the answer on the card (set the scale, pick an option, another reader): the row
   // takes the card's answer

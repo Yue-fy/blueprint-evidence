@@ -88,7 +88,10 @@ _YESNO = re.compile(r"^\s*(does|do|is|are|has|have|onko|gibt es|finns det)\b.*\b
 _COUNT_CUE = re.compile(
     r"\b(how many|number of|count|kuinka monta|montako|wie viele|anzahl|combien|nombre de|quant[ie]|hur många|"
     r"hvor mange|hoeveel|cuánt[oa]s|ile)\b", re.I)
-_MEASURE = re.compile(r"\b(area|m²|m2|ft²|sq\.? ?ft|square|volume|m³|length|long|width|wide|height|fläche|"
+# O1 c11 (X1 sc-273/274): 'How many linear feet of wall base … closet doorway?' was a DOOR count (feet, linear,
+# perimeter, skirting / base words were missing)
+_MEASURE = re.compile(r"\b(areas?|m²|m2|ft²|sq\.? ?ft|square|volume|m³|lengths?|long|widths?|wide|heights?|fläche|"
+                      r"feet|foot|linear|yards|inches|perimeters?|skirting|baseboards?|wall\s+base|"
                       r"pinta-ala|surface|superficie|meters|metres|suuri|pitkä|leveä|korkea|leveys|pituus|korkeus|"
                       r"neliö\w*)\b|\w*(?:pinta-?ala|fläche)\b", re.I)  # compounds: lattiapinta-ala, Wohnfläche
 

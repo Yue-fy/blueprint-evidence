@@ -163,3 +163,100 @@ def test_router_uses_the_visitors_scale(tmp_path, monkeypatch):
     assert j["scale"]["status"] == "known" and "1:100" in j["summary"]["scale"] and "remembered" in j["summary"]["scale"]
     monkeypatch.setenv("STOA_FEATURES", "trust_map")  # F7 off: our own reading again
     assert c.get("/feat/trust_map", params=q).json()["scale"]["status"] == "unknown"
+
+
+def _phone_photo(sheet: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """The sheet printed and photographed: tilted with perspective on a dark table, light falling off to one side.
+    Returns (RGB photo, the paper's corners in the photo)."""
+    import cv2
+
+    h, w = sheet.shape
+    W, H = 2600, 2000
+    quad = np.float32([[260, 220], [2330, 300], [2280, 1830], [200, 1700]])
+    M = cv2.getPerspectiveTransform(np.float32([[0, 0], [w - 1, 0], [w - 1, h - 1], [0, h - 1]]), quad)
+    paper = cv2.warpPerspective(np.full_like(sheet, 255), M, (W, H), borderValue=0)
+    ink = cv2.warpPerspective(sheet, M, (W, H), borderValue=255)
+    g = np.where(paper > 0, ink, 70).astype(np.float32)               # dark table around the sheet
+    light = np.linspace(1.0, 0.72, W, dtype=np.float32)[None, :]      # uneven light across the photo
+    g = np.clip(g * light, 0, 255).astype(np.uint8)
+    return cv2.cvtColor(g, cv2.COLOR_GRAY2RGB), quad
+
+
+def test_phone_photo_is_read_on_its_flat_copy(tmp_path):
+    """t4: a phone photo of a clean print is measured on O1's deskewed copy (what the answers read), not on the raw
+    photo whose table and light fall-off read as faint lines; tiles come back as quads on the photo."""
+    photo, quad = _phone_photo(_plan(False))
+    p = _save(tmp_path, photo, "phone.jpg")
+    if TM._photo(p) is None:
+        pytest.skip("O1's photo deskew is not available / did not detect the synthetic sheet")
+    m = TM.trust_map(p, ocr="off")
+    assert m["ok"] and m["photo"] and m["size"] == [2600, 2000]
+    s = m["summary"]
+    assert s["red"] <= 10, s                       # the clean print reads cleanly once flattened
+    assert s["photo"] and s["warning"] == TM.PHOTO_WARNING
+    used = [t for t in m["tiles"] if t["level"] != "empty"]
+    assert used and all(len(t["poly"]) == 4 for t in used)
+    # every tile lies on the paper (nothing is coloured on the table around it)
+    import cv2
+
+    for t in used:
+        for x, y in t["poly"]:
+            assert cv2.pointPolygonTest(quad.reshape(-1, 1, 2), (float(x), float(y)), True) >= -12, (x, y)
+    # level_at finds the quad holding a point
+    t = used[len(used) // 2]
+    cx = sum(x for x, _ in t["poly"]) / 4
+    cy = sum(y for _, y in t["poly"]) / 4
+    assert TM.level_at(m, [cx - 1, cy - 1, cx + 1, cy + 1]) == t["level"]
+    # the app's picture-scale reading does not make a photo's scale 'known' (its pixel size rests on an assumed paper)
+    assert TM.trust_map(p, ocr="off", app_scale="1 m = 51 px")["scale"]["status"] != "known"
+    # with the deskew switched off (STOA_O1_PHOTO=0) the same photo is read as it is: no quads, no photo note
+    import os
+
+    os.environ["STOA_O1_PHOTO"] = "0"
+    try:
+        TM._CACHE.clear()
+        raw = TM.trust_map(p, ocr="off")
+    finally:
+        os.environ.pop("STOA_O1_PHOTO", None)
+        TM._CACHE.clear()
+    assert not raw["photo"] and not raw["summary"]["photo"] and all("poly" not in t for t in raw["tiles"])
+
+
+def _levels(m):
+    return [t["level"] for t in m["tiles"]]
+
+
+def test_transparent_background_reads_like_white_paper(tmp_path):
+    """A CAD export with a transparent background (black RGB under alpha 0) is read on white, as the viewer shows it:
+    read as it is, the whole sheet was one block of 'ink' and the map came out empty (0 / 0 / 0 %)."""
+    g = _plan(False)
+    rgba = np.dstack([np.zeros_like(g)] * 3 + [(255 - g).astype(np.uint8)])
+    opaque = TM.trust_map(_save(tmp_path, g, "opaque.png"), ocr="off")
+    clear = TM.trust_map(_save(tmp_path, rgba, "clear.png"), ocr="off")
+    assert _levels(clear) == _levels(opaque)
+    assert any("transparent" in n for n in clear["notes"]) and not clear["negative"]
+
+
+def test_blueprint_is_measured_inverted_and_says_so(tmp_path):
+    """White lines on blue (a cyanotype): measured as its inverse; the sheet note says it is a blueprint and gives no
+    accuracy number (none measured)."""
+    g = _plan(False).astype(np.float32)
+    blue = np.dstack([25 + 0.8 * (255 - g), 60 + 0.7 * (255 - g), 140 + 0.45 * (255 - g)]).clip(0, 255).astype(np.uint8)
+    pos = TM.trust_map(_save(tmp_path, _plan(False), "pos.png"), ocr="off")
+    neg = TM.trust_map(_save(tmp_path, blue, "blueprint.png"), ocr="off")
+    assert neg["negative"] and not pos["negative"]
+    assert neg["summary"]["negative"] and neg["summary"]["warning"] == TM.NEGATIVE_WARNING
+    assert "%" not in TM.NEGATIVE_WARNING and "in 10" not in TM.NEGATIVE_WARNING
+    # the same drawing reads about the same either way round (was: lines lighter than the paper = no ink found)
+    assert neg["summary"]["red"] <= 10 and abs(neg["summary"]["clean"] - pos["summary"]["clean"]) <= 15, (neg["summary"], pos["summary"])
+    # a light sheet photographed on a black backdrop is NOT a blueprint (the bright part is a block, not lines)
+    dark = np.full((1100, 1600), 20, np.uint8)
+    dark[250:850, 400:1200] = 235
+    assert not TM._is_negative(dark)
+    # a dim photo of a normal print: dark paper, darker lines
+    assert not TM._is_negative((_plan(False) * 0.35 + 10).astype(np.uint8))
+
+
+def test_blank_page_says_no_drawing(tmp_path):
+    m = TM.trust_map(_save(tmp_path, np.full((900, 1300), 250, np.uint8), "blank.png"), ocr="off")
+    assert m["ok"] and m["summary"]["line"].startswith("No drawing found")

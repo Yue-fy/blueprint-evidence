@@ -62,6 +62,7 @@ LABELS = {
     "room_areas": "Printed room areas match the drawn rooms",
     "schedule_tags": "Door / window schedule marks are tagged on the plans",
     "floors_align": "Stairs and lifts line up with the floors above / below",
+    "plan_vs_model": "Plan matches the 3D model (doors, windows, walls, rooms)",
 }
 ALL_CHECKS = tuple(LABELS)
 
@@ -149,8 +150,55 @@ def _table_rows(path: str, page: int) -> tuple[list, str]:
         except Exception:  # noqa: BLE001
             mat = None
     else:
-        rows, space, mat = list(A.image_rows(path)), "image_px", None
+        rows, space, mat = list(_image_table_rows(path)), "image_px", None
     return _reading_order(rows, mat), space
+
+
+def _image_table_rows(path: str) -> tuple:
+    """areatable.image_rows from a STRICTLY cached text layer: image_rows goes through areatable._cached_layer, which
+    calls text_layer() and starts a cold OCR read (120 s budget) when only the VLM layer is on disk, and it OCRs the
+    table region when the rows look damaged. Seen in the uploads sweep: 123 s on a USACE S-100F scan. Here: the
+    cached layer or nothing, and a table whose rows look damaged is not checked."""
+    for tl in list(_image_layers(path))[:4]:
+        got = _layer_table_rows(path, tl)
+        if got:
+            return got
+    return ()
+
+
+def _layer_table_rows(path: str, tl) -> tuple:
+    from stoa.evidence import areatable as A
+
+    out = A._pair(A._item_lines((str(it.text), it.box) for it in tl.items), left_only=True)
+    box = A._table_box(tl)
+    if out and not A._suspect(out, tl, box):
+        return tuple(out)
+    # rows cut by the layer's tile seams (Stoa's AFCEC PNG): areatable OCRs the table crop once and caches it; use that
+    # read only when it is already cached (same crop file + OCR cache as areatable._crop_rows), never start it here
+    if box is None:
+        return ()
+    try:
+        import hashlib
+        import os
+
+        from PIL import Image
+
+        from stoa import ocr
+        from stoa.solvers.raster import textlayer as T
+
+        with Image.open(path) as im:
+            size = im.size
+        fx, fy = size[0] / tl.size[0], size[1] / tl.size[1]
+        b = (int(box[0] * fx), int(box[1] * fy), int(box[2] * fx), int(box[3] * fy))
+        tag = hashlib.sha1(f"{T.file_tag(path)}|{Path(path).name}|{b}".encode()).hexdigest()[:16]
+        f = Path(os.environ.get("JUNCTION_SHARED", ".stoa")) / "artifacts" / \
+            "E1" / "tablecrop" / f"{Path(path).stem[:40]}.{tag}.png"
+        if not (f.exists() and ocr.cached(str(f))):
+            return ()
+        crop = A._crop_rows(path, tl, box)  # a cache hit now
+        return tuple(crop) if crop and not A._suspect(crop, None, None, words=False) else ()
+    except Exception:  # noqa: BLE001
+        return ()
 
 
 def _reading_order(rows: list, mat=None) -> list:
@@ -298,6 +346,16 @@ def _plan_ratio(path: str, page: int) -> tuple[float | None, str]:
     if len(rs) == 1:
         return rs[0], f"1:{rs[0]:g} ({vs[0].scale_text or 'printed scale'})"
     if not rs:
+        # no titled view carries a scale (UK school plans print one '1:200@A3' in the title block): the page's only
+        # printed scale, already corrected for '@A1 on an A3 page' (E1's linework.sheet_scales)
+        try:
+            from stoa.evidence.linework import sheet_scales
+
+            sc = sheet_scales(path, page)
+        except Exception:  # noqa: BLE001
+            sc = ()
+        if len(sc) == 1:
+            return sc[0], f"1:{sc[0]:g} (the sheet's only printed scale)"
         return None, "no printed scale found"
     return None, "views at different scales (" + ", ".join(f"1:{r:g}" for r in rs) + ")"
 
@@ -319,21 +377,52 @@ def _ftin_txt(mm: float) -> str:
     return f"{inch // 12}'-{inch % 12}\""
 
 
+# a number with one of these right next to it is a quantity (an area-schedule cell '2470 SF', a percentage), not a
+# dimension string: Sports Complex A-801's Finish Room Schedule 'CLINIC 2470 SF' was read as a 2470 mm dimension with
+# the table's rule as its line (false alarm 'Dimension 2470 is drawn 2,231 mm long', cycle 4)
+_UNIT_WORD = re.compile(r"^(?:S\.?F\.?|SQ\.?|SQ\.?\s?FT\.?|SQFT|GSF|NSF|USF|RSF|FT²|FT2|M²|M2|M\^2|SM|M|MM|CM|LF|L\.F\.|%|KG|PCS|EA)$",
+                        re.I)
+
+
+def _unit_next(tb, words) -> bool:
+    """True when a unit word (_UNIT_WORD) sits right beside the number's box, in either text direction."""
+    x0, y0, x1, y1 = tb[:4]
+    h = max(1.0, min(x1 - x0, y1 - y0))  # the text height, whatever the text's direction (rotated pages)
+    for w in words:
+        if not _UNIT_WORD.match(str(w[4]).strip()):
+            continue
+        gx = max(w[0] - x1, x0 - w[2], 0.0)
+        gy = max(w[1] - y1, y0 - w[3], 0.0)
+        if gx <= 1.5 * h and gy <= 1.5 * h and (gx > 0 or gy > 0):
+            return True
+    return False
+
+
+_COMMA_MM = re.compile(r"^\d{1,3},\d{3}$")  # '8,670' / '66,720' / '120,000' mm
+
+
 def _dims(path: str, page: int, n: float) -> list[dict]:
     """Metric dimension strings (dimrect.dims: 3-5 digit mm) + US feet-inch ones ('133'-10"', AFCEC / USACE sheets)
-    read with the same line matcher (each value converted to mm). d["txt"] = the number as printed."""
+    read with the same line matcher (each value converted to mm). d["txt"] = the number as printed. A number with a
+    unit word beside it ('2470 SF') is a quantity, not a dimension."""
     from stoa.evidence import dimrect as R
 
     out = []
+    hs, vs, heads, words = R._geometry(path, page)
     for val, o, lo, hi, line, tb, meas in R.dims(path, page, n):
+        if _unit_next(tb, words):
+            continue
         out.append({"val": int(val), "o": o, "lo": float(lo), "hi": float(hi), "line": float(line), "box": tb,
                     "meas": float(meas), "txt": str(int(val)), "imperial": False})
-    hs, vs, heads, words = R._geometry(path, page)
     from stoa.evidence import linework as L
 
     mm_per_pt = n * L.PT_TO_M_AT_1 * 1000
     for w in words:
-        mm = _ftin_mm(w[4])
+        mm, imperial = _ftin_mm(w[4]), True
+        if mm is None and _COMMA_MM.match(w[4]) and not _unit_next(w, words):
+            # UK sheets print mm with a thousands comma ('8,670', '66,720': DfE / EFA baseline plans), which
+            # dimrect.dims (bare 3-5 digit numbers) does not read
+            mm, imperial = int(w[4].replace(",", "")), False
         if mm is None:
             continue
         try:
@@ -344,7 +433,7 @@ def _dims(path: str, page: int, n: float) -> list[dict]:
             continue
         val, o, lo, hi, line, tb, meas = got
         out.append({"val": int(val), "o": o, "lo": float(lo), "hi": float(hi), "line": float(line), "box": tb,
-                    "meas": float(meas), "txt": w[4].strip(), "imperial": True})
+                    "meas": float(meas), "txt": w[4].strip(), "imperial": imperial})
     return out
 
 
@@ -453,6 +542,39 @@ def _snap_to_ticks(path: str, page: int, by_line: dict, mm_per_pt: float, max_ga
                 p["meas"] = (p["hi"] - p["lo"]) * mm_per_pt
 
 
+def _traced_copy(img: str) -> str | None:
+    """The picture's traced vector copy (P1's vectorize: its lines as strokes, its OCR text as invisible text), if the
+    upload / takeoff already made one next to it ('<stem>.vecN.pdf' or a downsized '<stem>.s6000.vecN.pdf'); never
+    traces (cache-only, like orderlist.picture_doors)."""
+    p = Path(img)
+    try:
+        vecs = [*p.parent.glob(p.stem + ".vec*.pdf"), *p.parent.glob(p.stem + ".s[0-9]*.vec*.pdf")]
+        vecs = [v for v in vecs if v.stat().st_mtime >= p.stat().st_mtime - 1]
+    except OSError:
+        return None
+    return str(max(vecs, key=lambda q: q.stat().st_mtime)) if vecs else None
+
+
+def _dims_on_picture(path: str, file: str) -> tuple[_Run, _Run]:
+    """Dimension checks on a PICTURE's traced copy: AGREEMENTS only. A number that disagrees with its traced line is
+    noted, never reported: on a picture an OCR misread ('9950' read '9590') looks exactly like a drawing slip."""
+    vec = _traced_copy(path)
+    if vec is None:
+        why = "dimension strings are read on vector PDFs (or a picture's traced copy, made by its first measured question)"
+        return _Run("dimension_chains").skip(why), _Run("dimension_drawn").skip(why)
+    chains, drawn = check_dimensions(vec, 0, file)
+    for r in (chains, drawn):
+        if r.findings:
+            r.why = (f"{len(r.findings)} reading(s) disagree on the picture's traced copy: not reported (an OCR misread "
+                     "looks the same as a slip; check on the PDF)")
+            r.findings = []
+            if not r.passed:
+                r.skip(r.why)
+        r.passed = [{**{k: v for k, v in x.items() if k not in ("evidence", "zoom")},  # traced-copy space
+                     "what": f"{x['what']} (on the picture's traced lines)"} for x in r.passed]
+    return chains, drawn
+
+
 def check_dimensions(path: str, page: int, file: str) -> tuple[_Run, _Run]:
     chains, drawn = _Run("dimension_chains"), _Run("dimension_drawn")
     if not path.lower().endswith(".pdf"):
@@ -540,7 +662,10 @@ def check_dimensions(path: str, page: int, file: str) -> tuple[_Run, _Run]:
         tol = max(len(run_) * (13.0 if imp else 1.0), 0.002 * D["val"])  # rounding: 1/2 inch or 1/2 mm per number
         txt = " + ".join(p["txt"] for p in run_)
         if abs(s - D["val"]) <= tol:
-            chains.passed.append({"check": chains.check, "what": f"{txt} = {D['txt']}{'' if imp else ' mm'} ✓"})
+            evs = [_ev(file, page, _span_box({**D, "lo": ext[0], "hi": ext[1]}), f"overall dimension {D['txt']}")]
+            evs += [_ev(file, page, _span_box(p), f"chain piece {p['txt']}") for p in run_]
+            chains.passed.append({"check": chains.check, "what": f"{txt} = {D['txt']}{'' if imp else ' mm'} ✓",
+                                  "evidence": evs, "zoom": _pad(_union(e["bbox"] for e in evs), 20)})
             continue
         d = s - D["val"]
         # which number is off? the drawn spans: the overall line and each piece measured at 1:N
@@ -589,8 +714,11 @@ def check_dimensions(path: str, page: int, file: str) -> tuple[_Run, _Run]:
             abs(d["meas"] - d["val"]), 100 * err, "mm", "5 % (reader accuracy ~1 %)",
             [_ev(file, page, _span_box(d), f"dimension {d['txt']}, drawn {_len_txt(d['meas'], d['imperial'])}")]))
     if not drawn.findings:
+        evs = [_ev(file, page, _span_box(d), f"dimension {d['txt']}, drawn {_len_txt(d['meas'], d['imperial'])}")
+               for d in ds]
         drawn.passed.append({"check": drawn.check,
-                             "what": f"{len(ds)} dimension numbers match their drawn length at {how} (within 5 %) ✓"})
+                             "what": f"{len(ds)} dimension numbers match their drawn length at {how} (within 5 %) ✓",
+                             "evidence": evs, "zoom": _pad(_union(e["bbox"] for e in evs), 20)})
     return chains, drawn
 
 
@@ -837,6 +965,13 @@ _SHAFT = re.compile(r"\b(elev(?:ator)?s?|lifts?|stairs?|stairwells?|shafts?|chas
                     r"open to below|atrium|hoistway)\b", re.I)
 
 
+# rooms whose fittings are drawn along the walls (the tracer may stop at a counter / bath / WC edge)
+_FITTED = re.compile(r"\b(k[üu]che\w*|kitchen\w*|kitchenette|pantry|servery|keitti\w*|keittokomero|kök|köök|cuisine|"
+                     r"cucina|cocina|bad|bath\w*|shower\w*|dusche|wc|w\.c\.|toilet\w*|lavator\w*|washroom|"
+                     r"kph|ph|kylpy\w*|wasch\w*|laundry|utility|khh|tvätt\w*|pesu\w*|tualett\w*|vannitub\w*|"
+                     r"sauna|löyly\w*)\b", re.I)
+
+
 def check_room_areas(path: str, page: int, file: str, min_support: int = 8, flag_pct: float = 10.0,
                      near_pct: float = 5.0, notes: list | None = None) -> _Run:
     """Printed tag area vs the traced outline of the room around the tag. Only well-supported traces count
@@ -854,10 +989,11 @@ def check_room_areas(path: str, page: int, file: str, min_support: int = 8, flag
     except Exception as e:  # noqa: BLE001
         return run.skip(f"room tag reader failed ({type(e).__name__})")
     if not tags:
-        return run.skip("no room tags with a printed area in a floor plan view")
+        uk = _room_areas_uk(path, page, file, notes)  # UK school plans: 'Hall' over 'A: 180 m2', no views / numbers
+        return uk if uk is not None else run.skip("no room tags with a printed area in a floor plan view")
     from stoa.evidence.linework import measure_room
 
-    seen, unsure = set(), 0
+    seen, unsure, metric_off = set(), 0, []
     for t in tags:
         key = (t.view, t.number, _norm_name(t.name), t.value)
         if key in seen:
@@ -879,14 +1015,35 @@ def check_room_areas(path: str, page: int, file: str, min_support: int = 8, flag
         printed, meas = _m2(t), float(m["area_m2"])
         run.compared += 1
         pct = 100.0 * (meas - printed) / printed
+        metric = t.unit != "ft2"
+        if metric and float(t.value).is_integer():  # a rounded '4 m2' is 3.5-4.5 (F5 00:30)
+            lo, hi = printed - 0.5, printed + 0.5
+            pct = 0.0 if lo <= meas <= hi else 100.0 * (meas - (hi if meas > hi else lo)) / printed
         if abs(pct) < near_pct:
             run.passed.append({"check": run.check, "what": f"{t.label}: printed {t.text}, traced "
-                                                           f"{meas:.2f} m² ({pct:+.1f} %) ✓"})
+                                                           f"{meas:.2f} m² ({pct:+.1f} %) ✓",
+                               "evidence": [_ev(file, page, _bbox_of(m["polygon"]), f"{t.label}: printed {t.text}, "
+                                                f"traced {meas:.2f} m²", exact=False, polygon=m["polygon"])]})
+            continue
+        if metric:
+            # m² tags (UK / European plans) are compared for AGREEMENT only: on 6 clean UK secondary plans
+            # (experiments/f3/uk15.txt, F3 01:0x) this path reported 20 'differences', all tracer / tag-reader artefacts
+            # (open halls and circulation, changing rooms traced short, a tag whose name line was not found, small
+            # stores at the rounding edge); the ft² findings keep their bench (0 false alarms on 67 clean sheets)
+            metric_off.append(f"{t.label}: printed {t.text}, traced ≈ {meas:.1f} m² ({pct:+.0f} %)")
             continue
         if abs(pct) < flag_pct:
             if notes is not None:
                 notes.append(f"{t.label}: printed {t.text}, the traced outline is {pct:+.1f} %: near what tracing can "
                              f"tell apart (walls measured at centre vs finish), not reported")
+            continue
+        if pct < 0 and _FITTED.search(f"{t.name or ''} {t.label or ''}"):
+            # fittings drawn along the walls (counters, baths, WCs, machines) close the outline early: a SMALLER trace
+            # is expected there (uploads sweep: Swiss 'Küche 2.02' 12.05 m² printed, traced 9.31 m² to the counter
+            # edge). A LARGER trace still reports (fittings never make the outline grow).
+            if notes is not None:
+                notes.append(f"{t.label}: printed {t.text}, traced {meas:.2f} m² ({pct:+.1f} %): kitchens and "
+                             f"bathrooms have fittings drawn along the walls that the outline may follow; not reported")
             continue
         unit = t.unit
         meas_u = meas / FT2_M2 if unit == "ft2" else meas
@@ -903,11 +1060,156 @@ def check_room_areas(path: str, page: int, file: str, min_support: int = 8, flag
             [_ev(file, page, t.box, f"printed {t.label} {t.text}"),
              _ev(file, page, _bbox_of(m["polygon"]), f"traced outline ≈ {meas:.2f} m²", exact=False,
                  polygon=m["polygon"])]))
+    if metric_off and notes is not None:
+        notes.append(f"{len(metric_off)} printed room area(s) in m² differ from the outline traced around the tag by "
+                     f"{near_pct:g} % or more ({'; '.join(metric_off[:4])}): not reported — on metric plans a traced "
+                     "outline that merges or splits rooms looks the same as an out-of-date area.")
+    rooms = [p for p in run.passed if ": printed " in p["what"]]
+    if len(rooms) > 5:  # many agreeing rooms: one line (a 40-room plan should not read as 40 checks)
+        named = [p for p in rooms if not p["what"].startswith("(unlabelled")] or rooms
+        eg = ", ".join(p["what"].split(" (")[0].replace(": printed ", " ").replace(", traced ", " ≈ ")
+                       for p in named[:3])
+        evs = [e for p in rooms for e in p.get("evidence") or []]
+        run.passed = [p for p in run.passed if p not in rooms] + [
+            {"check": run.check, "what": f"{len(rooms)} printed room areas match the room traced around their tag "
+                                         f"(within {near_pct:g} %), e.g. {eg} ✓",
+             "evidence": evs, "zoom": _pad(_union(e["bbox"] for e in evs), 10)}]
     if unsure:
         run.why = f"{unsure} room(s) skipped: their outline could not be traced reliably (open plan / gaps)"
+    if run.compared and not run.passed and not run.findings and run.status == "ran":
+        run.skip(f"{run.compared} printed room areas traced, none within {near_pct:g} %: not reported")
     if run.compared == 0 and run.status == "ran":
+        uk = _room_areas_uk(path, page, file, notes)
+        if uk is not None and uk.status == "ran":
+            return uk
         run.skip(run.why or "no room could be traced reliably")
     return run
+
+
+# UK school plans (DfE / EFA baseline designs, the family of Stoa's DfE example): a room tag is the name over its area
+# 'A: 62 m2' (2014 primaries), '6 m2' (2014 secondaries) or '(13.0 m2)' (2012 sets); no room numbers, no view titles,
+# the scale in the title block ('1:200@A3'). The printed area is ROUNDED (F5 00:30): compare with the range 61.5-62.5.
+_UK_AREA = re.compile(r"^\s*\(?\s*(?:A\s*:\s*)?(\d{1,4}(?:\.\d{1,2})?)\s*(?:m2|m²|sq\.?\s*m)\s*\)?\s*$", re.I)
+
+
+def _uk_area_tags(path: str, page: int) -> list[dict]:
+    """[{name, value, half, box}] for every 'name' over 'A: N m2' stack on an UNROTATED page (pdf_pt); half = the
+    rounding of the printed number (0.5 for '62', 0.05 for '13.0')."""
+    import pymupdf
+
+    from stoa.evidence.linework import text_lines
+
+    with pymupdf.open(path) as d:
+        if page >= len(d) or d[page].rotation:
+            return []
+    lines = text_lines(path, page)
+    out = []
+    for txt, b in lines:
+        m = _UK_AREA.match(txt)
+        if not m:
+            continue
+        cx, h = (b[0] + b[2]) / 2, b[3] - b[1]
+        above = [(t2, b2) for t2, b2 in lines if b2[3] <= b[1] + 0.3 * h and b[1] - b2[3] < 1.2 * h
+                 and abs((b2[0] + b2[2]) / 2 - cx) < max(b2[2] - b2[0], b[2] - b[0]) and not _UK_AREA.match(t2)
+                 and re.search(r"[A-Za-z]{2}", t2)]
+        if not above:
+            continue
+        name, nb = max(above, key=lambda x: x[1][3])
+        s = m.group(1)
+        out.append({"name": name.strip(), "value": float(s), "text": txt.strip(),
+                    "half": 0.5 if "." not in s else 0.5 * 10 ** -len(s.split(".")[1]),
+                    "box": (min(b[0], nb[0]), min(b[1], nb[1]), max(b[2], nb[2]), max(b[3], nb[3]))})
+    return out
+
+
+def _room_areas_uk(path: str, page: int, file: str, notes: list | None, min_support: int = 10, near_pct: float = 5.0):
+    """Printed UK room areas vs the room traced around each tag: AGREEMENTS ONLY, or None (not this kind of sheet).
+    Bench (experiments/f3/uk15.txt, 15 clean DfE 2014 / 2012 plans, F3 01:0x): 23-49 rooms per sheet agree within the
+    rounding + 5 %, but 20 rooms traced >= 20 % off at support >= 10 are tracer misses, not slips (stairs, open
+    circulation, a hall / kitchen / changing room traced into its neighbour, 'Gen Office' -14 % where the fill polygon
+    says 11.27 m² = the printed 11): a disagreement here is noted, never reported."""
+    try:
+        tags = _uk_area_tags(path, page)
+    except Exception:  # noqa: BLE001 - unreadable / missing file: not this kind of sheet
+        return None
+    if len(tags) < 5:
+        return None
+    run = _Run("room_areas")
+    from stoa.evidence.linework import measure_room, sheet_scales
+
+    sc = sheet_scales(path, page)
+    if len(sc) != 1:
+        return run.skip(f"{len(tags)} printed room areas read, but the sheet prints "
+                        f"{'no scale' if not sc else 'several scales'}: rooms not traced")
+    n = sc[0]
+    agree, off, untraced = [], [], 0
+    for t in tags:
+        if _SHAFT.search(t["name"]) or t["value"] > 5000:
+            continue
+        c = _centre(t["box"])
+        try:
+            m = measure_room(path, page, c, n, tag_box=t["box"])
+        except Exception:  # noqa: BLE001
+            m = None
+        if not m or (m.get("support") or 0) < min_support:
+            untraced += 1
+            continue
+        a, v, half = float(m["area_m2"]), t["value"], t["half"]
+        outside = 0.0 if v - half <= a <= v + half else a - (v + half if a > v + half else v - half)
+        run.compared += 1
+        (agree if abs(100.0 * outside / v) < near_pct else off).append((t, a, 100.0 * outside / v, m["polygon"]))
+    if not agree:
+        return run.skip(f"{len(tags)} printed room areas read; {run.compared} traced, none within {near_pct:g} % of "
+                        f"the printed area: not reported (the tracer may have merged or split those rooms)")
+    eg = ", ".join(f"{t['name'][:24]} {t['value']:g} m² ≈ {a:.1f}" for t, a, _, _ in
+                   sorted(agree, key=lambda x: -x[0]["value"])[:3])
+    evs = [_ev(file, page, _bbox_of(poly), f"{t['name'][:40]}: printed {t['text']}, traced {a:.2f} m²", exact=False,
+               polygon=poly) for t, a, _, poly in agree]
+    run.passed.append({"check": run.check, "what": f"{len(agree)} printed room areas match the room drawn around their "
+                                                   f"tag at 1:{n:g} (within the printed rounding + {near_pct:g} %), "
+                                                   f"e.g. {eg} ✓", "evidence": evs,
+                       "zoom": _pad(_union(e["bbox"] for e in evs), 10)})
+    if off and notes is not None:
+        ex = "; ".join(f"{t['name'][:20]} {t['text']} vs ≈ {a:.1f} m²" for t, a, _, _ in
+                       sorted(off, key=lambda x: -abs(x[2]))[:4])
+        notes.append(f"{len(off)} printed room area(s) differ from the outline traced around the tag by more than "
+                     f"{near_pct:g} % ({ex}): not reported — on plans like this (open circulation, stairs, rooms with "
+                     "open sides) a traced outline that merges or splits rooms looks the same as an out-of-date area.")
+    run.why = "; ".join(x for x in (untraced and f"{untraced} room(s) not traced reliably",
+                                     off and f"{len(off)} traced room(s) outside {near_pct:g} %: noted, never reported")
+                        if x)
+    return run
+
+
+def _room_areas_on_picture(path: str, file: str, notes: list | None = None) -> _Run:
+    """Printed room areas vs rooms traced on a PICTURE's traced copy: AGREEMENTS only, as one line. On 9 traced scans
+    here (Swiss / French dwelling scans, X1's UK school scans; F3 01:2x) the per-room reading 'disagreed' 0-9 times per
+    sheet, every time a tracer or OCR artefact (corridors traced short, a 'Cage d'escalier' stair, '5.48 m²' read as
+    '1 m²'), while 3-28 rooms per sheet agreed within 5 %."""
+    vec = _traced_copy(path)
+    if vec is None:
+        return _Run("room_areas").skip("room outlines are traced from vector wall lines (PDF), or a picture's traced "
+                                       "copy (made by its first measured question)")
+    r = check_room_areas(vec, 0, file, notes=[])
+    off = len(r.findings)
+    r.findings = []
+    rooms = [p["what"] for p in r.passed if p["what"].endswith("✓") and ": printed " in p["what"]]
+    summary = [p for p in r.passed if p not in rooms and not (": printed " in p["what"])]
+    if len(rooms) > 1:
+        eg = ", ".join(x.split(" (")[0].replace(": printed ", " ").replace(", traced ", " ≈ ") for x in rooms[:3])
+        summary.append({"check": "room_areas", "what": f"{len(rooms)} printed room areas match the room traced around "
+                                                       f"their tag (within 5 %) on the picture's traced lines, e.g. "
+                                                       f"{eg} ✓"})
+    else:
+        summary = [{**p, "what": p["what"].replace(" ✓", " (on the picture's traced lines) ✓")}
+                   for p in summary + [{"check": "room_areas", "what": x} for x in rooms]]
+    r.passed = [{k: v for k, v in p.items() if k not in ("evidence", "zoom")} for p in summary]  # traced-copy space
+    if off and notes is not None:
+        notes.append(f"{off} printed room area(s) differ from the room traced on the picture: not reported (on a "
+                     "picture an OCR misread, or a traced outline that merges or splits rooms, looks the same as a slip)")
+    if not r.passed and r.status == "ran":
+        r.skip(f"{r.compared} printed room areas traced on the picture, none within 5 %: not reported")
+    return r
 
 
 def _bbox_of(poly) -> list:
@@ -1471,37 +1773,376 @@ def check_floors_align(path: str, page: int, file: str, notes: list | None = Non
 
 
 # ----------------------------------------------------------------------------------------------------------------------
+# 9. plan vs 3D model: a floor plan rendered from an IFC model (IfcConvert: every drawn product carries its GlobalId in
+# the SVG twin) vs the model's elements of that storey that cross the plan's cut plane (W1's stoa.kg cut compare, the
+# customer view's 'Differences found'). Elements without parsed geometry are never counted (their height is unknown).
+# A finding needs THREE readings to agree that something is missing: the model has the element crossing the cut, the
+# SVG tags no such GlobalId, AND the PDF has no linework where the model puts it. And the sheet must confirm the cut
+# height first (>= 90 % of the storey's crossing elements of the compared kinds are drawn), else the render was cut at
+# another height (frigento: plan-01 draws 6 doors for 3 modelled) and gaps are notes, not findings.
+
+_PVM_KINDS = (("doors", ("IfcDoor",)), ("windows", ("IfcWindow",)), ("walls", ("IfcWall", "IfcWallStandardCase")),
+              ("columns", ("IfcColumn",)), ("rooms", ("IfcSpace",)))
+_PVM_REPORT = {"doors", "windows", "columns"}  # small rigid things: a missing one is a real gap; walls / rooms pass-only
+_PVM_CUT_OK = 0.9
+
+
+def _pvm_model(path: str) -> tuple[str | None, str]:
+    """(model path, plan path) as the ifc helpers want them: dataset-relative under the data root, else absolute
+    (an upload / a copy with the .ifc next to it: '<model stem>_plan-NN-<level>.pdf' + '<model stem>.ifc')."""
+    p = Path(path)
+    try:
+        from stoa.data import data_root
+
+        rel = str(p.resolve().relative_to(data_root().resolve()))
+    except (ValueError, OSError):
+        rel = None
+    if rel is not None:
+        from stoa.solvers.ifc.solver import model_for
+
+        return model_for(rel), rel
+    for m in sorted(p.parent.glob("*.ifc")):
+        if p.stem.startswith(m.stem + "_plan-"):
+            return str(m), str(p)
+    return None, str(p)
+
+
+@functools.lru_cache(maxsize=16)
+def _pvm_lines(path: str, mtime: float) -> tuple:
+    """Bounding boxes (pdf_pt) of the page's linework, room fills left out (an IfcSpace fill covers the whole room)."""
+    import pymupdf
+
+    from stoa.evidence.ifcplan_pdf import _is_space_fill
+
+    with pymupdf.open(path) as doc:
+        if len(doc) == 0:
+            return ()
+        return tuple((r.x0, r.y0, r.x1, r.y1) for d in doc[0].get_drawings()
+                     if not _is_space_fill(d.get("fill")) and (r := d.get("rect")) is not None)
+
+
+def _pvm_drawn_at(lines: tuple, box) -> int:
+    """How many pieces of linework sit mostly (>= 70 %) inside `box` (padded 2 pt): > 0 = something is drawn there."""
+    x0, y0, x1, y1 = box[0] - 2, box[1] - 2, box[2] + 2, box[3] + 2
+    n = 0
+    for a, b, c, d in lines:
+        w, h = max(c - a, 0.5), max(d - b, 0.5)
+        iw = max(0.0, min(c, x1) - max(a, x0)) if c - a >= 0.5 else (1.0 if x0 <= a <= x1 else 0.0) * w
+        ih = max(0.0, min(d, y1) - max(b, y0)) if d - b >= 0.5 else (1.0 if y0 <= b <= y1 else 0.0) * h
+        if iw * ih >= 0.7 * w * h and w * h < 4 * max((x1 - x0) * (y1 - y0), 1.0):
+            n += 1
+    return n
+
+
+def check_plan_vs_model(path: str, page: int, file: str, notes: list | None = None) -> _Run:
+    run = _Run("plan_vs_model")
+    if not path.lower().endswith(".pdf") or "_plan-" not in Path(path).stem:
+        return run.skip("not a floor plan rendered from an IFC model (no linked 3D model)")
+    from stoa.kg.graph import CUT_HEIGHT, _crosses, floor_offset
+    from stoa.solvers.ifc.index import load_index
+    from stoa.solvers.ifc.plan2d import plan_items, project_box
+    from stoa.solvers.ifc.solver import plan_storey
+
+    model, plan = _pvm_model(path)
+    if not model:
+        return run.skip("no IFC model linked to this sheet")
+    items = plan_items(plan)
+    if not items:
+        return run.skip("this sheet carries no IFC element tags (no SVG twin): nothing to link to the model")
+    idx = load_index(model)
+    st, _why = plan_storey(plan, idx)
+    if st is None:
+        return run.skip("could not tell which storey of the model this plan shows")
+    cut_z = (st.elevation or 0.0) + floor_offset(idx) + CUT_HEIGHT
+    on = idx.in_storey(st.guid)
+    rows = []
+    for label, classes in _PVM_KINDS:
+        mine = [e for e in on if e.cls in classes or e.eff_cls in classes]
+        crossing = [e for e in mine if _crosses(e, cut_z) is True]
+        above_below = sum(1 for e in mine if _crosses(e, cut_z) is False)
+        tagged = {g: it for g, it in items.items() if it.cls in classes}
+        if not tagged:  # the sheet tags none of this kind: no 2D data (some renders tag rooms only)
+            if crossing:
+                run.why = (run.why + "; " if run.why else "") + f"the sheet tags no {label} (model: {len(crossing)})"
+            continue
+        drawn = [e for e in crossing if e.guid in tagged]
+        missing = [e for e in crossing if e.guid not in tagged]
+        extra = [g for g in tagged if g not in idx.elements]
+        rows.append((label, mine, crossing, above_below, drawn, missing, extra, tagged))
+    if not rows:
+        return run.skip(run.why or "no element of this storey to compare")
+    n_cross = sum(len(r[2]) for r in rows)
+    n_drawn = sum(len(r[4]) for r in rows)
+    cut_ok = n_cross > 0 and n_drawn / n_cross >= _PVM_CUT_OK
+    lines = _pvm_lines(path, Path(path).stat().st_mtime) if cut_ok else ()
+    where = f"'{st.name}'"
+    for label, mine, crossing, above_below, drawn, missing, extra, tagged in rows:
+        run.compared += 1
+        gone = []  # missing in the SVG AND blank in the PDF where the model puts them
+        for e in missing:
+            box = project_box(model, plan, e) if cut_ok else None
+            if box is not None and _pvm_drawn_at(lines, box) == 0:
+                gone.append((e, box))
+        # this kind itself must confirm the reading: >= 90 % of its crossing elements are drawn (tagged or not), else the
+        # renderer skips this kind here (frigento ground floor: 3 tagged + 3 untagged of 7 doors) and gaps are notes
+        kind_ok = bool(crossing) and (len(crossing) - len(gone)) / len(crossing) >= _PVM_CUT_OK
+        if label in _PVM_REPORT and cut_ok and ((gone and kind_ok) or extra):
+            gone = gone if kind_ok else []
+            k = len(gone) + len(extra)
+            names = ", ".join(sorted({(e.name or e.guid)[:24] for e, _ in gone}))[:120]
+            ev = [dict(_ev(file, 0, b, f"{label[:-1]} '{(e.name or '?')[:40]}' in the 3D model, not drawn here",
+                           exact=False), ifc_guid=e.guid) for e, b in gone[:12]]
+            ev += [dict(_ev(file, 0, tagged[g].bbox, f"{label[:-1]} drawn here, its GlobalId is not in the 3D model"),
+                        ifc_guid=g) for g in extra[:12]]
+            what = (f"On {where} the 3D model has {len(crossing)} {label} crossing the plan's cut height "
+                    f"(floor + {CUT_HEIGHT:g} m); the plan draws {len(drawn) + len(extra)}.")
+            if gone:
+                what += f" Not drawn: {names} (nothing is drawn where the model puts them)."
+            if extra:
+                what += f" {len(extra)} drawn {label} are not in the model."
+            run.findings.append(_finding(
+                "plan_vs_model", "warning", 0.85,
+                f"Plan and 3D model disagree: {k} {label[:-1] if k == 1 else label}",
+                what,
+                [{"label": "3D model (crossing the cut)", "value": len(crossing), "unit": label,
+                  "source": Path(model).name},
+                 {"label": "drawn on this plan", "value": len(drawn) + len(extra), "unit": label,
+                  "source": "element tags + linework"}],
+                k, None, label, "exact (GlobalId match), plus nothing drawn at the model's position",
+                ev, zoom=_pad(_union(e["bbox"] for e in ev), 20)))
+            continue
+        untagged = len(missing) - len(gone) if cut_ok else 0
+        if not missing and not extra:
+            extra_txt = f"; {above_below} more sit entirely above / below the cut and are not drawn (normal)" \
+                if above_below else ""
+            run.passed.append({"check": "plan_vs_model", "what":
+                               f"{label.capitalize()} on {where}: {len(drawn)} drawn = {len(crossing)} in the 3D model "
+                               f"at the plan's cut height{extra_txt}"})
+        elif cut_ok and untagged == len(missing) and not extra:
+            run.passed.append({"check": "plan_vs_model", "what":
+                               f"{label.capitalize()} on {where}: {len(drawn)} tagged + {untagged} drawn without their "
+                               f"IFC tag = {len(crossing)} in the 3D model"})
+        elif notes is not None:
+            notes.append(f"Plan vs 3D model, {label} on {where}: model {len(crossing)} crossing the cut, drawn "
+                         f"{len(drawn)}" + ("" if cut_ok else " (this render seems cut at another height: "
+                                            f"only {n_drawn} of {n_cross} crossing elements are drawn; not reported)")
+                         + (f"; {len(gone)} not drawn at all, but too many of this kind are missing on this render to "
+                            "call it a drawing slip (not reported)" if cut_ok and gone and not kind_ok else ""))
+    return run
+
+
+# ----------------------------------------------------------------------------------------------------------------------
 # entry point
 
-def _image_layer(path: str):
-    """The picture's text layer only if something already read it (an upload render's PDF words, memory, the OCR
-    cache, the VLM layer on disk); never starts a read. Not areatable._cached_layer / raster.sheet.cached_layer: both
-    end in text_layer(), which runs a cold OCR read (up to 120 s on the OCR server) when only the VLM layer is on disk
-    (F3 bench 21:40 on an older S-100F scan upload)."""
+def _image_layers(path: str):
+    """Every text layer of the picture that something already read (an upload render's PDF words, memory, the OCR
+    cache, the VLM layer on disk), in that order; never starts a read. Not areatable._cached_layer /
+    raster.sheet.cached_layer: both end in text_layer(), which runs a cold OCR read (up to 120 s on the OCR server) when
+    only the VLM layer is on disk (F3 bench 21:40 on an older S-100F scan upload). Several can exist: the API process
+    that answered a question keeps ITS layer in memory, which may differ from the one on disk (scanned AFCEC PDF upload:
+    the in-memory layer's table rows looked damaged, the disk layer's read cleanly)."""
     try:
         import json as _json
 
         from stoa import ocr
         from stoa.solvers.raster import textlayer as T
+    except Exception:  # noqa: BLE001
+        return
+    seen = set()
 
-        tl = T.pdf_render_layer(path)
-        if tl is not None:
-            return tl
-        tag = f"{path}{T.file_tag(path)}|"
-        for k, v in list(getattr(T, "_mem", {}).items()):
-            if str(k).startswith(tag):
-                return v
-        if ocr.cached(path) and T.ocr_suits(path):
-            return ocr.text_layer(path)  # a cached OCR read: a disk load
-        f = T._disk_key(path, 1100, "local")
-        if f.exists():
-            d = _json.loads(f.read_text())
-            d["items"] = [T.TextItem(**i) for i in d["items"]]
-            d["size"] = tuple(d["size"])
-            return T.TextLayer(**d)
+    def new(tl):
+        if tl is None or id(tl) in seen:
+            return False
+        seen.add(id(tl))
+        return True
+
+    for step in ("render", "mem", "ocr", "disk"):
+        try:
+            if step == "render":
+                cands = [T.pdf_render_layer(path)]
+            elif step == "mem":
+                tag = f"{path}{T.file_tag(path)}|"
+                cands = [v for k, v in list(getattr(T, "_mem", {}).items()) if str(k).startswith(tag)]
+            elif step == "ocr":
+                cands = [ocr.text_layer(path)] if ocr.cached(path) and T.ocr_suits(path) else []  # a disk load
+            else:
+                f = T._disk_key(path, 1100, "local")
+                cands = []
+                if f.exists():
+                    d = _json.loads(f.read_text())
+                    d["items"] = [T.TextItem(**i) for i in d["items"]]
+                    d["size"] = tuple(d["size"])
+                    cands = [T.TextLayer(**d)]
+        except Exception:  # noqa: BLE001
+            continue
+        for tl in cands:
+            if new(tl):
+                yield tl
+
+
+def _image_layer(path: str):
+    """The picture's first already-read text layer (see _image_layers), or None; never starts a read."""
+    try:
+        return next(iter(_image_layers(path)), None)
     except Exception:  # noqa: BLE001
         return None
-    return None
+
+
+def _page_is_scan(pdf: str, page: int) -> bool:
+    """normalize.scan_png's cheap test on any page: no rotation, (almost) no text, a small content stream, one image over
+    >= 50 % of the page. Lets a VECTOR set skip the one-page copy a scan needs."""
+    import pymupdf
+
+    from stoa.formats.pages import _stream_bytes
+
+    with pymupdf.open(pdf) as d:
+        if page >= len(d):
+            return False
+        pg = d[page]
+        imgs = pg.get_images(full=True)
+        if not imgs or pg.rotation or _stream_bytes(pg) > 20_000 or len((pg.get_text() or "").strip()) >= 20:
+            return False
+        area = max(pg.rect.get_area(), 1e-9)
+        return any((r & pg.rect).get_area() / area >= 0.5 for im in imgs for r in pg.get_image_rects(im[0]))
+
+
+def _scan_of(pdf: str, page: int = 0) -> tuple[str, float] | None:
+    """(rendered PNG, px per pt) when that page of the PDF is a scan; the SAME files the upload readers read and OCR
+    (page 0: normalize.scan_png; page k: pages.one_page_copy into normalize._cache_dir, then scan_png, as
+    normalize.prepare does), so their text layer is there after the first question. None for a drawn page / on error."""
+    try:
+        from stoa.formats.normalize import _cache_dir, scan_png
+
+        if page == 0:
+            return scan_png(pdf)
+        if not _page_is_scan(pdf, page):
+            return None
+        from stoa.formats.pages import one_page_copy
+
+        return scan_png(one_page_copy(pdf, page, _cache_dir(Path(pdf))))
+    except Exception:  # noqa: BLE001 — a failed scan check leaves the PDF to the PDF checks
+        return None
+
+
+def _photo_of(img: str) -> tuple[str, list] | None:
+    """(deskewed copy, 3x3 deskewed px -> photo px) when O1's photo step already rectified this phone photo of a print
+    (its '<stem>.photo.json' sidecar in normalize._cache_dir, valid for this file): the upload readers OCR THAT copy,
+    sometimes never the raw photo (3 of 12 photo uploads here). Cache-only: never deskews in a request."""
+    try:
+        import json as _json
+
+        from stoa.formats.normalize import _cache_dir
+        from stoa.solvers.raster import photo as PH
+
+        if not PH.enabled():
+            return None
+        src = Path(img)
+        side = Path(_cache_dir(src)) / f"{src.stem}.photo{'' if PH.FLATTEN else '-nf'}.json"
+        got = _json.loads(side.read_text())
+        key = {"v": PH.VERSION, "flat": PH.FLATTEN, "mtime": src.stat().st_mtime, "size": src.stat().st_size}
+        d = got.get("d") if got.get("key") == key else None
+        if not d or not Path(d["path"]).exists():
+            return None
+        return str(d["path"]), d["to_photo"]
+    except Exception:  # noqa: BLE001 — no / stale sidecar: not a photo we know
+        return None
+
+
+def _to_photo(findings: list, passed: list, H) -> None:
+    """Evidence on the deskewed copy (image_px) -> the raw photo's pixels through the homography (bbox = the box of the
+    four mapped corners), so the viewer (which shows the photo) outlines the right spot."""
+    import numpy as np
+
+    M = np.asarray(H, dtype=float)
+
+    def pt(x, y):
+        v = M @ np.array([x, y, 1.0])
+        return float(v[0] / v[2]), float(v[1] / v[2])
+
+    def box(b):
+        if not b:
+            return b
+        ps = [pt(b[0], b[1]), pt(b[2], b[1]), pt(b[2], b[3]), pt(b[0], b[3])]
+        return [round(min(p[0] for p in ps), 1), round(min(p[1] for p in ps), 1), round(max(p[0] for p in ps), 1),
+                round(max(p[1] for p in ps), 1)]
+
+    for item in [*findings, *passed]:
+        moved = False
+        for e in item.get("evidence") or []:
+            if e.get("bbox_space") == "image_px":
+                e["bbox"] = box(e.get("bbox"))
+                if e.get("polygon"):
+                    e["polygon"] = [[round(c, 1) for c in pt(x, y)] for x, y in e["polygon"]]
+                moved = True
+        if moved and item.get("zoom"):
+            item["zoom"] = box(item["zoom"])
+
+
+def _shrunk_of(img: str) -> tuple[str, float] | None:
+    """(the downsized copy the upload readers read, its factor) of a BIG picture: '<stem>.s6000.png' made by
+    normalize.shrunk_copy (pictures over 6000 px are read at 6000 px), only when its sidecar is valid (same source size,
+    SHRINK_VERSION, newer than the picture). Cache-only: never shrinks in a request. X1's scans of Stoa-like sheets at
+    6623 x 4678 / 6800 x 4400 px (S-100F, A-101F, AFCEE A-101, M-101A) had their text layer ONLY on that copy, so the
+    self-check said 'no text layer yet' after the visitor's questions had read it (F3 01:2x)."""
+    import json
+
+    p = Path(img)
+    if re.search(r"\.s\d+$", p.stem) or p.suffix.lower() not in (".png", ".jpg", ".jpeg"):
+        return None
+    try:
+        from PIL import Image
+
+        from stoa.formats import normalize as N
+
+        dst = N._cache_dir(p) / f"{p.stem}.s{N.IMAGE_MAX_SIDE}{'.jpg' if p.suffix.lower() != '.png' else '.png'}"
+        meta = dst.with_name(dst.name + ".json")
+        if not (dst.exists() and meta.exists() and dst.stat().st_mtime >= p.stat().st_mtime):
+            return None
+        m = json.loads(meta.read_text())
+        Image.MAX_IMAGE_PIXELS = None
+        with Image.open(p) as im:
+            size = list(im.size)
+        if m.get("src_size") != size or m.get("v", 1) != N.SHRINK_VERSION:
+            return None
+        f = float(m["factor"])
+    except Exception:  # noqa: BLE001
+        return None
+    return (str(dst), f) if 0.0 < f < 1.0 else None
+
+
+def _unshrink(findings: list, passed: list, factor: float) -> None:
+    """Evidence on the downsized copy (image_px) -> the uploaded picture's pixels."""
+    def box(b):
+        return [round(float(v) / factor, 1) for v in b] if b else b
+
+    for item in [*findings, *passed]:
+        moved = False
+        for e in item.get("evidence") or []:
+            if e.get("bbox_space") == "image_px":
+                e["bbox"] = box(e.get("bbox"))
+                if e.get("polygon"):
+                    e["polygon"] = [[round(x / factor, 1), round(y / factor, 1)] for x, y in e["polygon"]]
+                moved = True
+        if moved and item.get("zoom"):
+            item["zoom"] = box(item["zoom"])
+
+
+def _px_to_pt(findings: list, passed: list, file: str, zoom: float, page: int = 0) -> None:
+    """Evidence on a scanned PDF page's rendered picture (image_px) -> that page's points, so the viewer (which shows
+    the PDF) outlines the right spot (the same map as takeoff.px_to_pt; a one-page copy keeps size and coordinates)."""
+    def box(b):
+        return [round(float(v) / zoom, 2) for v in b] if b else b
+
+    for item in [*findings, *passed]:
+        moved = False
+        for e in item.get("evidence") or []:
+            if e.get("bbox_space") == "image_px":
+                e["file"], e["page"], e["bbox_space"], e["bbox"] = file, page, "pdf_pt", box(e.get("bbox"))
+                if e.get("polygon"):
+                    e["polygon"] = [[round(x / zoom, 2), round(y / zoom, 2)] for x, y in e["polygon"]]
+                moved = True
+        if moved and item.get("zoom"):
+            item["zoom"] = box(item["zoom"])
 
 
 def check(path: str, page: int = 0, file: str | None = None, checks=None) -> dict:
@@ -1515,9 +2156,25 @@ def check(path: str, page: int = 0, file: str | None = None, checks=None) -> dic
     runs: list[_Run] = []
     notes: list[str] = []
     is_pdf = path.lower().endswith(".pdf")
-    layer = None
+    scan_zoom, rep_page = None, page
+    if is_pdf:  # a scanned print (the page is one picture, no text, no lines): check the picture
+        scan = _scan_of(path, page)
+        if scan:
+            (path, scan_zoom), page = scan, 0  # the picture is one page; the report keeps the PDF's page
+            is_pdf = False
+            notes.append("Scanned PDF (the page is one picture): checked like a picture, places shown on the page.")
+    layer, photo_h, shrink = None, None, None
     if not is_pdf:
         layer = _image_layer(path)
+        sh = _shrunk_of(path) if layer is None and not scan_zoom else None
+        if sh and _image_layer(sh[0]) is not None:  # a big picture read at 6000 px: check the copy that was read
+            (path, shrink), layer = sh, _image_layer(sh[0])
+            notes.append(f"Large picture: checked on the {round(100 * shrink)} % copy the readers read, places shown "
+                         "on the picture.")
+        ph = _photo_of(path) if layer is None and not scan_zoom else None
+        if ph and _image_layer(ph[0]) is not None:  # a phone photo read only through its deskewed copy
+            (path, photo_h), layer = ph, _image_layer(ph[0])
+            notes.append("Phone photo of a print: checked on its straightened copy, places shown on the photo.")
         if layer is None:
             notes.append("This picture has no text layer yet (ask any question about it first, which reads it): "
                          "only checks that need no text ran.")
@@ -1535,26 +2192,51 @@ def check(path: str, page: int = 0, file: str | None = None, checks=None) -> dic
     if "area_table_sums" in want:
         runs.append(safe(check_area_table, path, page, file))
     if want & {"dimension_chains", "dimension_drawn"}:
-        got = safe(check_dimensions, path, page, file)
+        got = safe(check_dimensions, path, page, file) if is_pdf else safe(_dims_on_picture, path, file)
         runs += [r for r in (got if isinstance(got, tuple) else (got,)) if r.check in want]
     if "scale_bar" in want:
         runs.append(safe(check_scale_bar, path, page, file, layer, notes=notes) if (is_pdf or layer is not None)
                     else _Run("scale_bar").skip("no text layer"))
     if "room_tags" in want:
-        runs.append(safe(check_room_tags, path, page, file, layer) if (is_pdf or layer is not None)
-                    else _Run("room_tags").skip("no text layer"))
+        rt = safe(check_room_tags, path, page, file, layer) if (is_pdf or layer is not None) \
+            else _Run("room_tags").skip("no text layer")
+        if not is_pdf and rt.findings:
+            # on a picture the tags are OCR text: X1's scanned AFCEE A-101 (experiments/f3/scans32.txt, F3 01:1x) gave 4
+            # false alarms, 'Room number 2.06 is used twice: Operations Maniager Office / Operations Manager Office'
+            # (one tag read twice, spelt two ways) and 'Room 1.00 103 SF vs 108 SF in the RCP' (the vector sheet agrees):
+            # agreements only, like the picture's dimensions and room areas
+            notes.append(f"{len(rt.findings)} room tag reading(s) disagree on this picture ("
+                         + "; ".join(f["title"] for f in rt.findings[:3])
+                         + "): not reported, an OCR misread looks the same as a slip; check on the PDF")
+            rt.findings = []
+            if not rt.passed:
+                rt.skip("room tags read by OCR disagree: not reported (an OCR misread looks the same as a slip)")
+        runs.append(rt)
     if "room_areas" in want:
-        runs.append(safe(check_room_areas, path, page, file, notes=notes))
+        runs.append(safe(check_room_areas, path, page, file, notes=notes) if is_pdf
+                    else safe(_room_areas_on_picture, path, file, notes=notes))
     if "schedule_tags" in want:
         runs.append(safe(check_schedule_tags, path, page, file))
     if "floors_align" in want:
         runs.append(safe(check_floors_align, path, page, file, notes=notes))
+    if "plan_vs_model" in want:
+        runs.append(safe(check_plan_vs_model, path, page, file, notes=notes) if is_pdf
+                    else _Run("plan_vs_model").skip("not a floor plan rendered from an IFC model"))
+    for r in runs:  # a check that ran but had nothing to compare did not check anything (QA 21:35: AFCEC PNG headline)
+        if r.status == "ran" and not r.compared and not r.findings and not r.passed:
+            r.skip(r.why or "nothing on this sheet to compare")
     findings = [f for r in runs for f in r.findings]
+    if shrink is not None:
+        _unshrink(findings, [p for r in runs for p in r.passed], shrink)
+    if photo_h is not None:
+        _to_photo(findings, [p for r in runs for p in r.passed], photo_h)
+    if scan_zoom:
+        _px_to_pt(findings, [p for r in runs for p in r.passed], file, scan_zoom, rep_page)
     findings.sort(key=lambda f: (f["severity"] != "error", -f["sure"]))
     for i, f in enumerate(findings, 1):
         f["id"] = f"F{i}"
     wall = round(time.perf_counter() - t0, 3)
-    return {"file": file, "page": page, "version": VERSION, "findings": findings,
+    return {"file": file, "page": rep_page, "version": VERSION, "findings": findings,
             "passed": [p for r in runs for p in r.passed], "checks": [r.row() for r in runs], "notes": notes,
             "cost": {"wall_seconds": wall, "llm_tokens_in": 0, "llm_tokens_out": 0, "api_calls": 0, "gpu_seconds": 0},
             "cost_tier": "cheap"}
@@ -1568,7 +2250,9 @@ def summary_line(rep: dict) -> str:
     ran = [c for c in rep.get("checks") or [] if c["status"] == "ran"]
     if not ran:
         return "Nothing to cross-check on this sheet (no tables, dimension chains, scale bars or room tags read)"
-    return f"No inconsistencies found · {np_} cross-check{'s' if np_ != 1 else ''} agree"
+    # say how many checks ran (UX M10, as the panel does): 'No inconsistencies' over 1 of 9 checks overclaims
+    return (f"{len(ran)} check{'s' if len(ran) != 1 else ''} ran, no inconsistencies · {np_} cross-check"
+            f"{'s' if np_ != 1 else ''} agree")
 
 
 if __name__ == "__main__":  # python -m stoa.features.selfcheck <abs path> [page] [--file virtual/path]
@@ -1606,13 +2290,211 @@ def _roots() -> list[Path]:
     return out
 
 
+# ------------------------------------------------------------------------------------- a print vs its original: revision
+# UX C-10 (01:17) + the brief ('find the errors before they reach site'): a print / scan on site that is an OLDER issue
+# of the drawing than the original uploaded with it is a classic way an error reaches site. T3's project links the print
+# to its original (same drawing number / look); here both title blocks are read: the CURRENT revision (the value in the
+# box under / beside a 'REVISION' / 'REV' label that is not a history-table header) and the revision HISTORY rows (a
+# revision code with a date on its line). Only a difference that the original's own history confirms (it lists the
+# print's code as an earlier issue, or the print lists the original's) is called out; any other difference is a 'check'
+# line (an OCR misread of 'C01' looks the same as a different issue).
+_REV_LABEL = re.compile(r"^(?:REVISION|REV\.?|REV\.?\s*NO\.?|REVISION\s*NO\.?)$", re.I)
+_REV_HEADER_NEXT = re.compile(r"^(?:DATE|DESCRIPTION|DESC\.?|BY|CHK\.?|CHECKED|APP\.?|APPROVED|AMENDMENTS?|DETAILS?|"
+                              r"NOTES?|STATUS|ISSUE|PURPOSE|DRAWN|DRN)$", re.I)
+_REV_VAL = re.compile(r"^(?:[A-Z]{1,2}\d{1,3}|\d{1,3}|[A-Z])$")
+_REV_DATE = re.compile(r"^(?:\d{4}-\d{2}-\d{2}|\d{1,2}[./-]\d{1,2}[./-]\d{2,4}|\d{1,2}[./-][A-Z]{3}[./-]\d{2,4})$", re.I)
+
+
+def _rev_norm(t: str) -> str:
+    """'c0l' / 'CO1' (OCR) -> 'C01'; '02' stays; anything else upper-cased and stripped."""
+    t = str(t).strip().strip(".:;,()[]").upper()
+    m = re.fullmatch(r"([A-Z])([0-9OIL]{1,3})", t) or re.fullmatch(r"([A-Z]{2})([0-9OIL]{1,3})", t)  # 'CO1': C + O1
+    if m and any(ch.isdigit() for ch in m.group(2)):
+        t = m.group(1) + m.group(2).translate(str.maketrans("OIL", "011"))
+    return t
+
+
+def _rev_tokens(items) -> list[tuple[str, float, float, float, float]]:
+    """(text, x0, y0, x1, y1) per WORD; an OCR line ('REVISION DATE') is split with boxes in proportion to its chars."""
+    out = []
+    for text, x0, y0, x1, y1 in items:
+        parts = str(text).split()
+        if len(parts) <= 1:
+            out.append((str(text).strip(), x0, y0, x1, y1))
+            continue
+        n, pos = max(1, len(str(text))), 0
+        for w in parts:
+            i = str(text).find(w, pos)
+            pos = i + len(w)
+            out.append((w, x0 + (x1 - x0) * i / n, y0, x0 + (x1 - x0) * pos / n, y1))
+    return [t for t in out if t[0]]
+
+
+def _revision_from_words(items) -> dict | None:
+    """The current revision + the history rows from one sheet's words ((text, x0, y0, x1, y1), any one space)."""
+    ws = _rev_tokens(items)
+    labels = [w for w in ws if _REV_LABEL.match(w[0])]
+    if not labels:
+        return None
+    cur, heads = [], []
+    for lab in labels:
+        t, x0, y0, x1, y1 = lab
+        h = max(1e-6, y1 - y0)
+        cy = (y0 + y1) / 2
+        same_line = [w for w in ws if w is not lab and abs((w[2] + w[4]) / 2 - cy) < 0.6 * h and 0 <= w[1] - x1 <= 6 * h]
+        if any(_REV_HEADER_NEXT.match(w[0]) for w in same_line):
+            heads.append(lab)
+            continue
+        cands = []
+        for w in ws:
+            if w is lab or _REV_LABEL.match(w[0]) or _REV_DATE.match(w[0]):
+                continue
+            v = _rev_norm(w[0])
+            if not _REV_VAL.match(v):
+                continue
+            wcy = (w[2] + w[4]) / 2
+            below = w[2] >= cy and w[2] - y1 <= 2.5 * h and min(w[3], x1 + h) - max(w[1], x0 - h) > 0
+            right = abs(wcy - cy) < 0.6 * h and 0 <= w[1] - x1 <= 3 * h
+            if below or right:
+                cands.append((abs(wcy - cy) + abs(w[1] - x0), v, w, lab))
+        if cands:
+            cur.append(min(cands, key=lambda c: c[0]))
+    hist = []
+    for w in ws:
+        v = _rev_norm(w[0])
+        if not _REV_VAL.match(v) or _REV_LABEL.match(w[0]) or len(v) < 2 and not heads:
+            continue
+        h = max(1e-6, w[4] - w[2])
+        cy = (w[2] + w[4]) / 2
+        dated = [d for d in ws if _REV_DATE.match(d[0]) and abs((d[2] + d[4]) / 2 - cy) < 0.6 * h and 0 <= d[1] - w[3] <= 12 * h]
+        if not dated:
+            continue
+        in_col = any(min(w[3], hd[3] + h) - max(w[1], hd[1] - h) > 0 and abs(cy - (hd[2] + hd[4]) / 2) <= 25 * h for hd in heads)
+        if heads and not in_col:
+            continue
+        hist.append({"rev": v, "date": dated[0][0], "box": [round(w[1], 2), round(w[2], 2), round(w[3], 2), round(w[4], 2)]})
+    vals = {c[1] for c in cur}
+    if len(vals) != 1:  # none, or two boxes that disagree: no current revision
+        return {"rev": None, "box": None, "label_box": None, "history": hist} if hist else None
+    best = min(cur, key=lambda c: c[0])
+    _, v, w, lab = best
+    return {"rev": v, "box": [round(x, 2) for x in w[1:5]], "label_box": [round(x, 2) for x in lab[1:5]], "history": hist}
+
+
+def sheet_revision(path: str, page: int = 0) -> dict | None:
+    """The sheet's current revision code + revision history, with boxes in the space the viewer shows: a drawn PDF's
+    words (pdf_pt; unrotated pages only), a scanned PDF page's / a picture's EXISTING text layer (cache-only, never a
+    new OCR read; a big picture's 6000 px copy mapped back). None when nothing is readable."""
+    path = str(path)
+    try:
+        if path.lower().endswith(".pdf"):
+            scan = _scan_of(path, page)
+            if not scan:
+                import pymupdf
+
+                with pymupdf.open(path) as d:
+                    pg = d[int(page)]
+                    if pg.rotation:
+                        return None
+                    r = _revision_from_words([(w[4], w[0], w[1], w[2], w[3]) for w in pg.get_text("words")])
+                if r:
+                    r.update(space="pdf_pt", read="pdf text")
+                return r
+            png, zoom = scan
+            r = sheet_revision(png, 0)
+            if r:
+                for k in ("box", "label_box"):
+                    if r.get(k):
+                        r[k] = [round(v / zoom, 2) for v in r[k]]
+                for hh in r["history"]:
+                    hh["box"] = [round(v / zoom, 2) for v in hh["box"]]
+                r["space"] = "pdf_pt"
+            return r
+        q, factor = path, 1.0
+        lay = _image_layer(q)
+        if lay is None and (sh := _shrunk_of(q)) and _image_layer(sh[0]) is not None:
+            (q, factor), lay = sh, _image_layer(sh[0])
+        best = None
+        for lay in [x for x in _image_layers(q)][:3]:  # the OCR layer may miss a box the VLM layer read, or the reverse
+            r = _revision_from_words([(i.text, *i.box) for i in lay.items])
+            if r and (best is None or (r.get("rev") and not best.get("rev")) or len(r["history"]) > len(best["history"]) and bool(r.get("rev")) >= bool(best.get("rev"))):
+                if best and best.get("rev") and r.get("rev") and best["rev"] != r["rev"]:
+                    best["layers_disagree"] = True
+                    continue
+                best = {**r, "layers_disagree": bool(best and best.get("layers_disagree"))}
+        if best:
+            if factor != 1.0:
+                for k in ("box", "label_box"):
+                    if best.get(k):
+                        best[k] = [round(v / factor, 1) for v in best[k]]
+                for hh in best["history"]:
+                    hh["box"] = [round(v / factor, 1) for v in hh["box"]]
+            best.update(space="image_px", read="OCR")
+        return best
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def compare_revision(copy_path: str, copy_page: int, orig_path: str, orig_page: int,
+                     copy_file: str | None = None, orig_file: str | None = None) -> dict:
+    """A print / copy vs its original: {status: same | older | newer | differs | unread, line, severity, evidence}.
+    older = the original's history lists the print's revision as an earlier issue (the print is out of date); newer =
+    the print's history lists the original's (the uploaded original is the older one); differs = the codes differ and
+    no history says which came first (a misread is possible: 'check')."""
+    a, b = sheet_revision(copy_path, copy_page), sheet_revision(orig_path, orig_page)
+    ra, rb = (a or {}).get("rev"), (b or {}).get("rev")
+    cf, of = copy_file or copy_path, orig_file or orig_path
+
+    def ev(r, f, p, note):
+        return {"file": f, "page": p, "bbox": r["box"], "bbox_space": r.get("space", "pdf_pt"), "note": note}
+
+    out = {"status": "unread", "copy_rev": ra, "orig_rev": rb, "severity": None, "line": "", "evidence": []}
+    if not ra or not rb:
+        if ra or rb:
+            out["line"] = (f"Revision: {'this print' if ra else 'the original'} reads {ra or rb}; "
+                           f"{'the original' if ra else 'this print'}'s revision box could not be read")
+        return out
+    out["evidence"] = [ev(a, cf, copy_page, f"revision {ra} on this print ({a.get('read')})"),
+                       ev(b, of, orig_page, f"revision {rb} on the original ({b.get('read')})")]
+    if ra == rb:
+        out.update(status="same", line=f"Same revision as the original: {ra} on both ✓")
+        return out
+    older = any(h["rev"] == ra for h in b.get("history") or [])
+    newer = any(h["rev"] == rb for h in a.get("history") or [])
+    if older and not newer:
+        d = next(h["date"] for h in b["history"] if h["rev"] == ra)
+        out.update(status="older", severity="error",
+                   line=(f"Out of date: this print is revision {ra}, the original is {rb} (its revision table lists {ra} "
+                         f"of {d} as an earlier issue). Build from {rb}; check what changed before using this print."))
+    elif newer and not older:
+        d = next(h["date"] for h in a["history"] if h["rev"] == rb)
+        out.update(status="newer", severity="error",
+                   line=(f"This print is NEWER than the uploaded original: print revision {ra}, original {rb} (the "
+                         f"print's revision table lists {rb} of {d} as an earlier issue). Check which one is current."))
+    else:
+        out.update(status="differs", severity="check",
+                   line=(f"Revision codes read differently: this print {ra} ({a.get('read')}), the original {rb}: check "
+                         "both title blocks (neither revision table says which came first; a misread looks the same)."))
+    return out
+
+
+_UPLOAD_PATH = re.compile(r"^upload/([0-9a-f]{12})/(?:([a-z0-9_]+)/)?([^/\\]+)$")
+
+
 def resolve(path: str) -> Path | None:
     """The file on disk for a request path, or None when it is outside every allowed root / missing."""
     if not path or ".." in Path(path).parts:
         return None
     roots = _roots()
     if path.startswith("upload/"):
-        cand = roots[1 if len(roots) > 1 else 0] / path[len("upload/"):]
+        up = roots[1 if len(roots) > 1 else 0]
+        # a picture whose drawing style the upload guessed is 'upload/<id>/<style>/<name>' in the browser but stored at
+        # <uploads>/<id>/data/<style>/<name> (web/mock/stoaApi.ts uploadAbs; F8 22:42)
+        m = _UPLOAD_PATH.match(path)
+        if m and m.group(2):
+            cand = up / m.group(1) / "data" / m.group(2) / m.group(3)
+        else:
+            cand = up / path[len("upload/"):]
     elif path.startswith("/"):
         cand = Path(path)
     else:
@@ -1631,18 +2513,36 @@ def _cached(abs_path: str, mtime: float, page: int, file: str, layer_sig: int = 
     return check(abs_path, page, file)
 
 
-def _layer_sig(p: Path) -> int:
-    """A picture's report depends on its text layer, which the upload warm-up reads AFTER the first (background) check:
-    key the cache on it too, or a scan keeps 'no text layer yet' for the whole session. PDFs: 0."""
+@functools.lru_cache(maxsize=64)
+def _cached_copy(cp: str, cm: float, cpage: int, cfile: str, op: str, om: float, opage: int, ofile: str,
+                 csig=0, osig=0) -> dict:
+    return compare_revision(cp, cpage, op, opage, cfile, ofile)
+
+
+def _layer_sig(p: Path, page: int = 0):
+    """A picture's report depends on its text layer, which the upload warm-up reads AFTER the first (background) check,
+    and on its traced copy, which the first measured question makes: key the cache on both, or a scan keeps 'no text
+    layer yet' for the whole session. Drawn PDFs: 0; a scanned PDF: its rendered picture's (check() reads that)."""
+    q = str(p)
     if p.suffix.lower() == ".pdf":
-        return 0
-    lay = _image_layer(str(p))
-    if lay is None:
-        return -1
+        scan = _scan_of(q, page)
+        if not scan:
+            return 0
+        q = scan[0]
+    lay = _image_layer(q)
+    if lay is None and (sh := _shrunk_of(q)) and _image_layer(sh[0]) is not None:  # check() reads the 6000 px copy
+        q, lay = sh[0], _image_layer(sh[0])
+    if lay is None and (ph := _photo_of(q)):  # check() reads the straightened copy then (its layer, its traced copy)
+        q, lay = ph[0], _image_layer(ph[0])
     try:
-        return len(lay)
+        n = -1 if lay is None else len(lay)
     except TypeError:
-        return 1
+        n = 1
+    vec = _traced_copy(q)
+    try:
+        return (n, round(Path(vec).stat().st_mtime, 3) if vec else 0.0)
+    except OSError:
+        return (n, 0.0)
 
 
 try:
@@ -1655,9 +2555,18 @@ try:
         p = resolve(path)
         if p is None:
             raise HTTPException(404, "no such file (dataset-relative, upload/<id>/<name>, or an allowed root)")
-        rep = dict(_cached(str(p), p.stat().st_mtime, int(page), path, _layer_sig(p), _set_sig(p, path)))
+        rep = dict(_cached(str(p), p.stat().st_mtime, int(page), path, _layer_sig(p, int(page)), _set_sig(p, path)))
         rep["summary"] = summary_line(rep)
         return rep
+
+    @router.get("/copy")
+    def copy_endpoint(path: str = Query(...), page: int = 0, orig: str = Query(...), opage: int = 0) -> dict:
+        """A print / copy (T3's project knows it) vs its original: the revision codes of both title blocks."""
+        p, o = resolve(path), resolve(orig)
+        if p is None or o is None:
+            raise HTTPException(404, "no such file (dataset-relative, upload/<id>/<name>, or an allowed root)")
+        return _cached_copy(str(p), p.stat().st_mtime, int(page), path, str(o), o.stat().st_mtime, int(opage), orig,
+                            _layer_sig(p, int(page)), _layer_sig(o, int(opage)))
 
     @router.get("/checks")
     def checks_endpoint() -> dict:

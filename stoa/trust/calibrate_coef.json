@@ -1,0 +1,41 @@
+{
+ "w": {
+  "agree": 0.1456,
+  "b_bare": 0.5537,
+  "b_contra": 0.0,
+  "b_doubt": 0.0,
+  "b_geometry": -1.1579,
+  "b_marks": -0.7339,
+  "b_nofound": -1.1121,
+  "b_nothing": -0.2581,
+  "b_notprinted": 0.34,
+  "b_partial": 0.5265,
+  "b_printed": 1.3769,
+  "b_prior": -0.2666,
+  "b_readat": 0.2015,
+  "b_traced": 0.4147,
+  "b_uncounted": 0.0956,
+  "bias": 0.8495,
+  "k_area": 0.258,
+  "k_count": 0.2574,
+  "k_length": -0.214,
+  "lc": 1.1491,
+  "m_picture": -0.225,
+  "m_scan": -0.5724,
+  "m_structured": 0.4247,
+  "missing": -0.4469,
+  "s_approximate": -0.1274,
+  "s_supported": 0.2328,
+  "s_unlocated": -0.4142
+ },
+ "fitted_on": [
+  "20261114-233219-upload-stoa_like_dev-c166",
+  "20261114-234812-upload-wild_dev-8e85",
+  "20261114-220856-upload-scan_dev-1afd",
+  "20261114-233219-upload-stoa_like_sealed-f23e",
+  "20261114-234128-upload-wild_sealed-5632",
+  "20261114-215411-upload-scan_sealed-cf7f"
+ ],
+ "l2": 2.0,
+ "note": "experiments/t1/calib_fit.py --write (T1 c7); cross-fitted numbers in its output"
+}

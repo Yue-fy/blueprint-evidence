@@ -99,9 +99,14 @@ def page_scores(path: str | Path) -> list[dict]:
         return _with_scan_texts(path, [dict(pg) for pg in _SCORES[key]])
     out = []
     with fitz.open(path) as d:
+        from stoa.formats.normalize import ocr_layer_scan
+
         for i, p in enumerate(d):
             text = p.get_text("text") or ""
-            out.append({"page": i, "vector_bytes": _stream_bytes(p), "areas": len(_AREA.findall(text)),
+            vb = _stream_bytes(p)
+            if text.strip() and ocr_layer_scan(p):
+                text, vb = "", 0  # X1 c13: a scanner's OCR layer: a scanned page (its picture is read, not the layer)
+            out.append({"page": i, "vector_bytes": vb, "areas": len(_AREA.findall(text)),
                         "room_numbers": len(_ROOMNO.findall(text)), "chars": len(text), "own_chars": len(text),
                         "text": text})
     if key is not None:
@@ -412,26 +417,27 @@ _SCHED_Q = re.compile(r"\b(?:(door|window|room|finish(?:es)?|hardware|fixture|eq
 _SEE = re.compile(r"\b(?:see|refer|ref\.?|per|as\s+(?:per|shown))\b", re.I)
 
 
-def _schedule_pages(pages: list[dict], q: str) -> tuple[set[int], str] | None:
-    """({pages}, 'DOOR SCHEDULE') when the question names a schedule ('the door schedule', 'according to the
-    schedule') and some, not all, pages carry a title line that starts with that schedule's name (an optional sheet
-    number first: 'A-602 DOOR SCHEDULE'); cover / index pages and 'SEE DOOR SCHEDULE' notes do not count."""
-    m = _SCHED_Q.search(q or "")
-    if not m:
+def schedule_title(question: str, text: str) -> str | None:
+    """'DOOR SCHEDULE' when the question names a schedule ('the door schedule', 'according to the schedule') and this
+    page's text has a title line that starts with that schedule's name (an optional sheet number first: 'A-602 DOOR
+    SCHEDULE'); cover / index pages and 'SEE DOOR SCHEDULE' notes do not count. Else None."""
+    m = _SCHED_Q.search(question or "")
+    if not m or len(_INDEX_LINE.findall(text or "")) >= 4 or _INDEX_WORDS.search(text or ""):
         return None
     noun = m.group(1)
     head = re.compile(r"^\W*(?:[A-Z]{1,3}-?\d{1,4}(?:\.\d+)?[A-Z]?\s+)?" + (re.escape(noun.rstrip("s")) + r"s?\s+"
                       if noun else r"(?:[A-Za-z]+\s+){0,2}") + r"schedules?\b", re.I)
-    hit = set()
-    for pg in pages:
-        t = pg["text"]
-        if len(_INDEX_LINE.findall(t)) >= 4 or _INDEX_WORDS.search(t):
-            continue
-        if any(head.search(ln) and not _SEE.search(ln) for ln in t.splitlines() if 0 < len(ln.strip()) <= 60):
-            hit.add(pg["page"])
+    if any(head.search(ln) and not _SEE.search(ln) for ln in (text or "").splitlines() if 0 < len(ln.strip()) <= 60):
+        return (f"{noun} schedule" if noun else "schedule").upper()
+    return None
+
+
+def _schedule_pages(pages: list[dict], q: str) -> tuple[set[int], str] | None:
+    """({pages}, 'DOOR SCHEDULE'): the pages whose title is the schedule the question names, when some but not all do."""
+    hit = {pg["page"]: t for pg in pages if (t := schedule_title(q, pg["text"]))}
     if not hit or len(hit) == len(pages):
         return None
-    return hit, (f"{noun} schedule" if noun else "schedule").upper()
+    return set(hit), hit[min(hit)]
 
 
 def pick_page(path: str | Path, question: str = "") -> tuple[int, str]:
@@ -583,4 +589,27 @@ def one_page_copy(path: str | Path, page: int, out_dir: str | Path | None = None
             tmp = tmp_path(dst)  # X1 19:24: atomic, a parallel question never opens a half-written copy
             out.save(tmp, garbage=3, deflate=True)
             os.replace(tmp, dst)
+    side = dst.with_name(dst.name + ".json")  # DR 21:57: '<copy>.json' {original, page} -> openings finds the set's
+    if not side.exists():                     # DOOR SCHEDULE page even when the copy lives in a cache dir
+        try:
+            import json
+
+            from stoa.formats.normalize import tmp_path
+
+            tmp = tmp_path(side)
+            tmp.write_text(json.dumps({"original": str(src.resolve()), "page": int(page)}))
+            os.replace(tmp, side)
+        except OSError:
+            pass
     return str(dst)
+
+
+def copy_origin(copy: str | Path) -> tuple[str, int] | None:
+    """(original set, 0-based page) of a one_page_copy, from its '<copy>.json' sidecar; None for any other file."""
+    import json
+
+    try:
+        d = json.loads(Path(str(copy) + ".json").read_text())
+        return str(d["original"]), int(d["page"])
+    except (OSError, ValueError, KeyError, TypeError):
+        return None

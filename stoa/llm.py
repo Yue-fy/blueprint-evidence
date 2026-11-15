@@ -175,6 +175,32 @@ def check_private(backend: str) -> None:
         raise ExternalCallBlocked(f"private mode: the hosted model '{backend}' was not called (STOA_PRIVATE=1)")
 
 
+# T2 cycle 7: a caller that stops waiting for a hosted reply (G1's vision reading after STOA_VISION_WAIT) sets this
+# Event in the context it handed to the worker thread; chat() checks it before and after the throttle, so a request
+# whose reply nobody will read is never sent (a page image and its cost for nothing; 20 of 51 given-up waits on Sat
+# night were followed by such a send, 0.7-14.7 s after the wait ended)
+GAVE_UP: contextvars.ContextVar = contextvars.ContextVar("stoa_llm_gave_up", default=None)
+
+
+def _gave_up() -> bool:
+    ev = GAVE_UP.get()
+    return bool(ev is not None and ev.is_set())
+
+
+def _answer_returned() -> bool:
+    """T2 cycle 7: this thread works for an upload answer that has already been returned (stoa.netguard.watch() ended):
+    a hosted request sent now would show on no card (G1's vision reading gives up after STOA_VISION_WAIT, but its
+    request can still be queued in _nvidia_throttle). netguard refuses the new connection; this also covers a
+    kept-alive one (no connect event) and keeps the request out of the throttle and the call log."""
+    import sys
+
+    ng = sys.modules.get("stoa.netguard")
+    try:
+        return bool(ng is not None and hasattr(ng, "answer_returned") and ng.answer_returned())
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def _netguard_blocked(e: BaseException) -> bool:
     """T2's socket backstop (stoa.netguard.PrivateNetworkBlocked) anywhere in the exception's cause chain."""
     seen = 0
@@ -190,8 +216,32 @@ def check_private_url(url: str, what: str = "service") -> None:
     """The same guard for a non-LLM service URL (OCR $STOA_OCR_URL, door detector $STOA_DET_URL, ...): those callers use
     urllib directly, so a URL pointed at a hosted machine would send the drawing out in private mode. Call before the
     request; raises ExternalCallBlocked (a LocalModelUnavailable / RuntimeError: 'that reader is unavailable')."""
-    if private_mode() and not _private_host(str(url or "")):
+    if not private_mode():
+        return
+    if not _private_host(str(url or "")):
         raise ExternalCallBlocked(f"private mode: the {what} at {url} is not on this server or our network (not called)")
+    # T2 00:26: a port on THIS machine can still forward outside (an ssh tunnel to V1's detector twins :8145 / :8148);
+    # netguard refuses the socket anyway, but the reader then reports 'the detector service is down'. Say why instead.
+    # H 01:45: the same exception netguard makes at the socket (netguard.py, private and not (eu_only() and port in
+    # _eu_relay_ports())): with STOA_EU_ONLY=1 (W5's 'EU' option) a port the operator lists in STOA_EU_RELAY_PORTS ends
+    # at our own EU instance and is allowed; refusing it here cost the AFCEC north wing (34 -> 12 @0.087 boxless).
+    # STOA_PRIVATE_RELAY_NOTE=0 skips this check (netguard alone decides, as before bd2ae570).
+    if os.environ.get("STOA_PRIVATE_RELAY_NOTE", "1") == "0":
+        return
+    try:
+        from stoa import netguard
+
+        why = netguard.relay_for_url(str(url or "")) if hasattr(netguard, "relay_for_url") else None
+        if why and hasattr(netguard, "eu_only") and hasattr(netguard, "_eu_relay_ports") and netguard.eu_only():
+            from urllib.parse import urlparse
+
+            u = urlparse(str(url or ""))
+            if (u.port or (443 if u.scheme == "https" else 80)) in netguard._eu_relay_ports():
+                why = None  # our own EU instance, allowed in EU mode (netguard lets the socket through too)
+    except Exception:  # noqa: BLE001 — an older tree / a failed scan: netguard still guards the socket
+        why = None
+    if why:
+        raise ExternalCallBlocked(f"private mode: the {what} at {url} forwards outside this server ({why}; not called)")
 
 
 def api_route(backend: str, model: str | None) -> tuple[str, str | None]:
@@ -614,7 +664,7 @@ def _gemini_guard() -> None:
     n = gemini_calls_today()
     if n >= cap:
         raise RuntimeError(f"Gemini daily call cap reached for agent {_agent_id()!r} ({n} >= {cap}; Google's no-abuse "
-                           "rule, COMMON.md). Use the local server or hosted Nemotron.")
+                           "rule for our hackathon key; set GEMINI_MAX_CALLS_PER_DAY to change it). Use the local server or hosted Nemotron.")
 
 
 def _gemini_log(model: str, purpose: str | None, ok: bool, status: str, t0: float, resp: Any = None) -> None:
@@ -768,10 +818,18 @@ def chat(
     attempt = 0
     while attempt <= retries:
         attempt += 1
+        if not is_local(backend) and _answer_returned():
+            raise ExternalCallBlocked(f"{backend}: the answer this call was for was already returned (not sent)")
+        if not is_local(backend) and _gave_up():
+            raise ExternalCallBlocked(f"{backend}: the caller stopped waiting for this reply (not sent)")
         if backend in ("nvidia", "gemini"):
             if backend == "gemini":
                 _gemini_guard()
             _nvidia_throttle(backend)
+            if _answer_returned():  # the answer can be returned while this call waits for its turn
+                raise ExternalCallBlocked(f"{backend}: the answer this call was for was already returned (not sent)")
+            if _gave_up():  # ... or its caller can stop waiting
+                raise ExternalCallBlocked(f"{backend}: the caller stopped waiting for this reply (not sent)")
         t0 = time.time()
         left = None if deadline is None else deadline - (t0 - t_start)
         if left is not None and left < 1.0:

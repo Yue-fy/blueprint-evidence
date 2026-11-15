@@ -533,3 +533,331 @@ def test_iso_sheet_numbers_site_plan_and_unread_scan(tmp_path):
     assert by[land]["kind"] == "site_plan" and not by[land]["for_totals"]
     assert by[l00]["for_totals"] and not by[str(blank)]["for_totals"]
     assert any("no text read yet" in n for n in r["notes"])
+
+
+def test_footprint_gross_internal_area_matches_printed_gifa():
+    """stoa.sheet.footprint on EFA sheets that print their GIFA: ground floor exact (1248 m²), first floor after the
+    hall void drawn with an X (932 m²), an untitled single-drawing sheet at its '1:200@A3' note (1268 m²); the outline
+    is evidence in pdf_pt."""
+    from stoa.sheet.footprint import footprint
+
+    d = ".stoa/datasets/stoa-like/"
+    gf = footprint(need(d + "dfe-baseline-2012/15723_2-01-001_primary_type_2_420_26.pdf"))
+    assert abs(gf["gia_m2"] / 1248 - 1) < 0.02 and gf["gea_m2"] > gf["gia_m2"] and gf["ratio"] == 200
+    assert len(gf["polygon"]) >= 4 and all(0 <= x <= 1191 and 0 <= y <= 842 for x, y in gf["polygon"])
+    ff = footprint(need(d + "dfe-baseline-2012/15723_2_01_002_primary_type_2_420__26_001.pdf"))
+    assert ff["voids"] and abs(ff["gia_m2"] / 932 - 1) < 0.02
+    one = footprint(need(d + "dfe-baseline-2014/baseline-design-240-place-primary-school__1fe_240_place_jmi_primary_"
+                             "school.pdf"))
+    assert one["view"] == "(the sheet's only drawing)" and abs(one["gia_m2"] / 1268 - 1) < 0.02
+
+
+def test_footprint_voids_by_label_and_roofs_below():
+    """DfE SEN level 01: both 'Void' blocks (one with a faint X) are left out; the lower roofs drawn around the upper
+    floor are not part of it; level 02 of an EFA primary (a 10 m² plant room over the roofs) stays small."""
+    from stoa.sheet.footprint import footprint
+
+    d = ".stoa/datasets/stoa-like/"
+    sen = footprint(need(d + "dfe/SEN-DFE-XX-01-D-X-0202-Special_School_Plan_Level_01-A-C01.pdf"))
+    assert len(sen["voids"]) == 2 and 850 < sen["gia_m2"] < 1000
+    sf = footprint(need(d + "dfe-baseline-2012/15723_2_01_003_primary_type_2_420__26.pdf"))
+    assert sf["gia_m2"] < 40
+
+
+def test_footprint_c6_walls_voids_scale_bars_roofs():
+    """VP c6 on EFA / DfE sheets with a printed GIFA: secondary 2F (wall ink starting inside the outline; corridor voids
+    cut by dashed lines) 1274; secondary 1F (narrow X strip, small X boxes beside the hall voids) 1172 within 5 %; 3FE
+    630 GF (graphic scale bar next to the kitchen) 1645; DfE secondary Level 02 = its own floor, the two roofs beside
+    it left out (Level 01's main block is 1,975 m² GEA)."""
+    from stoa.sheet.footprint import footprint
+
+    d = ".stoa/datasets/stoa-like/"
+    s2 = footprint(need(d + "dfe-baseline-2014/baseline-designs-600-place-secondary-sch__secondary_type_3_600_second_"
+                            "floor_001.pdf"))
+    assert s2["wall_m"] > 0.3 and len(s2["voids"]) == 4 and abs(s2["gia_m2"] / 1274 - 1) < 0.02
+    s1 = footprint(need(d + "dfe-baseline-2014/baseline-designs-600-place-secondary-sch__secondary_type_3_600_first_"
+                            "floor_001.pdf"))
+    assert abs(s1["gia_m2"] / 1172 - 1) < 0.05
+    gf = footprint(need(d + "dfe-baseline-2014/baseline-designs-630-place-primary-schoo__3fe_630_place_jmi_primary_"
+                            "school_gf_002.pdf"))
+    assert abs(gf["gia_m2"] / 1645 - 1) < 0.02
+    l2 = footprint(need(d + "dfe/SEC-DFE-XX-02-D-X-0203-Secondary_School_GA_Plan_Level_02-A-C01.pdf"))
+    assert 1800 < l2["gea_m2"] < 2200 and any("no room name" in a for a in l2["assumptions"])
+
+
+def test_footprint_answer_hook():
+    """The contract hook: only whole-floor / gross area wordings; GIA by default, GEA when asked, ft² when asked;
+    evidence = the outline polygon (pdf_pt, not exact)."""
+    from stoa.sheet.footprint import footprint_answer, is_gross_area_question
+
+    assert is_gross_area_question("What is the total floor area on this plan?")
+    assert is_gross_area_question("What is the GIFA of level 01?")
+    assert is_gross_area_question("How big is the ground floor?")
+    assert not is_gross_area_question("What is the floor area of the kitchen?")
+    assert not is_gross_area_question("What is the total area of all rooms on this plan?")
+    gf = need(".stoa/datasets/stoa-like/dfe-baseline-2012/"
+              "15723_2-01-001_primary_type_2_420_26.pdf")
+    assert footprint_answer(gf, "How many doors are there?") is None
+    a = footprint_answer(gf, "What is the total floor area of this plan?")
+    # the sheet prints its GIFA: the printed row is the answer (exact evidence), the measured outline its cross-check
+    assert a.unit == "m2" and a.value == 1248 and a.evidence[0].exact is True
+    assert a.evidence[1].polygon and a.evidence[1].exact is False
+    e = footprint_answer(gf, "What is the gross external area in square feet?")
+    assert e.unit == "ft2" and e.value > a.value * 10.7639
+
+
+def test_gross_area_question_wordings_stay_narrow():
+    from stoa.sheet.footprint import is_gross_area_question as g
+
+    assert not g("What is the total floor area of English 1 to English 5?")
+    assert not g("Total floor area of the maths classrooms (Maths 1-5)?")
+    assert not g("What's the footprint of the generator set foundation?")
+    assert g("What is the total floor area of this floor?") and g("What is the building footprint?")
+    assert g("What is the total floor area of level 01?")
+    for q in ("What is the total area of this plan?", "How many square meters is this floor?", "What is the total square "
+              "footage?", "What's the area of the whole floor?", "What is the area of level 01?", "How many m2 is the "
+              "building?", "Wie groß ist die Bruttogrundfläche?", "Mikä on kerrosala?"):
+        assert g(q), q
+    for q in ("What is the area of the ground floor kitchen?", "What is the square footage of the master bedroom?",
+              "What is the total area of the kitchen?"):
+        assert not g(q), q
+
+
+def test_footprint_answer_on_a_picture_uses_its_traced_copy():
+    """A scan / export PNG: read on P1's cached traced vector copy (never traces itself), evidence in image px,
+    confidence capped; Stoa's DfE sheet 1 scan within 2 % of its vector PDF's reading."""
+    from stoa.sheet.footprint import footprint_answer
+
+    png = need(".stoa/neutral/x1scan2/b22eef0132/b22eef0132.png")
+    pdf = need(".stoa/datasets/stoa-like/dfe/"
+               "SEN-DFE-XX-00-D-X-0201-Special_School_Plan_Level_00-A-C01.pdf")
+    a = footprint_answer(png, "What is the total floor area on this plan?")
+    if a is None:
+        pytest.skip("no cached traced copy of the scan on this machine")
+    v = footprint_answer(pdf, "What is the total floor area on this plan?")
+    assert a.evidence[0].bbox_space == "image_px" and a.confidence <= 0.5
+    assert abs(a.value / v.value - 1) < 0.02
+
+
+def test_footprint_printed_totals_win_and_are_cross_checked():
+    """Printed gross rows (EFA 'Overall GIFA' blocks, AFCEC 'TOTAL SECOND FLOOR = 26,562 SF'): the row of the floor
+    the question means is the answer; the drawn outline (same floor) or the sheet's own part rows cross-check it;
+    targets, room tags and option notes ('FF 55m2 Classroom') are never rows."""
+    import glob
+
+    from stoa.sheet.footprint import footprint_answer, printed_gross
+
+    d = ".stoa/datasets/stoa-like/"
+    gf = need(d + "dfe-baseline-2012/15723_2-01-001_primary_type_2_420_26.pdf")
+    a = footprint_answer(gf, "What is the total floor area of this plan?")
+    assert a.value == 1248 and a.confidence >= 0.8 and any("agrees" in x for x in a.assumptions)
+    f = footprint_answer(gf, "What is the total floor area of the first floor?")
+    assert f.value == 932 and len(f.evidence) == 1          # another floor: this sheet's outline is no evidence
+    w = footprint_answer(gf, "What is the GIFA of the whole school?")
+    assert w.value == 2190 and any("add up" in x for x in w.assumptions)
+    e = footprint_answer(gf, "What is the building footprint?")
+    assert e.value > 1300 and e.evidence[0].exact is False   # GEA asked, the sheet prints GIFA: measured
+    gf3 = glob.glob(d + "dfe-baseline-2014/*630*gf_002.pdf")
+    if gf3:
+        assert all(r["value"] != 55 for r in printed_gross(gf3[0]))
+        assert footprint_answer(gf3[0], "What is the total floor area on this plan?").value == 1645
+    t = glob.glob(d + "dfe-baseline-2014/baseline-design-210*.pdf")
+    if t:
+        m = footprint_answer(t[0], "What is the total floor area on this plan?")
+        assert m.value != 1315 and any("Target" in x for x in m.assumptions)
+    dorm = d + "afcec-dorm/DAF_Dorm_SD_Drawings_April_2026.pdf"
+    if os.path.exists(dorm):
+        s2 = footprint_answer(dorm, "What is the total floor area of this floor?", 2)
+        assert (s2.value, s2.unit) == (26562, "ft2") and s2.confidence >= 0.75
+        assert abs(footprint_answer(dorm, "Total floor area of this floor in square metres?", 2).value - 2467.7) < 1
+    sen = d + "dfe/SEN-DFE-XX-00-D-X-0201-Special_School_Plan_Level_00-A-C01.pdf"
+    if os.path.exists(sen):
+        assert printed_gross(sen) == []                      # room tags 'A: 63 m2' are not floor totals
+        one = footprint_answer(sen, "What is the total floor area of the school?")
+        assert one.confidence <= 0.35 and any("other floors" in m for m in one.missing)   # one floor of two
+
+
+
+def test_key_plan_zones_afcec_t_shape():
+    """VP c6 (captain 23:04, Ziying: 'north wing' is the long wing at the top of the T): AFCEC A-2's KEY PLAN colour
+    blocks -> north / west / east wings + the pink core, named from the core with plan north up, each mapped onto the
+    main plan (PDF with /Rotate 90 and the Stoa PNG)."""
+    from stoa.sheet.keyplan import _to_disp, key_plan_zones, zone_for
+
+    pdf = need(".stoa/neutral/x1sl/4c33719c7c/4c33719c7c.pdf")
+    kp = key_plan_zones(pdf)
+    by = {z["name"]: z for z in kp["zones"]}
+    assert set(by) == {"north wing", "west wing", "east wing", "core"} and kp["confidence"] >= 0.7
+    box = {k: _to_disp(pdf, 0, z["plan_box"]) for k, z in by.items()}
+    cy = {k: (b[1] + b[3]) / 2 for k, b in box.items()}
+    cx = {k: (b[0] + b[2]) / 2 for k, b in box.items()}
+    assert cy["north wing"] < cy["core"] and cx["west wing"] < cx["core"] < cx["east wing"]
+    # the north wing's box sits on the long wing at the top of the T (displayed pt: x ~ 433..523, y ~ 152..400)
+    assert 400 < box["north wing"][0] < 470 and box["north wing"][3] < 450 and box["west wing"][1] > 500
+    z = zone_for(pdf, "How many doors are in the north wing?")
+    assert z and z["name"] == "north wing" and "KEY PLAN" in z["why"]
+    assert zone_for(pdf, "How many doors are there?") is None
+    png = ".stoa/artifacts/stoa-examples/afcec-dormitory-A-2-second-floor.png"
+    zp = zone_for(png, "How many doors are in the north wing?")
+    if zp is not None:   # needs the PNG's text layer cached
+        x0, y0, x1, y1 = zp["plan_box"]
+        assert 3300 < x0 < 3900 and y1 < 3600 and x1 - x0 < 1200
+
+
+def test_scope_for_wing_from_key_plan():
+    """scope_for: 'the north wing' on a sheet with a KEY PLAN = the wing's box on the main plan (one synthetic plan
+    view, the plan's scale kept); facade / side wordings and unnamed questions are not scoped to a wing."""
+    from stoa.sheet import scope_for
+
+    pdf = need(".stoa/neutral/x1sl/4c33719c7c/4c33719c7c.pdf")
+    s = scope_for(pdf, "How many doors are in the north wing?")
+    assert s is not None and s.views[0].title == "NORTH WING (key plan)" and "KEY PLAN" in s.reason
+    w = scope_for(pdf, "How many dorm rooms does the west wing have?")
+    assert w.views[0].title.startswith("WEST WING")
+    for q in ("How many windows are on the north side?", "How many doors on the north facade?",
+              "How many doors are there?"):
+        r = scope_for(pdf, q)
+        assert r is None or "key plan" not in r.views[0].title.lower()
+
+
+def test_storey_words_finnish_german_swedish():
+    """T3 23:09 (Stoa is Finnish): level words read with stoa.features.project.level_from_name's keys (Finnish / Swedish
+    count the entrance floor as 1, German 'Obergeschoss' from 0)."""
+    from stoa.sheet.sets import _storey_of
+
+    want = {"2. krs": "1", "POHJA 3.KRS": "2", "1. KRS POHJA": "0", "KERROS 2": "1", "KELLARIKERROS": "-1",
+            "ULLAKKO": "attic", "VESIKATTO": "roof", "Obergeschoss 2": "2", "Grundriss Untergeschoss": "-1",
+            "plan 2. våningen": "1", "källare": "-1", "POHJAKERROS": "0", "1. KERROS": "0", "SECOND FLOOR PLAN": "2"}
+    for t, k in want.items():
+        assert _storey_of(t)[0] == k, t
+    assert _storey_of("2 VAN SPACES")[0] is None
+
+
+def test_key_plan_zones_on_a_bw_scan():
+    """X1's 300-dpi B/W scan of AFCEC A-2: the key plan's blocks are grey tones (wings ~209, core ~197 on paper 231):
+    north / west / east wing + core, confidence <= 0.55; needs the scan's cached text layer (skips otherwise)."""
+    from stoa.sheet.keyplan import key_plan_zones
+
+    scan = need(".stoa/neutral/x1scan2/5b52dfb0eb/5b52dfb0eb.png")
+    kp = key_plan_zones(scan)
+    if not kp["found"] and "no text layer" in kp["note"]:
+        pytest.skip("scan text layer not cached")
+    by = {z["name"]: z for z in kp["zones"]}
+    assert set(by) == {"north wing", "west wing", "east wing", "core"} and kp["confidence"] <= 0.55
+    assert by["north wing"]["plan_box"][3] < by["core"]["plan_box"][1] + 200
+    assert by["west wing"]["plan_box"][2] <= by["east wing"]["plan_box"][0]
+
+
+# ---- c7: the scale checked on a second length (expert rule xr-11) ------------------------------------------------------
+
+def _resized(src: str, f: float, out: str) -> str:
+    """The same sheet printed at another paper size (f = page size factor): the printed 1:N no longer holds."""
+    import pymupdf
+
+    with pymupdf.open(src) as s:
+        d = pymupdf.open()
+        r = s[0].rect
+        pg = d.new_page(width=r.width * f, height=r.height * f)
+        pg.show_pdf_page(pg.rect, s, 0)
+        d.save(out)
+    return out
+
+
+def _dim_sheet(path: str, n: float, page_w: float = 842.0) -> str:
+    """A drawn sheet at 1:n with 6 dimension strings ('3600', '4800', ...) on their own lines with end ticks."""
+    import pymupdf
+
+    d = pymupdf.open()
+    pg = d.new_page(width=page_w, height=595)
+    k = 72 / 25.4 / n  # pt per mm at 1:n
+    y = 80
+    for mm in (3600, 4800, 2400, 6000, 3000, 5400):
+        x0, x1 = 60, 60 + mm * k
+        pg.draw_line((x0, y), (x1, y), width=0.3)
+        for x in (x0, x1):
+            pg.draw_line((x, y - 4), (x, y + 4), width=0.3)
+        pg.insert_text(((x0 + x1) / 2 - 8, y - 2), str(mm), fontsize=6)
+        y += 40
+    pg.draw_rect(pymupdf.Rect(50, 50, 600, 330), width=1.0)
+    pg.insert_text((60, 400), "GROUND FLOOR PLAN", fontsize=12)
+    pg.insert_text((60, 416), "SCALE 1:100", fontsize=8)
+    d.save(path)
+    return path
+
+
+def test_dimension_scale_checks_printed_scale(tmp_path):
+    """VP c7: 6 dimension strings drawn at 1:100 confirm a printed 1:100; the same strings drawn at 1:200 (the sheet
+    printed at half size, note unchanged) say 1:200, and views rescales the plan's page_ratio / px_per_m."""
+    from stoa.sheet.scalecheck import dimension_scale
+
+    ok = _dim_sheet(str(tmp_path / "ok.pdf"), 100)
+    d = dimension_scale(ok, 0, 100.0)
+    assert d["agrees"] is True and d["n"] == 6 and abs(d["ratio"] - 100) < 1
+    half = _dim_sheet(str(tmp_path / "half.pdf"), 200)
+    d = dimension_scale(half, 0, 100.0)
+    assert d["agrees"] is False and abs(d["factor"] - 2) < 0.03 and d["n_printed"] == 0
+    assert dimension_scale(half, 0, None)["ratio"] == pytest.approx(200, rel=0.01)  # unscaled: the strings alone
+    vs = [v for v in views(half) if v.ratio]
+    assert vs and all(v.page_ratio == pytest.approx(200, rel=0.01) for v in vs)
+    assert any("dimension strings measure 1:200" in n for v in vs for n in v.notes)
+    vs = [v for v in views(ok) if v.ratio]
+    assert vs and all(v.page_ratio == 100 for v in vs) and any("second length" in n for v in vs for n in v.notes)
+
+
+@pytest.mark.parametrize("src,printed,f,want", [
+    (A101F, 50.0, 0.5, 100.0),       # USACE A-101F 1:50 (mm) printed at half size
+    (A101F, 50.0, 0.7071, 70.71),    # ... one A-size step smaller
+    (".stoa/neutral/d1/816c77d1cf/816c77d1cf.pdf", 48.0, 0.5, 96.0),  # ft-in strings, 1/4" = 1'-0"
+])
+def test_dimension_scale_real_sheets_printed_smaller(tmp_path, src, printed, f, want):
+    """VP c7 (xr-11): real CAD sheets resized as a 'fit to page' print would: the printed note stays, the dimension
+    strings measure the true 1:N on the page; on the original they agree (0 false alarms on 149 upload-like PDFs)."""
+    from stoa.sheet.scalecheck import dimension_scale
+
+    need(src)
+    assert dimension_scale(src, 0, printed)["agrees"] is True
+    small = _resized(src, f, str(tmp_path / "small.pdf"))
+    d = dimension_scale(small, 0, printed)
+    assert d["agrees"] is False and d["ratio"] == pytest.approx(want, rel=0.02)
+    vs = [v for v in views(small) if v.ratio == printed]
+    assert vs and all(v.page_ratio == pytest.approx(want, rel=0.02) for v in vs)
+
+
+def test_footprint_frame_rules_and_overall_dimension_check():
+    """VP c7: on USACE A-101F (1:50, thin double-line walls) the line-pair closing turned the sheet's double frame into
+    a ring and the 'building outline' was the whole page (1,175 m² @0.35). Frame / title-block rules outside the view
+    (>= 70 % of the page long) are blanked; the outline that is left (still wider than the building: dimension chains)
+    is checked on the overall dimension strings (26.9 x 15.5 m) and flagged at 0.3 with the bounding rectangle."""
+    from stoa.sheet.footprint import footprint
+
+    r = footprint(need(A101F), 0)
+    assert r["gea_m2"] < 700 and r["confidence"] <= 0.3
+    assert any("longest dimension string" in m and "upper bound" in m for m in r["missing"])
+    assert any("second length" in a for a in r["assumptions"])
+
+
+def test_gross_question_steps_aside_for_excluded_parts():
+    """S0 23:55 (d30 wild-dev loss x1-140-farm): 'the footprint of the house without the porches' = the whole outline
+    (216.1 m², gold 47.57): the outline cannot leave named parts out, so footprint does not take such questions."""
+    from stoa.sheet.footprint import is_gross_area_question as g
+
+    assert not g("What is the footprint of the house without the porches, in square metres?")
+    assert not g("What is the total floor area excluding the garage?")
+    assert g("What is the footprint of the house?") and g("What is the gross internal floor area of this plan?")
+
+
+def test_dedupe_keeps_repeated_rooms_of_one_view():
+    """G1 00:01: EFA colour sheet prints 'ICT Classroom 62 m2' twice (two rooms) -> both kept (total 124, not 62)."""
+    from stoa.sheet.labels import as_area_tags
+
+    t = as_area_tags(need(f"{NEUTRAL}/d7c5a1e97b/d7c5a1e97b.pdf"), "What is the total area of the ICT classrooms?")
+    assert sorted(x["value"] for x in t if "ICT" in (x["name"] or "")) == [62.0, 62.0]
+
+
+def test_storey_words_estonian():
+    """T3 00:05 (Esplanades IFC plan sheets print 'Korruse plaan: 1.korrus'): Estonian levels, entrance floor = 1."""
+    from stoa.sheet.sets import _storey_of
+
+    assert _storey_of("Maleva tänav 18 korterelamu — Korruse plaan: 1.korrus")[0] == "0"
+    assert _storey_of("korrus 3")[0] == "2" and _storey_of("Keldrikorrus")[0] == "-1"
+    assert _storey_of("Katusekorrus")[0] == "attic" and _storey_of("Katuse plaan")[0] == "roof"

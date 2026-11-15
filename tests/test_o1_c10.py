@@ -30,6 +30,7 @@ def test_sticky_vlm_layer_after_an_ocr_budget_fallback(monkeypatch, tmp_path):
     monkeypatch.setattr(T, "ocr_suits", lambda path: True)
     monkeypatch.setattr(ocr, "available", lambda: True)
     monkeypatch.setattr(T, "_vlm_layer", vlm_layer)
+    monkeypatch.setattr(ocr, "verdict", lambda path: None)  # never ask the real OCR server from a test
     monkeypatch.setenv("STOA_TEXT_ENGINE", "auto")
 
     def over_budget(path):
@@ -115,3 +116,83 @@ def test_engine_writes_out_only_into_the_cache(monkeypatch, tmp_path):
     assert not E._write_out(str(tmp_path / "evil.json"), d) and not (tmp_path / "evil.json").exists()
     assert not E._write_out(str(good.with_suffix(".txt")), d)
     assert not E._write_out(str(good), {"error": "x"})
+
+
+def _bar_image(tmp_path, drawn: bool):
+    from PIL import Image, ImageDraw
+
+    im = Image.new("L", (1200, 300), 255)
+    if drawn:
+        ImageDraw.Draw(im).rectangle([100, 110, 900, 116], fill=0)
+    p = tmp_path / ("bar.png" if drawn else "nobar.png")
+    im.save(p)
+    return str(p)
+
+
+def test_bar_without_its_zero_label_needs_the_drawn_bar(tmp_path):
+    from stoa.solvers.raster import scalebar as SB
+
+    for drawn in (True, False):
+        p = _bar_image(tmp_path, drawn)
+        tl = T.TextLayer(path=p, size=(1200, 300), items=[T.TextItem("10m", [480.0, 130.0, 520.0, 150.0]),
+                                                          T.TextItem("20m", [880.0, 130.0, 920.0, 150.0])])
+        SB._CACHE.clear()
+        bs = SB.bars(p, reread=False, layer=tl)
+        if drawn:
+            assert len(bs) == 1 and bs[0].unit == "m" and "+nozero+drawn" in bs[0].source
+            assert abs(bs[0].px_per_unit - 40.0) < 0.5 and bs[0].labels[0][0] == 0.0
+        else:
+            assert bs == []  # two numbers with a unit are no bar on their own
+
+
+def test_bar_label_with_a_glued_mark_and_feet_marks():
+    from stoa.solvers.raster import scalebar as SB
+
+    cut, m = SB._label_of(T.TextItem("0'7'", [2723.0, 2361.0, 2795.0, 2394.0]))
+    assert cut.text == "0'" and abs(cut.cx - 2741.0) < 1.0
+    assert SB._label_of(T.TextItem("20'6\"", [0.0, 0.0, 50.0, 10.0])) is None  # a feet-inch dimension
+    items = [T.TextItem("0'", [100.0, 100.0, 120.0, 120.0]), T.TextItem("20'", [290.0, 102.0, 330.0, 122.0]),
+             T.TextItem("40'", [490.0, 105.0, 530.0, 125.0]), T.TextItem("80'", [890.0, 113.0, 930.0, 133.0])]
+    bs = SB._bars_from_items(items, items, "layer")  # tilted row: 80' is 13 px lower than 0' (0.6 x 20 = 12)
+    assert len(bs) == 1 and bs[0].unit == "ft" and [v for v, _, _ in bs[0].labels] == [0.0, 20.0, 40.0, 80.0]
+
+
+def test_thousands_from_any_line_of_the_sheet():
+    tl = [T.TextItem("TOTAL = 266,035 SQ FT", [0.0, 0.0, 10.0, 10.0])]
+    assert Q._thousands("266,035", None, "What is the total catchment area?", [], tl)
+    assert not Q._thousands("266,035", None, "What is the total catchment area?", [], [])
+
+
+def test_ocr_honours_a_timeout_marker_left_while_waiting_on_the_lock(monkeypatch, tmp_path):
+    import fcntl
+
+    import pytest
+
+    from stoa import ocr
+
+    img = tmp_path / "page.png"
+    from PIL import Image
+
+    Image.new("L", (300, 200), 255).save(img)
+    monkeypatch.setattr(ocr, "CACHE_DIR", tmp_path / "ocr")
+    ocr._mem.clear()
+    mark = ocr._key(str(img)).with_suffix(".timeout")
+    real = fcntl.flock
+    ran = {"n": 0}
+
+    def flock(fd, op):  # another process's read goes over the budget while we wait for the lock
+        if op == fcntl.LOCK_EX:
+            mark.parent.mkdir(parents=True, exist_ok=True)
+            mark.touch()
+        return real(fd, op)
+
+    def run(*a, **k):
+        ran["n"] += 1
+        return {"size": [300, 200], "items": []}
+
+    monkeypatch.setattr(fcntl, "flock", flock)
+    monkeypatch.setattr(ocr, "_run", run)
+    with pytest.raises(RuntimeError, match="OCR skipped"):
+        ocr.read(str(img))
+    assert ran["n"] == 0  # no second full-budget wait
+    ocr._mem.clear()

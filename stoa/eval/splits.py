@@ -25,6 +25,7 @@ import hashlib
 import json
 import os
 import random
+import re
 import sys
 from pathlib import Path
 
@@ -271,6 +272,18 @@ def _split_file(name: str) -> Path:
     return Path(name) if (name.endswith(".jsonl") or "/" in name) else splits_dir() / f"{name}.jsonl"
 
 
+_THOUSANDS_UNITS = {"ft2", "ft", "in", "sf", "sqft", "count", "lf"}
+
+
+def _human_number(ans: str, unit: str | None) -> float:
+    """An expert's typed number: '6,095' ft2 = 6095 (thousands comma, H 23:36), '1,234,567.5' = 1234567.5;
+    a decimal comma stays one ('20,5' m2 = 20.5, metric '3,450' m = 3.45: O1's convention). Raises ValueError for text."""
+    t = ans.strip().replace(" ", "")
+    if re.fullmatch(r"\d{1,3}(,\d{3})+(\.\d+)?", t) and ((unit or "").lower() in _THOUSANDS_UNITS or t.count(",") > 1):
+        return float(t.replace(",", ""))
+    return float(t.replace(",", "."))
+
+
 def _human_rows(f: Path) -> list[dict]:
     """`human` split: the last saved row per qid wins (the workbench appends edits; a last row with "deleted": true drops
     the qid); the expert's sureness, page and
@@ -291,7 +304,7 @@ def _human_rows(f: Path) -> list[dict]:
             ans = r.get("answer")
             if isinstance(ans, str):
                 try:
-                    ans = float(ans.replace(",", ".")) if ans.strip() else None
+                    ans = _human_number(ans, r.get("unit")) if ans.strip() else None
                 except ValueError:
                     pass  # a text answer stays text
             last[qid] = dict(qid=qid, path=r["path"], question=r["question"], answer=ans, unit=r.get("unit") or None,

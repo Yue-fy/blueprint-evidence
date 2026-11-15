@@ -11,7 +11,7 @@
  *  to change': never apply the sealed 87.7 % to uploads). Update them with RL's next truth pass. */
 const NEW_DRAWINGS = {
   inTen: 5,
-  detail: "held-out sibling sheets 53 %, real drawings 51 %; scans and phone photos lower (4 of 20, 0 of 4 in the audit)",
+  detail: "held-out sibling sheets 53 %, real drawings 51 %; scans and phone photos lower: 4 of 20 and 0 of 4 in the audit",
 };
 const esc = (s: unknown) => String(s ?? "").replace(/[&<>"']/g, (c) => `&#${c.charCodeAt(0)};`);
 

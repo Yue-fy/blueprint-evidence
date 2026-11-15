@@ -227,6 +227,11 @@ def _bare_ps_words(page: _Page) -> list[_Word]:
     ]
 
 
+# G1 (X1 21:26 'Hur många tryckmätare (PG) finns på rörplanen?'): count cues in the languages the rules read
+_COUNT_CUE = re.compile(r"\b(?:kuinka monta|montako|wie viele|anzahl|combien|hur m[aå]nga|hoeveel|hvor mange|quant[ie]|"
+                        r"cu[aá]nt[oa]s|laske|r[aä]kna|z[aä]hle)\b", re.IGNORECASE)
+
+
 def _count_target(question: str) -> tuple[str, bool] | None:
     q = question.upper()
     distinct = "DISTINCT" in q or "DIFFERENT" in q or "UNIQUE" in q
@@ -236,6 +241,10 @@ def _count_target(question: str) -> tuple[str, bool] | None:
     occurrences = re.search(r"\b(?:CALLOUTS?|LABELS?|OCCURRENCES?|PRINTED|APPEAR\w*|TIMES|MENTION\w*|INSTANCES?)\b", q)
     if "PRESSURE" in q and ("SENSOR" in q or "GAUGE" in q):
         return ("PS" if "SENSOR" in q else "PG", distinct)
+    if re.search(r"\bPG\b|\bGAUGES?\b", q):
+        # G1 (X1 21:26 rp-010): 'how many PG gauges' / Swedish 'tryckmätare (PG)' went to pdf_text 3 @0.55; the bare
+        # tag token names Erin's PG family (21 printed)
+        return "PG", distinct
     if "MANUAL AIR VENT" in q or re.search(r"\bMAV\b", q):
         return "MAV", distinct
     for family in ("FSCV", "FSI", "FSR", "CV", "FP"):
@@ -569,7 +578,8 @@ class PipingSolver(BaseSolver):
             return answer or self.abstain("named line size was not found")
 
         target = _count_target(question)
-        if target is None or not re.search(r"\b(?:HOW\s+MANY|COUNT|NUMBER)\b", question, re.IGNORECASE):
+        if target is None or not (re.search(r"\b(?:HOW\s+MANY|COUNT|NUMBER)\b", question, re.IGNORECASE) or
+                                  _COUNT_CUE.search(question)):
             return self.abstain("unsupported piping question kind")
 
         family, distinct = target

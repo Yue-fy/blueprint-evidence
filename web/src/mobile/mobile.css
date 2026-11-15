@@ -1,23 +1,25 @@
 /* The phone page (web/mobile.html). Tokens come from ../style.css (:root, dark values under
    body[data-view="customer"]); everything here is scoped to body.m so the desktop UI is untouched. */
-html:has(body.m) { height: auto; }
+/* background none: the body's (dark) background then paints the whole canvas; a ':root { background: var(--bg) }' rule
+   in the shared CSS (night, 23:1x) resolves --bg on :root = the LIGHT token, a light band under a short page in dark mode */
+html:has(body.m) { height: auto; background: none; }
 body.m {
   height: auto; min-height: 100%; overflow-x: hidden; overflow-y: auto; background: var(--bg); color: var(--ink);
   font-size: 16px; -webkit-tap-highlight-color: transparent; padding-bottom: env(safe-area-inset-bottom);
 }
 body.m * { -webkit-touch-callout: none; }
 .m-top {
-  position: sticky; top: 0; z-index: 20; display: flex; align-items: center; gap: 10px;
+  position: sticky; top: 0; z-index: 20; display: flex; align-items: center; gap: 7px;
   padding: calc(10px + env(safe-area-inset-top)) 16px 10px; background: var(--glass);
   -webkit-backdrop-filter: saturate(180%) blur(20px); backdrop-filter: saturate(180%) blur(20px); border-bottom: 1px solid var(--line);
 }
 .m-logo { width: 30px; height: 30px; border-radius: 9px; background: var(--ink); color: var(--bg); display: grid; place-items: center; font-weight: 700; font-size: 16px; }
 .m-brand { display: flex; flex-direction: column; line-height: 1.15; flex: 1; min-width: 0; }
-.m-brand b { font-size: 17px; letter-spacing: -0.01em; }
+.m-brand b { font-size: 16px; letter-spacing: -0.015em; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .m-brand small { color: var(--muted); font-size: 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-.m-desk { color: var(--accent); font-size: 14px; text-decoration: none; padding: 8px 4px; }
+.m-desk { color: var(--accent); font-size: 14px; text-decoration: none; padding: 0 4px; min-height: 44px; display: inline-flex; align-items: center; }
 /* private mode switch (the desktop's .priv-toggle from style.css), sized for a thumb; its note under the header */
-body.m .m-priv { padding: 8px 6px; min-height: 40px; font-size: 14px; gap: 6px; border-radius: 10px; }
+body.m .m-priv { padding: 8px 6px; min-height: 44px; font-size: 14px; gap: 6px; border-radius: 10px; }
 body.m .priv-note { top: calc(60px + env(safe-area-inset-top)); left: 12px; right: 12px; max-width: none; font-size: 14px; }
 body.m .m-badges .data-went { font-size: 13px; }
 @media (max-width: 360px) { body.m .m-brand small { display: none; } }
@@ -54,17 +56,31 @@ body.m[data-step="asking"] #chips, body.m[data-step="asking"] #askForm { opacity
 .m-case-k { font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: .05em; padding: 3px 7px; border-radius: 999px;
   color: var(--muted); border: 1px solid var(--line-strong); }
 .m-case-k.scan { background: var(--warn-soft); color: var(--warn); border-color: transparent; }
+/* the case's difficulty (catalogue 'level'), same tints as the desktop's .pc-level (W5) */
+.m-case-tags { display: flex; flex-direction: column; align-items: flex-end; gap: 4px; }
+.m-lvl { font-size: 11.5px; font-weight: 600; padding: 2px 8px; border-radius: 999px; white-space: nowrap; }
+.m-lvl.lv-simple { background: rgba(52, 199, 89, .15); color: #1b6f31; }
+.m-lvl.lv-medium { background: rgba(255, 159, 10, .17); color: #7a4a00; }
+.m-lvl.lv-complex { background: rgba(0, 113, 227, .12); color: #0055aa; }
+@media (prefers-color-scheme: dark) {
+  .m-lvl.lv-simple { background: rgba(48, 209, 88, .2); color: #7ee29a; }
+  .m-lvl.lv-medium { background: rgba(255, 159, 10, .2); color: #ffc66b; }
+  .m-lvl.lv-complex { background: rgba(10, 132, 255, .22); color: #8cc4ff; }
+}
+.m-more-h { font-size: 15px; font-weight: 650; color: var(--muted); margin: 14px 6px 2px; letter-spacing: -0.005em; }
 /* a case with several sheets (Maleva: 5 floor plans): one small button per sheet above the chips */
 .m-sheets { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; margin-bottom: 10px; }
 .m-sheets > span { color: var(--muted); font-size: 13px; margin-right: 2px; }
-.m-sheets .m-chip { min-height: 36px; padding: 0 12px; font-size: 14px; }
+.m-sheets .m-chip { min-height: 44px; padding: 0 14px; font-size: 14px; }
 .m-sheets .m-chip[aria-pressed="true"] { background: var(--accent); border-color: transparent; color: #fff; }
 .m-casenote { margin-top: 10px; color: var(--muted); font-size: 13px; line-height: 1.4; }
 .m-casenote a { color: var(--accent); text-decoration: none; font-weight: 600; white-space: nowrap; }
 /* where the answer came from: one button per mark, tap = zoom there */
 .m-where { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 12px; }
 .m-where .m-wlabel { width: 100%; color: var(--muted); font-size: 13px; }
-.m-where .m-chip { max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* up to 2 lines: one line cut the number ('Outline · Multi-Purpose Hall: 247.73 m…', UX 23:30) */
+.m-where .m-chip { max-width: 100%; overflow: hidden; white-space: normal; text-align: left; line-height: 1.25; padding: 7px 12px;
+  display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2; line-clamp: 2; overflow-wrap: anywhere; }
 .m-btn {
   position: relative; display: inline-flex; align-items: center; justify-content: center; gap: 8px; min-height: 50px; padding: 0 20px;
   border-radius: 14px; border: 1px solid var(--line-strong); background: var(--panel); color: var(--ink); font-size: 17px; font-weight: 600;
@@ -76,11 +92,25 @@ body.m[data-step="asking"] #chips, body.m[data-step="asking"] #askForm { opacity
 .m-btn.small { min-height: 44px; padding: 0 14px; font-size: 15px; border-radius: 12px; }
 .m-btn.ghost { background: transparent; border-color: transparent; color: var(--accent); }
 .m-btn:active { transform: scale(.98); }
-.m-ico { font-size: 22px; }
+.m-ico { font-size: 22px; flex: none; }
+/* UX M13: 'Take a photo' in reach on the start screen (below 6 case cards it sat at y ~ 1,090 on a 844 px phone) */
+.m-photobar {
+  position: sticky; bottom: 0; z-index: 6; display: flex; gap: 8px; margin: 0 -16px; padding: 10px 16px calc(12px + env(safe-area-inset-bottom));
+  background: var(--bg); /* opaque: through glass, the photo card's title under it showed as a ghost (Pixel 7 dark) */
+  border-top: 1px solid var(--line); transition: opacity .2s ease, transform .2s ease;
+}
+.m-photobar .m-btn { flex: 1; min-height: 50px; font-size: 16px; gap: 8px; }
+.m-photobar.away { opacity: 0; transform: translateY(14px); pointer-events: none; }
+.m-mic { display: grid; place-items: center; color: var(--ink); }
+.m-mic.on { color: #fff; }
 .m-link { border: 0; background: none; color: var(--accent); font-size: 15px; padding: 12px; min-height: 44px; }
 
 /* the photo */
 .m-stage { flex-direction: column; gap: 8px; scroll-margin-top: 64px; }
+/* the marks pill (W5's .marks-chip from style.css) over the photo's top edge */
+.m-stage { position: relative; }
+.m-stage .marks-chip { top: 10px; max-width: calc(100% - 24px); font-size: 13px; padding: 2px 2px 2px 14px; }
+.m-stage .marks-chip .mc-btn { min-height: 44px; min-width: 44px; }
 .m-photo {
   position: relative; height: min(58vh, 560px); min-height: 240px; border-radius: var(--radius-lg); overflow: hidden;
   background: var(--canvas-3d); touch-action: none; box-shadow: var(--shadow); user-select: none;
@@ -98,6 +128,9 @@ body.m[data-tool="scale"] .m-photo, body.m[data-tool="room"] .m-photo { box-shad
 .mk.user { stroke: #ff9f0a; stroke-width: 3; }
 .mk.user.poly { fill: rgba(255, 159, 10, 0.20); }
 .mk.user.line { stroke-width: 3.5; stroke-dasharray: 8 5; }
+/* the long-press menu's room (the room the menu is about), dashed grey until an item is chosen */
+.mk.muted { stroke: #8e8e93; stroke-width: 2.5; stroke-dasharray: 6 4; }
+.mk.muted.poly { fill: rgba(142, 142, 147, 0.16); }
 .dot { fill: #fff; stroke: var(--accent); stroke-width: 2.5; }
 .dot.user { stroke: #ff9f0a; }
 .dot-halo { fill: rgba(0, 113, 227, .22); }
@@ -105,8 +138,13 @@ body.m[data-tool="scale"] .m-photo, body.m[data-tool="room"] .m-photo { box-shad
 .tag { fill: var(--accent); stroke: #fff; stroke-width: 1.5; }
 .tag.user { fill: #c25e00; }
 .tag-t { fill: #fff; font: 700 14px -apple-system, BlinkMacSystemFont, "Inter Variable", sans-serif; }
-.m-stagebar { display: flex; align-items: center; justify-content: space-between; gap: 8px; min-height: 44px; }
-.m-note { flex: 1; color: var(--muted); font-size: 12.5px; text-align: center; line-height: 1.3; }
+/* the note ('Recognised: part of Special school · Level 00 (on file) — tap a room') gets its own line under the buttons:
+   between New photo · Delete file · Whole sheet it was squeezed to one word per line and pushed the bar to 429 px in a
+   361 px card (the iPhone page scrolled sideways); the bar wraps so a long button row never overflows either */
+.m-stagebar { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; column-gap: 8px; row-gap: 0; min-height: 44px; }
+.m-note { order: 9; flex: 1 1 100%; color: var(--muted); font-size: 12.5px; text-align: center; line-height: 1.3; padding-bottom: 4px; }
+.m-note:empty { display: none; }
+#delMine { order: 8; }
 /* a multi-page PDF (drawing sets): ‹ 3 / 121 › */
 .m-pager { display: inline-flex; align-items: center; gap: 2px; font-size: 13px; color: var(--muted); white-space: nowrap; font-variant-numeric: tabular-nums; }
 .m-pager[hidden] { display: none; }
@@ -135,6 +173,15 @@ body.m[data-tool="scale"] .m-photo, body.m[data-tool="room"] .m-photo { box-shad
 .m-toolbar span { flex: 1; }
 .m-sheet { padding: 14px 16px; border-radius: var(--radius); background: var(--panel); box-shadow: var(--shadow-lift); }
 .m-sheet label { display: block; font-weight: 650; margin-bottom: 8px; }
+.m-touchhint { font-size: 14px; line-height: 1.35; color: var(--muted); }
+body:not([data-step="ask"]) .m-touchhint { display: none; }
+/* long-press on the plan: the room's items (the desktop's right-click menu) */
+.m-press[hidden] { display: none; }
+.m-press-h { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; font-size: 17px; }
+.m-press-h b { flex: 1; min-width: 0; overflow-wrap: anywhere; }
+.m-press-x { min-width: 44px; min-height: 44px; border: 0; border-radius: 22px; background: transparent; color: var(--muted); font-size: 18px; cursor: pointer; }
+.m-press-items { display: flex; flex-direction: column; gap: 6px; }
+.m-press-i { justify-content: flex-start; text-align: left; min-height: 46px; }
 .m-row { display: flex; align-items: center; gap: 8px; }
 .m-row input { flex: 1; min-width: 0; min-height: 48px; font-size: 20px; padding: 0 14px; border-radius: 12px; border: 1.5px solid var(--line-strong); background: var(--bg); }
 .m-unit-in { font-size: 18px; color: var(--muted); }
@@ -167,16 +214,20 @@ body.m[data-tool="scale"] .m-photo, body.m[data-tool="room"] .m-photo { box-shad
 .m-listhead { font-size: 26px; font-weight: 700; letter-spacing: -0.015em; line-height: 1.15; }
 .m-list { margin: 8px 0 0; padding: 0 0 0 20px; font-size: 18px; line-height: 1.45; font-variant-numeric: tabular-nums; }
 .m-list li { overflow-wrap: anywhere; }
+/* long items (S-100F slab types: a callout + its sizes per line) in body type, so three of them fit one screen */
+.m-list.long { font-size: 15px; line-height: 1.4; }
+.m-list.long li + li { margin-top: 6px; }
 .m-unit { font-size: 28px; font-weight: 600; color: var(--muted); }
 .m-sentence { font-size: 17px; line-height: 1.4; margin-top: 8px; }
 .m-badges { margin-top: 12px; }
 .m-badges .conf { width: auto; text-align: left; }
 .m-badges > * { min-height: 32px; display: inline-flex; align-items: center; }
 .m-scale { font-size: 13.5px; padding: 6px 12px; border-radius: 999px; background: var(--fill-2); color: var(--muted); }
-.m-tier { gap: 6px; font-size: 13.5px; padding: 6px 12px; border-radius: 999px; background: var(--fill-2); color: var(--muted); font-weight: 600; }
-.m-tier.t-cheap .tier-dots i.on { background: #2f8f5b; }
-.m-tier.t-mid .tier-dots i.on { background: #c98a12; }
-.m-tier.t-high .tier-dots i.on { background: #c0392b; }
+/* the desktop card's cost pill (style.css .hero-badges .tier): neutral grey, the words say the cost (UX 00:53 NEW-4) */
+.m-tier { gap: 6px; font-size: 13.5px; padding: 6px 12px; border-radius: 999px; background: var(--fill-2); color: var(--ink); font-weight: 500; }
+.m-tier small { color: var(--muted); font-size: 12px; }
+/* W5 01:14 / captain 21:39 (4): the tier dots in neutral grey for every tier, as the desktop's answer card (red read as 'our own answer is bad') */
+.m-tier .tier-dots i.on { background: var(--muted); }
 .m-assume { color: var(--muted); font-size: 13.5px; line-height: 1.4; margin-top: 8px; }
 .m-actions { display: flex; flex-direction: column; gap: 8px; }
 .m-time { color: var(--muted); font-size: 13px; }

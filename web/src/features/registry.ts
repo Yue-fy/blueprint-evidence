@@ -42,6 +42,36 @@ export type PointerCtx = {
   guid: string | null; // IFC element under the pointer in 3D (or on an IFC sheet), when known
   answer: Answer | null; // the answer on screen
   question: string; // the text in the question box
+  /** captain 23:47: the THING under the pointer, selected and highlighted at once (right-click / long-press); null =
+   *  nothing recognised there. Set before the menu's when() predicates run; may be refined once (async trace). */
+  selection?: Selection | null;
+};
+
+/** What a right-click selected (captain 23:47). Hit-test priority: a counted symbol (door / window box of the answer on
+ *  screen, else the sheet's door / window finder) > a room (its outline from the answer, the sheet's takeoff or a trace)
+ *  > a tag or printed label > a dimension string > a slab zone. bbox / poly are in the drawing space (= Evidence.bbox). */
+export type SelectionType = "door" | "window" | "symbol" | "room" | "tag" | "dimension" | "wall" | "slab";
+export type Selection = {
+  type: SelectionType;
+  bbox: [number, number, number, number] | null;
+  poly?: DrawingPt[] | null;
+  /** = poly (F1 00:36 reads ctx.selection.polygon for 'Edit outline'): the room's / zone's outline, >= 3 points */
+  polygon?: DrawingPt[] | null;
+  space: Space;
+  page: number;
+  /** where it came from: 'answer' = a mark of the answer on screen (index = its place in answer.evidence); 'detector' =
+   *  the sheet's door / window finder (takeoff); 'takeoff' = a room outline of the sheet's takeoff; 'trace' = traced now
+   *  from the wall lines around the room's label; 'label' = printed text only */
+  source: "answer" | "detector" | "template" | "takeoff" | "trace" | "label";
+  index?: number;
+  /** the selection's short label on the drawing: 'Kitchen · 35.6 m²' / 'Door 12' / 'FP-3' */
+  label: string;
+  /** the room name / tag text for questions ('Kitchen', 'FP-3'); for rooms with a number 'Zimmer 2.01' */
+  name?: string;
+  /** a value already known for it (the takeoff's area of the room) */
+  value?: { value: number; unit: string } | null;
+  /** the label point of a room (for ctx.room) */
+  at?: DrawingPt;
 };
 
 /** Extra context sent with a question (API side: G1 'point' / 'view' / 'region' in /ask). */
@@ -71,6 +101,14 @@ export type MeasureEv = {
   space: Space;
 };
 
+/** addPanel's options. group + tab put the panel in ONE floating sheet with tabs (captain 21:51: the takeoff's
+ *  Quantities · Conventions · Order list · Check list); order sorts the tabs (lower = left). The features 'conventions',
+ *  'orderlist' and 'checklist' (and F2's takeoff panel as 'Quantities') join the 'takeoff' group by name. */
+export type PanelOpts = { id: string; title: string; render: (el: HTMLElement) => void; onClose?: () => void; group?: string; tab?: string; order?: number };
+export type PanelHandle = { el: HTMLElement; open(): void; close(): void; toggle(): void; isOpen(): boolean };
+/** A quiet button on the answer card (F8 'Report'): shown when when(a, q) is true (default: every answer with a value). */
+export type CardAction = { id: string; label: string; title?: string; icon?: string; when?: (a: Answer, question: string) => boolean; run: (a: Answer, question: string) => void; order?: number };
+
 export type Overlay2D = {
   g: SVGGElement; // your layer inside the drawing's SVG overlay (content pixels)
   toContent(p: DrawingPt): [number, number]; // drawing point → content px
@@ -92,6 +130,9 @@ export type Host = {
   /** The room under the pointer from its traced outline (the printed name INSIDE it), when that differs from the nearest
    *  label; undefined = keep ctx.room. Optional (async: the menu opens at once and is refreshed when this lands). */
   refineRoom?(ctx: PointerCtx): Promise<PointerCtx["room"] | undefined>;
+  /** captain 23:47: the thing under the pointer, from cached geometry at once (now), and when that found no room, a
+   *  slower trace (later: resolves to a better selection, null = none, undefined = keep now). */
+  selectAt?(ctx: PointerCtx): { now: Selection | null; later?: Promise<Selection | null | undefined> };
   overlayLayer(): SVGGElement | null;
   toContent(p: DrawingPt): [number, number];
   toClient(p: DrawingPt): { x: number; y: number } | null;
@@ -116,8 +157,16 @@ export type FeatureApi = {
   addToolbarButton(o: { id: string; label: string; title?: string; icon?: string; onClick: () => void; when?: () => boolean }): () => void;
   /** An item in the right-click / long-press menu, shown when when(ctx) is true (max ~5 items show at once). */
   addContextMenuItem(o: { id: string; label: string | ((ctx: PointerCtx) => string); when: (ctx: PointerCtx) => boolean; run: (ctx: PointerCtx) => void; order?: number }): () => void;
-  /** A side panel (floating sheet on the right of the viewer); one panel is open at a time. */
-  addPanel(o: { id: string; title: string; render: (el: HTMLElement) => void; onClose?: () => void }): { el: HTMLElement; open(): void; close(): void; toggle(): void; isOpen(): boolean };
+  /** A side panel (floating sheet on the right of the viewer); one panel is open at a time. With group/tab it is a tab
+   *  of a shared sheet (see PanelOpts). */
+  addPanel(o: PanelOpts): PanelHandle;
+  /** A tab in the takeoff sheet (captain 21:51: Quantities · Conventions · Order list · Check list): addPanel in the
+   *  'takeoff' group + one toolbar entry that folds into the takeoff's (only the first visible one of the group shows). */
+  addTakeoffTab(o: { id: string; label: string; title?: string; render: (el: HTMLElement) => void; onClose?: () => void; order?: number; when?: () => boolean }): PanelHandle;
+  /** A quiet button on the answer card, e.g. 'Report' (F8); at most 3 show. Returns remove(). */
+  addCardAction(o: CardAction): () => void;
+  /** = addCardAction (the name F8's plug-in feature-detects). */
+  addAnswerAction(o: CardAction): () => void;
   /** A 2D overlay layer; redraw it in onDrawing() (the layer is emptied when another drawing or page opens). */
   addOverlay2D(id: string): Overlay2D;
   /** The 3D viewer (three.js; Viewer3D), or null when the open file has no model. */
@@ -155,6 +204,11 @@ export type FeatureApi = {
   openMeasure(tool?: "scale" | "length" | "area", at?: DrawingPt): void;
   /** The visitor's uploaded files open now ('upload/<id>/<name>'): the open one + the files dropped with it (T2). */
   uploads(): string[];
+  /** The visitor changed what a drawing is read as in the recognition menu (F7): {file, solver, label}, or null for
+   *  'Read it as detected'. */
+  onReadAs(cb: (r: { file: string; solver: string; label: string } | null) => void): () => void;
+  /** One plain-text line (no HTML) under the answer card's badges, recomputed for every answer; null = nothing (F6). */
+  addAnswerNote(fn: (a: Answer, question: string) => string | null): () => void;
   /** Read-only state. */
   file(): FileInfo | null;
   answer(): Answer | null;
@@ -191,9 +245,40 @@ const flags = readFlags();
 /** On unless switched off (?features=-rightclick or none): captain 21:02, right-click on any 2D sheet with its
  *  'Ask about this area…' item (F1's region). */
 const DEFAULT_ON = new Set(["rightclick", "region"]);
+/** captain 00:31: the features the API serves (GET /api/feat: 'mounted', or 'web-only' when STOA_FEATURES names a
+ *  web-only one) are on by default, so the final swap only sets STOA_FEATURES on :8100. An explicit list
+ *  (?features=a,b or a remembered one) decides alone; '-name' / 'none' still switch off. */
+const apiOn = new Set<string>();
 export function enabled(name: string): boolean {
   if (flags.has("none") || flags.has("-" + name.toLowerCase())) return false;
-  return flags.has("all") || flags.has("*") || flags.has(name.toLowerCase()) || DEFAULT_ON.has(name.toLowerCase());
+  return flags.has("all") || flags.has("*") || flags.has(name.toLowerCase()) || DEFAULT_ON.has(name.toLowerCase()) || apiOn.has(name.toLowerCase());
+}
+const explicitList = () => [...flags].some((f) => !f.startsWith("-") && f !== "none");
+async function servedFeatures() {
+  if (explicitList() || flags.has("none")) return;
+  let st: Record<string, string> = {};
+  try {
+    const r = await fetch("/api/feat");
+    if (!r.ok) return;
+    st = ((await r.json()) as { features?: Record<string, string> }).features ?? {};
+  } catch {
+    return;
+  }
+  const late: string[] = [];
+  for (const name of features.keys()) {
+    const v = String(st[name] ?? st[name.toLowerCase()] ?? "");
+    if ((v === "mounted" || v === "web-only") && !enabled(name)) {
+      apiOn.add(name.toLowerCase());
+      start(name);
+      if (!failed.has(name)) late.push(name);
+    }
+  }
+  if (!late.length || !host) return;
+  // the late ones catch up: the sheet already open, the answer already shown
+  const f = host.file(), a = host.answer(), q = host.question();
+  for (const e of [...drawingCbs]) if (late.includes(e.feature) && f) guard(e.feature, () => e.cb(f, host!.page()), undefined)();
+  for (const e of [...answerCbs]) if (late.includes(e.feature) && a) guard(e.feature, () => e.cb(a, q), undefined)();
+  console.info(`[features] on from the API's list: ${late.join(", ")}`);
 }
 const setFlags = (v: string) => {
   try {
@@ -227,7 +312,21 @@ const scaleCbs: { feature: string; cb: (s: ScaleEv) => void }[] = [];
 const pickCbs: { feature: string; cb: (c: unknown, o: unknown, q: string) => void }[] = [];
 const uploadCbs: { feature: string; cb: (files: FileInfo[]) => void }[] = [];
 const measureCbs: { feature: string; cb: (m: MeasureEv) => void }[] = [];
+const readAsCbs: { feature: string; cb: (r: { file: string; solver: string; label: string } | null) => void }[] = [];
+const noteFns: { feature: string; fn: (a: Answer, q: string) => string | null }[] = [];
 const beforeAskFns: { feature: string; fn: (q: string, f: FileInfo) => Promise<Answer> | null }[] = [];
+const cardActs: (CardAction & { feature: string })[] = [];
+/** Panels that share one sheet with tabs (captain 21:51). Keyed by '<feature>/<panel id>' first, then '<feature>'. */
+const GROUP_TITLE: Record<string, string> = { takeoff: "Takeoff" };
+const KNOWN_TABS: Record<string, { group: string; tab: string; order: number }> = {
+  "takeoff/takeoff": { group: "takeoff", tab: "Quantities", order: 0 },
+  conventions: { group: "takeoff", tab: "Conventions", order: 10 },
+  orderlist: { group: "takeoff", tab: "Order list", order: 20 },
+  checklist: { group: "takeoff", tab: "Check list", order: 30 },
+};
+const groupOf = (feature: string, id: string) => KNOWN_TABS[`${feature}/${id}`] ?? KNOWN_TABS[feature];
+type Tab = { key: string; feature: string; group: string; tab: string; order: number; open: () => void; isOpen: () => boolean };
+const tabs: Tab[] = [];
 function listen<T extends { feature: string }>(list: T[], e: T): () => void {
   list.push(e);
   return onClean(e.feature, () => {
@@ -274,7 +373,114 @@ const onClean = (name: string, c: () => void) => {
   return c;
 };
 
-let openPanel: { id: string; close(): void } | null = null;
+let openPanel: { id: string; close(): void; group?: string } | null = null;
+
+// --- the toolbar on the drawing: at most 3 pills, the rest under 'More tools' (QA 21:47: with every flag on, ten pills
+// sat in three rows over the drawing and its sheet pager). A tab of the takeoff sheet folds into the takeoff's pill.
+const PRIORITY: Record<string, number> = { takeoff: 0, region: 1, "project/project": 2, measure: 3, batch: 4, revcompare: 5, "project/newproject": 20 };
+const rankOfBtn = (b: HTMLElement) => PRIORITY[`${b.dataset.feature}/${b.dataset.id}`] ?? PRIORITY[b.dataset.feature ?? ""] ?? 50;
+const watched = new WeakSet<HTMLElement>();
+const overflow = new WeakMap<HTMLElement, HTMLButtonElement[]>(); // the bar's entries under 'More tools', in order
+let lastMoreClose = 0;
+function watchBar(bar: HTMLElement) {
+  if (watched.has(bar)) return layoutBar(bar);
+  watched.add(bar);
+  let queued = false;
+  const later = () => {
+    if (queued) return;
+    queued = true;
+    requestAnimationFrame(() => {
+      queued = false;
+      layoutBar(bar);
+    });
+  };
+  new MutationObserver(later).observe(bar, { childList: true, subtree: true, attributes: true, attributeFilter: ["hidden"] });
+  window.addEventListener("resize", later);
+  later();
+}
+function layoutBar(bar: HTMLElement) {
+  const all = [...bar.querySelectorAll<HTMLButtonElement>(".feat-btn:not(.feat-more)")];
+  const shown = all.filter((b) => !b.hidden);
+  // a group (the takeoff's tabs): only its first visible pill, in tab order
+  const lead = new Map<string, HTMLButtonElement>();
+  for (const b of shown) {
+    const g = b.dataset.group;
+    if (!g) continue;
+    const cur = lead.get(g);
+    if (!cur || Number(b.dataset.gorder ?? 50) < Number(cur.dataset.gorder ?? 50)) lead.set(g, b);
+  }
+  const live = shown.filter((b) => !b.dataset.group || lead.get(b.dataset.group) === b);
+  live.sort((x, y) => rankOfBtn(x) - rankOfBtn(y) || all.indexOf(x) - all.indexOf(y));
+  // one row: 3 pills on a wide drawing, 2 at 1440 px with the answer card open (the drawing is ~900 px wide)
+  const max = (bar.parentElement?.clientWidth ?? 1200) < 1100 ? 2 : 3;
+  const pills = live.length <= max + 1 ? live : live.slice(0, max);
+  const rest = live.slice(pills.length);
+  overflow.set(bar, rest);
+  for (const b of all) {
+    b.classList.toggle("feat-folded", !pills.includes(b));
+    const k = String(Math.max(0, pills.indexOf(b)));
+    if (b.style.order !== k) b.style.order = k;
+  }
+  let more = bar.querySelector<HTMLButtonElement>(".feat-more");
+  if (!rest.length) {
+    if (more && !more.hidden) more.hidden = true;
+    return;
+  }
+  if (!more) {
+    more = document.createElement("button");
+    more.type = "button";
+    more.className = "feat-btn feat-more";
+    more.setAttribute("aria-haspopup", "menu");
+    more.setAttribute("aria-expanded", "false");
+    more.innerHTML = `<span>More tools</span><span class="feat-caret" aria-hidden="true">▾</span>`;
+    more.addEventListener("click", () => {
+      if (performance.now() - lastMoreClose < 350) return; // the press that closed it
+      openMore(bar, more!);
+    });
+    bar.append(more);
+  }
+  more.style.order = "99";
+  more.title = rest.map(btnLabel).filter(Boolean).join(" · ");
+  if (more.hidden) more.hidden = false;
+}
+/** A pill's label as shown (features rewrite it: 'Learned (2)' replaces the spans with plain text). */
+function btnLabel(b: HTMLElement): string {
+  const c = b.cloneNode(true) as HTMLElement;
+  c.querySelectorAll(".feat-ic").forEach((x) => x.remove());
+  return (c.textContent ?? "").replace(/\s+/g, " ").trim();
+}
+function openMore(bar: HTMLElement, more: HTMLButtonElement) {
+  closeMenu();
+  layoutBar(bar);
+  const list = (overflow.get(bar) ?? []).filter((b) => b.isConnected && !b.hidden);
+  if (!list.length) return;
+  const m = document.createElement("div");
+  m.className = "feat-menu feat-more-menu";
+  m.dataset.kind = "more";
+  m.setAttribute("role", "menu");
+  for (const b of list) {
+    const it = document.createElement("button");
+    it.type = "button";
+    it.setAttribute("role", "menuitem");
+    const ic = b.querySelector(".feat-ic");
+    it.innerHTML = `<span class="feat-ic" aria-hidden="true">${ic ? ic.innerHTML : ""}</span><span></span>`;
+    it.querySelector("span:last-child")!.textContent = btnLabel(b) || b.dataset.id || "";
+    if (b.dataset.warn === "1") it.classList.add("warn");
+    it.title = b.title;
+    it.addEventListener("click", () => {
+      closeMenu();
+      b.click();
+    });
+    m.append(it);
+  }
+  document.body.append(m);
+  menuEl = m;
+  more.setAttribute("aria-expanded", "true");
+  const r = more.getBoundingClientRect(), mr = m.getBoundingClientRect();
+  m.style.left = `${Math.max(8, Math.min(r.left, window.innerWidth - mr.width - 8))}px`;
+  m.style.top = `${Math.max(8, r.top - mr.height - 8)}px`;
+  (m.querySelector("button") as HTMLButtonElement | null)?.focus();
+}
 function apiFor(name: string): FeatureApi {
   const h = () => host!;
   return {
@@ -290,16 +496,24 @@ function apiFor(name: string): FeatureApi {
       b.title = o.title ?? o.label;
       b.innerHTML = `${o.icon ? `<span class="feat-ic" aria-hidden="true">${o.icon}</span>` : ""}<span></span>`;
       b.querySelector("span:last-child")!.textContent = o.label;
+      const g = (o as { group?: { group: string; order: number } }).group ?? groupOf(name, o.id);
+      if (g) {
+        b.dataset.group = g.group;
+        b.dataset.gorder = String(g.order);
+      }
       b.addEventListener("click", guard(name, () => o.onClick(), undefined));
       bar.append(b);
       bar.hidden = false;
+      watchBar(bar);
       const sync = guard(name, () => void (b.hidden = !!o.when && !o.when()), undefined);
       sync();
       const offA = apiFor(name).onDrawing(sync);
+      const offB = apiFor(name).onAnswer(sync); // when() may depend on the answer on screen (F8 22:18)
       return onClean(name, () => {
         offA();
+        offB();
         b.remove();
-        bar.hidden = !bar.querySelector(".feat-btn");
+        bar.hidden = !bar.querySelector(".feat-btn:not(.feat-more)");
       });
     },
     addContextMenuItem(o) {
@@ -317,35 +531,78 @@ function apiFor(name: string): FeatureApi {
       el.dataset.feature = name;
       el.hidden = true;
       el.setAttribute("aria-label", o.title);
-      el.innerHTML = `<header><h3></h3><button type="button" class="feat-x" aria-label="Close">✕</button></header><div class="feat-body"></div>`;
-      el.querySelector("h3")!.textContent = o.title;
+      el.innerHTML = `<header><h3></h3><button type="button" class="feat-x" aria-label="Close">✕</button></header><div class="feat-tabs" role="tablist" hidden></div><div class="feat-body"></div>`;
+      const h3 = el.querySelector("h3")!;
+      h3.textContent = o.title;
       const body = el.querySelector<HTMLElement>(".feat-body")!;
+      const key = `${name}/${o.id}`;
+      const g = o.group ? { group: o.group, tab: o.tab ?? o.title, order: o.order ?? 50 } : groupOf(name, o.id);
+      if (g) el.dataset.group = g.group;
+      // one sheet, several tabs: the strip lists the group's panels (of features that are on and did not fail)
+      const drawTabs = () => {
+        if (!g) return;
+        const list = tabs.filter((t) => t.group === g.group && !failed.has(t.feature)).sort((x, y) => x.order - y.order);
+        const strip = el.querySelector<HTMLElement>(".feat-tabs")!;
+        if (list.length < 2) {
+          strip.hidden = true;
+          h3.textContent = o.title;
+          return;
+        }
+        h3.textContent = GROUP_TITLE[g.group] ?? o.title;
+        strip.hidden = false;
+        strip.replaceChildren(...list.map((t) => {
+          const tb = document.createElement("button");
+          tb.type = "button";
+          tb.setAttribute("role", "tab");
+          tb.setAttribute("aria-selected", String(t.key === key));
+          tb.className = t.key === key ? "on" : "";
+          tb.textContent = t.tab;
+          tb.addEventListener("click", () => { if (t.key !== key) t.open(); });
+          return tb;
+        }));
+      };
       root?.append(el);
       const p = {
         el: body,
         open: () => {
-          if (openPanel && openPanel.id !== `${name}/${o.id}`) openPanel.close();
+          // a tab switch inside one sheet: no fade-in (the sheet stays where it is)
+          el.classList.toggle("tab-switch", !!g && !!openPanel && openPanel.id !== key && openPanel.group === g.group);
+          if (openPanel && openPanel.id !== key) openPanel.close();
+          drawTabs();
           guard(name, () => o.render(body), undefined)();
           el.hidden = false;
           if (root) root.hidden = false;
-          openPanel = { id: `${name}/${o.id}`, close: p.close };
+          openPanel = { id: key, close: p.close, group: g?.group };
         },
         close: () => {
           el.hidden = true;
           if (root) root.hidden = !root.querySelector(".feat-panel:not([hidden])");
-          if (openPanel?.id === `${name}/${o.id}`) openPanel = null;
+          if (openPanel?.id === key) openPanel = null;
           if (o.onClose) guard(name, o.onClose, undefined)();
         },
         toggle: () => (el.hidden ? p.open() : p.close()),
         isOpen: () => !el.hidden,
       };
       el.querySelector(".feat-x")!.addEventListener("click", () => p.close());
+      const tab: Tab | null = g ? { key, feature: name, group: g.group, tab: g.tab, order: g.order, open: p.open, isOpen: p.isOpen } : null;
+      if (tab) tabs.push(tab);
       onClean(name, () => {
         el.remove();
+        if (tab && tabs.indexOf(tab) >= 0) tabs.splice(tabs.indexOf(tab), 1);
         if (root) root.hidden = !root.querySelector(".feat-panel:not([hidden])");
       });
       return p;
     },
+    addTakeoffTab(o) {
+      const api = apiFor(name);
+      const order = o.order ?? 50;
+      const p = api.addPanel({ id: o.id, title: o.label, render: o.render, onClose: o.onClose, group: "takeoff", tab: o.label, order });
+      // its own entry, folded into the takeoff's while that one shows (the group's first visible button wins)
+      api.addToolbarButton({ id: o.id, label: o.label, title: o.title, when: o.when, onClick: () => p.toggle(), group: { group: "takeoff", order } } as Parameters<FeatureApi["addToolbarButton"]>[0]);
+      return p;
+    },
+    addCardAction: (o) => listen(cardActs, { ...o, feature: name, order: o.order ?? 50 }),
+    addAnswerAction: (o) => listen(cardActs, { ...o, feature: name, order: o.order ?? 50 }),
     addOverlay2D(id) {
       const parent = h().overlayLayer();
       const g = document.createElementNS("http://www.w3.org/2000/svg", "g");
@@ -393,6 +650,8 @@ function apiFor(name: string): FeatureApi {
     onMeasure: (cb) => listen(measureCbs, { feature: name, cb }),
     openMeasure: (tool, at) => guard(name, () => h().openMeasure(tool, at), undefined)(),
     uploads: () => guard(name, () => h().uploads(), [] as string[])(),
+    onReadAs: (cb) => listen(readAsCbs, { feature: name, cb }),
+    addAnswerNote: (fn) => listen(noteFns, { feature: name, fn }),
     async askWith(question, ctx = {}) {
       if (ctx.show === false) return h().ask(question, ctx);
       return h().askShown(question, ctx);
@@ -424,13 +683,24 @@ export function initFeatures(h: Host) {
   host = h;
   for (const name of features.keys()) start(name);
   installContextMenu();
+  void servedFeatures();
 }
 /** main.ts: after an answer is shown. */
 export function emitAnswer(a: Answer, q: string) {
+  clearSelection(); // the answer's own marks take over
   for (const e of [...answerCbs]) guard(e.feature, () => e.cb(a, q), undefined)();
 }
 /** main.ts: after a drawing (or another page of it) has opened. */
+let lastDrawing = "";
 export function emitDrawing(f: FileInfo | null, page: number) {
+  // a selection never survives a sheet / floor change, and a menu about the old sheet goes too; the SAME sheet drawn
+  // again (a warm-up refresh, a re-render) keeps them (UX N-7: the menu closed by itself ~4 s after opening)
+  const key = `${f?.path ?? ""}|${page}`;
+  if (key !== lastDrawing) {
+    closeMenu();
+    clearSelection();
+  }
+  lastDrawing = key;
   for (const e of [...drawingCbs]) guard(e.feature, () => e.cb(f, page), undefined)();
 }
 /** api.ts: the solver_args every enabled feature adds to a question ({} when none). */
@@ -438,6 +708,19 @@ export function extraAskArgs(path: string, q: string): Record<string, unknown> {
   const out: Record<string, unknown> = {};
   for (const e of askArgFns) Object.assign(out, guard(e.feature, () => e.fn(path, q), null)() ?? {});
   return out;
+}
+/** main.ts: the recognition menu's kind pick (F7). */
+export function emitReadAs(r: { file: string; solver: string; label: string } | null) {
+  for (const e of [...readAsCbs]) guard(e.feature, () => e.cb(r), undefined)();
+}
+/** main.ts renderAnswer: the enabled features' plain-text notes for this answer (F6), at most 3. */
+export function answerNotes(a: Answer, q: string): string[] {
+  const out: string[] = [];
+  for (const e of noteFns) {
+    const t = guard(e.feature, () => e.fn(a, q), null)();
+    if (typeof t === "string" && t.trim()) out.push(t.trim().slice(0, 240));
+  }
+  return out.slice(0, 3);
 }
 /** main.ts (measure.ts onMeasure): a measurement finished on the drawing. */
 export function emitMeasure(m: MeasureEv) {
@@ -463,33 +746,234 @@ export function emitScale(s: ScaleEv) {
 export function emitClarifyPick(c: unknown, o: unknown, q: string) {
   for (const e of [...pickCbs]) guard(e.feature, () => e.cb(c, o, q), undefined)();
 }
+/** main.ts renderHero: the card's feature buttons for this answer (F8 'Report'), at most 3. */
+export function cardActions(a: Answer, q: string): { id: string; feature: string; label: string; title: string; icon: string; run: () => void }[] {
+  return cardActs
+    .filter((x) => !failed.has(x.feature) && guard(x.feature, () => (x.when ? x.when(a, q) : a.value !== null && a.value !== undefined), false)())
+    .sort((x, y) => (x.order ?? 50) - (y.order ?? 50))
+    .slice(0, 3)
+    .map((x) => ({ id: x.id, feature: x.feature, label: x.label, title: x.title ?? x.label, icon: x.icon ?? "", run: guard(x.feature, () => x.run(a, q), undefined) }));
+}
 export const anyFeatureOn = () => [...features.keys()].some((n) => enabled(n) && !failed.has(n));
+
+// --- the selection (captain 23:47): right-click selects the thing under the pointer and highlights it at once -------
+// One selection at a time. It goes on: Esc, a left-click on empty paper, 'Clear selection' (bottom of the menu), the ×
+// on its label, 'Clear marks', a new answer, and any sheet / floor / page / Plan-3D change (checked every frame).
+type SelState = { sel: Selection; file: string; page: number; view: ViewMode; g: SVGGElement; tag: HTMLElement; raf: number; z: number;
+  /** which top corner the label hangs from: away from the menu (UX N-1: the menu covered the label's ×) */
+  align: "center" | "left" | "right"; below: boolean;
+  /** the open menu's rectangle: the label moves aside so the menu never covers it or its × (UX N-1) */
+  avoid: { x: number; y: number; w: number; h: number } | null };
+let cur: SelState | null = null;
+let finding: HTMLElement | null = null;
+const SVGNS = "http://www.w3.org/2000/svg";
+/** The selection on the drawing now (null: none). */
+export const currentSelection = (): Selection | null => cur?.sel ?? null;
+export const hasSelection = () => !!cur;
+function stopFinding() {
+  finding?.remove();
+  finding = null;
+}
+export function clearSelection() {
+  stopFinding();
+  if (!cur) return;
+  cancelAnimationFrame(cur.raf);
+  cur.g.remove();
+  cur.tag.remove();
+  cur = null;
+  document.getElementById("v2d")?.classList.remove("has-selection");
+  window.dispatchEvent(new CustomEvent("stoa:selection", { detail: null }));
+}
+/** captain 01:18 'Start over' (window 'stoa:reset'): the shell's part here: the right-click menu, the selection and the
+ *  open feature panel; every plug-in clears itself on the same event. */
+window.addEventListener("stoa:reset", () => {
+  closeMenu();
+  clearSelection();
+  openPanel?.close();
+});
+const boxOf = (s: Selection): [number, number, number, number] | null => {
+  if (s.bbox) return s.bbox;
+  const p = s.poly ?? [];
+  if (!p.length) return null;
+  const xs = p.map((q) => q[0]), ys = p.map((q) => q[1]);
+  return [Math.min(...xs), Math.min(...ys), Math.max(...xs), Math.max(...ys)];
+};
+function drawSelection(sel: Selection | null) {
+  clearSelection();
+  if (sel && sel.poly && !sel.polygon) sel.polygon = sel.poly;
+  const h0 = host;
+  const parent = h0?.overlayLayer();
+  if (!h0 || !sel || !parent) return;
+  const g = document.createElementNS(SVGNS, "g");
+  g.classList.add("feat-sel");
+  g.dataset.type = sel.type;
+  parent.append(g);
+  const tag = document.createElement("div");
+  tag.className = "feat-sel-tag";
+  tag.dataset.type = sel.type;
+  tag.setAttribute("role", "status");
+  const txt = document.createElement("span");
+  txt.textContent = sel.label.length > 60 ? sel.label.slice(0, 59) + "…" : sel.label;
+  const x = document.createElement("button");
+  x.type = "button";
+  x.textContent = "×";
+  x.title = "Clear selection (Esc)";
+  x.setAttribute("aria-label", "Clear selection");
+  x.addEventListener("click", (e) => {
+    e.stopPropagation();
+    closeMenu();
+    clearSelection();
+  });
+  tag.addEventListener("pointerdown", (e) => e.stopPropagation());
+  tag.addEventListener("contextmenu", (e) => e.preventDefault());
+  tag.append(txt, x);
+  document.body.append(tag);
+  const st: SelState = { sel, file: h0.file()?.path ?? "", page: h0.page(), view: h0.view(), g, tag, raf: 0, z: 0, align: "center", below: false, avoid: null };
+  cur = st;
+  document.getElementById("v2d")?.classList.add("has-selection");
+  const paint = (z: number) => {
+    g.replaceChildren();
+    const shape = (cls: string, w: number) => {
+      let el: SVGElement | null = null;
+      if (sel.poly && sel.poly.length >= 3) {
+        el = document.createElementNS(SVGNS, "polygon");
+        el.setAttribute("points", sel.poly.map((q) => h0.toContent(q).join(",")).join(" "));
+      } else {
+        const b = boxOf(sel);
+        if (!b) return;
+        const [x0, y0] = h0.toContent([b[0], b[1]]);
+        const [x1, y1] = h0.toContent([b[2], b[3]]);
+        const padC = 3 / z; // a few screen px around a small symbol, so the outline does not hide it
+        el = document.createElementNS(SVGNS, "rect");
+        el.setAttribute("x", String(Math.min(x0, x1) - padC));
+        el.setAttribute("y", String(Math.min(y0, y1) - padC));
+        el.setAttribute("width", String(Math.abs(x1 - x0) + 2 * padC));
+        el.setAttribute("height", String(Math.abs(y1 - y0) + 2 * padC));
+        el.setAttribute("rx", String(4 / z));
+      }
+      el.classList.add(cls);
+      el.setAttribute("stroke-width", String(w / z));
+      g.append(el);
+    };
+    shape("feat-sel-halo", 10);
+    shape("feat-sel-under", 4);
+    shape("feat-sel-line", 2.5);
+    // UX S-B3: distinct from the answer's solid marks — the selection's outline is dashed ('marching' unless reduced motion)
+    const line = g.querySelector<SVGElement>(".feat-sel-line");
+    line?.setAttribute("stroke-dasharray", `${7 / z} ${4 / z}`);
+  };
+  const tick = () => {
+    if (cur !== st) return;
+    const h1 = host!;
+    if ((h1.file()?.path ?? "") !== st.file || h1.page() !== st.page || h1.view() !== st.view || !g.isConnected) {
+      closeMenu();
+      return clearSelection();
+    }
+    const z = h1.zoom() || 1;
+    if (z !== st.z || !g.childElementCount) { // zoomed, or the layer was emptied by a redraw of the same sheet
+      st.z = z;
+      paint(z);
+    }
+    const b = boxOf(sel);
+    const a = b ? h1.toClient([b[0], b[1]]) : null, c = b ? h1.toClient([b[2], b[3]]) : null;
+    const p = a && c ? { x: st.align === "left" ? Math.min(a.x, c.x) : st.align === "right" ? Math.max(a.x, c.x) : (a.x + c.x) / 2, y: st.below ? Math.max(a.y, c.y) : Math.min(a.y, c.y) } : null;
+    const r = document.getElementById("v2d")?.getBoundingClientRect();
+    const show = !!p && !!r && p.x >= r.left - 40 && p.x <= r.right + 40 && p.y >= r.top - 4 && p.y <= r.bottom;
+    tag.hidden = !show;
+    if (show) {
+      // explicit corner: x0 / y0 of the label, moved aside from an open menu
+      const w = tag.offsetWidth, h = tag.offsetHeight;
+      let x0 = st.align === "left" ? p!.x : st.align === "right" ? p!.x - w : p!.x - w / 2;
+      let y0 = st.below ? p!.y + 8 : Math.max(p!.y, r!.top + 36 + h + 8) - 8 - h;
+      const m = st.avoid;
+      const hits = (x: number, y: number) => !!m && x + w > m.x && x < m.x + m.w && y + h > m.y && y < m.y + m.h;
+      if (m && hits(x0, y0)) {
+        const left = m.x - 8 - w, right = m.x + m.w + 8;
+        if (left >= 8 && (x0 + w / 2 <= m.x + m.w / 2 || right + w > window.innerWidth - 8)) x0 = left;
+        else if (right + w <= window.innerWidth - 8) x0 = right;
+        else y0 = Math.max(8, m.y - 8 - h);
+      }
+      // UX NEW-R4: the label stays over the drawing (it sat over the left panel); kept clear of the menu by moving up
+      const cx = Math.min(Math.max(x0, r!.left + 4), Math.max(r!.left + 4, r!.right - w - 4));
+      if (cx !== x0) {
+        x0 = cx;
+        if (hits(x0, y0)) y0 = Math.max(r!.top + 4, m!.y - 8 - h);
+      }
+      tag.style.transform = "none";
+      tag.style.left = `${Math.round(x0)}px`;
+      tag.style.top = `${Math.round(y0)}px`;
+    }
+    st.raf = requestAnimationFrame(tick);
+  };
+  tick();
+  window.dispatchEvent(new CustomEvent("stoa:selection", { detail: sel }));
+}
+/** 'Finding what's here…' at the pointer while the room is being traced (no cached outline there). */
+function showFinding(x: number, y: number) {
+  stopFinding();
+  const t = document.createElement("div");
+  t.className = "feat-sel-tag finding";
+  t.setAttribute("role", "status");
+  t.textContent = "Finding what's here…";
+  t.style.left = `${Math.round(x)}px`;
+  t.style.top = `${Math.round(y - 10)}px`;
+  document.body.append(t);
+  finding = t;
+}
+/** ctx.room follows the selection: a room's name, else none (the menu is about the door / tag / spot selected). */
+function withSelection(ctx: PointerCtx, sel: Selection | null): PointerCtx {
+  if (sel && sel.poly && !sel.polygon) sel.polygon = sel.poly;
+  const room = sel?.type === "room" && sel.name ? { name: sel.name, at: sel.at ?? ctx.point ?? [0, 0] as DrawingPt } : null;
+  return { ...ctx, selection: sel, room };
+}
 
 // --- the right-click / long-press menu (items from every enabled feature) ------------------------------------------
 let menuEl: HTMLElement | null = null;
 function closeMenu() {
+  if (menuEl?.dataset.kind === "more") {
+    lastMoreClose = performance.now();
+    document.querySelector(".feat-more")?.setAttribute("aria-expanded", "false");
+  }
   menuEl?.remove();
   menuEl = null;
+  if (cur) cur.avoid = null;
 }
 function itemsFor(ctx: PointerCtx) {
   return menuItems
     .filter((it) => !failed.has(it.feature) && guard(it.feature, () => it.when(ctx), false)())
-    .sort((a, b) => a.order - b.order)
-    .slice(0, 5);
+    .sort((a, b) => a.order - b.order);
 }
-function showMenu(ctx: PointerCtx): boolean {
+/** Items shown before 'More…' (QA 22:09 / S0 22:30: a fixed cap of 5 hid later plug-ins' items inside a named room). */
+const MENU_FIRST = 5;
+/** captain 23:47: a selected room's menu is his list (Area · Skirting · Doors · Windows · Perimeter · Edit outline / Trace
+ *  it yourself): up to 7 rows before 'More…' when something is selected. */
+const MENU_SELECTED = 7;
+/** Items a plug-in registered under this id (e.g. F1's 'trace-yourself'), enabled and not failed: another plug-in's
+ *  item can then step aside instead of showing the same action twice. */
+export const menuHas = (id: string, ctx?: PointerCtx) =>
+  menuItems.some((it) => it.id === id && !failed.has(it.feature) && enabled(it.feature) && (!ctx || guard(it.feature, () => it.when(ctx), false)()));
+function showMenu(ctx: PointerCtx, all = false, pending = false): boolean {
   closeMenu();
-  const found = itemsFor(ctx);
+  // while the room is being traced: only 'Finding what's here…' (UX S-M5: the items must not change under the pointer)
+  const every = pending ? [] : itemsFor(ctx);
+  const cap = ctx.selection ? MENU_SELECTED : MENU_FIRST;
+  // one 'More…' row instead of a 6th / 7th item; it opens the full list in place
+  const found = all || every.length <= cap + 1 ? every : [...every.slice(0, cap),
+    { feature: "", id: "more", order: 999, when: () => true, run: () => void showMenu(ctx, true), label: `More… (${every.length - cap})` } as Item];
   // captain 21:02: never an empty menu — say that nothing was recognised under the pointer
-  const items: Item[] = found.length ? found : [{ feature: "", id: "nothing", order: 99, when: () => true, run: () => undefined,
+  const items: Item[] = found.length || pending ? found : [{ feature: "", id: "nothing", order: 99, when: () => true, run: () => undefined,
     label: ctx.point ? "Nothing recognised here: try a room name, a tag or a note" : "Right-click on the drawing to ask about a spot" }];
   const m = document.createElement("div");
   m.className = "feat-menu";
   m.setAttribute("role", "menu");
-  const head = ctx.room?.name || (ctx.label && ctx.label.dist < 40 ? ctx.label.text : "");
+  const sel = ctx.selection;
+  const TYPE_WORD: Partial<Record<SelectionType, string>> = { room: "Room", tag: "Tag", symbol: "Symbol" };
+  const typed = sel ? (TYPE_WORD[sel.type] && !sel.label.toLowerCase().startsWith(TYPE_WORD[sel.type]!.toLowerCase()) ? `${TYPE_WORD[sel.type]} · ${sel.label}` : sel.label) : "";
+  const head = pending ? "Finding what's here…" : sel ? typed : ctx.selection === null ? "" : ctx.room?.name || (ctx.label && ctx.label.dist < 40 ? ctx.label.text : "");
   if (head) {
     const t = document.createElement("div");
     t.className = "feat-menu-head";
+    if (pending) t.classList.add("pending");
     t.textContent = head.length > 48 ? head.slice(0, 47) + "…" : head;
     m.append(t);
   }
@@ -502,20 +986,106 @@ function showMenu(ctx: PointerCtx): boolean {
       b.disabled = true;
       b.classList.add("feat-menu-none");
     }
+    if (it.id === "more" && !it.feature) b.classList.add("feat-menu-more");
     b.addEventListener("click", () => {
+      if (it.id === "more" && !it.feature) return void showMenu(ctx, true, pending);
       closeMenu();
       guard(it.feature, () => it.run(ctx), undefined)();
+    });
+    m.append(b);
+  }
+  if (cur || sel) { // captain 23:47: 'Clear selection' at the bottom of every menu with a selection
+    const b = document.createElement("button");
+    b.type = "button";
+    b.setAttribute("role", "menuitem");
+    b.className = "feat-menu-clear";
+    b.textContent = "Clear selection";
+    b.addEventListener("click", () => {
+      closeMenu();
+      clearSelection();
     });
     m.append(b);
   }
   document.body.append(m);
   menuEl = m;
   const r = m.getBoundingClientRect();
-  const x = Math.min(ctx.client.x, window.innerWidth - r.width - 8);
-  const y = Math.min(ctx.client.y, window.innerHeight - r.height - 8);
-  m.style.left = `${Math.max(8, x)}px`;
-  m.style.top = `${Math.max(8, y)}px`;
-  (m.querySelector("button") as HTMLButtonElement | null)?.focus();
+  let px = ctx.client.x + 12, py = ctx.client.y;
+  // UX S-B3: beside the selection, not over it (small things: a door, a tag, a room that fits on screen)
+  const b = sel && host ? boxOf(sel) : null;
+  let box: { L: number; R: number; T: number } | null = null;
+  if (b && host) {
+    const a = host.toClient([b[0], b[1]]), c = host.toClient([b[2], b[3]]);
+    if (a && c) {
+      const L = Math.min(a.x, c.x), R = Math.max(a.x, c.x), T = Math.min(a.y, c.y);
+      box = { L, R, T };
+      if (R - L < window.innerWidth * 0.4) {
+        if (R + 12 + r.width <= window.innerWidth - 8) px = R + 12;
+        else if (L - 12 - r.width >= 8) px = L - 12 - r.width;
+        py = Math.max(T, ctx.client.y - 40);
+      }
+      // the selection's label hangs from the corner AWAY from the menu (UX N-1)
+      if (cur && cur.sel === sel && px >= (L + R) / 2) cur.align = "left";
+      else if (cur && cur.sel === sel) cur.align = "right";
+    }
+  }
+  const x = Math.max(8, Math.min(px, window.innerWidth - r.width - 8));
+  const y = Math.max(8, Math.min(py, window.innerHeight - r.height - 8));
+  m.style.left = `${x}px`;
+  m.style.top = `${y}px`;
+  // the label steps aside from the menu (UX N-1: the menu covered the label and its ×)
+  if (cur && (cur.sel === sel || !sel)) cur.avoid = { x, y, w: r.width, h: r.height };
+  void box;
+  // UX N-2: no item is pre-selected (Enter must not teach 'This is a door'): the menu takes focus; arrows / Tab move
+  m.tabIndex = -1;
+  m.addEventListener("keydown", (e) => {
+    if (e.key !== "ArrowDown" && e.key !== "ArrowUp") return;
+    const bs = [...m.querySelectorAll<HTMLButtonElement>("button:not(:disabled)")];
+    if (!bs.length) return;
+    e.preventDefault();
+    const i = bs.indexOf(document.activeElement as HTMLButtonElement);
+    bs[(i + (e.key === "ArrowDown" ? 1 : -1) + bs.length + (i < 0 && e.key === "ArrowUp" ? 1 : 0)) % bs.length].focus();
+  });
+  m.focus({ preventScroll: true });
+  return true;
+}
+/** UX S-M3: while Measure is drawing, a right-click belongs to the tool: its own controls (Undo point / Done / Clear
+ *  selection), never the room under the shape (whose Esc would also discard the corners). */
+function showToolMenu(x: number, y: number, panel: HTMLElement): boolean {
+  closeMenu();
+  const ctl = [...panel.querySelectorAll<HTMLButtonElement>(".m-ctl button")].filter((b) => !b.disabled && (/undo|done|clear selection/i.test(b.textContent ?? "") || b.dataset.act === "cancel")); // F1 01:05: 'Cancel shape' carries data-act="cancel"
+  const m = document.createElement("div");
+  m.className = "feat-menu";
+  m.dataset.kind = "tool";
+  m.setAttribute("role", "menu");
+  const t = document.createElement("div");
+  t.className = "feat-menu-head";
+  t.textContent = "Measuring";
+  m.append(t);
+  for (const src of ctl) {
+    const b = document.createElement("button");
+    b.type = "button";
+    b.setAttribute("role", "menuitem");
+    b.textContent = src.dataset.act === "cancel" ? "Discard this shape" : (src.textContent ?? "").replace(/^Clear selection$/, "Discard this shape");
+    b.addEventListener("click", () => {
+      closeMenu();
+      src.click();
+    });
+    m.append(b);
+  }
+  const keep = document.createElement("button");
+  keep.type = "button";
+  keep.setAttribute("role", "menuitem");
+  keep.className = "feat-menu-clear";
+  keep.textContent = "Keep measuring";
+  keep.addEventListener("click", closeMenu);
+  m.append(keep);
+  document.body.append(m);
+  menuEl = m;
+  const r = m.getBoundingClientRect();
+  m.style.left = `${Math.max(8, Math.min(x + 12, window.innerWidth - r.width - 8))}px`;
+  m.style.top = `${Math.max(8, Math.min(y, window.innerHeight - r.height - 8))}px`;
+  m.tabIndex = -1;
+  m.focus({ preventScroll: true });
   return true;
 }
 let installed = false;
@@ -525,14 +1095,47 @@ function installContextMenu() {
   const target = () => document.getElementById("v2d");
   const open = (x: number, y: number) => {
     if (!host || !menuItems.length) return false;
-    const ctx = host.pointerCtx(x, y);
-    if (!showMenu(ctx)) return false;
+    // a tool that is drawing owns the right-click (UX S-M3 / S-M4): Measure gets its own short menu; a region being
+    // dragged gets none (and no browser menu either)
+    const meas = document.querySelector<HTMLElement>(".measure.on");
+    if (meas && meas.querySelector(".m-ctl button")) return showToolMenu(x, y, meas);
+    if (document.querySelector(".feat-region-capture")) return true;
+    const ctx0 = host.pointerCtx(x, y);
+    if (host.selectAt && ctx0.point && ctx0.view !== "3d") {
+      // captain 23:47: select the thing under the pointer at once (cached geometry), highlight it, menu by its type;
+      // when no cached outline holds the point, 'Finding what's here…' until the room is traced from its label
+      let pick: ReturnType<NonNullable<Host["selectAt"]>> = { now: null };
+      try { pick = host.selectAt(ctx0); } catch (e) { console.warn("[features] selectAt failed", e); }
+      const ctx = withSelection(ctx0, pick.now);
+      drawSelection(pick.now);
+      const pending = !pick.now && !!pick.later;
+      if (pending) showFinding(x, y);
+      if (!showMenu(ctx, false, pending)) return false;
+      const shown = menuEl;
+      if (pick.later) {
+        void pick.later.then((s) => {
+          stopFinding();
+          if (menuEl !== shown) {
+            if (s && !menuEl && !cur && host?.file()?.path === ctx0.file?.path) drawSelection(s); // menu closed meanwhile: still show it
+            return;
+          }
+          const sel = s === undefined ? pick.now : s;
+          if (sel !== pick.now) drawSelection(sel);
+          showMenu(withSelection(ctx0, sel ?? null));
+        }).catch(() => {
+          stopFinding();
+          if (menuEl === shown) showMenu(ctx);
+        });
+      }
+      return true;
+    }
+    if (!showMenu(ctx0)) return false;
     // the nearest printed name can be the room next door: once the room under the pointer is traced, the menu names
     // the room whose label lies inside that outline (same place, items rebuilt)
     const shown = menuEl;
-    void host.refineRoom?.(ctx).then((room) => {
-      if (room === undefined || menuEl !== shown || (room?.name ?? "") === (ctx.room?.name ?? "")) return;
-      showMenu({ ...ctx, room });
+    void host.refineRoom?.(ctx0).then((room) => {
+      if (room === undefined || menuEl !== shown || (room?.name ?? "") === (ctx0.room?.name ?? "")) return;
+      showMenu({ ...ctx0, room });
     }).catch(() => undefined);
     return true;
   };
@@ -558,7 +1161,29 @@ function installContextMenu() {
   document.addEventListener("pointermove", cancel, true);
   document.addEventListener("pointerup", cancel, true);
   document.addEventListener("pointercancel", cancel, true);
-  document.addEventListener("keydown", (e) => { if (e.key === "Escape") closeMenu(); });
+  // Esc: the open menu / the selection first, and ONLY that (UX S-M3: the Esc that closed the menu also discarded
+  // Measure's corners): window capture runs before every document listener (main.ts, measure.ts)
+  window.addEventListener("keydown", (e) => {
+    if (e.key !== "Escape" || (!menuEl && !cur)) return;
+    closeMenu();
+    clearSelection();
+    e.preventDefault();
+    e.stopPropagation();
+  }, true);
+  // a left-click on the paper (no drag) clears the selection; its label's × and the menu stop their own clicks
+  let down: { x: number; y: number } | null = null;
+  document.addEventListener("pointerdown", (e) => {
+    const t = target();
+    down = cur && e.button === 0 && t && t.contains(e.target as Node) ? { x: e.clientX, y: e.clientY } : null;
+  }, true);
+  document.addEventListener("pointerup", (e) => {
+    // (not the end of a long-press: that one has just opened the menu)
+    if (down && !menuEl && Math.hypot(e.clientX - down.x, e.clientY - down.y) < 6) clearSelection();
+    down = null;
+  }, true);
+  window.addEventListener("stoa:clear-marks", () => clearSelection());
+  // F1 00:36: Measure took the selected room (Edit outline) or its Esc / Clear selection: drop the highlight only
+  window.addEventListener("stoa:deselect", () => clearSelection());
   window.addEventListener("blur", closeMenu);
   document.addEventListener("wheel", closeMenu, { passive: true });
 }

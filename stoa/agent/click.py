@@ -489,6 +489,29 @@ def answer(pipe, path: str, question: str, ctx: Ask, solve) -> Answer:
     return ans
 
 
+_ONE_ROOM_Q = re.compile(r"\b(?:the|this|that)\s+(?:room|space)\b(?!s)", re.I)
+
+
+def _one_room_label(path: str, poly, q: str) -> str | None:
+    """The one room NAME printed inside the drawn region, when the question asks about 'the room' (singular); None for
+    zero or several names (then the region's own area / its tags answer as before)."""
+    if os.environ.get("STOA_G1_ONE_ROOM", "1") == "0" or not _ONE_ROOM_Q.search(q):
+        return None
+    got = sorted(((t.strip(), bb) for t, bb in lines(path, 0) if inside(centre(bb), poly) and _NAMEISH.search(t) and
+                  not _NOT_NAME.search(t) and len(t.split()) <= 4 and not re.search(r"\d", t)), key=lambda x: x[1][1])
+    merged: list[list] = []
+    for t, bb in got:  # a label printed on two lines ('Multi-Purpose' / 'Hall') is one name
+        if merged:
+            pt, pb = merged[-1]
+            h = max(1.0, pb[3] - pb[1])
+            if 0 <= bb[1] - pb[3] <= 0.8 * h and min(bb[2], pb[2]) - max(bb[0], pb[0]) > 0:
+                merged[-1] = [f"{pt} {t}", (min(pb[0], bb[0]), pb[1], max(pb[2], bb[2]), bb[3])]
+                continue
+        merged.append([t, bb])
+    names = list(dict.fromkeys(t for t, _ in merged))
+    return names[0] if len(names) == 1 else None
+
+
 def _region(pipe, path, q, ctx, task, solve) -> Answer | None:
     poly = ctx.region
     if len(poly) == 2 or (task == "length" and not _ROOMS_IN.search(q)):
@@ -537,6 +560,23 @@ def _region(pipe, path, q, ctx, task, solve) -> Answer | None:
                        assumptions=["rooms = the printed room tags whose centre lies inside the region"],
                        missing=[])
             return _with_ctx(a, ctx, "region", ctx.line())
+        one = _one_room_label(path, poly, q) if want_rooms and not tg else None
+        if one:
+            # UX M23 (DfE L00, box over the Multi-Purpose Hall, 'Area of the room in here'): the box's own area
+            # (287.87 'rough guess') while the hall's measured outline is 247.73: one labelled room inside the box = that
+            # room's own measured area, named
+            q1 = f"What is the area of the {one}?"
+            try:  # the full solver (an upload: its traced vector copy measures the room), without the region
+                with use(None):
+                    a = pipe.solve(path, q1) if hasattr(pipe, "solve") else solve(path, q1)
+            except Exception:  # noqa: BLE001
+                a = solve(path, q1)
+            if a.value is not None and isinstance(a.value, (int, float)) and a.confidence >= 0.3 and \
+                    any(e.bbox or e.polygon for e in a.evidence or []):
+                a = a.model_copy(deep=True)
+                a.trace = [f"1 room in your box: {one} -> its own measured area", *a.trace]
+                a.assumptions = [f"1 room in your box: {one} (its own outline, not the box)", *a.assumptions]
+                return _with_ctx(a, ctx, "region", ctx.line())
         sc = _scale(pipe, path, ctx, centre(_bbox(poly)))
         if sc is None:  # never the WHOLE sheet's area for 'this region' (AFCEC PNG: the floor total 26,562 SF)
             a = Answer(value=None, confidence=0.0, solver="pipeline/context",

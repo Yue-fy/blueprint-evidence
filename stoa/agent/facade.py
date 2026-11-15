@@ -83,6 +83,17 @@ def parse(question: str) -> Ask | None:
         return None
     wing, text = [], ""
     m = _WING.search(q)
+    if not m:
+        # DR 22:12: 'the north facade of the Multi-Purpose Hall' named no wing word -> the whole building was measured
+        # (6 = right by luck): the room / part named after 'facade / side of (the)' is the scope
+        r = re.search(rf"\b(?:{_FACE})\s+of\s+(?:the\s+)?((?:[A-Za-z][\w'-]*\s*){{1,4}}?)\s*(?:\?|$|,|\bon\b|\bin\b)", q,
+                      re.I)
+        if r and not re.fullmatch(r"(?i)(?:building|school|house|block|plan|sheet|drawing|whole building|"
+                                  r"entire building)", r.group(1).strip()):
+            m = re.match(r"((?:\S+\s+){0,3})(\S+)", r.group(1).strip() + " ")
+            room = m.group(2).lower().strip("'") if m else ""
+    else:
+        room = ""
     if m:
         words = m.group(1).split()
         keep: list[str] = []
@@ -94,6 +105,8 @@ def parse(question: str) -> Ask | None:
         names = [w.lower().strip("'") for w in keep if w.lower() not in _STOP and len(w) > 2]
         wing = [re.sub(r"'s$", "", w) for w in names]
         wing = [w[:-1] if w.endswith("s") and len(w) > 4 else w for w in wing]
+        if room and room not in _STOP and len(room) > 2:
+            wing.append(room)  # a room's own name: its last word ('Hall') is part of the label, not a 'wing' noun
     return Ask(side[0], side[1], side[2], kind, wing, text)
 
 

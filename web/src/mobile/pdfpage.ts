@@ -47,3 +47,37 @@ export async function renderPage(url: string, page = 0, maxSide = 2400): Promise
   if (!blob) throw new Error("could not draw the PDF page");
   return { url: URL.createObjectURL(blob), scale, pages: doc.numPages, rotation: vp.rotation, toPx, toPt };
 }
+
+/** A printed word or text run: its centre, its text and half its width / height (PyMuPDF's unrotated pt space for a PDF
+ *  page, image px for a picture). */
+export interface Word { at: Pt; t: string; hw: number; hh: number }
+/** The page's printed text runs (runs with 2+ letters or a digit), or null when the page has no text layer or it could not
+ *  be read. The phone's tap-the-room uses them to tell a labelled small room (a store, a WC: its name is printed inside)
+ *  from furniture (a table: no words inside), and to name the room the visitor tapped. */
+const wordMemo = new Map<string, Promise<Word[] | null>>();
+export function pageRuns(url: string, page = 0): Promise<Word[] | null> {
+  const key = `${url}#${page}`;
+  if (!wordMemo.has(key)) {
+    wordMemo.set(key, (async () => {
+      const d = docs.get(url);
+      if (!d) return null;
+      const doc = await d;
+      const p = await doc.getPage(Math.min(doc.numPages, page + 1));
+      const flat = p.getViewport({ scale: 1, rotation: 0 });
+      const tc = await p.getTextContent();
+      const out: Word[] = [];
+      for (const it of tc.items as { str?: string; transform?: number[]; width?: number; height?: number }[]) {
+        if (!it.str || !/[A-Za-z]{2}|\d/.test(it.str) || !it.transform) continue; // a name or a room number
+        const [a, b, , , e, f] = it.transform;
+        const n = Math.hypot(a, b) || 1, dx = a / n, dy = b / n, w = it.width ?? 0, h = it.height ?? 0;
+        // the middle of the run: half its width along the baseline, a third of its height above it
+        const at = flat.convertToViewportPoint(e + dx * w / 2 - dy * h / 3, f + dy * w / 2 + dx * h / 3) as Pt;
+        out.push({ at, t: it.str, hw: (Math.abs(dx) * w + Math.abs(dy) * h) / 2, hh: (Math.abs(dy) * w + Math.abs(dx) * h) / 2 });
+      }
+      return out.length ? out : null;
+    })().catch(() => null));
+  }
+  return wordMemo.get(key)!;
+}
+/** Where the page's printed words are (centres only): see pageRuns. */
+export const pageWords = (url: string, page = 0): Promise<Pt[] | null> => pageRuns(url, page).then((r) => (r ? r.map((w) => w.at) : null));

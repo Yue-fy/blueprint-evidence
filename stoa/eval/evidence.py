@@ -26,13 +26,19 @@ from pathlib import Path
 
 from stoa.evidence.check import check_item, expected_kinds
 
-def is_exact(ev: dict, solver: str = "") -> bool:
-    """The item's `exact` when set (D25), else stoa.evidence.exactness.classify; unknown counts as exact here."""
+def exactness(ev: dict, solver: str = "") -> bool | None:
+    """The item's `exact` when set (D25), else stoa.evidence.exactness.classify; None = unknown."""
     if ev.get("exact") is not None:
         return bool(ev["exact"])
     from stoa.evidence.exactness import classify
 
-    return classify(ev.get("note") or "", solver, bool(ev.get("bbox")), bool(ev.get("ifc_guid"))) is not False
+    return classify(ev.get("note") or "", solver, bool(ev.get("bbox")), bool(ev.get("ifc_guid")))
+
+
+def is_exact(ev: dict, solver: str = "") -> bool:
+    """Unknown counts as exact here (kept for the release numbers' continuity); ev_unknown_n / ev_right_exact_known
+    (T1 21:16) keep the exact-box precision honest."""
+    return exactness(ev, solver) is not False
 
 
 def _num(v):
@@ -108,7 +114,8 @@ def annotate(rows: list[dict]) -> list[dict]:
                     ev = {**ev, "file": t}
             c = check_item(ev, r.get("question") or "", kinds)
             out.append({"status": c.status, "kind": c.kind, "ident": c.ident, "alts": list(c.alts), "gt": c.gt_source,
-                        "exact": is_exact(ev, r.get("solver") or "")})
+                        "exact": is_exact(ev, r.get("solver") or ""),
+                        "known": exactness(ev, r.get("solver") or "") is not None})
         r["ev_check"] = out
     return rows
 
@@ -180,6 +187,9 @@ def evidence_metrics(rows: list[dict]) -> dict:
         "ev_wrong_object": _rate(sum(c["status"] == "wrong_object" for c in items), len(items)),
         "ev_off": _rate(sum(c["status"] == "off" for c in items), len(items)),
         "ev_exact_n": len(ex), "ev_right_exact": _rate(sum(c["status"] == "right" for c in ex), len(ex)),
+        "ev_unknown_n": sum(1 for c in ex if c.get("known") is False),
+        "ev_right_exact_known": _rate(sum(c["status"] == "right" for c in ex if c.get("known") is not False),
+                                      sum(1 for c in ex if c.get("known") is not False)),
         "ev_approx_n": len(ap), "ev_right_approx": _rate(sum(c["status"] == "right" for c in ap), len(ap)),
         "ev_answers_checked_n": len(checked), "ev_answer_all_right": _rate(len(all_right), len(checked)),
         "ev_count_n": len(cnt), "ev_count_exact": _rate(len(cnt_ok), len(cnt)),

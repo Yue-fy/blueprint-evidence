@@ -123,6 +123,13 @@ def cached_layer(path: str) -> T.TextLayer | None:
     if key in T._mem:
         return T._mem[key]
     if T._disk_key(path, 1100, "local").exists():
+        if eng in ("ocr", "auto") and os.environ.get("STOA_O1_CACHED_VLM", "1") != "0":
+            from stoa import ocr
+
+            if not ocr.cached(path) and (eng == "ocr" or T.ocr_suits(path)):
+                # O1 c11: text_layer would start a cold OCR read here (up to its 120 s budget, and a sticky VLM note
+                # when it runs over): the cached VLM reading is what this function promises
+                return T._vlm_layer(path, "local", 1100, 2000, 2500, 6)
         return T.text_layer(path)  # disk hit: billed as computed, no LLM call
     return None
 

@@ -166,6 +166,38 @@ def _level_of(ent: SheetEntry) -> None:
             ent.level, ent.level_name = k, name
 
 
+_PROJECT_WORDS = re.compile(r"\b(?:DISTRICT|FUELING\s+SYSTEM|SYSTEM\s+TYPE|AIR\s+FORCE\s+BASE|AFB|PROJECT|CONTRACT|"
+                            r"SOLICITATION|CORPS\s+OF\s+ENGINEERS|\d{3,}\s+[A-Z]+\s+(?:AVE|ST|RD|BLVD|DR)\b\.?)", re.I)
+_DRAWING_WORDS = re.compile(r"\b(?:PLANS?|SECTIONS?|ELEVATIONS?|DETAILS?|SCHEDULES?|LEGENDS?|NOTES|DIAGRAMS?|RISERS?|"
+                            r"ISOMETRICS?|LAYOUTS?|INDEX|ABBREVIATIONS|SYMBOLS|TABLES?|SITE|STAIRS|PITS?|VAULTS?)\b", re.I)
+
+
+def _strip_shared_prefix(out: list[SheetEntry]) -> None:
+    """F8 c8: 37 of AW-28's 156 titles read '1616 CAPITAL AVE. OMAHA, NE 68102 ABBREVIATIONS' (the site address printed
+    over the title in the title block). A leading run of words shared by >= 15 % of the file's titles (>= 3), that looks
+    like an address / project line (a 3+ digit number or a project word, no drawing word), is cut where something is left."""
+    titles = [e.title for e in out if e.title]
+    if len(titles) < 4:
+        return
+    import collections
+    cnt = collections.Counter()
+    for t in titles:
+        w = t.split()
+        for k in range(3, min(len(w) - 1, 12) + 1):
+            cnt[" ".join(w[:k])] += 1
+    need = max(3, int(0.15 * len(titles) + 0.999))
+    good = [(len(pfx.split()), pfx) for pfx, n in cnt.items() if n >= need and not _DRAWING_WORDS.search(pfx)
+            and (re.search(r"\d{3,}", pfx) or _PROJECT_WORDS.search(pfx))]
+    if not good:
+        return
+    pfx = max(good)[1]
+    for e in out:
+        if e.title and e.title.startswith(pfx + " "):
+            rest = e.title[len(pfx):].strip(" ,-·")
+            if len(re.findall(r"[A-Za-z]", rest)) >= 4:
+                e.title = rest
+
+
 def _sheet_core(ent: SheetEntry, lines: list[_Line], W: float, H: float) -> None:
     edge = [l for l in lines if (SHEET_TOKEN.match(l.text) or ISO_NUMBER.match(l.text)) and
             (l.box[0] > 0.72 * W or l.box[1] > 0.8 * H)]
@@ -188,6 +220,7 @@ def _sheet_core(ent: SheetEntry, lines: list[_Line], W: float, H: float) -> None
              and not _LABEL_LINE.search(l.text) and not SHEET_TOKEN.match(l.text)
              and not re.search(r"(?:\b\w ){4,}", l.text)]  # letter-spaced title-block fonts ('S O L I C I T')
     if cands:
+        cands0 = cands
         big = max(c.size for c in cands)
         cands = [c for c in cands if c.size >= 0.85 * big]
 
@@ -204,6 +237,13 @@ def _sheet_core(ent: SheetEntry, lines: list[_Line], W: float, H: float) -> None
             hi += 1
         ent.title = " ".join(l.text for l in same[lo:hi + 1])[:120]
         ent.title_box = tuple(_union(_union(same[lo].src, same[hi].src), same[i].src))
+        if _PROJECT_WORDS.search(ent.title) and not _DRAWING_WORDS.search(ent.title):
+            # F8 c8 (UX P2b-5): the OCR of Stoa's M-101A picture gave 'RESSURIZED HYDRANT OMAHA DISTRICT FUELING SYSTEM
+            # TYPE III' (the project's name, printed bigger) for a sheet titled 'PIPING PLAN': a drawing title wins
+            alt = [c for c in cands0 if _DRAWING_WORDS.search(c.text) and not _PROJECT_WORDS.search(c.text)]
+            if alt:
+                b = min(alt, key=dist)
+                ent.title, ent.title_box = b.text[:120], tuple(b.src)
     else:
         body = [l for l in lines if l.box[2] < 0.85 * W and l.size >= 1.8 * num.size * 0.5 and
                 len(re.findall(r"[A-Za-z]", l.text)) >= 6 and not SHEET_TOKEN.match(l.text)]
@@ -392,6 +432,10 @@ def sheet_index(path: str) -> list[SheetEntry]:
                     out.append(_sheet_of(pg))
                 except Exception:  # noqa: BLE001 — one odd page never sinks the set
                     out.append(SheetEntry(page=pg.number, number=None, title=None))
+        try:
+            _strip_shared_prefix(out)
+        except Exception:  # noqa: BLE001
+            pass
         with _CACHE_LOCK:
             _CACHE[key] = out
     return out
@@ -578,7 +622,16 @@ def _resolve(ref: Ref, path: str, idx: list[SheetEntry], own: str | None, with_v
 
 
 # '101A', 'D-12', and module-dotted '7.04B' (AFCEE MEDIUMFC A-602: module 7, room 04, leaf B)
-_ROW_KEY = re.compile(r"^(?:\d{2,4}[A-Z]?|[A-Z]{1,2}-?\d{1,3}[A-Z]?|\d{1,2}\.(?:\d{2}[A-Z]?|\d[A-Z]))$")
+# row keys: '101A', 'D-12', '7.04B', '9A.1A' / '9D.1C' (sub-modules, SFO A-303), '10.01A'; a key column also takes a stray
+# lowercase letter suffix ('1z', SFO A-303: a real row with its own sizes) once >= 3 proper keys made the column
+_ROW_KEY = re.compile(r"^(?:\d{2,4}[A-Z]?|[A-Z]{1,2}-?\d{1,3}[A-Z]?|\d{1,2}\.(?:\d{2}[A-Z]?|\d[A-Z])|\d{1,2}[A-Z]\.\d{1,2}[A-Z]?)$")
+_ROW_KEY_LOOSE = re.compile(r"^\d{1,3}[a-z]$")
+# DR 21:57: a key column only under a header that names the row's own id, never 'Room Number' / 'Door Type' / 'Hardware
+# Group' (A-801: their codes 'A1' / '01' look like keys); no header read = accepted as before
+_ID_HEAD = re.compile(r"\b(?:DOOR|WINDOW|OPENING|DR|WDW|WIN)\.?\s*(?:NO\b|NO\.|NUMBER|NUM\b|#|MARK|ID\b|TAG)|^\s*(?:NO\.?|NUMBER|MARK|TAG|ID|#)\s*$|\bMARK\b", re.I)
+_NOT_ID_HEAD = re.compile(r"\b(?:ROOM|TYPE|HARDWARE|HDW|GROUP|FRAME|RATING|ELEV(?:ATION)?|FINISH|SIZE|WIDTH|HEIGHT|REMARKS?|NOTES?)\b", re.I)
+# a scheduled row that is not a door leaf (estimators: 'cased openings are not doors')
+_OPENING_ONLY = re.compile(r"\bCASED\s+OPENING|\bOPENING\s+ONLY\b|\bNO\s+DOOR\b|\bFRAMED\s+OPENING\b", re.I)
 # a room number printed on a plan ('7.04', '101'): doors are often numbered after their room plus a leaf letter
 # ('7.04A', '7.04B'), and plans like A-103 print only the room number, never the door's
 _ROOM_NO = re.compile(r"^(?:\d{1,2}\.\d{1,2}|\d{3,4}|[A-Z]\d{3})$")
@@ -598,7 +651,7 @@ def schedule_rows(path: str, page: int) -> list[dict]:
     out: list[dict] = []
     if got and got[0]:
         lines = got[0]
-        keys = [l for l in lines if _ROW_KEY.match(l.text) and l.dir == (1, 0)]
+        keys = [l for l in lines if (_ROW_KEY.match(l.text) or _ROW_KEY_LOOSE.match(l.text)) and l.dir == (1, 0)]
         heads = [l for l in lines if _SCHEDULE_TITLE.search(l.text) and l.dir == (1, 0)]
         # key columns: keys whose centres line up (left- or centre-aligned cells: '101A' and '102' share a centre)
         cols: dict[int, list[_Line]] = {}
@@ -609,6 +662,18 @@ def schedule_rows(path: str, page: int) -> list[dict]:
                 run += 1
             cols.setdefault(run, []).append(l)
             last = c
+        # a short key in a LEFT-aligned column ('1z' under '1.01A') has its centre a few points off: it joins the column
+        # whose left edge it shares
+        big = [c for c in cols.values() if len(c) >= 3]
+        for k in [k for k, c in cols.items() if len(c) < 3]:
+            for l in list(cols[k]):
+                hh = l.box[3] - l.box[1]
+                home = next((c for c in big if abs(sorted(m.box[0] for m in c)[len(c) // 2] - l.box[0]) <= max(1.5, 0.25 * hh)), None)
+                if home is not None:
+                    home.append(l)
+                    cols[k].remove(l)
+            if not cols[k]:
+                del cols[k]
         # table heading LINE -> its LEFTMOST key column (the row keys). Keyed by the heading's position, not its text:
         # A-602 prints two side-by-side tables both titled 'DOOR SCHEDULE' (the second continues the first)
         first: dict[tuple, tuple[list[_Line], float, str]] = {}
@@ -626,9 +691,20 @@ def schedule_rows(path: str, page: int) -> list[dict]:
                 cur.append(b)
             runs.append(cur)
         for col in runs:
-            if len(col) < 3:
+            if sum(1 for l in col if _ROW_KEY.match(l.text)) < 3:
                 continue
             h = sorted(l.box[3] - l.box[1] for l in col)[len(col) // 2]
+            # the column's own header (the text just above its first key, over the column): 'Room Number' / 'Type' -> not
+            # the row ids (DR 21:57); door / window tables only (a room schedule's key IS the room number)
+            cx0, cx1 = min(l.box[0] for l in col), max(l.box[2] for l in col)
+            hdr = " ".join(m.text for m in lines if m.dir == (1, 0) and m.box[3] <= col[0].box[1] + 1
+                           and col[0].box[1] - m.box[3] < 5 * h and m.box[0] < cx1 + h and m.box[2] > cx0 - h
+                           and not _ROW_KEY.match(m.text) and not _SCHEDULE_TITLE.search(m.text))
+            if hdr and _NOT_ID_HEAD.search(hdr) and not _ID_HEAD.search(hdr):
+                above0 = [hd for hd in heads if hd.box[3] <= col[0].box[1] + 1 and col[0].box[1] - hd.box[3] < 30 * h]
+                tk = next((k for k, rx in _TABLE_KIND if above0 and rx.search(max(above0, key=lambda hd: hd.box[3]).text)), "")
+                if tk in ("door", "window"):
+                    continue
             above = [hd for hd in heads if hd.box[3] <= col[0].box[1] + 1 and col[0].box[1] - hd.box[3] < 30 * h
                      and hd.box[0] - 60 * h <= col[0].box[0] <= hd.box[2] + 10 * h]
             if not above:
@@ -646,8 +722,12 @@ def schedule_rows(path: str, page: int) -> list[dict]:
                 band = [m for m in lines if abs((m.box[1] + m.box[3]) / 2 - (l.box[1] + l.box[3]) / 2) <= 0.6 * h
                         and l.box[0] - 30 <= m.box[0] <= l.box[0] + 60 * h and m.box[2] < right - 2]
                 x1 = max(m.box[2] for m in band) if band else l.box[2]
-                out.append({"key": l.text, "kind": kind, "table": table, "bbox": _box(
-                    _src_rect(l, (l.box[0] - 4, l.box[1] - 1.5, x1 + 4, l.box[3] + 1.5)))})
+                text = " ".join(m.text for m in sorted(band, key=lambda m: m.box[0]))
+                row = {"key": l.text, "kind": kind, "table": table, "bbox": _box(
+                    _src_rect(l, (l.box[0] - 4, l.box[1] - 1.5, x1 + 4, l.box[3] + 1.5))), "text": text[:200]}
+                if kind == "door" and _OPENING_ONLY.search(text):
+                    row["opening_only"] = True             # a cased opening: scheduled, but no door leaf
+                out.append(row)
     with _CACHE_LOCK:
         _CACHE[key] = out
     return out
@@ -832,10 +912,13 @@ def reconcile(path: str, set_paths: list[str] | None = None, max_pages: int = 40
         for r in schedule_rows(e.file or path, e.page):
             tk = (e.file or path, e.page, r["table"] or e.title)
             t = tables.setdefault(tk, {"sheet": e.number, "title": e.title, "page": e.page, "file": e.file,
-                                       "table": r["table"] or e.title, "kind": r["kind"], "keys": [], "boxes": {}})
+                                       "table": r["table"] or e.title, "kind": r["kind"], "keys": [], "boxes": {},
+                                       "openings": []})
             if r["key"] not in t["boxes"]:
                 t["keys"].append(r["key"])
                 t["boxes"][r["key"]] = r["bbox"]
+                if r.get("opening_only"):
+                    t["openings"].append(r["key"])        # a cased opening: no door leaf (no tag needed on a plan)
             rows.setdefault(r["key"].upper(), []).append((r, e))
     links: dict[str, list[dict]] = {}
     rooms: dict[str, list[dict]] = {}       # room number printed on a plan -> where (its doors' rows count as shown)
@@ -870,7 +953,8 @@ def reconcile(path: str, set_paths: list[str] | None = None, max_pages: int = 40
     out = []
     for t in tables.values():
         lk = {k: links.get(k.upper(), [])[:20] or rooms.get(_room_of(k) or "", [])[:20] for k in t["keys"]}
-        untagged = [{"key": k, "bbox": t["boxes"][k]} for k in t["keys"] if not lk[k]]
+        untagged = [{"key": k, "bbox": t["boxes"][k], **({"opening_only": True} if k in t["openings"] else {})}
+                    for k in t["keys"] if not lk[k]]
         out.append({k2: v for k2, v in t.items() if k2 not in ("keys", "boxes")} |
                    {"rows": len(t["keys"]), "tagged": len(t["keys"]) - len(untagged), "untagged": untagged,
                     "links": {k: v for k, v in lk.items() if v}, "row_boxes": t["boxes"]})
@@ -1000,8 +1084,11 @@ def register(la: list[_Line], wa: float, ha: float, lb: list[_Line], wb: float, 
     if len(got) < 6:
         return None
     rms = (sum(abs(s * g[0] + t - g[1]) ** 2 for g in got) / len(got)) ** 0.5
+    # matches inside the drawing body (not the title block / border band): a copy of the same drawing matches its room
+    # labels there; two sheets of one set match only their shared title block (HAER C3 / C6: 36 matches, 3 inside)
+    inner = sum(1 for g in got if 0.05 * wa < g[0].real < 0.80 * wa and 0.05 * ha < g[0].imag < 0.85 * ha)
     return {"a": round(s.real, 6), "b": round(s.imag, 6), "tx": round(t.real, 2), "ty": round(t.imag, 2),
-            "inliers": len(got), "of": len({i for i, _, _ in cand}), "rms": round(rms, 2)}
+            "inliers": len(got), "of": len({i for i, _, _ in cand}), "rms": round(rms, 2), "inner": inner}
 
 
 def map_box(tr: dict, box) -> list:
@@ -1070,6 +1157,15 @@ def _copy_of(a: SheetEntry, b: SheetEntry) -> str | None:
     return None
 
 
+def _registers_as_copy(tr: dict | None) -> bool:
+    """Two copies of one drawing share most of their printed labels at one similarity transform. Two DIFFERENT sheets of
+    one set share only the title block (HAER scans C3 / C6 both print 'HAER No. HI-76', read as their number): a few
+    matches, a small share. The same-paper-frame fallback alone is never enough (every sheet of a set has one frame)."""
+    if not tr or tr.get("frame"):
+        return False
+    return int(tr.get("inliers") or 0) >= 8 and int(tr.get("inner") or 0) >= 6
+
+
 def _level_order(k: str | None) -> float | None:
     if k is None:
         return None
@@ -1103,8 +1199,9 @@ def _link_refs(path: str, page: int, lines: list[_Line], own: SheetEntry, idx: l
             continue
         tf = e.file or path
         tr = _register_cached(path, page, tf, e.page)
-        fit = (f"; registered on {tr['inliers']} matching labels (rms {tr['rms']})" if tr and tr.get("inliers") else
-               "; same paper frame" if tr else "; not registered (too few labels read)")
+        if not _registers_as_copy(tr):
+            continue                          # same number, different drawing (a project id read as the number)
+        fit = f"; registered on {tr['inliers']} matching labels (rms {tr['rms']})"
         r = Ref(page=page, kind="copy", text=me.number or me.title or "this drawing", bbox=_box(anchor or (0, 0, 40, 20)),
                 sheet=e.number, subject=_fmt(tf), target_page=e.page,
                 target_file=e.file if e.file and not _same(e.file, path) else None, target_sheet=e.number,
@@ -1204,11 +1301,13 @@ def related_sheets(path: str, page: int = 0, set_paths: list[str] | None = None)
         if _same(e.file or path, path) and e.page == page:
             continue
         why = _copy_of(me, e)
+        tf = e.file or path
+        if why and not _registers_as_copy(_register_cached(path, page, tf, e.page)):
+            why = None                        # same number, different drawing (HAER 'HI-76' on every sheet)
         o = _level_order(e.level)
         floor = not why and lo is not None and o is not None and o != lo and _same_project(me, e)
         if not why and not floor:
             continue
-        tf = e.file or path
         out.append({"kind": "copy" if why else "floor", "file": e.file if e.file and not _same(e.file, path) else None,
                     "page": e.page, "number": e.number, "title": e.title, "level": e.level, "level_name": e.level_name,
                     "format": _fmt(tf), "why": why or f"{e.level_name or 'another floor'} of the same building",
@@ -1234,11 +1333,28 @@ def set_refs(path: str, with_views: bool = False) -> dict:
 _STOP = set("the a an of on in at to for and or is are what which how many much does do this that with from by be "
             "sheet sheets drawing plan detail section see per".split())
 _SCHEDULE_Q = re.compile(r"\b(?:schedule|hardware|fire[- ]?rat(?:ing|ed)|frame|finish(?:es)?|door\s+type|window\s+type|"
-                         r"glazing|lintel|threshold|leaf|leaves|width|height|size|material|keying|closer)\b", re.I)
+                         r"glazing|lintel|threshold|leaf|leaves|width|height|size|material|keying|closer|head|jamb|sill)\b", re.I)
 _PLAN_Q = re.compile(r"\b(?:areas?|how\s+many|number\s+of|count|square|sq\.?\s?(?:m|ft)|m²|perimeter|total\s+length|"
                      r"linear|skirting|baseboards?)\b", re.I)
 _FINISH_Q = re.compile(r"\bceiling\s+height|\b(?:floor|wall|base|ceiling)\s+finish|\bfinish\s+schedule", re.I)
 _OPENING_Q = re.compile(r"\b(?:doors?|windows?|openings?|rooms?)\b", re.I)
+# F8 c7: 'How tall is door 7.04A?' / 'How wide is window W2?': plain size words are a schedule attribute only when the
+# question names the door / window BY ITS NUMBER (not 'how wide is the door into the kitchen', which is measured on the plan)
+_KEYED_OPENING_Q = re.compile(r"\b(?:doors?|windows?)\s+(?:no\.?\s*|number\s*|#\s*)?"
+                              r"(?:\d{1,3}[A-Z]?\.\d{1,3}[A-Z]?|[A-Z]{0,2}-?\d{1,4}[A-Z]?)\b", re.I)
+_KEYED_SIZE_Q = re.compile(r"\b(?:wide|tall|high|thick(?:ness)?|dimensions?|rough\s+opening|how\s+big)\b", re.I)
+# F8 c7: an AREA question about rooms ('What is the size of the largest room?', 'What size are the rooms on this floor?',
+# 'total floor area of the rooms with a VCT floor finish') is measured on the PLAN: it never hops to a room / finish
+# schedule (AW-28 sent all three to A-601) unless it says 'schedule'. Door / window sizes are schedule attributes.
+_AREA_Q = re.compile(r"\b(?:areas?|square|sq\.?\s?(?:m|ft)|m²|m2|how\s+big|largest|smallest|biggest)\b", re.I)
+_ROOM_SIZE_Q = re.compile(r"\bsizes?\b", re.I)
+_DOOR_WORD_Q = re.compile(r"\b(?:doors?|windows?|openings?)\b", re.I)
+# F8 c10: the size / height word belongs to a ROOM that a numbered door only locates ('What size is the room next to door
+# 104S?', 'ceiling height of the room behind door 104S'): AW-28 read door 104S's printed 3'-0" x 7'-0" / 7'-0" and put it
+# over the reader's answer at 0.8. Such questions stay on the plan. 'the mech room door 104S' / 'room's door' stay doors.
+_ROOM_SUBJECT_Q = re.compile(r"\b(?:sizes?|areas?|dimensions?|big|large|tall|high|wide|height|width|long|length)\b[^?]*?"
+                             r"\b(?:room|space)s?\b(?!(?:'s)?\s+(?:doors?|windows?)\b)[^?]*?\b(?:doors?|windows?)\s+"
+                             r"(?:no\.?\s*|number\s*|#\s*)?(?:\d{1,3}[A-Z]?\.\d{1,3}[A-Z]?|[A-Z]{0,2}-?\d{1,4}[A-Z]?)\b", re.I)
 _SHEET_Q = re.compile(rf"\b(?:(?:on|in|from|see|sheet|drawing|dwg\.?)\s+)({_NUM})\b|\b({_NUM})\b")
 _DETAIL_Q = re.compile(rf"\b(?:detail|section|view|callout)\s+([A-Z]{{0,2}}\d{{1,3}}[A-Z]?|[A-Z]{{1,2}})(?:\s*(?:/|on|of)\s*({_NUM}))?\b",
                        re.I)
@@ -1266,12 +1382,117 @@ class Hop:
     to_file: str | None = None        # set indexes: the other PDF to_page is in (None = this file)
     mode: str = "auto"                # auto = the question itself names the target (sheet / detail / schedule attribute);
     #                                   suggest = matched by subject words only: offer it as a choice, do not re-route
+    to_row: dict | None = None        # the schedule row the question names: {key, table, cells: [{text, bbox}]} (F8 c7:
+    #                                   the web marks the answer's value in THIS row, not the first match on the sheet)
 
     def as_dict(self) -> dict:
         return asdict(self)
 
 
-def follow_plan(path: str, page: int, question: str, set_paths: list[str] | None = None) -> Hop | None:
+_COLUMN_WORDS = {"width": r"WIDTH|WD", "height": r"HEIGHT|HGT|HT", "thickness": r"THICKNESS|THICK|THK"}
+
+
+def _row_cells(path: str, page: int, box, column: str | None = None) -> tuple[list[dict], dict | None]:
+    """The printed cells (text lines) inside one schedule row's box, in the row box's space (unrotated pdf_pt; image px):
+    [{text, bbox}] (at most 40), and the cell under the asked COLUMN's header ('height' -> the 'HEIGHT' heading above the
+    row in the displayed page; a heading line 'WIDTH HEIGHT THICKNESS' is split by character position) as
+    {column, text, bbox, header} or None. Empty / None when the page cannot be read or no heading is found."""
+    try:
+        got = _lines_of(path, page)
+    except Exception:  # noqa: BLE001
+        got = None
+    if not got or not box:
+        return [], None
+    x0, y0, x1, y1 = (float(v) for v in box[:4])
+    inside = []
+    for ln in got[0]:
+        a, b, c, d = ln.src
+        cx, cy = (a + c) / 2, (b + d) / 2
+        if x0 - 1 <= cx <= x1 + 1 and y0 - 1 <= cy <= y1 + 1:
+            inside.append(ln)
+    cells = [{"text": ln.text, "bbox": [round(v, 2) for v in ln.src]} for ln in inside][:40]
+    rowd = [ln for ln in inside if ln.dir == (1, 0)]
+
+    def under(col: str) -> dict | None:
+        word = _COLUMN_WORDS.get(col)
+        if not word or not rowd:
+            return None
+        rb = (min(ln.box[0] for ln in rowd), min(ln.box[1] for ln in rowd), max(ln.box[2] for ln in rowd),
+              max(ln.box[3] for ln in rowd))
+        best = None
+        for ln in got[0]:
+            # a heading above the row: its centre above the row's top (a tight first row overlaps the heading's
+            # box by a fraction of a point: F8 c8)
+            if ln.dir != (1, 0) or (ln.box[1] + ln.box[3]) / 2 > rb[1] or ln.box[2] < rb[0] or ln.box[0] > rb[2]:
+                continue
+            for m in re.finditer(rf"\b(?:{word})\.?(?![A-Z])", ln.text.upper()):
+                n = max(1, len(ln.text))
+                wx = ln.box[0] + (ln.box[2] - ln.box[0]) * (m.start() + m.end()) / 2 / n   # the word's centre
+                if not rb[0] - 2 <= wx <= rb[2] + 2:
+                    continue
+                if best is None or ln.box[3] > best[0].box[3]:     # the nearest heading above the row
+                    best = (ln, wx)
+        if best is None:
+            return None
+        ln, wx = best
+        hit = [c for c in rowd if c.box[0] - 3 <= wx <= c.box[2] + 3]
+        if len(hit) == 1 and re.search(r"\d", hit[0].text):
+            return {"column": col, "text": hit[0].text, "bbox": [round(v, 2) for v in hit[0].src], "header": ln.text}
+        return None
+
+    if column == "size":
+        # F8 c8: 'What size is door 7.04A?' / 'dimensions of door 104S' = WIDTH x HEIGHT of the named row (a door size is
+        # printed as two cells; the reader answered one of them, or another row's). Both cells or nothing.
+        w, h = under("width"), under("height")
+        if not (w and h) or w["bbox"] == h["bbox"]:
+            return cells, None
+        hdr = w["header"] if w["header"] == h["header"] else f"{w['header'].strip()} / {h['header'].strip()}"
+        return cells, {"column": "size", "text": f"{w['text']} x {h['text']}", "bbox": w["bbox"], "header": hdr,
+                       "parts": [w, h]}
+    return cells, under(column or "")
+
+
+_ROOM_GENERIC = {"room", "rooms", "door", "doors", "window", "windows", "opening", "openings", "into", "from", "this",
+                 "that", "what", "which", "width", "height", "size", "wide", "tall", "high", "thick", "thickness", "type",
+                 "material", "frame", "fire", "rating", "rated", "hardware", "schedule", "detail", "head", "jamb", "sill",
+                 "glazing", "finish", "leaf", "leaves", "how", "the", "and", "for", "with", "does", "use", "uses"}
+
+
+def _door_of_room(rows: list[dict], q: str, room: dict | None = None) -> tuple[dict | None, str | None]:
+    """'How tall is the door to the mech room?' on a sheet with a ROOM FINISH schedule and a DOOR schedule (AW-28
+    A-601): the room row whose name shares a specific word with the question (104 'MECH. ROOM') -> the door rows keyed by
+    that room number ('104', '104S', '104A'; '7.04' -> '7.04A'). Only when exactly ONE room and ONE door number fit
+    (a pair of leaves listed twice is one door); else (None, None) and the reader picks."""
+    if not re.search(r"\b(?:doors?|windows?)\b", q, re.I):
+        return None, None
+    kind = "window" if re.search(r"\bwindows?\b", q, re.I) and not re.search(r"\bdoors?\b", q, re.I) else "door"
+    qw = {_sing(w) for w in _words(q)} - _ROOM_GENERIC
+    scored = []
+    for r in rows:
+        if r.get("kind") != "room":
+            continue
+        name = re.sub(rf"^\s*{re.escape(r['key'])}\s*", "", r.get("text") or "")
+        sc = 9 if room is not None and r is room else len(qw & {_sing(w) for w in _words(name)})
+        if sc:
+            scored.append((sc, r, name))
+    if not scored:
+        return None, None
+    scored.sort(key=lambda x: -x[0])
+    if len(scored) > 1 and scored[1][0] == scored[0][0]:
+        return None, None
+    rk = scored[0][1]["key"]
+    doors = [r for r in rows if r.get("kind") == kind and re.fullmatch(rf"{re.escape(rk)}[A-Z]{{0,2}}", r["key"], re.I)]
+    keys = list(dict.fromkeys(r["key"].upper() for r in doors))
+    if len(keys) != 1:
+        return None, None
+    toks = scored[0][2].split()
+    end = next((i + 1 for i, w in enumerate(toks[:3]) if re.fullmatch(r"(?:ROOM|RM\.?)", w, re.I)), 1)
+    nm = " ".join(toks[:end]) if toks and re.search(r"[A-Za-z]{2}", toks[0]) else ""
+    return doors[0], f"the {kind} of room {rk}{(' ' + nm) if nm else ''} is {kind} {keys[0]} ({kind} numbers carry the room number)"
+
+
+def follow_plan(path: str, page: int, question: str, set_paths: list[str] | None = None,
+                _probe: bool = False) -> Hop | None:
     """Where a question asked on `page` should be answered, when the answer lives on another sheet of the set (this
     PDF's pages, or every PDF in `set_paths` when several files were dropped together).
 
@@ -1324,7 +1545,27 @@ def follow_plan(path: str, page: int, question: str, set_paths: list[str] | None
                            f"{q} (view: {r.target_view})" if r.target_view else q)
     refs = page_refs(path, here.page, with_views=False, set_paths=sp)
     # (2) schedule questions: door / window / room attributes live on the schedule sheet
-    if (_OPENING_Q.search(q) and _SCHEDULE_Q.search(q) or _FINISH_Q.search(q)) and \
+    room_subject = bool(_ROOM_SUBJECT_Q.search(q))
+    keyed = bool(_KEYED_OPENING_Q.search(q) and _KEYED_SIZE_Q.search(q) and not _PLAN_Q.search(q)) and not room_subject
+    # F8 c8: 'What type is window W1?' / 'type of door 104S': a type named for ONE numbered opening is a schedule cell
+    keyed_type = bool(_KEYED_OPENING_Q.search(q) and re.search(r"\btypes?\b", q, re.I) and not _PLAN_Q.search(q))
+    room_area = bool((_AREA_Q.search(q) or _ROOM_SIZE_Q.search(q) and not _DOOR_WORD_Q.search(q) or room_subject)
+                     and not re.search(r"\bschedule", q, re.I) and not keyed)
+    named_size = keyed or bool(_KEYED_OPENING_Q.search(q) and re.search(r"\b(?:size|width|height|thickness)\b", q, re.I)
+                               and not _PLAN_Q.search(q) and not room_subject)
+    if named_size and not room_area and not _probe and here.title and _SCHEDULE_TITLE.search(here.title):
+        # F8 c9: the visitor is ON the schedule and names one opening ('What size is door 104S?' on AW A-601: the reader
+        # said 7'-0" x 1 3/4" = HEIGHT x THICKNESS @0.85): plan it as if asked on another sheet of this file; when that
+        # lands on THIS page with the named row, return it (to_page = this page: the browser asks here, no jump, and puts
+        # the row's printed cell(s) over the reader's value)
+        alt = next((e for e in idx if _same(e.file, path) and e.page != here.page
+                    and not (e.title and _SCHEDULE_TITLE.search(e.title))), None)
+        h = follow_plan(path, alt.page, question, set_paths, _probe=True) if alt is not None else None
+        if h is not None and h.mode == "auto" and h.to_file is None and h.to_page == here.page and h.to_row:
+            h.from_page, h.from_sheet = here.page, here.number
+            h.why = h.why.replace(" — this sheet refers to it", "") + " (the sheet on screen)"
+            return h
+    if (_OPENING_Q.search(q) and _SCHEDULE_Q.search(q) or _FINISH_Q.search(q) or keyed or keyed_type) and not room_area and \
             not (here.title and _SCHEDULE_TITLE.search(here.title)):
         scheds = [e for e in idx if e.title and _SCHEDULE_TITLE.search(e.title) and other(e.file, e.page)]
         if scheds:
@@ -1341,18 +1582,54 @@ def follow_plan(path: str, page: int, question: str, set_paths: list[str] | None
             why = f"a {'/'.join(sorted(want))} attribute is read from the schedule: sheet {pick.label()} " \
                   f"({at(pick)})" + (" — this sheet refers to it" if ptd else "")
             # the row itself when the question names a key the schedule lists ('door 104B' -> row 104B)
-            box = None
+            box, to_row = None, None
             try:
                 rows = schedule_rows(pick.file or path, pick.page)
-                asked = {t.upper() for t in re.findall(r"\b[A-Z]{0,2}-?\d{1,4}[A-Z]?\b", q.upper())}
+                # dotted US module numbers first ('7.04B', '9A.1A', '10.01A'): else findall stops at the '7' (F8 c7)
+                asked = {t.upper() for t in re.findall(r"\b(?:\d{1,3}[A-Z]?\.\d{1,3}[A-Z]?|[A-Z]{0,2}-?\d{1,4}[A-Z]?)\b",
+                                                        q.upper())}
                 row = next((r for r in rows if r["key"].upper() in asked and r["kind"] in want), None) or \
                     next((r for r in rows if r["key"].upper() in asked), None)
+                via = None
+                if row is None and not asked and not _PLAN_Q.search(q):     # never a count / area: one row
+                    row, via = _door_of_room(rows, q)
+                elif row is not None and row["kind"] == "room" and re.search(r"\b(?:doors?|windows?)\b", q, re.I) \
+                        and not _PLAN_Q.search(q):
+                    # 'the door into room 102': 102 is a ROOM number; its door is 102S
+                    d, v = _door_of_room(rows, q, room=row)
+                    if d is not None:
+                        row, via = d, v
                 if row:
                     box = row["bbox"]
-                    why += f", row {row['key']} of {row['table']}"
+                    why += (f", {via}" if via else "") + f", row {row['key']} of {row['table']}"
+                    ql = q.lower()
+                    col = None if row["kind"] not in ("door", "window") else \
+                        "width" if re.search(r"\b(?:width|wide)\b", ql) else \
+                        "height" if re.search(r"\b(?:height|tall|high)\b", ql) else \
+                        "thickness" if re.search(r"\bthick(?:ness)?\b", ql) else None
+                    named = {c for c in ("width", "height", "thickness")
+                             if re.search({"width": r"\b(?:width|wide)\b", "height": r"\b(?:height|tall|high)\b",
+                                           "thickness": r"\bthick(?:ness)?\b"}[c], ql)}
+                    if col and len(named) > 1:
+                        # 'width and height' = the door's size; with the thickness too: no single answer
+                        col = "size" if named == {"width", "height"} else None
+                    if row["kind"] in ("door", "window") and not named and \
+                            re.search(r"\b(?:size|dimensions?|how\s+big)\b", ql) and not _PLAN_Q.search(q):
+                        col = "size"                                # F8 c8: width x height of the named row
+                    cells, asked = _row_cells(pick.file or path, pick.page, box, col)
+                    to_row = {"key": row["key"], "table": row["table"], "cells": cells, "asked": asked}
             except Exception:  # noqa: BLE001
                 pass
-            return hop(pick.file, pick.page, pick.number, pick.title, why, None, box)
+            qq = q
+            if keyed and not re.search(r"\b(?:width|height|thickness|size)\b", q, re.I):
+                # the schedule's own column word: 'How tall is door 7.04A?' read the WIDTH on d31 (3'-0" @0.65, gold 7'-0")
+                w = _KEYED_SIZE_Q.search(q).group(0).lower()
+                col = {"wide": "width", "tall": "height", "high": "height"}.get(w, "thickness" if w.startswith("thick") else "size")
+                qq = f"What is the {col} of {_KEYED_OPENING_Q.search(q).group(0)}?"
+                why += f"; asked there as '{qq}' (the schedule's column)"
+            h = hop(pick.file, pick.page, pick.number, pick.title, why, None, box, qq)
+            h.to_row = to_row
+            return h
     # (3) a callout whose target view's title matches the question ('pipe trench' -> E1 / S-501F 'PIPE TRENCH
     # SECTION'), else a 'SEE SHEET X FOR <subject>' note that does. Generic words never match alone.
     qw = _words(q) - {"foundation", "floor", "building", "wall", "room"}
@@ -1399,17 +1676,23 @@ def _uploads_root() -> Path:
     return Path(os.environ.get("STOA_UPLOADS") or os.path.join(tempfile.gettempdir(), "stoa-uploads"))
 
 
+_UPLOAD_PATH = re.compile(r"^upload/([A-Za-z0-9_-]{1,64})/(?:([a-z0-9_]+)/)?([^/\\]+)$")
+
+
 def resolve_path(p: str) -> str:
     """A browser path -> a local file: 'upload/<id>/<name>' (W5's uploads, $STOA_UPLOADS) or a dataset-relative path
     (data/...). Raises ValueError for anything else ('..', absolute paths, missing files)."""
     if not p or ".." in Path(p).parts or p.startswith("/") or "\\" in p:
         raise ValueError("path must be 'upload/<id>/<name>' or dataset-relative, without '..'")
     if p.startswith("upload/"):
-        parts = p.split("/")
-        if len(parts) != 3:
-            raise ValueError("upload path is upload/<id>/<name>")
+        # 'upload/<id>/<name>', or 'upload/<id>/<style>/<name>' = a picture uploaded with a drawing style (the web stores
+        # it under '<id>/data/<style>/<name>', web/mock/stoaApi.ts uploadAbs; images get one by default when the style
+        # guess is sure, e.g. 'cubicasa5k')
+        m = _UPLOAD_PATH.match(p)
+        if not m or m.group(3).startswith("."):
+            raise ValueError("upload path is upload/<id>/<name> or upload/<id>/<style>/<name>")
         root = _uploads_root().resolve()
-        f = (root / parts[1] / parts[2]).resolve()
+        f = (root / m.group(1) / "data" / m.group(2) / m.group(3) if m.group(2) else root / m.group(1) / m.group(3)).resolve()
         if root not in f.parents:
             raise ValueError("path outside the uploads folder")
     else:

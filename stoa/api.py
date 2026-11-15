@@ -94,7 +94,9 @@ def _safe_rel(path: str) -> str:
 def health() -> dict:
     from stoa.solvers import available, import_errors
 
-    return {"ok": True, "data_root": str(data_root()), "solvers": available(),
+    # T2 22:5x: not the absolute path (it showed the operator's home folder and login to every visitor); the folder's
+    # name + whether it is there say the same for a health check
+    return {"ok": True, "data_root": data_root().name, "data": data_root().is_dir(), "solvers": available(),
             "import_errors": sorted(import_errors())}
 
 

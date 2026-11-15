@@ -39,18 +39,18 @@ _KINDS: list[tuple[str, re.Pattern]] = [
     ("schedule", re.compile(r"\bSCHEDULES?\b|\bTABLE\b|\bMATRIX\b", re.I)),
     ("rcp", re.compile(r"REFLECTED\s+CEILING|\bRCP\b|\bCEILING\s+PLAN|\bALAKATTO", re.I)),
     ("axon", re.compile(r"\bAXON|\bISOMETRIC|\bISO\s+VIEW|\b3D\b|\bPERSPECTIVE|\bBIRD'?S?\s*EYE", re.I)),
-    ("section", re.compile(r"\bSECTIONS?\b|\bLEIKKAUS|\bSCHNITT|\bCOUPE\b", re.I)),
-    ("elevation", re.compile(r"\bELEVATIONS?\b|\bJULKISIVU|\bANSICHT|\bFA[CÇ]ADE", re.I)),
+    ("section", re.compile(r"\bSECTIONS?\b|\bLEIKKAUS|\bSCHNITT|\bCOUPE\b|\bSEKTION\b", re.I)),
+    ("elevation", re.compile(r"\bELEVATIONS?\b|\bJULKISIVU|\bANSICHT|\bFA[CÇ]ADE|\bFASAD(?:ER)?\b", re.I)),
     ("detail", re.compile(r"\bDETAILS?\b|\bENLARGED\s+(?!PLAN)", re.I)),
     ("key_plan", re.compile(r"\bKEY\s*PLAN\b|\bKEYPLAN\b|\bLOCATION\s+PLAN\b|\bVICINITY", re.I)),
     ("site_plan", re.compile(r"\bSITE\s+PLAN\b|\bMASTER\s*-?\s*PLAN\b|\bLANDSCAPE\s+(?:PLAN|LAYOUT|GENERAL\s+ARRANGEMENT)\b|"
-                             r"\bPLOT\s+PLAN\b|\bASEMAPIIRUS|\bLAGEPLAN", re.I)),
+                             r"\bPLOT\s+PLAN\b|\bASEMAPIIRUS|\bLAGEPLAN|\bSITUATIONSPLAN", re.I)),
     ("roof_plan", re.compile(r"\bROOF\s+(?:FRAMING\s+)?PLAN\b|\bVESIKATTO", re.I)),
     ("foundation_plan", re.compile(r"\bFOUNDATION\b.*\bPLAN\b|\bSLAB\s+PLAN\b|\bFOOTING\s+PLAN\b|"
                                    r"\b(?:FLOOR\s+)?FRAMING\s+PLAN|\bPERUSTUS", re.I)),
     ("services_plan", re.compile(r"\b(?:PIPING|PLUMBING|MECHANICAL|HVAC|DUCT(?:WORK)?|ELECTRICAL|LIGHTING|POWER|"
                                  r"FIRE\s+PROTECTION|SPRINKLER|SANITARY|DRAINAGE|WATER)\b.*\bPLAN\b|\bLVI\b", re.I)),
-    ("floor_plan", re.compile(r"\bFLOOR\s+PLAN\b|\bPLAN\b|\bPOHJA(?:PIIRUSTUS)?\b|\bKERROS\b|\bGRUNDRISS|\bPLAN\s+DE\b|"
+    ("floor_plan", re.compile(r"\bFLOOR\s+PLAN\b|\bPLAN\b|\bPOHJA(?:PIIRUSTUS)?\b|\bKERROS\b|\b\d\.?\s*KRS\b|\bV[ÅA]NINGSPLAN|\bGRUNDRISS|\bPLAN\s+DE\b|"
                               r"\bPLATTEGROND|\bPLANTA\b|\bLEVEL\s+\w+\s*$|\bGROUND\s+FLOOR\s*$|\bUPPER\s+FLOOR\s*$|"
                               r"\b(?:FIRST|SECOND|THIRD|FOURTH|FIFTH)\s+FLOOR\s*$", re.I)),
 ]
@@ -771,7 +771,50 @@ def _views_cached(path: str, page: int) -> tuple:
     r = _pdf_page(path, page)
     if r is None:
         return ()
-    return tuple(_detect(*r))
+    out = _detect(*r)
+    if _DIMSCALE:
+        try:
+            _apply_dims(path, page, out)
+        except Exception:  # noqa: BLE001 - the check is optional: never break the views
+            pass
+    return tuple(out)
+
+
+_DIMSCALE = __import__("os").environ.get("STOA_VP_DIMSCALE", "1") != "0"
+
+
+def _apply_dims(path: str, page: int, out: list) -> None:
+    """Expert rule xr-11 (Ziying, dfe-01: 'a printed 1:N holds only at its paper size; check the scale on a second
+    length'): each printed scale of the page's drawing views checked on the sheet's own dimension strings
+    (stoa.sheet.scalecheck). They agree -> a note ('scale checked on a second length: 85 printed dimension strings
+    measure 1:50 ✓'); they CLEARLY measure the printed ratio x a paper-size step (sqrt 2, 2, 2 sqrt 2: an A1 sheet
+    printed on A2 / A3 without a note) -> page_ratio / px_per_m rescaled with a note; any other disagreement is noted
+    ('check'). With views at several scales only the strings inside each view's extent count. Kill switch
+    STOA_VP_DIMSCALE=0."""
+    from stoa.sheet.scalecheck import STEPS, dimension_scale
+
+    groups: dict = {}
+    for v in out:
+        if v.kind in DRAWING_KINDS and (v.page_ratio or v.ratio):
+            groups.setdefault(round(v.page_ratio or v.ratio, 3), []).append(v)
+    for r, vs in groups.items():
+        boxes = [v.bbox for v in vs if v.bbox] if len(groups) > 1 else None
+        if len(groups) > 1 and not boxes:
+            continue
+        d = dimension_scale(path, page, r, within=boxes)
+        if not d or d.get("agrees") is None:
+            continue
+        step = next((s for s in STEPS[1:] if abs(d["factor"] / s - 1) <= 0.03), None)
+        for v in vs:
+            if d["agrees"]:
+                v.notes.append(d["note"])
+                v.confidence = round(min(0.97, v.confidence + 0.02), 2)
+            elif step and not (v.bar_ratio and abs(v.bar_ratio / r - 1) <= 0.05):  # a bar agreeing with 1:r wins
+                v.page_ratio = round(r * step, 2)
+                v.px_per_m = round(72.0 / 0.0254 / v.page_ratio, 4)
+                v.notes.append(d["note"] + f" -> 1:{v.page_ratio:g} used on this page")
+            else:
+                v.notes.append(d["note"] + ": check")
 
 
 _IMG_CACHE: dict = {}
@@ -1294,6 +1337,35 @@ def attach_view_choices(ans, path: str, question: str, page: int = 0, layer=None
     return ans
 
 
+_WING_Q = re.compile(r"\b(?:north|south|east|west)(?:ern)?(?:[\s-]?(?:east|west)(?:ern)?)?[\s-]+(?:wing|block|arm|leg)\b|"
+                     r"\b(?:central|centre|center|middle)\s+(?:core|block|part|section)\b", re.I)
+_FACADE_Q = re.compile(r"\b(?:facade|façade|elevation|face|side|frontage|exterior wall|outside wall)s?\b", re.I)
+
+
+def _wing_scope(path: str, question: str, page: int, layer, vs) -> Scope | None:
+    """'the north wing' on a sheet with a KEY PLAN (stoa.sheet.keyplan): the main plan's part the key plan's block on
+    that side maps to, as one synthetic plan view. Facade / side questions are not wings (G1's facade reader)."""
+    if not _WING_Q.search(question or "") or _FACADE_Q.search(question or "") or \
+            not any(v.kind == "key_plan" for v in vs):
+        return None
+    try:
+        from stoa.sheet.keyplan import zone_for
+
+        z = zone_for(path, question, page, layer)
+    except Exception:  # noqa: BLE001
+        return None
+    if not z or not z.get("plan_box") or z.get("confidence", 0) < 0.55:
+        return None                    # 0.4 = the key plan's shape differs from the plan's (an enlarged part): no map
+    plans = [v for v in vs if v.kind in PLAN_KINDS and v.bbox]
+    base = max(plans, key=lambda v: (v.bbox[2] - v.bbox[0]) * (v.bbox[3] - v.bbox[1])) if plans else None
+    v = View(kind="floor_plan", title=f"{z['name'].upper()} (key plan)", bbox=tuple(z["plan_box"]),
+             title_bbox=tuple(z["key_box"]), scale_text=base.scale_text if base else None,
+             ratio=base.ratio if base else None, page_ratio=base.page_ratio if base else None,
+             subject=z["name"].upper(), confidence=z.get("confidence", 0.5),
+             px_per_m=base.px_per_m if base else None)
+    return Scope([v], z["why"], z.get("confidence", 0.5), list(vs))
+
+
 def scope_for(path: str, question: str, page: int = 0, min_views: int = 2, layer=None) -> Scope | None:
     """The hook for readers: the views the question means on this page, or None when there is nothing to narrow
     (fewer than `min_views` titled drawing views, or the pick keeps every drawing view). Images need their text
@@ -1302,6 +1374,9 @@ def scope_for(path: str, question: str, page: int = 0, min_views: int = 2, layer
     Use it for what is DRAWN (room tags, door swings, traced rooms, symbols). Never filter schedule / table / notes
     readers by it: area tables and 'ROOM COUNT' tables sit outside the plan views and answer whole-floor questions."""
     vs = views(path, page, layer=layer)
+    zs = _wing_scope(path, question, page, layer, vs)
+    if zs is not None:
+        return zs
     drawings = [v for v in vs if v.kind in DRAWING_KINDS]
     if len(drawings) < min_views:
         return None

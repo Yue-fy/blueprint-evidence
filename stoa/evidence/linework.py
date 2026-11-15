@@ -37,6 +37,11 @@ import re
 PT_TO_M_AT_1 = 0.0254 / 72  # 1 pt on paper = this many metres at 1:1
 TOL = 0.06  # traced area vs printed area
 MAX_SIDE_PX = 4500
+# D1 c7 (23:18): pages larger than ANSI D / A1 (A0, ANSI E: long side > 2600 pt) are rendered at least as finely as
+# an A2 sheet at MAX_SIDE_PX (2.67 px/pt). At 4500 px an A0 sheet at 1:200 is 5.3 cm of ground per px and rooms come
+# out ~2-3 % small (DfE Secondary GA plans: dfe26 rows 46 -> 82 / 118, 0 losses; A2 / ANSI D / A1 unchanged).
+BIG_PAGE_PT = 2600
+MIN_PPT_BIG = MAX_SIDE_PX / 1684
 GAPS_M = (0.0, 0.08, 0.2, 0.35, 0.5, 0.65)  # half door-opening widths tried, in metres (closes openings up to 1.3 m)
 _MAX_PATHS = 600_000
 
@@ -59,9 +64,12 @@ def _page(pdf_abs: str, page: int) -> dict | None:
     if not drawings or len(drawings) > _MAX_PATHS:
         return None
     ppt = min(4.0, MAX_SIDE_PX / max(W, H))
+    if max(W, H) > BIG_PAGE_PT:  # A0 / ANSI E: at least A2's resolution (D1 23:18)
+        ppt = max(ppt, MIN_PPT_BIG)
     strokes: list[tuple] = []  # (pts int32 (n,2), width_pt, dark)
     curves: list[tuple] = []  # (pts, width_pt) of Bezier segments
     fills: list = []
+    fill_lines: list = []  # thin filled strips / rings = lines (THIN_FILL_PT)
     for d in drawings:
         typ = d.get("type") or ""
         col, fill = d.get("color"), d.get("fill")
@@ -112,11 +120,23 @@ def _page(pdf_abs: str, page: int) -> dict | None:
                 strokes.append((np.round(np.asarray(p, dtype=float) * ppt).astype(np.int32), w, dark,
                                 _angle(p) if len(p) == 2 else None, col))
             curves += [(np.round(np.asarray(p, dtype=float) * ppt).astype(np.int32), w) for p in arcs]
+        if "f" in typ and fill and sum(fill) / len(fill) < 0.5 and THIN_FILL_PT > 0 and len(polys) >= 2 and not arcs:
+            tr = _thin_ring(polys)
+            if tr is not None:  # a court / frame LINE drawn as an even-odd ring (outer + inner loop 0.35 pt apart)
+                fill_lines.append((np.round(np.asarray(tr[0], dtype=float) * ppt).astype(np.int32),
+                                   max(1, int(round(tr[1] * ppt)))))  # (outer loop px, band width px)
+                continue
         if "f" in typ and fill and sum(fill) / len(fill) < 0.5:  # wall poché; light room fills are not walls
             ring = [q for p in (polys + arcs) for q in p]  # the whole path is one filled region (a hatch's disjoint
             if len(ring) >= 3:                     # segments enclose ~nothing and are dropped here)
                 xs, ys = np.asarray(ring, dtype=float).T
                 if abs(float(np.dot(xs, np.roll(ys, 1)) - np.dot(ys, np.roll(xs, 1)))) / 2 >= 2.0:
+                    if THIN_FILL_PT > 0 and _thin_strip(ring) is not None:
+                        # X1 23:20 (EFA superblock Sports Hall): court markings drawn as 0.3-0.4 pt FILLED strips (= 50 mm
+                        # court lines at 1:400) are LINES, not wall poché: drawn in every line set, but not in the walls-
+                        # only reading 'wall@N' (as 'walls' they closed it around the label: 63.9 of 594 m²)
+                        fill_lines.append((np.round(np.asarray(ring, dtype=float) * ppt).astype(np.int32), 0))
+                        continue
                     fills.append(np.round(np.asarray(ring, dtype=float) * ppt).astype(np.int32))
     # hatching: many straight single segments at one oblique angle with one width / colour (Swiss sheets hatch whole
     # apartments at 45°): they would cut every room into slivers, so they are not walls
@@ -136,14 +156,64 @@ def _page(pdf_abs: str, page: int) -> dict | None:
     if traced and TRACED_FILLS and not fills:
         fills = _thick_ink_fills(strokes, (int(H * ppt) + 2, int(W * ppt) + 2), ppt)
     return {"W": W, "H": H, "ppt": ppt, "strokes": strokes, "fills": fills, "curves": curves, "dashes": dashes,
-            "shape": (int(H * ppt) + 2, int(W * ppt) + 2), "hatch_classes": len(hatch)}
+            "shape": (int(H * ppt) + 2, int(W * ppt) + 2), "hatch_classes": len(hatch), "traced": bool(traced),
+            "fill_lines": fill_lines}
 
 
 # OFF by default (E1 cycle 9): the rebuilt fills win 3 EFA renders (Sports Hall, Studio, Kitchen) but grow Stoa's DfE
 # PNG laundry 6.97 -> 7.24 (gold 7.0) and fitness 26.97 -> 27.39 via the bridge reading -> check before turning on
 TRACED_FILLS = bool(int(__import__("os").environ.get("E1_TRACED_FILLS", "0")))
 TRACED_DASHES = bool(int(__import__("os").environ.get("E1_TRACED_DASHES", "1")))
+# X1 23:20 (EFA primary PNG, 1:200): grid-line dashes 4.8-5 pt with 4.5-4.8 pt gaps (4.0 missed them; the hall was cut
+# into 59 of its 180 m²)
+TRACED_DASH_GAP_PT = float(__import__("os").environ.get("E1_TRACED_DASH_GAP_PT", "6.0"))
 TRACED_WALL_PT = float(__import__("os").environ.get("E1_TRACED_WALL_PT", 1.0))  # ink at least this wide = a wall fill
+
+
+THIN_FILL_PT = float(__import__("os").environ.get("E1_THIN_FILL_PT", "0.5"))  # 0 = every dark fill is a wall
+
+
+def _thin_strip(ring):
+    """A filled polygon that is a LINE: its minimum rotated rectangle is < THIN_FILL_PT wide and >= 10x as long ->
+    (its centre line [(x, y), (x, y)] in pt, its width in pt), else None."""
+    import cv2
+    import numpy as np
+
+    pts = np.asarray(ring, dtype=np.float32)
+    (cx, cy), (w, h), ang = cv2.minAreaRect(pts)
+    short, long_ = min(w, h), max(w, h)
+    if short >= THIN_FILL_PT or long_ < 10 * max(short, 0.05) or long_ < 3.0:
+        return None
+    import math
+    a = math.radians(ang if w >= h else ang + 90)
+    dx, dy = math.cos(a) * long_ / 2, math.sin(a) * long_ / 2
+    return [(cx - dx, cy - dy), (cx + dx, cy + dy)], float(max(short, 0.1))
+
+
+def _thin_ring(polys):
+    """A filled path of >= 2 closed loops whose band (outer area - inner areas) is < THIN_FILL_PT wide on average
+    (band / outer perimeter): a line drawn as a ring -> (outer loop points in pt, band width in pt), else None."""
+    import numpy as np
+
+    loops = []
+    for p in polys:
+        a = np.asarray(p, dtype=float)
+        if len(a) < 4 or np.hypot(*(a[0] - a[-1])) > 0.5:
+            return None
+        xs, ys = a.T
+        loops.append((abs(float(np.dot(xs, np.roll(ys, 1)) - np.dot(ys, np.roll(xs, 1)))) / 2, a))
+    loops.sort(key=lambda t: -t[0])
+    (ao, outer), inner = loops[0], loops[1:]
+    x0, y0 = outer.min(0)
+    x1, y1 = outer.max(0)
+    if any(not (x0 - 0.5 <= a[:, 0].min() and a[:, 0].max() <= x1 + 0.5 and y0 - 0.5 <= a[:, 1].min() and
+                a[:, 1].max() <= y1 + 0.5) for _, a in inner):
+        return None
+    band = ao - sum(ai for ai, _ in inner)
+    per = float(np.hypot(*np.diff(outer, axis=0).T).sum())
+    if per <= 0 or band <= 0 or band / per >= THIN_FILL_PT or ao < 4.0:
+        return None
+    return [tuple(q) for q in outer], float(max(band / per, 0.1))
 
 
 def _traced_doc_page(pg, drawings) -> bool:
@@ -202,7 +272,7 @@ HATCH_MIN = 25
 DROP_DASHED = bool(int(__import__("os").environ.get("E1_DROP_DASHED", "1")))
 
 
-def _traced_dashes(strokes: list, ppt: float, max_piece_pt: float = 8.0, max_gap_pt: float = 4.0,
+def _traced_dashes(strokes: list, ppt: float, max_piece_pt: float = 8.0, max_gap_pt: float = TRACED_DASH_GAP_PT,
                    min_run: int = 6) -> set:
     """Indices of DASH outlines on a traced copy (E1 19:58, X1 sc-215 Studio: the dash-dot grid line across the room
     closed it at 5.86 m instead of 6.76; on the PDF _drop_dashed drops those dashes, but a traced dash is a small
@@ -244,9 +314,9 @@ def _traced_dashes(strokes: list, ppt: float, max_piece_pt: float = 8.0, max_gap
             if p_[2] >= 0 and p_[0] - run[-1][1] <= max_gap_pt:
                 run.append(p_)
                 continue
-            if len(run) >= min_run:
-                drop.update(q[2] for q in run)
-                lines.append((horiz, float(np.mean([q[3] for q in run])), run[0][0], run[-1][1]))
+            for sub in _regular_runs(run, min_run):
+                drop.update(q[2] for q in sub)
+                lines.append((horiz, float(np.mean([q[3] for q in sub])), sub[0][0], sub[-1][1]))
             run = [p_]
     for cx, cy, i in dots:
         for horiz, off, t0, t1 in lines:
@@ -255,6 +325,35 @@ def _traced_dashes(strokes: list, ppt: float, max_piece_pt: float = 8.0, max_gap
                 drop.add(i)
                 break
     return drop
+
+
+def _regular_runs(run: list, min_run: int, base_gap: float = 4.0) -> list:
+    """A run that needs gaps above base_gap (TRACED_DASH_GAP_PT) is a dashed line only when its pieces and gaps are
+    REGULAR (a printed dash pattern: EFA primary PNG 4.8-5 pt dashes, 4.5-4.8 pt gaps); a solid line a scan broke into
+    uneven pieces (EFA scan PNG 'Learning Resource Centre' south wall) is split at the base_gap gaps instead and each
+    part judged as before."""
+    import numpy as np
+
+    if len(run) < min_run:
+        return []
+    gaps = [b[0] - a[1] for a, b in zip(run, run[1:])]
+    if max(gaps) <= base_gap:
+        return [run]
+    ln = np.array([q[1] - q[0] for q in run])
+    g = np.array(gaps)
+    if ln.mean() > 0 and g.mean() > 0 and ln.std() / ln.mean() <= 0.2 and g.std() / g.mean() <= 0.3:
+        return [run]
+    out, cur = [], [run[0]]
+    for q, gp in zip(run[1:], gaps):
+        if gp <= base_gap:
+            cur.append(q)
+        else:
+            if len(cur) >= min_run:
+                out.append(cur)
+            cur = [q]
+    if len(cur) >= min_run:
+        out.append(cur)
+    return out
 
 
 KEEP_SEPARATIONS = bool(int(__import__("os").environ.get("E1_KEEP_SEPARATIONS", "1")))
@@ -382,13 +481,146 @@ def _variants(pg: dict) -> list[str]:
     levels = Counter(round(w, 2) for _, w, dark in pg["strokes"] if dark)
     ws = sorted(w for w, n in levels.items() if n >= 20)
     out = ["all", "dark"]
+    if TRACED_NO_ALL and pg.get("traced") and not pg["fills"] and any(not dk for _, _, dk in pg["strokes"]):
+        # D1 23:45: on a picture traced into lines (no fills) grey furniture (worktops, desks: 0.6 grey) closes the
+        # room in 'all' at gap 0 and wins the (gap, -area) key -- Practical Classroom 52.77 vs 'dark' 57.25 (57.58)
+        out = ["dark"]
     out += [f"w>={w}" for w in ws[1:4]]
     return out
 
 
+TRACED_NO_ALL = bool(int(__import__("os").environ.get("E1_TRACED_NO_ALL", "1")))
+TRACED_ALL_FALLBACK = bool(int(__import__("os").environ.get("E1_TRACED_ALL_FALLBACK", "1")))  # measure_room
+
+
 DOOR_R_M = (0.45, 1.45)  # door leaf radius (one leaf), metres
 LINE_GROW_PT = 1.0  # a room grows into its bounding lines up to their middle, at most this deep (pt)
+RING_FIX = bool(int(__import__("os").environ.get("E1_RING_FIX", "0")))  # see measure_room (c11)
 FILL_GROW_M = float(__import__("os").environ.get("E1_FILL_GROW_M", "0.08"))  # into a solid wall fill: at most this (m)
+# D1 00:3x (dfe26 PDF rooms read +1.85 cm per side = +2-3 % on 3-13 m² rooms): the traced room counts its boundary
+# pixels whole and grows into the wall ink by up to FILL_GROW_M, so its area sits ~0.7 px per side outside the CAD wall
+# face (= the vector path: the fill edge / the line's centre, which X1's measure_rect golds and D1's golds both use).
+# FACE_SNAP moves every side of an orthogonal outline onto the nearest parallel vector wall / line edge (<= max(0.8 pt,
+# 2 px)) and answers that polygon's area when >= FACE_SNAP_MIN of the perimeter snapped and it is within 5 % of the
+# pixel area. Vector pages only (not P1's traced copies of pictures).
+FACE_SNAP = bool(int(__import__("os").environ.get("E1_FACE_SNAP", "1")))
+FACE_SNAP_MIN = float(__import__("os").environ.get("E1_FACE_SNAP_MIN", "0.9"))
+# a short diagonal at a corner (the grow-back rounds corners: SEN Resource 3 x 1.5 pt) is squared, not a reason to stop
+FACE_SNAP_CUT_PT = float(__import__("os").environ.get("E1_FACE_SNAP_CUT_PT", "3.5"))
+
+
+@functools.lru_cache(maxsize=8)
+def _vector_edges(pdf_abs: str, page: int) -> tuple:
+    """Axis-aligned edges of the page's DARK fills and DARK strokes in PDF points: (vertical [(x, y0, y1)], horizontal
+    [(y, x0, x1)]), each sorted by position. Grey strokes (furniture, fixtures) are left out."""
+    import bisect  # noqa: F401  (used by _snap_edge through the sorted lists)
+
+    import pymupdf
+
+    vert, horiz = [], []
+    with pymupdf.open(pdf_abs) as doc:
+        if page >= len(doc):
+            return [], []
+        for d in doc[page].get_drawings():
+            typ = d.get("type") or ""
+            f, c = d.get("fill"), d.get("color")
+            if not (("f" in typ and f is not None and max(f) < 0.15) or ("s" in typ and c is not None and max(c) < 0.35)):
+                continue
+            for it in d.get("items", []):
+                if it[0] == "re":
+                    r = it[1]
+                    segs = [((r.x0, r.y0), (r.x1, r.y0)), ((r.x1, r.y0), (r.x1, r.y1)), ((r.x1, r.y1), (r.x0, r.y1)),
+                            ((r.x0, r.y1), (r.x0, r.y0))]
+                elif it[0] == "l":
+                    segs = [((it[1].x, it[1].y), (it[2].x, it[2].y))]
+                elif it[0] == "qu":
+                    q = it[1]
+                    segs = [((q.ul.x, q.ul.y), (q.ur.x, q.ur.y)), ((q.ur.x, q.ur.y), (q.lr.x, q.lr.y)),
+                            ((q.lr.x, q.lr.y), (q.ll.x, q.ll.y)), ((q.ll.x, q.ll.y), (q.ul.x, q.ul.y))]
+                else:
+                    continue
+                for (ax, ay), (bx, by) in segs:
+                    if abs(ax - bx) < 0.05 and abs(ay - by) > 0.5:
+                        vert.append((ax, min(ay, by), max(ay, by)))
+                    elif abs(ay - by) < 0.05 and abs(ax - bx) > 0.5:
+                        horiz.append((ay, min(ax, bx), max(ax, bx)))
+    return sorted(vert), sorted(horiz)
+
+
+def _snap_edge(value: float, lo: float, hi: float, segs: list, tol: float) -> float | None:
+    """The vector edge nearest to `value` (within tol pt) whose segments cover >= 15 % of the side [lo, hi]."""
+    import bisect
+
+    i = bisect.bisect_left(segs, (value - tol, -1e9, -1e9))
+    cov: dict = {}
+    while i < len(segs) and segs[i][0] <= value + tol:
+        pos, a, b = segs[i]
+        ov = min(b, hi) - max(a, lo)
+        if ov > 0:
+            cov[round(pos, 2)] = cov.get(round(pos, 2), 0.0) + ov
+        i += 1
+    good = [(abs(p - value), p) for p, c in cov.items() if c >= 0.15 * (hi - lo)]
+    return min(good)[1] if good else None
+
+
+def _face_snap(pdf_abs: str, page: int, contour, ppt: float):
+    """The traced room outline (px contour) as an ORTHOGONAL polygon with each side on its vector wall face.
+    Returns (polygon pt [closed], area pt², snapped share of the perimeter) or None (diagonal / curved sides)."""
+    import cv2
+    import numpy as np
+
+    vert, horiz = _vector_edges(pdf_abs, page)
+    if not vert or not horiz:
+        return None
+    ap = cv2.approxPolyDP(contour, 2.0, True)[:, 0, :].astype(float)
+    if len(ap) < 4 or len(ap) > 40:
+        return None
+    edges = []  # (orientation, position px, lo px, hi px)
+    for a, b in zip(ap, np.roll(ap, -1, axis=0)):
+        dx, dy = b[0] - a[0], b[1] - a[1]
+        if abs(dx) <= 3 and abs(dy) <= 3:
+            if abs(dx) == abs(dy):
+                continue
+            e = ("v", (a[0] + b[0]) / 2, min(a[1], b[1]), max(a[1], b[1])) if abs(dy) > abs(dx) else \
+                ("h", (a[1] + b[1]) / 2, min(a[0], b[0]), max(a[0], b[0]))
+        elif abs(dx) <= 3:
+            e = ("v", (a[0] + b[0]) / 2, min(a[1], b[1]), max(a[1], b[1]))
+        elif abs(dy) <= 3:
+            e = ("h", (a[1] + b[1]) / 2, min(a[0], b[0]), max(a[0], b[0]))
+        elif max(abs(dx), abs(dy)) <= FACE_SNAP_CUT_PT * ppt:
+            continue  # a corner cut: the neighbouring sides meet at the square corner
+        else:
+            return None  # a diagonal side: not snapped
+        if edges and edges[-1][0] == e[0] and abs(edges[-1][1] - e[1]) <= 3:
+            p_ = edges.pop()
+            e = (e[0], (p_[1] + e[1]) / 2, min(p_[2], e[2]), max(p_[3], e[3]))
+        edges.append(e)
+    if len(edges) > 1 and edges[0][0] == edges[-1][0] and abs(edges[0][1] - edges[-1][1]) <= 3:
+        p_ = edges.pop()
+        edges[0] = (p_[0], (p_[1] + edges[0][1]) / 2, min(p_[2], edges[0][2]), max(p_[3], edges[0][3]))
+    if len(edges) < 4 or len(edges) % 2 or any(a[0] == b[0] for a, b in zip(edges, edges[1:] + edges[:1])):
+        return None
+    tol = max(0.8, 2.0 / ppt)
+    snapped = total = 0.0
+    pos = []
+    for o, p_, lo, hi in edges:
+        val, lo_pt, hi_pt = (p_ + 0.5) / ppt, (lo + 0.5) / ppt, (hi + 0.5) / ppt
+        sv = _snap_edge(val, lo_pt, hi_pt, vert if o == "v" else horiz, tol)
+        total += hi_pt - lo_pt
+        if sv is not None:
+            snapped += hi_pt - lo_pt
+        pos.append(sv if sv is not None else val)
+    pts = []
+    for i, (o, _p, _lo, _hi) in enumerate(edges):
+        j = (i + 1) % len(edges)
+        pts.append((pos[i], pos[j]) if o == "v" else (pos[j], pos[i]))
+    xs = np.array([q[0] for q in pts])
+    ys = np.array([q[1] for q in pts])
+    area = abs(float(np.dot(xs, np.roll(ys, 1)) - np.dot(ys, np.roll(xs, 1)))) / 2
+    if total <= 0 or area <= 0:
+        return None
+    poly = [[round(float(x), 2), round(float(y), 2)] for x, y in pts]
+    return poly + [poly[0]], area, snapped / total
 
 
 def _door_spokes(pg: dict, scale_n: float) -> list:
@@ -679,8 +911,12 @@ def _dist(pdf_abs: str, page: int, variant: str):
     doors = dsuf.startswith("doors@")
     anch = variant == "anch"  # 'all' minus the stroke clusters that touch no wall fill
     bridge_n = float(variant[7:]) if variant.startswith("bridge@") else None  # 'all' + collinear wall-end bridges
+    # 'wall@N' (E1 c12): the wall fills + their collinear bridges (+ door radii) and NO stroke: furniture, counters and
+    # millwork are not walls (AFCEE A-101 Break Room: the kitchen counter cut the floor-plan trace to 9.48 m², gold 11.59)
+    wall_n = float(variant[5:]) if variant.startswith("wall@") else None
+    bridge_n = bridge_n or wall_n
     if anch or bridge_n:
-        variant = "all"
+        variant = "wall" if wall_n else "all"
     wmin = float(variant[3:]) if variant.startswith("w>=") else None
     by_th: dict[int, list] = {}
     arc_ids: dict = {}
@@ -694,6 +930,8 @@ def _dist(pdf_abs: str, page: int, variant: str):
             keep = [a[j:j + 2] for j in range(len(a) - 1) if not any(j0 <= j < j1 for j0, j1 in arc_ids[i])]
             by_th.setdefault(max(1, int(round(w * pg["ppt"]))), []).extend(keep)
             continue
+        if variant == "wall":
+            continue
         if variant != "all" and not dark:
             continue
         if wmin is not None and round(w, 2) < wmin:
@@ -704,6 +942,12 @@ def _dist(pdf_abs: str, page: int, variant: str):
             by_th.setdefault(max(1, int(round(w * pg["ppt"]))), []).append(a)
     for th, arrs in by_th.items():
         cv2.polylines(m, arrs, False, 255, thickness=th, lineType=cv2.LINE_8)
+    if pg.get("fill_lines") and variant != "wall":
+        for poly_, ring_w in pg["fill_lines"]:  # one by one: an even-odd fill of the whole list would XOR crossings
+            if ring_w:
+                cv2.polylines(m, [poly_], True, 255, thickness=ring_w, lineType=cv2.LINE_8)
+            else:
+                cv2.fillPoly(m, [poly_], 255)
     if pg["fills"]:
         if anch:  # only the stroke clusters that touch a solid wall fill (see ANCHORED)
             fm = np.zeros(pg["shape"], dtype=np.uint8)
@@ -732,9 +976,12 @@ def _dist(pdf_abs: str, page: int, variant: str):
     return np.minimum(d, 255).astype(np.uint8)
 
 
-def _region(dist, seed, k: int):
+def _region(dist, seed, k: int, free=None, max_px: float | None = None, memo: list | None = None):
     """Free region around `seed` after growing the lines by k px, grown back by k, holes (furniture drawn as closed
-    outlines inside the room) filled; (mask, bbox (x0, y0, x1, y1) px) or None when it leaks to the page edge."""
+    outlines inside the room) filled; (mask, bbox (x0, y0, x1, y1) px) or None when it leaks to the page edge.
+    `free`: (dist > k) as uint8, when the caller reuses it across seeds. `max_px`: the flood fill already holds more
+    pixels than that -> False (the grown-back region is at least as big; P1 00:39: outline_for_area spent 12 s of 31 in
+    distanceTransforms of leaked regions that could never match the printed area)."""
     import cv2
     import numpy as np
 
@@ -742,7 +989,8 @@ def _region(dist, seed, k: int):
     x, y = seed
     if not (0 <= x < w and 0 <= y < h):
         return None
-    free = (dist > k).astype(np.uint8)
+    if free is None:
+        free = (dist > k).astype(np.uint8)
     if not free[y, x]:  # the tag sits on / near a line: nearest free pixel within a small window
         r = 2 * k + 4
         y0, y1, x0, x1 = max(0, y - r), min(h, y + r + 1), max(0, x - r), min(w, x + r + 1)
@@ -752,11 +1000,22 @@ def _region(dist, seed, k: int):
         d = (cand[:, 0] + y0 - y) ** 2 + (cand[:, 1] + x0 - x) ** 2
         fy, fx = cand[int(np.argmin(d))]
         x, y = int(fx + x0), int(fy + y0)
+    if memo is not None:  # P1 01:16: a seed inside a region already flooded (same line set, same k) gets its result
+        for (mx, my, mm), res in memo:
+            if mx <= x < mx + mm.shape[1] and my <= y < my + mm.shape[0] and mm[y - my, x - mx]:
+                return res
     ff = np.zeros((h + 2, w + 2), dtype=np.uint8)
-    _, _, _, rect = cv2.floodFill(free, ff, (x, y), 2, flags=4 | (1 << 8) | cv2.FLOODFILL_MASK_ONLY)
+    n_px, _, _, rect = cv2.floodFill(free, ff, (x, y), 2, flags=4 | (1 << 8) | cv2.FLOODFILL_MASK_ONLY)
     rx, ry, rw, rh = rect
+    key = (rx, ry, ff[1 + ry:1 + ry + rh, 1 + rx:1 + rx + rw].copy()) if memo is not None else None
     if rx <= 0 or ry <= 0 or rx + rw >= w or ry + rh >= h:
+        if key is not None:
+            memo.append((key, None))
         return None
+    if max_px is not None and n_px > max_px:
+        if key is not None:
+            memo.append((key, False))
+        return False
     m = k + 2
     X0, Y0, X1, Y1 = max(0, rx - m), max(0, ry - m), min(w, rx + rw + m), min(h, ry + rh + m)
     reg = ff[1 + Y0:1 + Y1, 1 + X0:1 + X1].copy()
@@ -765,11 +1024,16 @@ def _region(dist, seed, k: int):
         reg = ((dd <= k) & (dist[Y0:Y1, X0:X1] > 0)).astype(np.uint8)
     cs, _ = cv2.findContours(reg, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     if not cs:
+        if key is not None:
+            memo.append((key, None))
         return None
     c = max(cs, key=cv2.contourArea)
     filled = np.zeros_like(reg)
     cv2.drawContours(filled, [c], -1, 1, thickness=-1)
-    return filled, c + np.array([[X0, Y0]]), (X0, Y0, X1, Y1)
+    out = (filled, c + np.array([[X0, Y0]]), (X0, Y0, X1, Y1))
+    if key is not None:
+        memo.append((key, out))
+    return out
 
 
 def _polygon(contour, ppt: float) -> list | None:
@@ -826,6 +1090,7 @@ def outline_for_area(pdf_abs: str, page: int, pt: tuple[float, float], area_m2: 
     `others` (pdf_pt points): other rooms' tags; an outline that holds one of them leaked into that room and is
     dropped (default: every other printed area tag on the page)."""
     import cv2
+    import numpy as np
 
     if not area_m2 or area_m2 <= 0 or not scale_n or scale_n <= 0:
         return None
@@ -847,6 +1112,7 @@ def outline_for_area(pdf_abs: str, page: int, pt: tuple[float, float], area_m2: 
                  if (x - pt[0]) ** 2 + (y - pt[1]) ** 2 > 4.0 ** 2
                  and not (tag_box and tag_box[0] - 1 <= x <= tag_box[2] + 1 and tag_box[1] - 1 <= y <= tag_box[3] + 1)]
     variants = _variants(pg)
+    max_px = area_m2 * (1 + tol) * 1.02 / m_per_px ** 2  # flood-fill pixels past which no reading can match
     cands = []  # every (variant, gap) whose outline passes: (gap, seed, err, area, contour, variant, shapely poly)
     for gap in GAPS_M:
         k = int(round(gap / m_per_px))
@@ -856,9 +1122,13 @@ def outline_for_area(pdf_abs: str, page: int, pt: tuple[float, float], area_m2: 
             break
         for variant in variants:
             dist = _dist(pdf_abs, page, variant)
+            free_k = (dist > k).astype(np.uint8)  # once per (line set, gap), not per seed
+            memo_k = [] if REGION_SKIP else None
             for si, seed in enumerate(seeds):
-                r = _region(dist, seed, k)
-                if r is None:
+                # an outside seed (si > 0) whose flood fill alone is already too big cannot match: skipped before the
+                # grow-back (seed 0 is measured in full: its size decides whether the outside seeds are tried at all)
+                r = _region(dist, seed, k, free=free_k, max_px=max_px if si and REGION_SKIP else None, memo=memo_k)
+                if r is None or r is False:
                     continue
                 filled, contour, _ = r
                 if cv2.pointPolygonTest(contour, (float(seeds[0][0]), float(seeds[0][1])), False) < 0:
@@ -890,6 +1160,7 @@ def outline_for_area(pdf_abs: str, page: int, pt: tuple[float, float], area_m2: 
 
 
 MIN_SUPPORT = 2  # readings (line set x gap) that trace the same outline (IoU >= 0.9), the chosen one included
+REGION_SKIP = bool(int(__import__("os").environ.get("E1_REGION_SKIP", "1")))  # outline_for_area: see _region max_px
 
 
 def _shape(contour):
@@ -983,6 +1254,20 @@ def text_lines(pdf_abs: str, page: int = 0) -> tuple:
                  for b in blocks for ln in b.get("lines", []))
 
 
+def text_lines_dir(pdf_abs: str, page: int = 0) -> tuple:
+    """((text, bbox pdf_pt, (dx, dy) writing direction), ...): text_lines plus each line's direction ((1, 0) =
+    horizontal; (0, -1) = drawn upwards, e.g. every label of a sheet plotted with /Rotate 90)."""
+    import pymupdf
+
+    with pymupdf.open(pdf_abs) as doc:
+        if page >= len(doc):
+            return ()
+        blocks = doc[page].get_text("dict").get("blocks", [])
+    return tuple((" ".join(s.get("text", "") for s in ln.get("spans", [])).strip(), tuple(ln["bbox"]),
+                  tuple(ln.get("dir", (1.0, 0.0))))
+                 for b in blocks for ln in b.get("lines", []))
+
+
 ANCHORED = bool(int(__import__("os").environ.get("E1_ANCHORED", "1")))
 BRIDGE = bool(int(__import__("os").environ.get("E1_BRIDGE", "1")))
 BRIDGE_M = float(__import__("os").environ.get("E1_BRIDGE_M", "2.5"))  # widest opening closed between collinear stubs
@@ -1066,7 +1351,7 @@ def _anchored_pick(pdf_abs, page, pg, pick, seed, others_px, m_per_px, scale_n):
 
 
 def measure_room(pdf_abs: str, page: int, pt: tuple[float, float], scale_n: float, tag_box: tuple | None = None,
-                 own_radius_pt: float = 25.0) -> dict | None:
+                 own_radius_pt: float = 25.0, base_variants: list[str] | None = None) -> dict | None:
     """A room's outline and area MEASURED around its label when no area is printed (line-only CAD sheets, X1 14:31).
     X1 wild LEVEL_11 (A2, 1:100): comms room 16.41 m² (gold 16.83, -2.5 %), long side 5.24 m (5.253), conference room
     7.72 m (7.73). KNOWN: a side across a door opening bulges by up to the gap (grow-back after the flood fill; synthetic
@@ -1075,7 +1360,8 @@ def measure_room(pdf_abs: str, page: int, pt: tuple[float, float], scale_n: floa
     of every traced region that holds the label, holds no other word label (the next room's name) and does not run
     off the page, the one most readings (line set x gap) agree on (IoU >= 0.9). Returns {"polygon", "area_m2",
     "support", "n_readings", "gap_m", "variant", "sides_m"} or None. Approximate (exact=False): wall faces, door
-    openings closed at `gap_m` x 2."""
+    openings closed at `gap_m` x 2. `base_variants` (e.g. ['wall@96']) replaces the line sets tried; then no bridge
+    fallback, anchored pick or reveal cut runs (the caller asked for exactly those readings)."""
     import cv2
     import numpy as np
 
@@ -1095,29 +1381,40 @@ def measure_room(pdf_abs: str, page: int, pt: tuple[float, float], scale_n: floa
         if tag_box and tag_box[0] - 2 <= c[0] <= tag_box[2] + 2 and tag_box[1] - 2 <= c[1] <= tag_box[3] + 2:
             continue
         others_px.append((float(c[0] * ppt), float(c[1] * ppt)))
-    variants = _variants(pg)
+    variants = list(base_variants) if base_variants else _variants(pg)
+    if base_variants and any(v.startswith("wall@") for v in base_variants) and not pg["fills"]:
+        return None  # no wall fills: a walls-only reading has no walls
     if _door_spokes(pg, scale_n) or (DOOR_LEAVES and _door_leaves(pg, scale_n)):  # every line set with the door
         # swings replaced by their radii (see _door_arcs) and straight leaves closed at their hinge (_door_leaves)
         variants = [f"{v}|doors@{scale_n:g}" for v in variants]
     cands = []
-    for gap in GAPS_M:
-        k = int(round(gap / m_per_px))
-        if (gap and k < 1) or k > 250:
-            continue
-        for variant in variants:
-            r = _region(_dist(pdf_abs, page, variant), seeds[0], k)
-            if r is None:
+
+    def _collect(vs):
+        for gap in GAPS_M:
+            k = int(round(gap / m_per_px))
+            if (gap and k < 1) or k > 250:
                 continue
-            filled, contour, _ = r
-            if cv2.pointPolygonTest(contour, (float(seeds[0][0]), float(seeds[0][1])), False) < 0:
-                continue
-            if any(cv2.pointPolygonTest(contour, q, False) >= 0 for q in others_px):
-                continue
-            a = float(filled.sum()) * m_per_px ** 2
-            if not 0.8 <= a <= 3000:
-                continue
-            cands.append((gap, variant, a, contour, _shape(contour), filled, r[2]))
-    if not cands and BRIDGE and pg["fills"] and _solid_walls(pdf_abs, page):
+            for variant in vs:
+                r = _region(_dist(pdf_abs, page, variant), seeds[0], k)
+                if r is None:
+                    continue
+                filled, contour, _ = r
+                if cv2.pointPolygonTest(contour, (float(seeds[0][0]), float(seeds[0][1])), False) < 0:
+                    continue
+                if any(cv2.pointPolygonTest(contour, q, False) >= 0 for q in others_px):
+                    continue
+                a = float(filled.sum()) * m_per_px ** 2
+                if not 0.8 <= a <= 3000:
+                    continue
+                cands.append((gap, variant, a, contour, _shape(contour), filled, r[2]))
+
+    _collect(variants)
+    if not cands and not base_variants and TRACED_ALL_FALLBACK and not any(v.split("|")[0] == "all" for v in variants):
+        # M1 00:45: the traced SCAN copy of DfE L00 closes the Multi-Purpose Hall only in 'all' (245.6 m², gold 244.6;
+        # 'dark' never closes it) -- the 'all' line set dropped on traced copies (_variants) comes back as a fallback
+        dsuf = "|" + variants[0].partition("|")[2] if variants and "|" in variants[0] else ""
+        _collect(["all" + dsuf])
+    if not cands and not base_variants and BRIDGE and pg["fills"] and _solid_walls(pdf_abs, page):
         # every reading leaked into another room: openings wider than the door gaps between COLLINEAR wall stubs (EFA
         # Nursery -> Cloak / Toilets / Lobby through ~2 m openings). Fallback only: wall pieces on one line, <= BRIDGE_M
         # apart, are joined; the same guards apply (label-clean, closed, agreeing readings)
@@ -1153,10 +1450,10 @@ def measure_room(pdf_abs: str, page: int, pt: tuple[float, float], scale_n: floa
     dr = [d for d in cluster if "doors@" in str(d[1])]
     pick = min(dr, key=lambda d: (d[0], -d[2])) if dr else max(cluster, key=lambda d: d[2])
     reveal_cut = False
-    anchored = _anchored_pick(pdf_abs, page, pg, pick, seeds[0], others_px, m_per_px, scale_n)
+    anchored = None if base_variants else _anchored_pick(pdf_abs, page, pg, pick, seeds[0], others_px, m_per_px, scale_n)
     if anchored is not None:
         pick, support = anchored
-    if REVEAL_CUT and BRIDGE and "bridge@" not in str(pick[1]) and pg["fills"] and _solid_walls(pdf_abs, page):
+    if REVEAL_CUT and BRIDGE and not base_variants and "bridge@" not in str(pick[1]) and pg["fills"] and _solid_walls(pdf_abs, page):
         # the outline runs into wide door openings (no door drawn) up to the wall's depth: EFA Main Hall perimeter
         # 57.63 vs 55.95 with the area right. The same room with its wall lines closed across those openings, when
         # it is nearly the same region (IoU >= 0.97, 0-3 % smaller), is the room's own outline
@@ -1201,6 +1498,22 @@ def measure_room(pdf_abs: str, page: int, pt: tuple[float, float], scale_n: floa
     lim = np.full(dcrop.shape, float(e), np.float32)
     if fm is not None:
         lim[fm > 0] = min(float(e), FILL_GROW_M / (scale_n * PT_TO_M_AT_1) * ppt)
+    if RING_FIX:
+        # E1 c11: _dist truncates OpenCV's L2 distance (mask 3: 0.955 next to ink) to uint8, so the free pixel next to
+        # every line reads 0 = ink (a one-pixel RING), and cv2 draws thickness t as 2t-1 px. A thick wall line's middle
+        # then lies deeper than the 1 pt cap (AF module plans, 1.26 pt lines at 1.74 px/pt: rooms 0.6 px short per
+        # side, -2 to -3 % on 120 sq ft rooms). On a stroke's pixels the room may grow to that stroke's centre pixel
+        # (ring + t), never less than before and at most one pixel past the cap. The centre pixel counts whole (+half a
+        # pixel per side; synthetic 1.26 pt box: -1.1 % -> +1.06 %); the AF schedules sit ~0.5 % above the faces.
+        tmap = np.zeros(dcrop.shape, np.uint8)
+        by_t: dict = {}
+        off = np.array([x0p, y0p])
+        for a_, w_, _dk in pg["strokes"]:
+            by_t.setdefault(max(1, int(round(w_ * ppt))), []).append((a_ - off).astype(np.int32))
+        for t_ in sorted(by_t):
+            cv2.polylines(tmap, by_t[t_], False, int(min(t_, 255)), thickness=t_, lineType=cv2.LINE_8)
+        on = (tmap > 0) & line
+        lim[on] = np.maximum(lim[on], np.minimum(float(e) + 1.0, 1.0 + tmap[on].astype(np.float32)))
     grown = (room > 0) | (line & (d_room <= d_other + 0.5) & (d_room <= lim))
     filled = cv2.copyMakeBorder(grown.astype(np.uint8), 1, 1, 1, 1, cv2.BORDER_CONSTANT, value=0)
     X0, Y0, e = x0p, y0p, 1
@@ -1213,13 +1526,28 @@ def measure_room(pdf_abs: str, page: int, pt: tuple[float, float], scale_n: floa
     poly = _polygon(contour, ppt)
     if not poly:
         return None
+    face_snap = None
+    if FACE_SNAP and pg["fills"] and not pg.get("traced"):
+        try:
+            fs = _face_snap(pdf_abs, page, contour, ppt)
+            if fs is not None and fs[2] >= FACE_SNAP_MIN:
+                from shapely.geometry import Point, Polygon as _P
+
+                a_s = fs[1] * (scale_n * PT_TO_M_AT_1) ** 2
+                sp = _P([tuple(q) for q in fs[0]])
+                if sp.is_valid and abs(a_s - a) <= 0.05 * a and sp.contains(Point(pt[0], pt[1])):
+                    face_snap = {"area_px_m2": round(a, 2), "snapped_share": round(fs[2], 3)}
+                    a, poly = a_s, fs[0]
+                    shp = _shape(np.round(np.asarray(fs[0][:-1]) * ppt).astype(np.int32).reshape(-1, 1, 2))
+        except Exception:  # noqa: BLE001 — the pixel reading stands
+            face_snap = None
     sides = None
     try:
         r = shp.minimum_rotated_rectangle
         xy = list(r.exterior.coords)[:4]
         d = sorted(((xy[i][0] - xy[i + 1][0]) ** 2 + (xy[i][1] - xy[i + 1][1]) ** 2) ** 0.5 for i in range(2))
-        sides = [round((v + 1) * m_per_px, 3) for v in reversed(d)]  # long, short (m); +1 px: pixel centres
+        sides = [round((v + (0 if face_snap else 1)) * m_per_px, 3) for v in reversed(d)]  # long, short (m); +1 px: pixel centres
     except Exception:  # noqa: BLE001
         pass
     return {"polygon": poly, "area_m2": round(a, 2), "support": support, "n_readings": len(cands), "gap_m": gap,
-            "variant": variant, "sides_m": sides, "scale_n": scale_n, "reveal_cut": reveal_cut}
+            "variant": variant, "sides_m": sides, "scale_n": scale_n, "reveal_cut": reveal_cut, "face_snap": face_snap}

@@ -29,9 +29,15 @@ import re
 from stoa.contract import Answer, Evidence
 
 SOLVER = "slab_area"
-_SLAB_Q = re.compile(r"\b(slabs?|slab-on-grade|sog|mat foundation|foundation pad|equipment pad|bodenplatte|"
-                     r"betonplatte|laatta|platta)\b", re.I)
-_AREA_Q = re.compile(r"\b(area|how (?:big|large)|size|square|m²|m2|sq\.? ?(?:m|ft)|fläche|pinta-ala)\b", re.I)
+_SLAB_Q = re.compile(r"\b(slabs?|slab-on-grade|sog|mat foundation|foundation pad|equipment pad|bodenplatte\w*|"
+                     r"betonplatte\w*|laat(?:ta|an|at|oi|oj)\w*|platta\w*|plattor\w*)\b", re.I)  # 'laatan', 'plattan'
+_AREA_Q = re.compile(r"\b(area|how (?:big|large)|size|square|m²|m2|sq\.? ?(?:m|ft)|fläche|pinta-ala|footprint)\b", re.I)
+# H 23:51 (e)-(g): 'Sum of all slab areas?', 'How many m² is the 300 mm slab …', a weaker m² answer re-checked
+SLAB_WORDING = os.environ.get("E1_SLAB_WORDING", "1") != "0"
+if SLAB_WORDING:
+    _AREA_Q = re.compile(_AREA_Q.pattern.replace(r"\b(area|", r"\b(areas?|", 1), re.I)
+_HOWMANY_NOT_AREA = (r"\b(how many|number of)\b(?!\s+(?:square|sq|m²|m2|ft²|ft2|sf\b|met(?:re|er)s|feet))" if SLAB_WORDING
+                     else r"\b(how many|number of)\b(?!\s+(?:square|sq))")
 _THK = re.compile(r"(?<![\d.])(\d{2,4})\s*(?:mm\b)?\s*(?:thk\.?|thick)?\s*(?:conc(?:rete)?\.?\s*)?(?:structural\s+)?"
                   r"slab", re.I)
 _THK_Q = re.compile(r"(?<![\d.])(\d{2,4})\s*(?:mm|millimet\w*)\b|(?<![\d.])(\d{2,4})\s*(?:thk|thick)", re.I)
@@ -162,8 +168,9 @@ def _traced(pdf_abs: str, page: int) -> bool:
 
 
 def _pick(cs: tuple, q: str):
-    qt = {int(a or b) for a, b in _THK_Q.findall(q)} | {int(x) for x in _THK.findall(q)} | \
-        {_imp_mm(m) for m in _IMP_THK.finditer(q)}
+    q_t = _SPACING.sub(" ", _BAR.sub(" ", q))  # 'the D13 slab': '13' is a bar mark, '@ 300' a spacing, not thicknesses
+    qt = {int(a or b) for a, b in _THK_Q.findall(q_t)} | {int(x) for x in _THK.findall(q_t)} | \
+        {_imp_mm(m) for m in _IMP_THK.finditer(q_t)}
     qb = {_norm_bar(x) for x in _BAR.findall(q)}
     qs = {int(x) for x in _SPACING.findall(q)}
     if not (qt or qb):
@@ -172,6 +179,9 @@ def _pick(cs: tuple, q: str):
             and (c[1] is not None or c[2])]
     if not hits and qs:  # the spacing may be printed in the callout's next text block ('… W/ D22' / '@ 300 TOP OF …')
         hits = [c for c in cs if (not qt or c[1] in qt) and (not qb or qb <= set(c[2])) and (c[1] is not None or c[2])]
+    if len(hits) > 1:  # 'the D13 slab': the slab-type callout (thickness + bars), not a rebar note that names D13
+        typed = [c for c in hits if c[1] is not None]
+        hits = typed if typed else hits
     return hits[0] if len(hits) == 1 else None
 
 
@@ -374,7 +384,10 @@ def _mask(pdf_abs: str, page: int, n: float):
             joints.append((np.asarray(a, np.int32), w))
             continue  # a control joint divides a slab into panels
         x0, y0, x1, y1 = ln.bounds
-        if any(box(b[0] - 12, b[1] - 12, b[2] + 12, b[3] + 12).contains(ln) and
+        # X1 22:31: bounds test instead of a new shapely box per (stroke, block): on a traced PNG copy that was 1.2 M
+        # box() calls = 30 s of the first slab question. An axis-aligned box contains a line iff the line's bounds lie
+        # inside it (shapely's contains() also needs an interior point: a line lying ON the box edge is the only change)
+        if any(b[0] - 12 <= x0 and b[1] - 12 <= y0 and x1 <= b[2] + 12 and y1 <= b[3] + 12 and
                ((x1 - x0) > 0.8 * (b[2] - b[0]) or (y1 - y0) > 0.8 * (b[3] - b[1])) for b in blocks):
             continue  # a frame around a callout / note
         keep = []
@@ -482,11 +495,11 @@ def _answer(path: str, question: str, page: int) -> Answer | None:
         cs = callouts(pdf, page)
         return _callout_answer(path, pdf, page, q, cs) if cs else None
     if not _SLAB_Q.search(q) and _ITEM_Q.search(q) and _AREA_Q.search(q) and not re.search(
-            r"\b(how many|number of)\b(?!\s+(?:square|sq))", q, re.I):
+            _HOWMANY_NOT_AREA, q, re.I):
         pdf = str(abspath(path))
         return _label_dims(path, pdf, page, q) if pdf.lower().endswith(".pdf") else None
     if not _SLAB_Q.search(q) or not (_PANELS_Q.search(q) or (_AREA_Q.search(q) and not re.search(
-            r"\b(how many|number of)\b(?!\s+(?:square|sq))", q, re.I))):
+            _HOWMANY_NOT_AREA, q, re.I))):
         return None
     pdf = str(abspath(path))
     if not pdf.lower().endswith(".pdf"):
@@ -584,6 +597,14 @@ def _answer(path: str, question: str, page: int) -> Answer | None:
         r = None
     if r is None and traced:
         r = _ocr_sides(pdf, page, n, (min(xsd), min(ysd), max(xsd), max(ysd)), bx, by, a_m2)
+    me = _main_ext(pdf, page, n, full, ppt, a_m2, traced=traced) if MAIN_EXT and \
+        (r is None or abs(r["area_m2"] - a_m2) > 0.05 * a_m2) else None
+    if me is not None:
+        return _main_ext_answer(path, page, n, c, me, q, a_m2)
+    grid = _dim_grid(pdf, page, n, ct, ppt, a_m2) if DIM_GRID and not traced and \
+        (r is None or abs(r["area_m2"] - a_m2) > 0.05 * a_m2) else None
+    if grid is not None:
+        return _grid_answer(path, page, n, c, grid, poly, a_m2)
     if r is not None and abs(r["area_m2"] - a_m2) <= 0.05 * a_m2:
         # the traced slab IS the rectangle two printed dimensions span (S-100F D13: 9950 x 6200 = 61.69 vs traced
         # 60.77): the printed numbers are the answer
@@ -608,11 +629,543 @@ def _answer(path: str, question: str, page: int) -> Answer | None:
                          f"{val} m² (extent {bx:.2f} x {by:.2f} m) at 1:{n:g}"])
 
 
+DIM_GRID = bool(int(__import__("os").environ.get("E1_DIM_GRID", "0")))  # c12 experiment: OFF (D16 210.6, see board NEXT)
+
+
+def _dim_grid(pdf: str, page: int, n: float, ct, ppt: float, a_m2: float) -> dict | None:
+    """The slab measured on its PRINTED DIMENSION GRID (captain 22:40 / Ziying S-100F: 'Read the dimensions; do not
+    trace'): the dimension ticks (dimrect.dims) over the traced region's extent cut it into grid cells; a cell >= 50 %
+    covered by the region (holes filled: landings, stair symbols and pipe trenches are not voids) is slab; each cell's
+    sides come from the printed values (a chain of dimensions between two ticks) or, where no printed chain links two
+    ticks, from the drawing at 1:N. S-100F D16: 11000 x 19500 + the stair pocket 1750 x (150 + 2200) = 218.61 m² (traced
+    212.45). Kept when the extent's outer ticks are printed, >= 80 % of the area comes from printed sides and the result
+    is within -3 / +10 % of the trace. -> {"area_m2", "main_m2", "cells", "dims", "printed_share"} or None."""
+    import cv2
+    import numpy as np
+
+    from stoa.evidence import dimrect as D
+    from stoa.evidence import linework as L
+
+    try:
+        dl = D.dims(pdf, page, n)
+    except Exception:  # noqa: BLE001
+        return None
+    if not dl:
+        return None
+    x, y, w, h = cv2.boundingRect(ct)
+    bb = (x / ppt, y / ppt, (x + w) / ppt, (y + h) / ppt)
+    mm_pt = n * L.PT_TO_M_AT_1 * 1000
+    tol = max(3.0, 150 / mm_pt)
+
+    def axis(kind, lo, hi):
+        segs = [(min(d[2], d[3]), max(d[2], d[3]), float(d[0]), d) for d in dl if d[1] == kind and
+                lo - tol <= min(d[2], d[3]) and max(d[2], d[3]) <= hi + tol]
+        vals = sorted(v for a, b, _, _d in segs for v in (a, b))
+        cl: list = []
+        for t in vals:
+            if cl and t - cl[-1][-1] <= 1.0:
+                cl[-1].append(t)
+            else:
+                cl.append([t])
+        ts = [sum(c_) / len(c_) for c_ in cl]
+        if len(ts) < 2 or abs(ts[0] - lo) > tol or abs(ts[-1] - hi) > tol:
+            return None
+        def ix(v):
+            return min(range(len(ts)), key=lambda i: abs(ts[i] - v))
+        adj: dict = {i: [] for i in range(len(ts))}
+        for a, b, v, _d in segs:
+            i, j = ix(a), ix(b)
+            if i != j:
+                adj[i].append((j, v))
+                adj[j].append((i, -v))
+        pos: dict = {}
+        comp: dict = {}
+        for r0 in range(len(ts)):
+            if r0 in pos:
+                continue
+            pos[r0], comp[r0], st = 0.0, r0, [r0]
+            while st:
+                u = st.pop()
+                for v_, dv in adj[u]:
+                    if v_ not in pos:
+                        pos[v_], comp[v_] = pos[u] + dv, r0
+                        st.append(v_)
+        # the MAIN component (printed chains linked through shared ticks) must hold both outer ticks of the extent:
+        # the overall size is printed; other chains are placed by the drawing at 1:N (they only subdivide)
+        main = comp[0]
+        if comp[len(ts) - 1] != main:
+            return None
+        mt = sorted((ts[i], pos[i]) for i in range(len(ts)) if comp[i] == main)
+        def interp(t):
+            for (t0, p0), (t1, p1) in zip(mt, mt[1:]):
+                if t0 <= t <= t1:
+                    return p0 + (p1 - p0) * (t - t0) / (t1 - t0) if t1 > t0 else p0
+            return mt[0][1] + (t - mt[0][0]) * mm_pt if t < mt[0][0] else mt[-1][1] + (t - mt[-1][0]) * mm_pt
+        gp = {}
+        for k in set(comp.values()):
+            idx_k = [i for i in range(len(ts)) if comp[i] == k]
+            off = 0.0 if k == main else float(np.median([interp(ts[i]) - pos[i] for i in idx_k]))
+            for i in idx_k:
+                gp[i] = pos[i] + off
+        sizes = [max(0.0, gp[i + 1] - gp[i]) for i in range(len(ts) - 1)]
+        printed = [comp[i] == main and comp[i + 1] == main for i in range(len(ts) - 1)]
+        return ts, sizes, printed, [d for *_x, d in segs]
+
+    X, Y = axis("h", bb[0], bb[2]), axis("v", bb[1], bb[3])
+    if __import__("os").environ.get("E1_DEBUG_GRID"):
+        print("GRID bb", [round(v, 1) for v in bb], "tol", round(tol, 1), "X", X and [round(t, 1) for t in X[0]],
+              X and [round(v) for v in X[1]], "Y", Y and [round(t, 1) for t in Y[0]], Y and [round(v) for v in Y[1]])
+    if X is None or Y is None or len(X[0]) > 40 or len(Y[0]) > 40:
+        return None
+    mask = np.zeros((h + 2, w + 2), np.uint8)
+    cv2.fillPoly(mask, [ct.reshape(-1, 2) - np.array([x - 1, y - 1])], 1)
+    kk = max(3, int(round(1000 / mm_pt * ppt)) | 1)  # ~1 m: notches cut by symbols / landings close, corners stay
+    mask = cv2.morphologyEx(cv2.copyMakeBorder(mask, kk, kk, kk, kk, cv2.BORDER_CONSTANT, value=0), cv2.MORPH_CLOSE,
+                            np.ones((kk, kk), np.uint8))[kk:-kk, kk:-kk]
+    cov = np.zeros((len(X[0]) - 1, len(Y[0]) - 1), bool)
+    for i in range(len(X[0]) - 1):
+        px0, px1 = int(round(X[0][i] * ppt)) - x + 1, int(round(X[0][i + 1] * ppt)) - x + 1
+        for j in range(len(Y[0]) - 1):
+            py0, py1 = int(round(Y[0][j] * ppt)) - y + 1, int(round(Y[0][j + 1] * ppt)) - y + 1
+            sub = mask[max(0, py0):max(0, py1), max(0, px0):max(0, px1)]
+            cov[i, j] = sub.size > 0 and float(sub.mean()) >= 0.5
+    if not cov.any():
+        return None
+    xs_, ys_ = np.array(X[1]), np.array(Y[1])
+    cell = np.outer(xs_, ys_) / 1e6
+    area = float((cell * cov).sum())
+    pr = np.outer(np.array(X[2], float), np.array(Y[2], float)).astype(bool)
+    share = float((cell * cov * pr).sum()) / area if area else 0.0
+    if __import__("os").environ.get("E1_DEBUG_GRID"):
+        print("GRID area", round(area, 2), "share", round(share, 3), "trace", a_m2, "cov", cov.astype(int).tolist())
+    if not 0.97 * a_m2 <= area <= 1.10 * a_m2:
+        return None
+    main = 0.0  # the largest rectangle of covered cells ('without the stair pocket')
+    nx_, ny_ = cov.shape
+    for i0 in range(nx_):
+        for i1 in range(i0, nx_):
+            for j0 in range(ny_):
+                for j1 in range(j0, ny_):
+                    if cov[i0:i1 + 1, j0:j1 + 1].all():
+                        main = max(main, float(xs_[i0:i1 + 1].sum() * ys_[j0:j1 + 1].sum() / 1e6))
+    used = [d for d in X[3] + Y[3]]
+    return {"area_m2": round(area, 2), "main_m2": round(main, 2), "dims": used, "printed_share": round(share, 3),
+            "w_mm": round(float(xs_[cov.any(axis=1)].sum())), "h_mm": round(float(ys_[cov.any(axis=0)].sum()))}
+
+
+def _grid_answer(path: str, page: int, n: float, c, g: dict, poly, a_m2: float) -> Answer:
+    name = c[0][:60]
+    val = g["area_m2"]
+    ev = [Evidence(file=path, page=page, bbox=[min(p[0] for p in poly), min(p[1] for p in poly),
+                                               max(p[0] for p in poly), max(p[1] for p in poly)],
+                   bbox_space="pdf_pt", exact=False, polygon=poly,
+                   note=f"{name}: {val} m² on its printed dimension grid (traced outline {round(a_m2, 2)} m²)"),
+          Evidence(file=path, page=page, bbox=[round(v, 1) for v in c[4]], bbox_space="pdf_pt", exact=True,
+                   note=f"slab callout: {name}")]
+    for d in sorted(g["dims"], key=lambda d: -d[0])[:12]:
+        ev.append(Evidence(file=path, page=page, bbox=[round(t, 1) for t in d[5]], bbox_space="pdf_pt", exact=True,
+                           note=f"dimension {d[0]} mm (printed; measures {d[6]} mm at 1:{n:g})"))
+    alt = g["main_m2"]
+    assumptions = [f"slab type = the printed callout '{name}'",
+                   f"area from the PRINTED dimension strings: the slab's traced outline laid on the grid of its "
+                   f"dimension lines ({g['printed_share']:.0%} of the area from printed numbers, the rest measured at "
+                   f"1:{n:g}); landings, stair symbols and trenches inside the outline are not cut out (not drawn as "
+                   "voids)"]
+    if alt and abs(alt - val) > 0.005 * val:
+        assumptions.append(f"its main rectangle alone (without the {val - alt:.2f} m² part outside it, e.g. a pocket "
+                           f"round a corner) = {alt:.2f} m²")
+    return Answer(value=val, unit="m2", confidence=0.6, evidence=ev, solver=SOLVER, assumptions=assumptions,
+                  missing=[], trace=[f"slab_area: '{name}' on its printed dimension grid: {val} m² (main rectangle "
+                                     f"{alt} m²; traced {round(a_m2, 2)} m²)"])
+
+
+MAIN_EXT = bool(int(os.environ.get("E1_MAIN_EXT", "1")))
+MAIN_COVER = 0.90  # the traced slab must fill its printed main rectangle (notches by landings / stair symbols: ~2 %)
+MAIN_EDGE = 0.50  # ... and each side lies ON the slab edge: the 300 mm band inside it this full (S-100F: 0.83 with the
+# DN landing; the foundation-grid chain one tick past the slab edge: 0.12)
+EXT_COVER = 0.50  # a part outside it counts when the traced slab fills its snapped rectangle this much
+EXT_PRINTED = 0.5  # ... and its area must come at least this much from printed numbers (S-100F pocket: 0.94)
+_POCKET_Q = re.compile(r"\b(without|excluding|excl\.?|not (?:counting|including)|minus|less)\b[^.?!]{0,40}?"
+                       r"\b(pocket|recess|notch|extension|bump|stair)", re.I)
+
+
+def _chains(dl: tuple, kind: str, lo: float, hi: float, tol: float) -> tuple:
+    """Ticks and printed edges of one axis: the dimensions of `kind` whose spans lie in [lo, hi] (+- tol); ticks within
+    1 pt are one. -> (ticks [pt], edges [(i, j, value_mm, dim)] with i < j)."""
+    segs = [d for d in dl if d[1] == kind and lo - tol <= min(d[2], d[3]) and max(d[2], d[3]) <= hi + tol]
+    vals = sorted(v for d in segs for v in (min(d[2], d[3]), max(d[2], d[3])))
+    cl: list = []
+    for t in vals:
+        if cl and t - cl[-1][-1] <= 1.0:
+            cl[-1].append(t)
+        else:
+            cl.append([t])
+    ts = [sum(c_) / len(c_) for c_ in cl]
+
+    def ix(v):
+        return min(range(len(ts)), key=lambda i: abs(ts[i] - v))
+    edges = []
+    for d in segs:
+        i, j = ix(min(d[2], d[3])), ix(max(d[2], d[3]))
+        if i < j:
+            edges.append((i, j, float(d[0]), d))
+    return ts, edges
+
+
+def _printed_runs(ts: list, edges: list) -> list:
+    """Every tick pair (a, b) linked by a CONTIGUOUS run of printed dimensions (a chain 6300 + 7400 + 5800, or one
+    overall 19500) -> [(t_a, t_b, total_mm, dims)], one per pair (fewest dimensions)."""
+    out: dict = {}
+    fw: dict = {}
+    for i, j, v, d in edges:
+        fw.setdefault(i, []).append((j, v, d))
+    for a in range(len(ts)):
+        best: dict = {a: (0.0, [])}
+        for u in range(a, len(ts)):  # ticks are sorted, edges go forward: one pass in order
+            if u not in best:
+                continue
+            tot, ds = best[u]
+            for j, v, d in fw.get(u, ()):
+                if j not in best or len(best[j][1]) > len(ds) + 1:
+                    best[j] = (tot + v, ds + [d])
+        for b, (tot, ds) in best.items():
+            if b != a and (a, b) not in out:
+                out[(a, b)] = (ts[a], ts[b], tot, ds)
+    return list(out.values())
+
+
+def _side_mm(ts: list, edges: list, a: float, b: float, mm_pt: float, tol: float) -> tuple:
+    """Length a -> b (pt) on one axis from the printed dimensions where they link ticks, the rest measured at 1:N
+    (shortest measured remainder). -> (mm, printed_mm, dims)."""
+    pts = sorted({a, b} | {t for t in ts if a + 0.5 < t < b - 0.5})
+    nodes = pts
+    def near(t):
+        k = min(range(len(ts)), key=lambda i: abs(ts[i] - t)) if ts else None
+        return k if k is not None and abs(ts[k] - t) <= 1.0 else None
+    # DP: best[i] = (measured_mm, total_mm, printed_mm, dims) reaching nodes[i]
+    best = {0: (0.0, 0.0, 0.0, [])}
+    idx = {near(t): i for i, t in enumerate(nodes) if near(t) is not None}
+    for i in range(len(nodes)):
+        if i not in best:
+            continue
+        me, to, pr, ds = best[i]
+        cand = []
+        if i + 1 < len(nodes):
+            g = (nodes[i + 1] - nodes[i]) * mm_pt
+            cand.append((i + 1, me + g, to + g, pr, ds))
+        ki = near(nodes[i])
+        if ki is not None:
+            for e in edges:
+                if e[0] == ki and e[1] in idx and idx[e[1]] > i:
+                    cand.append((idx[e[1]], me, to + e[2], pr + e[2], ds + [e[3]]))
+        for j, me2, to2, pr2, ds2 in cand:
+            if j not in best or me2 < best[j][0] - 1e-6:
+                best[j] = (me2, to2, pr2, ds2)
+    me, to, pr, ds = best.get(len(nodes) - 1, ((b - a) * mm_pt, (b - a) * mm_pt, 0.0, []))
+    return to, pr, ds
+
+
+def _side_txt(mm: float, pr: float, ds: list) -> str:
+    """'2350 (2200 printed + 150 measured)' / '1750 (printed)'."""
+    rest = mm - pr
+    if not ds:
+        return f"{mm:.0f} (measured)"
+    if rest < 1:
+        return f"{mm:.0f} (printed)" if len(ds) == 1 else f"{mm:.0f} ({' + '.join(f'{d[0]}' for d in ds)} printed)"
+    return f"{mm:.0f} ({' + '.join(f'{d[0]}' for d in ds)} printed + {rest:.0f} measured)"
+
+
+def _ocr_chains(pdf: str, page: int, n: float) -> tuple:
+    """Dimension CHAINS read from a picture's OCR'd numbers alone (P1's traced copies: the dimension lines come out
+    broken, their arrow heads lost): a printed number sits in the middle of its own dimension segment, so two
+    neighbours on one line are (v1 + v2) / 2 apart at 1:N (S-100F PNG: 5800 -> 7400 centres 374.1 pt = 6599 mm,
+    7400 -> 6300 6858 mm). Pairs within 3 % (>= 2 pt) on a common line (+- 3 pt) link; each chain of >= 2 numbers
+    becomes dimrect-style tuples (value, 'h'|'v', a, b, line, bbox, value, 'ocr') whose shared ticks sit half-way
+    between the neighbours' implied ends. Orientation from the pair, not the OCR box (rotated text gets flat boxes)."""
+    import pymupdf
+
+    from stoa.evidence import linework as L
+
+    mm_pt = n * L.PT_TO_M_AT_1 * 1000
+    with pymupdf.open(pdf) as d:
+        if page >= len(d):
+            return ()
+        ws = [w for w in d[page].get_text("words") if _NUM.match(w[4]) and 100 <= int(w[4]) <= 60000]
+    pts = [((w[0] + w[2]) / 2, (w[1] + w[3]) / 2, int(w[4]), tuple(w[:4])) for w in ws]
+    out = []
+    for kind, ax in (("h", 0), ("v", 1)):
+        links: dict = {}
+        order = sorted(range(len(pts)), key=lambda i: pts[i][ax])
+        for ii, i in enumerate(order):
+            for j in order[ii + 1:]:
+                gap = pts[j][ax] - pts[i][ax]
+                want = (pts[i][2] + pts[j][2]) / 2 / mm_pt
+                if gap > 1.04 * want + 2:
+                    if gap > 1.04 * 60000 / mm_pt:
+                        break
+                    continue
+                if abs(pts[j][1 - ax] - pts[i][1 - ax]) <= 3.0 and abs(gap - want) <= max(2.0, 0.03 * want):
+                    if i not in links:  # nearest partner along the line only
+                        links[i] = j
+        nxt = {}
+        for i, j in links.items():
+            if j not in nxt.values():
+                nxt[i] = j
+        heads = [i for i in nxt if i not in nxt.values()]
+        for h_ in heads:
+            ch = [h_]
+            while ch[-1] in nxt and len(ch) < 30:
+                ch.append(nxt[ch[-1]])
+            if len(ch) < 2:
+                continue
+            ends = []
+            for a, b in zip(ch, ch[1:]):
+                ea = pts[a][ax] + pts[a][2] / 2 / mm_pt
+                eb = pts[b][ax] - pts[b][2] / 2 / mm_pt
+                ends.append((ea + eb) / 2)
+            ticks = [pts[ch[0]][ax] - pts[ch[0]][2] / 2 / mm_pt] + ends + [pts[ch[-1]][ax] + pts[ch[-1]][2] / 2 / mm_pt]
+            line = sum(pts[i][1 - ax] for i in ch) / len(ch)
+            for k_, i in enumerate(ch):
+                out.append((pts[i][2], kind, ticks[k_], ticks[k_ + 1], line, pts[i][3], pts[i][2], "ocr"))
+    return tuple(out)
+
+
+def _main_ext(pdf: str, page: int, n: float, full, ppt: float, a_m2: float, traced: bool = False) -> dict | None:
+    """The slab from its PRINTED dimension strings (captain 22:40, Ziying S-100F: 'Read the dimensions; do not trace'):
+    (a) MAIN rectangle = a printed run on each axis (a chain 6300 + 7400 + 5800 = 19500 by 5500 + 5500 = 11000) whose
+    rectangle the traced slab fills >= MAIN_COVER (holes and notches by landings / stair symbols are not voids) -- the
+    largest such rectangle; (b) EXTENSIONS = the traced slab outside it (>= 1 m², slivers opened away), each snapped to
+    the nearest printed ticks per side and counted when the slab fills >= EXT_COVER of the snapped rectangle; its sides
+    from printed values where ticks are linked, else measured at 1:N (S-100F stair pocket 1750 x (150 + 2200)).
+    Kept when the total is within -3 / +10 % of the trace. -> {"area_m2", "main_m2", "main", "exts", "dims",
+    "printed_share", "outline"} or None."""
+    import cv2
+    import numpy as np
+
+    from stoa.evidence import dimrect as D
+    from stoa.evidence import linework as L
+
+    try:
+        dl = D.dims(pdf, page, n)
+    except Exception:  # noqa: BLE001
+        return None
+    if traced:  # a picture: its OCR'd chains (the traced dimension lines are broken), lines-found ones kept apart
+        try:
+            dl = tuple(dl) + _ocr_chains(pdf, page, n)
+        except Exception:  # noqa: BLE001
+            pass
+    if not dl:
+        return None
+    ys_, xs_ = np.nonzero(full)
+    if not len(xs_):
+        return None
+    bb = (xs_.min() / ppt, ys_.min() / ppt, (xs_.max() + 1) / ppt, (ys_.max() + 1) / ppt)
+    mm_pt = n * L.PT_TO_M_AT_1 * 1000
+    tol = max(3.0, 150 / mm_pt)
+    TX, EX = _chains(dl, "h", bb[0], bb[2], tol)
+    TY, EY = _chains(dl, "v", bb[1], bb[3], tol)
+    if len(TX) < 2 or len(TY) < 2 or len(TX) > 60 or len(TY) > 60:
+        return None
+    rx = [r for r in _printed_runs(TX, EX) if r[1] - r[0] >= 0.4 * (bb[2] - bb[0])]
+    ry = [r for r in _printed_runs(TY, EY) if r[1] - r[0] >= 0.4 * (bb[3] - bb[1])]
+    if not rx or not ry:
+        return None
+    H, W = full.shape
+
+    def px(v):
+        return int(round(v * ppt))
+
+    def cover(x0, y0, x1, y1):
+        sub = full[max(0, px(y0)):min(H, px(y1)), max(0, px(x0)):min(W, px(x1))]
+        return float(sub.mean()) if sub.size else 0.0
+    trace_px = float(full.sum())
+    bw = max(3.0, 300 / mm_pt)  # each side of the main rectangle lies ON the slab edge: the band inside it is slab
+
+    ins = max(3.0, 100 / mm_pt) if traced else 0.0  # a picture: ticks from OCR'd number centres (+- 3-6 pt) and
+    # thick traced edge lines -- the band starts a little inside
+
+    def edges_ok(x0, y0, x1, y1):
+        x0, y0, x1, y1 = x0 + ins, y0 + ins, x1 - ins, y1 - ins
+        return min(cover(x0, y0, x0 + bw, y1), cover(x1 - bw, y0, x1, y1), cover(x0, y0, x1, y0 + bw),
+                   cover(x0, y1 - bw, x1, y1)) >= MAIN_EDGE
+    best = None
+    for a in rx:
+        for b in ry:
+            area = a[2] * b[2] / 1e6
+            if best is not None and area <= best[0]:
+                continue
+            rect_px = (px(a[1]) - px(a[0])) * (px(b[1]) - px(b[0]))
+            if rect_px < 0.6 * trace_px or cover(a[0], b[0], a[1], b[1]) < MAIN_COVER or \
+                    not edges_ok(a[0], b[0], a[1], b[1]):
+                continue
+            best = (area, a, b)
+    if best is None:
+        return None
+    main_m2, ra, rb = best
+    mx0, mx1, my0, my1 = ra[0], ra[1], rb[0], rb[1]
+    rem = full.copy()
+    sb = max(2, int(round(100 / mm_pt * ppt)))  # slivers along the main edges (half a slab-edge line) go; a part's
+    # thin arms round a notch stay (S-100F pocket: 150 / 300 mm strips either side of a stair cut-out)
+    rem[max(0, px(my0) - sb):px(my1) + sb, max(0, px(mx0) - sb):px(mx1) + sb] = 0
+    rem = cv2.morphologyEx(rem, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
+    nlab, lab, stats, _c = cv2.connectedComponentsWithStats(rem, connectivity=4)
+    m2_px = (mm_pt / ppt / 1000) ** 2
+    ticks_x = sorted(set(TX) | {mx0, mx1})
+    ticks_y = sorted(set(TY) | {my0, my1})
+    # every tick of the sheet on the axis may bound an extension (its own chains sit outside the main extent)
+    allx = sorted({t for d in dl if d[1] == "h" for t in (d[2], d[3])} | set(ticks_x))
+    ally = sorted({t for d in dl if d[1] == "v" for t in (d[2], d[3])} | set(ticks_y))
+
+    def snap(v, ticks):
+        t = min(ticks, key=lambda t_: abs(t_ - v)) if ticks else v
+        return (t, True) if abs(t - v) <= tol else (v, False)
+    exts, used = [], list(ra[3]) + list(rb[3])
+    nums = []
+    if traced:
+        import pymupdf
+
+        with pymupdf.open(pdf) as d_:
+            nums = [(int(w[4]), (w[0] + w[2]) / 2, (w[1] + w[3]) / 2, tuple(w[:4])) for w in d_[page].get_text("words")
+                    if _NUM.match(w[4])]
+    for i in range(1, nlab):
+        if stats[i, cv2.CC_STAT_AREA] * m2_px < 1.0:
+            continue
+        x, y, w, h = (int(v) for v in stats[i, :4])
+        x0, y0, x1, y1 = x / ppt, y / ppt, (x + w) / ppt, (y + h) / ppt
+        (sx0, kx0), (sx1, kx1) = snap(x0, allx), snap(x1, allx)
+        (sy0, ky0), (sy1, ky1) = snap(y0, ally), snap(y1, ally)
+        # clip to the main rectangle's edges where the part adjoins it
+        if mx0 - tol <= sx0 and sx1 <= mx1 + tol:
+            sx0, sx1 = max(sx0, mx0), min(sx1, mx1)
+        if my0 - tol <= sy0 and sy1 <= my1 + tol:
+            sy0, sy1 = max(sy0, my0), min(sy1, my1)
+        if sx1 - sx0 <= 1 or sy1 - sy0 <= 1 or cover(sx0, sy0, sx1, sy1) < EXT_COVER:
+            continue
+        inside_x = mx0 - 0.5 <= sx0 and sx1 <= mx1 + 0.5
+        inside_y = my0 - 0.5 <= sy0 and sy1 <= my1 + 0.5
+        if inside_x and inside_y:
+            continue
+        TXe, EXe = _chains(dl, "h", sx0, sx1, 1.0)
+        TYe, EYe = _chains(dl, "v", sy0, sy1, 1.0)
+        wmm, wpr, wds = _side_mm(TXe, EXe, sx0, sx1, mm_pt, tol)
+        hmm, hpr, hds = _side_mm(TYe, EYe, sy0, sy1, mm_pt, tol)
+        if traced:  # OCR'd ticks are noisy: a side that equals a printed number near the part (2 %) is that number
+            for side in (0, 1):
+                mm_ = (sx1 - sx0 if side == 0 else sy1 - sy0) * mm_pt
+                pad = max(sx1 - sx0, sy1 - sy0)
+                hit = [d for d in nums if abs(d[0] - mm_) <= 0.02 * mm_ and sx0 - pad <= d[1] <= sx1 + pad and
+                       sy0 - pad <= d[2] <= sy1 + pad]
+                if hit:
+                    h_ = min(hit, key=lambda d: abs(d[0] - mm_))
+                    pd = (h_[0], "h" if side == 0 else "v", 0.0, 0.0, 0.0, h_[3], h_[0], "ocr")
+                    if side == 0:
+                        wmm, wpr, wds = float(h_[0]), float(h_[0]), [pd]
+                    else:
+                        hmm, hpr, hds = float(h_[0]), float(h_[0]), [pd]
+        a_ = wmm * hmm / 1e6
+        if wpr * hpr < EXT_PRINTED * wmm * hmm:
+            return None  # a part the printed strings do not dimension (a leak of the trace, X1's scanned S-100F D13:
+            # 300 printed of 3316 x 1356) -- the main rectangle alone would not be the slab either: no answer here
+        exts.append({"rect": (sx0, sy0, sx1, sy1), "w_mm": round(wmm), "h_mm": round(hmm), "area_m2": a_,
+                     "sides": (_side_txt(wmm, wpr, wds), _side_txt(hmm, hpr, hds)),
+                     "printed": (wpr * hpr) / (wmm * hmm) if wmm and hmm else 0.0, "snapped": (kx0, ky0, kx1, ky1),
+                     "dims": wds + hds})
+        used += wds + hds
+    area = main_m2 + sum(e["area_m2"] for e in exts)
+    if __import__("os").environ.get("E1_DEBUG_GRID"):
+        print("MAINEXT main", round(main_m2, 3), [round(v, 1) for v in (mx0, my0, mx1, my1)], "exts",
+              [(e["w_mm"], e["h_mm"], round(e["area_m2"], 3), [round(v, 1) for v in e["rect"]]) for e in exts],
+              "area", round(area, 3), "trace", a_m2)
+    if not 0.97 * a_m2 <= area <= 1.10 * a_m2:
+        return None
+    share = (main_m2 + sum(e["area_m2"] * e["printed"] for e in exts)) / area
+    try:
+        from shapely.geometry import box
+        from shapely.ops import unary_union
+
+        u = unary_union([box(mx0, my0, mx1, my1)] + [box(*e["rect"]) for e in exts]).buffer(0.01).buffer(-0.01)
+        outline = [[round(float(x_), 1), round(float(y_), 1)] for x_, y_ in
+                   (u.exterior.coords if u.geom_type == "Polygon" else max(u.geoms, key=lambda g: g.area).exterior.coords)][:-1]
+    except Exception:  # noqa: BLE001
+        outline = [[mx0, my0], [mx1, my0], [mx1, my1], [mx0, my1]]
+    return {"area_m2": round(area, 2), "main_m2": round(main_m2, 2), "main": (ra[2], rb[2], (mx0, my0, mx1, my1)),
+            "exts": exts, "dims": used, "printed_share": round(share, 3), "outline": outline, "traced": traced}
+
+
+def _main_ext_answer(path: str, page: int, n: float, c, g: dict, q: str, a_m2: float) -> Answer:
+    name = c[0][:60]
+    wm, hm, mr = g["main"]
+    exts = g["exts"]
+    excl = bool(exts) and bool(_POCKET_Q.search(q))
+    val = g["main_m2"] if excl else g["area_m2"]
+    parts = " + ".join(f"{e['w_mm']} x {e['h_mm']} mm" for e in exts)
+    ev = [Evidence(file=path, page=page, bbox=[min(p[0] for p in g["outline"]), min(p[1] for p in g["outline"]),
+                                               max(p[0] for p in g["outline"]), max(p[1] for p in g["outline"])],
+                   bbox_space="pdf_pt", exact=False, polygon=g["outline"],
+                   note=f"{name}: {val} m² from its printed dimensions ({wm:g} x {hm:g} mm" +
+                        (f" + {parts}" if exts and not excl else "") + f"; traced outline {round(a_m2, 2)} m²)"),
+          Evidence(file=path, page=page, bbox=[round(v, 1) for v in mr], bbox_space="pdf_pt", exact=False,
+                   polygon=[[round(mr[0], 1), round(mr[1], 1)], [round(mr[2], 1), round(mr[1], 1)],
+                            [round(mr[2], 1), round(mr[3], 1)], [round(mr[0], 1), round(mr[3], 1)]],
+                   note=f"main rectangle {wm:g} x {hm:g} mm = {g['main_m2']} m²")]
+    for e in ([] if excl else exts):
+        r = e["rect"]
+        ev.append(Evidence(file=path, page=page, bbox=[round(v, 1) for v in r], bbox_space="pdf_pt", exact=False,
+                           polygon=[[round(r[0], 1), round(r[1], 1)], [round(r[2], 1), round(r[1], 1)],
+                                    [round(r[2], 1), round(r[3], 1)], [round(r[0], 1), round(r[3], 1)]],
+                           note=f"part beyond the main rectangle {e['sides'][0]} x {e['sides'][1]} mm = "
+                                f"{e['area_m2']:.2f} m²"))
+    ev.append(Evidence(file=path, page=page, bbox=[round(v, 1) for v in c[4]], bbox_space="pdf_pt", exact=True,
+                       note=f"slab callout: {name}"))
+    seen = set()
+    for d in g["dims"]:
+        if id(d) in seen:
+            continue
+        seen.add(id(d))
+        ocr = len(d) > 7 and d[7] == "ocr"
+        ev.append(Evidence(file=path, page=page, bbox=[round(t, 1) for t in d[5]], bbox_space="pdf_pt", exact=not ocr,
+                           note=f"dimension {d[0]} mm (printed; OCR'd from the picture, placed by its chain's spacing at "
+                                f"1:{n:g})" if ocr else f"dimension {d[0]} mm (printed; measures {d[6]} mm at 1:{n:g})"))
+    assumptions = [f"slab type = the printed callout '{name}'",
+                   f"area from the PRINTED dimension strings: main rectangle {wm:g} x {hm:g} mm = {g['main_m2']} m²" +
+                   (f" + the part(s) beyond it {parts} = {sum(e['area_m2'] for e in exts):.2f} m² (sides snapped to "
+                    f"the printed dimension ticks: " + "; ".join(f"{e['sides'][0]} x {e['sides'][1]} mm" for e in exts) +
+                    (f"; {g['printed_share']:.1%} of the area from printed numbers, the rest measured at 1:{n:g})"
+                     if g["printed_share"] < 0.9995 else ")") if exts else "") +
+                   "; landings, stair symbols and trenches inside the outline are not cut out (not drawn as voids)"]
+    if exts and not excl:
+        assumptions.append(f"without the {parts} part(s) beyond the main rectangle (e.g. a stair pocket round a corner) "
+                           f"it is {g['main_m2']} m²")
+    elif excl:
+        assumptions.append(f"the {parts} part(s) beyond the main rectangle left out as asked; with them "
+                           f"{g['area_m2']} m²")
+    conf = (0.6 if g["printed_share"] >= 0.9 else 0.5) - (0.1 if g.get("traced") else 0.0)
+    if g.get("traced"):
+        assumptions.append("a picture traced into lines: the dimension numbers are OCR'd; each chain is accepted only "
+                           "when its numbers' spacing matches their values at the printed scale")
+    return Answer(value=val, unit="m2", confidence=conf, evidence=ev, solver=SOLVER, assumptions=assumptions,
+                  missing=[], trace=[f"slab_area: '{name[:50]}' from its printed dimensions: main {wm:g} x {hm:g} mm = "
+                                     f"{g['main_m2']} m²" + (f" + {parts}" if exts else "") +
+                                     f" = {g['area_m2']} m² (traced {round(a_m2, 2)} m²)"])
+
+
 _ITEM_Q = re.compile(r"\b(foundations?|footings?|pads?|plinths?|pits?|sumps?|platforms?|pedestals?|"
                      r"fundament\w*|perustu\w*)\b", re.I)
 _Q_STOP = {"how", "big", "large", "is", "are", "the", "a", "an", "in", "on", "of", "plan", "what", "area", "size",
            "its", "this", "sheet", "drawing", "square", "metres", "meters", "feet", "m2", "sf", "total", "floor", "much",
-           "does", "take", "up", "cover", "footprint"}
+           "does", "take", "up", "cover", "footprint", "what's", "whats", "kuinka", "suuri", "pinta", "ala", "mikä",
+           "wie", "groß", "gross", "ist", "der", "die", "das", "hur", "stor", "är", "och", "the"}
+
+
+_ITEM_SYN_RE = re.compile(r"\bgenerator\s+sets?\b|\bgenerators?\b|\bgeneraattori\w*|\bgenerator\w*|"
+                          r"\bperustu\w*|\bfundament\w*|\bpads?\b", re.I)
+
+
+def _item_syn(w: str) -> str:
+    """'generator set' / 'generaattorin' -> 'genset' (the printed GENSET FOUNDATION, G1 22:21); 'perustuksen' /
+    'Fundament' -> 'foundation'."""
+    w = w.lower()
+    return "foundation" if w.startswith(("perustu", "fundament", "pad")) else "genset"
 
 
 def _label_dims(path: str, pdf: str, page: int, q: str) -> Answer | None:
@@ -622,13 +1175,16 @@ def _label_dims(path: str, pdf: str, page: int, q: str) -> Answer | None:
 
     from stoa.evidence import linework as L
 
-    qw = [w for w in re.findall(r"[a-zà-ÿ0-9]+", q.lower()) if w not in _Q_STOP and len(w) >= 3]
+    ql = _ITEM_SYN_RE.sub(lambda m_: _item_syn(m_.group(0)), q.lower())
+    qw = list(dict.fromkeys(w for w in re.findall(r"[a-zà-ÿ0-9]+", ql) if w not in _Q_STOP and len(w) >= 3))
     if not qw:
         return None
     with pymupdf.open(pdf) as d:
         if page >= len(d):
             return None
-        blocks = [b for b in d[page].get_text("blocks") if b[6] == 0]
+        # a traced picture's OCR lines come as page-wide blocks: stack them into labels as for slab callouts
+        blocks = list(text_blocks(d[page])) if ocr_layer(d[page]) else \
+            [b for b in d[page].get_text("blocks") if b[6] == 0]
     hits = []
     for b in blocks:
         bw = set(re.findall(r"[a-zà-ÿ0-9]+", str(b[4]).lower()))
@@ -642,7 +1198,18 @@ def _label_dims(path: str, pdf: str, page: int, q: str) -> Answer | None:
     n = scales[0]
     b = hits[0]
     c = (" ".join(str(b[4]).split()), None, (), (), tuple(b[:4]))
-    a = _leader_dims(path, pdf, page, n, c)
+    tctx = None
+    if _traced(pdf, page):  # a picture traced into lines: follow the leader in the ink (as for a slab callout)
+        import cv2
+
+        mk = _mask(pdf, page, n)
+        if mk is None:
+            return None
+        m, ppt = mk[0], mk[1]
+        g = int(round(DASH_GAP_PT * ppt))
+        mf = cv2.dilate(m, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * g + 1, 2 * g + 1))) if g else m
+        tctx = (mf, m, callouts(pdf, page))
+    a = _leader_dims(path, pdf, page, n, c, tctx)
     if a is None:
         return None
     name = c[0][:60]
@@ -676,6 +1243,22 @@ def _extent_answer(path: str, page: int, q: str, c, ex) -> Answer:
 _TOTAL_Q = re.compile(r"\b(total|all|overall|whole|entire|combined|sum|gesamt\w*|insgesamt|yhteensä)\b", re.I)
 
 
+_ALT_RE = re.compile(r"^without the .* beyond the main rectangle .* it is ([\d.]+) m²")
+
+
+def _short(c) -> str:
+    """'300 SLAB-ON-GRADE W/ D16 @ 300' from '300 SLAB-ON-GRADE W/ D16 @ 300 TOP FACE. BOTTOM' (<= 40 chars, cut at a
+    word; a hyphen broken over two lines joined)."""
+    t = re.sub(r"-\s+", "-", c[0].split(". ")[0])
+    m = re.match(r".*?\b[#D]\s?\d{1,2}\b(?:\s*@\s*\d+)?", t)  # up to the bar mark and its spacing
+    if m:
+        t = m.group(0)
+    if len(t) <= 40:
+        return t
+    m = re.match(r".{0,40}(?=\s)", t)
+    return (m.group(0) if m else t[:40]).rstrip(" ,;:/")
+
+
 def _total_answer(path: str, pdf: str, page: int, cs: tuple) -> Answer | None:
     """'What is the total slab area?' (Ziying's s100f-04): every slab TYPE on the sheet (a thickness + bars callout)
     measured on its own (traced / printed dimensions / leader), summed; abstains when any type cannot be measured."""
@@ -689,12 +1272,22 @@ def _total_answer(path: str, pdf: str, page: int, cs: tuple) -> Answer | None:
             return None
         parts.append((c, a))
     total = round(sum(a.value for _, a in parts), 2)
-    terms = " + ".join(f"{a.value:g} ({c[0][:28]})" for c, a in parts)
+    terms = " + ".join(f"{a.value:g} ({_short(c)})" for c, a in parts)
     ev = [e for _, a in parts for e in a.evidence]
-    conf = round(min(0.45, min(a.confidence for _, a in parts)), 3)
+    conf = round(min(0.55, min(a.confidence for _, a in parts)), 3)  # each part's own calibration; a sum risks more
+    alts = []  # a part with a stated 'without the … part(s) beyond the main rectangle … it is X m²' (S-100F pocket)
+    for c, a in parts:
+        for t in a.assumptions:
+            m_ = _ALT_RE.search(t)
+            if m_:
+                alts.append((c, a.value - float(m_.group(1))))
+    alt = [f"without the part(s) beyond each main rectangle ({', '.join(f'{d:.2f} m² of {_short(c)}' for c, d in alts)}) "
+           f"the total is {round(total - sum(d for _, d in alts), 2)} m²"] if alts else []
     return Answer(value=total, unit="m2", confidence=conf, evidence=ev, solver=SOLVER,
                   assumptions=[f"total slab area = the sum of the {len(parts)} slab types printed on the sheet: {terms} "
                                f"= {total} m²",
+                               "by type: " + "; ".join(f"{_short(c)}: {a.value:g} m²" for c, a in parts),
+                               *alt,
                                "each slab measured to its edge (printed dimensions where they span it, else traced at "
                                "the printed scale); openings deducted only where drawn as voids"],
                   missing=[m for _, a in parts for m in a.missing][:2],
@@ -805,6 +1398,14 @@ def _ray(ink, p, ang: float, gap: int = 3) -> float:
 
 
 def _traced_leader(pdf: str, page: int, box_pt) -> tuple | None:
+    """_traced_leader_once; when it finds nothing, once more for a 2-line label with a short tail and a DOTTED leader
+    (S-100F PNG 'GENSET FOUNDATION / SEE A1/S-513': ~20 pt tail, dash-dot diagonal into the genset): half the row
+    height and 7 px gaps along the runs."""
+    got = _traced_leader_once(pdf, page, box_pt)
+    return got if got is not None else _traced_leader_once(pdf, page, box_pt, row_k=0.5, gap=7)
+
+
+def _traced_leader_once(pdf: str, page: int, box_pt, row_k: float = 1.0, gap: int = 3) -> tuple | None:
     """Tip (px, unit direction) of a leader drawn from a callout on a traced copy (no vector leader: the leader is ink
     outlines merged with every wall it crosses). From the ink nearest the callout's side, follow straight runs (<= 3,
     each >= 2 text heights, turning >= 20 deg) and return the end of the last one. S-100F PNG D22 callout -> the
@@ -816,7 +1417,7 @@ def _traced_leader(pdf: str, page: int, box_pt) -> tuple | None:
         return None
     ink, ppt = got
     x0, y0, x1, y1 = (v * ppt for v in box_pt)
-    hh = max(4.0, min(y1 - y0, 12 * ppt))  # one text row is at most the block's height
+    hh = max(4.0, min(y1 - y0, 12 * ppt) * row_k)  # one text row is at most the block's height
     H, W = ink.shape
     best = None
     for side in ("r", "l"):
@@ -832,8 +1433,10 @@ def _traced_leader(pdf: str, page: int, box_pt) -> tuple | None:
         i = int(np.argmin(d))
         p0 = (float(xs[i] + xa), float(ys[i] + ya))
         a0 = 0.0 if side == "r" else math.pi
-        cand = [(_ray(ink, p0, a0 + math.radians(k)), a0 + math.radians(k)) for k in range(-80, 81, 5)]
+        cand = [(_ray(ink, p0, a0 + math.radians(k), gap), a0 + math.radians(k)) for k in range(-80, 81, 5)]
         L0, ang = max(cand)
+        if row_k != 1.0:  # thin long leaders: 5 deg drifts off them
+            L0, ang = max((_ray(ink, p0, ang + math.radians(k / 2), gap), ang + math.radians(k / 2)) for k in range(-9, 10))
         if L0 >= 2 * hh and (best is None or L0 > best[0]):
             best = (L0, p0, ang)
     if best is None:
@@ -843,18 +1446,22 @@ def _traced_leader(pdf: str, page: int, box_pt) -> tuple | None:
     for _ in range(3):
         q = (p[0] + L0 * math.cos(ang), p[1] + L0 * math.sin(ang))
         pts.append(q)
+        if row_k != 1.0 and len(pts) >= 3:
+            break  # tail + one diagonal: past the arrow the ray would run on along a dimension line
         nxt = []
         for k in range(0, 360, 5):
             a2 = math.radians(k)
             dd = abs((a2 - ang + math.pi) % (2 * math.pi) - math.pi)
             if dd < math.radians(20) or dd > math.radians(160):
                 continue  # straight on / back the way it came
-            Ln = _ray(ink, q, a2)
+            Ln = _ray(ink, q, a2, gap)
             if Ln >= 2 * hh:
                 nxt.append((Ln, a2))
         if len(nxt) != 1 and not (nxt and max(nxt)[0] >= 2.5 * sorted(nxt)[-2][0]):
             break  # a clean bend continues one way only (a wall crossing would offer two)
         L0, ang = max(nxt)
+        if row_k != 1.0:
+            L0, ang = max((_ray(ink, q, ang + math.radians(k / 2), gap), ang + math.radians(k / 2)) for k in range(-9, 10))
         p = q
     if len(pts) < 3:
         return None  # a straight tail ending in open space is not a leader we can trust
@@ -910,11 +1517,101 @@ def _traced_leader_answer(path: str, pdf: str, page: int, n: float, c, mf, m, cs
     bx, by = (max(xsd) - min(xsd)) * n * L.PT_TO_M_AT_1, (max(ysd) - min(ysd)) * n * L.PT_TO_M_AT_1
     r = _ocr_sides(pdf, page, n, (min(xsd), min(ysd), max(xsd), max(ysd)), bx, by, a_m2)
     if r is None:
+        r = _traced_rect_at(pdf, page, n, (tx / ppt, ty / ppt), (min(xsd), min(ysd), max(xsd), max(ysd)))
+        if r is not None:
+            return _dims_answer(path, page, n, c, r, f"the callout's leader (followed in the traced ink) ends at "
+                                                     f"({tx / ppt:.0f}, {ty / ppt:.0f}) pt inside the rectangle these "
+                                                     f"printed numbers (OCR'd) dimension; its 4 edges are drawn and "
+                                                     f"measure them at 1:{n:g} within 3 %", poly)
         return None
     return _dims_answer(path, page, n, c, r, f"the callout's leader (followed in the traced ink) ends at "
                                              f"({tx / ppt:.0f}, {ty / ppt:.0f}) pt; the slab traced there "
                                              f"({a_m2:.2f} m², extent {bx:.2f} x {by:.2f} m) has sides equal to these "
                                              f"printed numbers (OCR'd) within 1.5 %", poly)
+
+
+def _traced_rect_at(pdf: str, page: int, n: float, tip: tuple, reg_bb: tuple) -> dict | None:
+    """dimrect.rect_at for a picture traced into lines (S-100F PNG genset, 'D22' callout with a leader): the printed
+    numbers are OCR'd and the dimension lines broken, so each number is placed by its chain (_ocr_chains) or, alone,
+    as a span centred on it; a horizontal and a vertical one whose spans hold the leader tip span a rectangle, kept
+    when the flooded piece at the tip lies inside it, each side slid <= 5 pt onto its traced ink line is >= 60 % inked,
+    and the slid sides measure the printed values within 3 % at 1:N. Same dict as rect_spanning (+ 'ocr')."""
+    import numpy as np
+    import pymupdf
+
+    from stoa.evidence import dimrect as D
+    from stoa.evidence import linework as L
+
+    mm_pt = n * L.PT_TO_M_AT_1 * 1000
+    d_ = L.ink_dist(pdf, page)
+    pg = L._page(pdf, page)
+    if d_ is None or pg is None:
+        return None
+    ppt = pg["ppt"]
+    H, W = d_.shape
+    dl = [(*d, "dim") for d in D.dims(pdf, page, n)] + list(_ocr_chains(pdf, page, n))
+    with pymupdf.open(pdf) as doc:
+        ws = [w for w in doc[page].get_text("words") if _NUM.match(w[4]) and 200 <= int(w[4]) <= 30000]
+    for w in ws:
+        v = int(w[4])
+        cx, cy, hl = (w[0] + w[2]) / 2, (w[1] + w[3]) / 2, v / 2 / mm_pt
+        dl.append((v, "h", cx - hl, cx + hl, cy, tuple(w[:4]), v, "ocr1"))
+        dl.append((v, "v", cy - hl, cy + hl, cx, tuple(w[:4]), v, "ocr1"))
+    x, y = tip
+    def near(kind, u, w_):  # every chain-placed span holding the tip + the 8 nearest single numbers
+        c_ = [d for d in dl if d[1] == kind and d[2] - 1 <= u <= d[3] + 1]
+        return sorted([d for d in c_ if d[7] != "ocr1"], key=lambda d: abs(d[4] - w_))[:16] + \
+            sorted([d for d in c_ if d[7] == "ocr1"], key=lambda d: abs(d[4] - w_))[:20]
+    hh, vv = near("h", x, y), near("v", y, x)
+
+    def share(ax, ay, bx, by):
+        on, k = 0, 60
+        for i in range(k):
+            t = (i + 0.5) / k
+            xi, yi = int(round((ax + (bx - ax) * t) * ppt)), int(round((ay + (by - ay) * t) * ppt))
+            if 0 <= xi < W and 0 <= yi < H and d_[yi, xi] <= 2.5:
+                on += 1
+        return on / k
+
+    def slide(rect):
+        x0, y0, x1, y1 = rect
+        offs = np.arange(-5.0, 5.01, 0.5)
+        bx0 = max(offs, key=lambda o: share(x0 + o, y0, x0 + o, y1))
+        bx1 = max(offs, key=lambda o: share(x1 + o, y0, x1 + o, y1))
+        by0 = max(offs, key=lambda o: share(x0, y0 + o, x1, y0 + o))
+        by1 = max(offs, key=lambda o: share(x0, y1 + o, x1, y1 + o))
+        r = (x0 + bx0, y0 + by0, x1 + bx1, y1 + by1)
+        ink = (share(r[0], r[1], r[2], r[1]), share(r[2], r[1], r[2], r[3]), share(r[0], r[3], r[2], r[3]),
+               share(r[0], r[1], r[0], r[3]))
+        return r, ink
+    tol = max(3.0, 150 / mm_pt)
+    best = None
+    for h in hh:
+        for v in vv:
+            rect = (h[2], v[2], h[3], v[3])
+            if not (rect[0] - tol <= reg_bb[0] and rect[1] - tol <= reg_bb[1] and reg_bb[2] <= rect[2] + tol and
+                    reg_bb[3] <= rect[3] + tol):
+                continue
+            r, ink = slide(rect)
+            wm, hm = (r[2] - r[0]) * mm_pt, (r[3] - r[1]) * mm_pt
+            if min(ink) < 0.6 or abs(wm - h[0]) > 0.03 * h[0] or abs(hm - v[0]) > 0.03 * v[0]:
+                continue
+            # rank: the cleanest drawn edges (6200 x 4272 genset 0.98; a grid chain's 6000 slid onto a weak line 0.62;
+            # 7200 = 6200 + 2 x 500 foundation band 0.7), then the closest measure (6200 measures 6200), then sides
+            # shared with the flooded piece (a pad drawn inside the slab shares none), then chain-placed numbers
+            co = sum(abs(a_ - b_) <= 3.0 for a_, b_ in zip(r, reg_bb))
+            err = max(abs(wm - h[0]) / h[0], abs(hm - v[0]) / v[0])
+            key = (round(min(ink), 1), -round(err * 200), co, -((h[7] == "ocr1") + (v[7] == "ocr1")))
+            if __import__("os").environ.get("E1_DEBUG_GRID"):
+                print("TRECT", h[0], h[7], v[0], v[7], [round(t, 1) for t in r], [round(t, 2) for t in ink], round(wm), round(hm), key)
+            if best is None or key > best[0]:
+                best = (key, r, ink, (h[0], "h", r[0], r[2], h[4], h[5], round(wm)), (v[0], "v", r[1], r[3], v[4], v[5],
+                                                                                      round(hm)))
+    if best is None:
+        return None
+    _k, r, ink, hd, vd = best
+    return {"w_mm": hd[0], "h_mm": vd[0], "area_m2": round(hd[0] * vd[0] / 1e6, 3), "rect": r, "dims": (hd, vd),
+            "ink": tuple(round(v, 2) for v in ink), "ocr": True}
 
 
 def _leader_dims(path: str, pdf: str, page: int, n: float, c, traced_ctx=None) -> Answer | None:
@@ -980,8 +1677,22 @@ def prefer_slab_area(path: str, question: str, ans: Answer) -> Answer:
     except Exception:  # noqa: BLE001
         v_ok = False
     if v_ok and not callout_q:
-        return ans
-    b = answer(path, question)
+        if not (SLAB_WORDING and _SLAB_Q.search(question) and _AREA_Q.search(question)):
+            return ans
+        # H 23:51 (g): pdf_text '750 m²' (the three thickness labels summed) @0.55 kept although the slabs reader
+        # measures 306.79 from printed dimensions -- a dimension-confirmed slab reading (>= 0.5) replaces a different
+        # m² value
+        b = answer(path, question)
+        try:
+            def _m2(x):
+                return float(x.value) * (FT2_M2 if str(x.unit or "").lower() in ("ft2", "sf", "ft²") else 1.0)
+            same = b is not None and abs(_m2(b) - _m2(ans)) <= 0.02 * abs(_m2(b))
+        except (TypeError, ValueError):
+            same = False
+        if b is None or b.confidence < 0.5 or same or b.confidence < (ans.confidence or 0) - 0.15:
+            return ans
+    else:
+        b = answer(path, question)
     if b is None:
         return ans
     b.solver = f"pipeline/{SOLVER}" if str(ans.solver or "").startswith("pipeline/") else SOLVER

@@ -260,3 +260,24 @@ def test_count_wordings_reach_label_count():
               "Tell me how many filter separators there are.", "What is the total number of filter separators?"):
         assert as_how_many(q) == "How many filter separators?", q
     assert as_how_many("What is the number of the room with the stair?") == "What is the number of the room with the stair?"
+
+
+def test_a_line_of_a_longer_stacked_label_is_not_a_room_of_its_own(tmp_path, monkeypatch):
+    """D1 c8 (DfE 2026 Secondary L00: 'Store' 15 vs 11): 'Sports Equipment' over 'Store' is ONE room, not a Store; a room
+    number under 'Store' does not make it a longer label."""
+    import pymupdf
+
+    from stoa.solvers import label_count as LC
+
+    f = str(tmp_path / "plan.pdf")
+    doc = pymupdf.open()
+    pg = doc.new_page(width=842, height=595)
+    for x, y, t in [(100, 100, "Store"), (300, 100, "Store"), (500, 100, "Sports Equipment"), (507, 105, "Store"),
+                    (100, 300, "Store"), (103, 305, "1.05"), (300, 300, "Classroom")]:
+        pg.insert_text((x, y), t, fontsize=4.4)
+    doc.save(f)
+    q = "How many rooms labelled 'Store' are there on this plan?"
+    monkeypatch.setattr(LC, "STACK_FRAG", True)
+    assert LC.LabelCount().solve(f, q).value == 3
+    monkeypatch.setattr(LC, "STACK_FRAG", False)
+    assert LC.LabelCount().solve(f, q).value == 4

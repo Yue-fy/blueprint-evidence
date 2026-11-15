@@ -233,7 +233,7 @@ def summarize(preds: list[dict]) -> dict:
         out["cost_mean"]["gpu_seconds_billed"] = round(statistics.fmean(gpu_seconds_billed(r["cost"]) for r in preds), 6)
         out["usd_per_1k_q"] = round(1000 * out["cost_mean"]["usd"], 4)
         # P1: local GPU and hosted API priced side by side (stoa/cost.py), plus the prices used
-        for k in ("gpu_usd", "api_usd", "cpu_usd"):
+        for k in ("gpu_usd", "api_usd", "cpu_usd", "prep_usd", "question_usd"):  # prep = one-time file readings
             out["cost_mean"][k] = round(statistics.fmean(_cost.breakdown(r["cost"])[k] for r in preds), 7)
             out[f"{k}_per_1k_q"] = round(1000 * out["cost_mean"][k], 4)
         out["rates"] = _cost.rates()
@@ -302,9 +302,11 @@ def print_report(m: dict, file=sys.stdout) -> None:
     if "gpu_usd_per_1k_q" in m:
         r = m.get("rates") or {}
         print(f"cost per 1k: GPU ${m['gpu_usd_per_1k_q']:.3f} (at ${r.get('gpu_usd_per_hour', 0):.2f}/h)  "
-              f"API ${m['api_usd_per_1k_q']:.3f}  CPU ${m['cpu_usd_per_1k_q']:.3f}  (stoa/cost.py)", file=file)
+              f"API ${m['api_usd_per_1k_q']:.3f}  CPU ${m['cpu_usd_per_1k_q']:.3f}  (stoa/cost.py)"
+              + (f"; of which one-time file readings ${m['prep_usd_per_1k_q']:.3f} (text layers, shared by every question"
+                 " on a file)" if m.get("prep_usd_per_1k_q") else ""), file=file)
     if m.get("cost_tier3"):
-        print("cost tiers: " + "  ".join(f"{t} {100 * v['share']:.0f}% (acc {pct(v['accuracy']).strip()})"
+        print("cost tiers (each question's own work): " + "  ".join(f"{t} {100 * v['share']:.0f}% (acc {pct(v['accuracy']).strip()})"
                                          for t, v in m["cost_tier3"].items()), file=file)
     cal = m.get("calibration")
     if cal:
@@ -330,7 +332,7 @@ def _hide_gemini(n: int) -> None:
     for k in GEMINI_ENV:
         if os.environ.pop(k, None) is not None:
             print(f"[eval] {k} hidden from solvers for this run ({n} questions > {GEMINI_BULK_CAP}: no bulk Gemini, "
-                  f"COMMON.md); pass --allow-gemini to keep it", file=sys.stderr)
+                  f"a rule of our hackathon key); pass --allow-gemini to keep it", file=sys.stderr)
 
 
 def main(argv: list[str] | None = None) -> int:

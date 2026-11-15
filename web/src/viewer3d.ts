@@ -11,8 +11,9 @@ import { OrbitControls } from "three/examples/jsm/controls/OrbitControls.js";
 import { mergeGeometries } from "three/examples/jsm/utils/BufferGeometryUtils.js";
 import * as WebIFC from "web-ifc";
 import wasmUrl from "web-ifc/web-ifc.wasm?url";
-import { CLAY, CLAY_GLASS, Look3D, LookPanel, MAX_DPR, ROLE, ROOM_HEX, ROOM_TYPES, areaColor, clayify, getLook, onLook, rimGlow,
-  roomType, type RoomType } from "./look3d";
+import { floorName } from "./floornames";
+import { CLAY, CLAY_GLASS, Look3D, LookPanel, MAX_DPR, ROLE, ROOM_HEX, ROOM_TYPES, areaColor, clayify, getLook, onLook, rimGlow, roomTypeOne, setLook,
+  keyLight, roomType, spotColor, type RoomType } from "./look3d";
 
 export interface Storey {
   id: number;
@@ -35,6 +36,8 @@ interface Bucket {
   /** IfcCovering (ceilings): hidden while one storey is shown, else a ceiling hides the floor's rooms (the calm look's
    * walls are opaque; the old see-through ghost let you look through it) */
   ceiling?: boolean;
+  /** thin profiles (beams, members, railings): kept out of the AO, whose deep I-beam channels read as black bars (W7) */
+  thin?: boolean;
   pos: number[];
   nrm: number[];
   col: number[];
@@ -61,6 +64,20 @@ const ROLE_HEX: [number[], string][] = [
 const ROLE_WALL = "#eeebe5";
 /** thin edges: a soft warm grey, a touch of the model's own definition while orbiting (the AO comes on still frames) */
 const EDGE_HEX = "#9a978f";
+/** Section caps (W7 c3): the flat top of a solid where a floor is cut, a plan's poché: the element's role colour a step
+ * darker (walls #eeebe5 → ~#b3ada3 warm grey, door leaves dark wood); one flat colour while an answer is lit / in Clay */
+const CAP_HEX = "#b3ada3", CAP_FADED_HEX = "#dcd8d1", CAP_CLAY_HEX = "#cdc8bf";
+/** exploded floors above the lowest are also cut this far BELOW their floor (W7 c4): a ramp or foundation that hangs a
+ * storey down (TU Wien EG, 3.2 m) cluttered the gap between floors; = the AO band's base, so slab bottoms stay */
+const LOW_CUT = 0.8;
+/** A clip plane that cuts nothing (keeps y <= 1e6): fills the unused clip slots, see Viewer3D.oneCut. */
+const NO_CUT = new THREE.Plane(new THREE.Vector3(0, -1, 0), 1e6);
+const NO_CUTS: THREE.Plane[] = [NO_CUT, NO_CUT];
+/** the camera's vertical field of view: stacked / one floor, and exploded floors (a longer lens, see frame()) */
+const BASE_FOV = 45, EXPLODE_FOV = 30;
+/** steel / timber profiles and railings: no AO (see Bucket.thin) */
+const THIN_TYPES = new Set<number>([WebIFC.IFCBEAM, WebIFC.IFCMEMBER, WebIFC.IFCRAILING]);
+const CAP_K = 0.53; // linear-light factor on the role colour (#eeebe5 → #b4b1ac)
 const ROLE_GLASS = "#9cc4e2";
 const ROLE_FURN = "#d1ccc3";
 const roleByType = new Map<number, THREE.Color>();
@@ -76,7 +93,7 @@ interface Tint {
   spaces: { id: number; type: RoomType; area: number; v0: number; v1: number }[];
 }
 /** A floor's name beside the building: its sampled plan points (x, z) and the label height (world y, stacked). */
-interface FloorLabel { el: HTMLDivElement; storey: number; pts: THREE.Vector3[]; y: number }
+interface FloorLabel { el: HTMLDivElement; storey: number; pts: THREE.Vector3[]; y: number; w?: number; c?: THREE.Vector3 }
 /** fade of the room tints toward white while an answer is lit (shared uniform of the tint materials) */
 const TINT_FADE = { value: 0 };
 
@@ -111,6 +128,9 @@ function rankMat(k: number, space: boolean): THREE.MeshLambertMaterial {
 /** The customer view's calm look (clay model, answers stay solid blue with an x-ray through walls); the expert view keeps
  * the model's own colours and the see-through ghost. */
 const calmView = () => document.body.dataset.view !== "expert";
+/** The visitor's last explode / stack click (W7 c2): a building opens exploded unless they chose 'Stack floors'. */
+const EXPLODE_KEY = "be.explode3d";
+const stackedByChoice = () => { try { return localStorage.getItem(EXPLODE_KEY) === "stacked"; } catch { return false; } };
 
 /** One merged highlight (one material, one storey): its x-ray twin and its place in the floor-by-floor reveal. */
 interface HlPart { mesh: THREE.Mesh; xray?: THREE.Mesh; opacity: number; xrayOpacity: number; at: number; storey: number }
@@ -126,8 +146,14 @@ export class Viewer3D {
   private buckets: Bucket[] = [];
   /** Floor height of each storey in world y (10th percentile of its vertices; IFC elevations are not in world units after COORDINATE_TO_ORIGIN). */
   private storeyBaseY = new Map<number, number>();
+  /** opaque, non-furniture vertices per storey (how much a storey holds) */
+  private storeyVerts = new Map<number, number>();
   /** With a storey filter: cut everything above the next storey's floor (elements a model assigns to a storey but places higher up). */
   private clipPlane = new THREE.Plane(new THREE.Vector3(0, -1, 0), 0);
+  /** Every material always gets exactly two clip planes (W7 c6): three.js compiles one shader per plane COUNT, so a view
+   * that changed the count (exploded 2 / lowest floor 1 / one floor 1 / stacked 0) compiled 4 + 4 programs when the floors
+   * landed after 'Stack floors' (73 + 65 ms frames, measured on the GPU). Unused slots hold NO_CUT. */
+  private oneCut: THREE.Plane[] = [this.clipPlane, NO_CUT];
   private spaceBuckets = new Map<number, Bucket>();
   private elementBuckets = new Map<number, { b: Bucket; r: Range }[]>();
   private api: WebIFC.IfcAPI | null = null;
@@ -140,13 +166,28 @@ export class Viewer3D {
   private ghost = false;
   file = "";
   onPick: (guid: string, label: string, props: Record<string, string>) => void = () => {};
+  /** W7 c4 (UX S-B1): a pick was cleared in the 3D view — a click on nothing, a click on the picked element again, or
+   * Esc. The model's colours are already back; the page hides its panel. Default: hide main.ts's #pick panel. */
+  onUnpick: () => void = () => { const p = document.getElementById("pick"); if (p) p.hidden = true; };
+  /** the element a click in the 3D view picked (GlobalId), until it is cleared or another highlight replaces it */
+  private picked: string | null = null;
+  /** what is picked, in words ('room', 'door', …) for the selection chip */
+  private pickKind = "";
+  /** a picked room's name for the chip ('Koridor 105 selected'); '' for other elements (their IFC names are codes) */
+  private pickName = "";
+  private chipObs: MutationObserver | null = null;
+  /** how far exploded floors are lifted right now (0 = stacked, 1 = full gap; applyLift) */
+  private liftK = 1;
+  private chip = document.createElement("div");
   private loadToken = 0;
   private needsRender = true;
   /** an eased camera move in progress (frame(): 650 ms ease-out instead of a jump; captain 15:40) */
-  private tween: { t0: number; dur: number; p0: THREE.Vector3; p1: THREE.Vector3; c0: THREE.Vector3; c1: THREE.Vector3 } | null = null;
+  private tween: { t0: number; dur: number; p0: THREE.Vector3; p1: THREE.Vector3; c0: THREE.Vector3; c1: THREE.Vector3; f0: number; f1: number } | null = null;
   private lastFramed: THREE.Object3D | null = null;
+  /** the key light: follows the camera (W7 c2), so the faces you look at are lit from any side */
+  private sun!: THREE.DirectionalLight;
   /** Customer view: numbered pins 1…5 over the elements the answer lists (HTML labels, placed on every render). */
-  private labels: { el: HTMLDivElement; p: THREE.Vector3; rail?: { pts: THREE.Vector3[]; y: number } }[] = [];
+  private labels: { el: HTMLDivElement; p: THREE.Vector3; rail?: { pts: THREE.Vector3[]; y: number }; storey?: number }[] = [];
   /** a floor pin was clicked (customer view, whole-building answers): its index in setNumberGroups(…, true) */
   onPickNumber: (k: number) => void = () => {};
   private labelLayer = document.createElement("div");
@@ -165,9 +206,16 @@ export class Viewer3D {
   private areaIds: number[] | null = null;
   private typeOfId = new Map<number, number>();
   /** 'Explode floors': lift offset per storey (world y) and each storey's cut plane; null = stacked */
-  private explode: Map<number, { dy: number; plane: THREE.Plane }> | null = null;
+  /** exploded floors: lift (dy, animated toward full), the cut 1.3 m above the floor (plane) and, on every floor but the
+   * lowest, a cut 0.8 m below it (low: ramps / foundations that hang a storey down, TU Wien's EG ramp to the basement);
+   * planes = the material's clipping planes */
+  private explode: Map<number, { dy: number; full: number; plane: THREE.Plane; low: THREE.Plane | null; planes: THREE.Plane[] }> | null = null;
+  /** the floors lifting apart (W7 c2): dy eases 0 → full with the camera's tween */
+  private liftAnim: { t0: number; dur: number; down?: boolean } | null = null;
   /** floor names beside the building (whole-building view and exploded floors) */
   private floorLabels: FloorLabel[] = [];
+  /** room names on the floor of the storey shown (W7): biggest rooms first, as the camera comes close enough */
+  private roomLabels: { el: HTMLDivElement; p: THREE.Vector3; storey: number; size: number; type: RoomType }[] = [];
 
   constructor(el: HTMLElement) {
     this.el = el;
@@ -178,7 +226,7 @@ export class Viewer3D {
     // the canvas colour follows the page theme (--canvas-3d: light grey, or dark grey in dark mode)
     this.renderer.localClippingEnabled = true;
     el.append(this.renderer.domElement);
-    this.camera = new THREE.PerspectiveCamera(45, 1, 0.1, 5000);
+    this.camera = new THREE.PerspectiveCamera(BASE_FOV, 1, 0.1, 5000);
     this.look = new Look3D(this.renderer, this.scene, this.camera);
     const bg = () => {
       const c = new THREE.Color(getComputedStyle(document.body).getPropertyValue("--canvas-3d").trim() || "#eef1f5");
@@ -199,12 +247,22 @@ export class Viewer3D {
     this.scene.add(new THREE.HemisphereLight(0xffffff, 0x9aa3b0, 2.0));
     const sun = new THREE.DirectionalLight(0xfffaf2, 1.7);
     sun.position.set(-40, 100, 60);
+    this.sun = sun;
     this.scene.add(sun, this.root, this.hlGroup);
     new ResizeObserver(() => this.resize()).observe(el);
     this.installPick();
     this.panel = new LookPanel(el);
-    this.panel.onExplode = (on) => this.setExploded(on);
+    this.panel.onExplode = (on) => {
+      try { localStorage.setItem(EXPLODE_KEY, on ? "exploded" : "stacked"); } catch { /* private window */ }
+      this.setExploded(on);
+    };
+    this.panel.onType = (k) => this.setTypeFocus(k);
     onLook(() => this.updateMaterials());
+    this.chip.className = "v3d-chip";
+    this.chip.hidden = true;
+    this.chip.addEventListener("pointerdown", (e) => e.stopPropagation());
+    el.append(this.chip);
+    window.addEventListener("stoa:reset", () => this.reset());
     const loop = () => {
       requestAnimationFrame(loop);
       if (this.tween) {
@@ -213,12 +271,24 @@ export class Viewer3D {
         const e = 1 - Math.pow(1 - k, 3);
         this.camera.position.lerpVectors(tw.p0, tw.p1, e);
         this.controls.target.lerpVectors(tw.c0, tw.c1, e);
+        if (tw.f0 !== tw.f1) { this.camera.fov = tw.f0 + (tw.f1 - tw.f0) * e; this.camera.updateProjectionMatrix(); }
         if (k >= 1) this.tween = null;
         this.needsRender = true;
+      }
+      if (this.liftAnim) {
+        const la = this.liftAnim;
+        const k = Math.min(1, (performance.now() - la.t0) / la.dur);
+        const e = 1 - Math.pow(1 - k, 3);
+        this.applyLift(la.down ? 1 - e : e);
+        if (k >= 1) {
+          this.liftAnim = null;
+          if (la.down) this.endDrop();
+        }
       }
       this.controls.update();
       if (this.hlParts.length && performance.now() < this.revealUntil + 50) this.stepReveal();
       if (this.needsRender) {
+        keyLight(this.sun, this.camera, this.controls.target);
         this.look.fast();
         this.needsRender = false;
         this.benchFrames++;
@@ -266,17 +336,27 @@ export class Viewer3D {
       const el = document.createElement("div");
       el.className = `v3d-num pin-badge${rail ? " rail" : ""}`;
       el.textContent = String(k + 1);
+      // the group's own storey (when all its elements share one): exploded floors lift its pin by THAT floor's lift;
+      // guessing it from the pin's height put Frigento's basement pin (base 0.55 m under the ground floor's) on the
+      // ground floor (W7 c3)
+      const st = new Set(groups[k].map((g) => this.storeyOf.get(this.guidToId.get(g) ?? -1)));
+      const storey = st.size === 1 ? [...st][0] : undefined;
       let r: { pts: THREE.Vector3[]; y: number } | undefined;
       if (rail) {
         // floors: the pin sits just left of this floor's own elements on screen, at the floor's mid-height (never
-        // inside the volume); sampled vertices, so a building rotated on its site is followed too
-        r = { pts: this.samplePoints(groups[k], mat, 400), y: (box.min.y + box.max.y) / 2 };
+        // inside the volume); sampled vertices, so a building rotated on its site is followed too. The height stays
+        // inside its own storey (floor → halfway up to the next): Maleva's floor 1 has a stair space that runs up the
+        // building, so the group's mid-height was floor 3's and pin 1 hid under pin 3 (UX P2b-11, W7 c7)
+        let y = (box.min.y + box.max.y) / 2;
+        const base = storey !== undefined ? this.storeyBaseY.get(storey) : undefined;
+        if (base !== undefined) y = Math.min(Math.max(y, base), (base + (this.nextBaseY(storey!) ?? base + 3)) / 2);
+        r = { pts: this.samplePoints(groups[k], mat, 400), y };
         el.title = "Show only this floor";
         el.addEventListener("click", () => this.onPickNumber(k));
         el.addEventListener("pointerdown", (e) => e.stopPropagation());
       }
       this.labelLayer.append(el);
-      this.labels.push({ el, p, rail: r });
+      this.labels.push({ el, p, rail: r, storey });
     });
     mat.dispose();
     this.needsRender = true;
@@ -334,6 +414,13 @@ export class Viewer3D {
   }
 
   /** World y → its exploded y (the offset of the storey whose floor is at or below it). */
+  /** A point of storey `storey` at height y, lifted with its floor (unknown storey: by height, liftY). */
+  private liftOf(storey: number | undefined, y: number): number {
+    if (!this.explode) return y;
+    const e = storey !== undefined ? this.explode.get(storey) : undefined;
+    return e ? y + e.dy : this.liftY(y);
+  }
+
   private liftY(y: number): number {
     if (!this.explode) return y;
     let best = -Infinity, dy = 0;
@@ -346,21 +433,27 @@ export class Viewer3D {
 
   private placeLabels() {
     this.placeFloorLabels();
+    this.placeRoomLabels();
     if (!this.labels.length) return;
     const w = this.renderer.domElement.clientWidth, h = this.renderer.domElement.clientHeight;
+    let below = Infinity; // the screen y of the floor pin below (rail pins come bottom floor first): keep >= 24 px apart
     for (const l of this.labels) {
       if (l.rail) {
         let best: THREE.Vector3 | null = null;
-        const ry = this.liftY(l.rail.y);
+        const ry = this.liftOf(l.storey, l.rail.y);
         for (const p of l.rail.pts) {
           const v = new THREE.Vector3(p.x, ry, p.z).project(this.camera);
           if (v.z < 1 && (!best || v.x < best.x)) best = v;
         }
         l.el.style.display = best ? "" : "none";
-        if (best) l.el.style.transform = `translate(${Math.max(18, ((best.x + 1) / 2) * w - 14)}px, ${((1 - best.y) / 2) * h}px) translate(-100%, -50%)`;
+        if (best) {
+          const y = Math.min(((1 - best.y) / 2) * h, below - 24);
+          below = y;
+          l.el.style.transform = `translate(${Math.max(18, ((best.x + 1) / 2) * w - 14)}px, ${y}px) translate(-100%, -50%)`;
+        }
         continue;
       }
-      const v = l.p.clone().setY(this.liftY(l.p.y)).project(this.camera);
+      const v = l.p.clone().setY(this.liftOf(l.storey, l.p.y)).project(this.camera);
       const vis = v.z < 1 && Math.abs(v.x) <= 1.02 && Math.abs(v.y) <= 1.02;
       l.el.style.display = vis ? "" : "none";
       if (vis) l.el.style.transform = `translate(${((v.x + 1) / 2) * w}px, ${((1 - v.y) / 2) * h}px) translate(-50%, -110%)`;
@@ -375,7 +468,7 @@ export class Viewer3D {
     const w = this.renderer.domElement.clientWidth, h = this.renderer.domElement.clientHeight;
     // one column right of the building (the rightmost floor point), each label at its floor's height, kept >= 22 px
     // apart from the floor below (bottom up)
-    const at: { f: FloorLabel; x: number; y: number }[] = [];
+    const at: { f: FloorLabel; x: number; y: number; wy: number }[] = [];
     for (const f of this.floorLabels) {
       const e = this.explode?.get(f.storey);
       const on = show && (!this.explode || !!e);
@@ -387,7 +480,16 @@ export class Viewer3D {
         const v = new THREE.Vector3(p.x, y, p.z).project(this.camera);
         if (v.z < 1 && (!best || v.x > best.x)) best = v;
       }
-      if (best) at.push({ f, x: ((best.x + 1) / 2) * w, y: ((1 - best.y) / 2) * h });
+      if (!best) continue;
+      // exploded: the label's height is the floor's CENTRE at its height (the rightmost point lies nearer or deeper
+      // per floor, so TU Wien's 'Basement 1' / 'Basement 2' labels touched although the floors are 19 m apart)
+      let sy = best.y;
+      if (e) {
+        f.c ??= f.pts.reduce((a, p) => a.add(p), new THREE.Vector3()).divideScalar(f.pts.length);
+        const vc = new THREE.Vector3(f.c.x, y, f.c.z).project(this.camera);
+        if (vc.z < 1) sy = vc.y;
+      }
+      at.push({ f, x: ((best.x + 1) / 2) * w, y: ((1 - sy) / 2) * h, wy: y });
     }
     if (!at.length) return;
     if (!this.explode) {
@@ -404,35 +506,170 @@ export class Viewer3D {
         a.y = ((1 - v.y) / 2) * h;
       }
     }
-    const x = Math.min(w - 90, Math.max(...at.map((a) => a.x)) + 14);
-    at.sort((a, b) => b.y - a.y);
+    // W7 c3: the column stays inside the pane (long names like 'Solaio interrato' were cut at the right edge), and the
+    // labels keep the floors' order bottom-up: each floor's rightmost point can lie deeper or nearer, so its screen
+    // height alone put TU Wien's 'UG2' above 'UG1' and Barlad's 'Attic' above 'Level 4'
+    for (const a of at) a.f.el.style.display = "";
+    for (const a of at) a.f.w ??= a.f.el.offsetWidth || undefined;
+    const lw = Math.max(60, ...at.map((a) => a.f.w ?? 90));
+    const x = Math.max(8, Math.min(w - lw - 8, Math.max(...at.map((a) => a.x)) + 14));
+    at.sort((a, b) => a.wy - b.wy);
     let prev = Infinity;
     for (const a of at) {
       const y = Math.min(a.y, prev - 22);
       prev = y;
-      a.f.el.style.display = "";
       a.f.el.style.transform = `translate(${x}px, ${y}px) translate(0, -50%)`;
     }
   }
 
+  /** Room names on the shown storey (customer view, no answer lit): a label appears once its room is ≥ ~70 px across
+   * on screen, biggest rooms first, never overlapping another label. */
+  private placeRoomLabels() {
+    if (!this.roomLabels.length) return;
+    const on = calmView() && this.activeStorey !== null && !this.explode && !this.ghost && this.el.dataset.state === "ready";
+    const w = this.renderer.domElement.clientWidth, h = this.renderer.domElement.clientHeight;
+    const f = h / (2 * Math.tan((this.camera.fov * Math.PI) / 360));
+    const taken: [number, number, number, number][] = [];
+    for (const l of this.roomLabels) {
+      let show = on && l.storey === this.activeStorey && (!this.typeFocus || l.type === this.typeFocus);
+      let x = 0, y = 0;
+      if (show) {
+        const d = this.camera.position.distanceTo(l.p);
+        const v = l.p.clone().project(this.camera);
+        x = ((v.x + 1) / 2) * w;
+        y = ((1 - v.y) / 2) * h;
+        const hw = Math.max(40, l.el.textContent!.length * 3.4), hh = 15;
+        show = v.z < 1 && x - hw > 4 && x + hw < w - 4 && y - hh > 4 && y + hh < h - 4 && (l.size * f) / d >= 70;
+        if (show) {
+          const r: [number, number, number, number] = [x - hw, y - hh, x + hw, y + hh];
+          show = !taken.some((t) => r[0] < t[2] && r[2] > t[0] && r[1] < t[3] && r[3] > t[1]);
+          if (show) taken.push(r);
+        }
+      }
+      l.el.style.display = show ? "" : "none";
+      if (show) l.el.style.transform = `translate(${x}px, ${y}px) translate(-50%, -50%)`;
+    }
+  }
+
+  private buildRoomLabels() {
+    for (const l of this.roomLabels) l.el.remove();
+    this.roomLabels = [];
+    if (!this.api) return;
+    this.ensureGuidIndex();
+    for (const t of this.tints) {
+      const pos = t.mesh.geometry.attributes.position as THREE.BufferAttribute;
+      for (const sp of t.spaces) {
+        if (sp.area < 4) continue;
+        const c = new THREE.Vector3();
+        for (let i = sp.v0; i < sp.v1; i++) c.add(new THREE.Vector3(pos.getX(i), pos.getY(i), pos.getZ(i)));
+        c.multiplyScalar(1 / Math.max(1, sp.v1 - sp.v0));
+        const guid = this.idToGuid.get(sp.id);
+        const name = (guid && this.spaceTitle(guid)) || "";
+        if (!name) continue;
+        const el = document.createElement("div");
+        el.className = "v3d-room";
+        el.innerHTML = "<b></b><span></span>";
+        el.querySelector("b")!.textContent = name;
+        el.querySelector("span")!.textContent = `${sp.area >= 100 ? Math.round(sp.area) : sp.area.toFixed(1)} m²`;
+        el.style.display = "none";
+        this.labelLayer.append(el);
+        this.roomLabels.push({ el, p: c.setY(c.y + 0.05), storey: t.storey, size: Math.sqrt(sp.area), type: sp.type });
+      }
+    }
+    // biggest first: they win the space when labels would overlap
+    this.roomLabels.sort((a, b) => b.size - a.size);
+  }
+
   /** The storeys that are floors people use: those with rooms (IfcSpace floors), else every storey with geometry. */
   private roomStoreys(): number[] {
-    const withRooms = new Set(this.tints.map((t) => t.storey));
-    const ids = this.storeys.map((s) => s.id).filter((id) => this.storeyBaseY.has(id));
+    // a roof storey is not a floor people use, even when the model puts a 'ROOF' space on it (Duplex)
+    const ROOF = /^(roof|katus|dach|toit|tetto|katto|tak|techo|dak)\b/i;
+    const roofy = (id: number) => ROOF.test(this.storeys.find((s) => s.id === id)?.name.trim() ?? "")
+      || (this.tints.find((t) => t.storey === id)?.spaces.every((sp) => /^\s*(roof|katus|dach)/i.test(this.spaceName(sp.id))) ?? false);
+    const withRooms = new Set(this.tints.map((t) => t.storey).filter((id) => !roofy(id)));
+    const ids = this.storeys.map((s) => s.id).filter((id) => this.storeyBaseY.has(id) && !roofy(id));
     const rooms = ids.filter((id) => withRooms.has(id));
-    return rooms.length >= 2 ? rooms : ids;
+    if (rooms.length >= 2) return rooms;
+    // without rooms: every storey that holds something, but not one with a few posts on it (W7 c4: Barlad's 'Attic'
+    // and Gymzaal's '02 Tweede verdieping' hold 0.4 % of the biggest floor's geometry: an empty gap with a label)
+    const big = Math.max(0, ...ids.map((id) => this.storeyVerts.get(id) ?? 0));
+    return ids.filter((id) => (this.storeyVerts.get(id) ?? 0) >= 0.02 * big);
+  }
+
+  /** How many of the floors people use (roomStoreys) hold >= 4 walls (W7 c3: the open-exploded rule for models
+   * without rooms). */
+  private wallStoreys(): number {
+    const api = this.api;
+    if (!api) return 0;
+    const per = new Map<number, number>();
+    for (const t of [WebIFC.IFCWALL, WebIFC.IFCWALLSTANDARDCASE]) {
+      try {
+        const ids = api.GetLineIDsWithType(this.modelID, t);
+        for (let i = 0; i < ids.size(); i++) {
+          const s = this.storeyOf.get(ids.get(i));
+          if (s !== undefined) per.set(s, (per.get(s) ?? 0) + 1);
+        }
+      } catch { /* a schema without this type */ }
+    }
+    const use = new Set(this.roomStoreys());
+    return [...per].filter(([id, n]) => use.has(id) && n >= 4).length;
+  }
+
+  private spaceName(id: number): string {
+    try {
+      const l = this.api!.GetLine(this.modelID, id);
+      return String(l.LongName?.value ?? l.Name?.value ?? "");
+    } catch {
+      return "";
+    }
+  }
+
+  /** The footprint's main axis (radians, in x/z) and its extents along / across it, from the room floors (else the
+   * solid parts' vertices). */
+  private footprint(): { ang: number; long: number; short: number } | null {
+    const xs: number[] = [], zs: number[] = [];
+    const take = (pos: ArrayLike<number>, stride: number) => {
+      const n = pos.length / stride;
+      const step = Math.max(1, Math.floor(n / 3000));
+      for (let i = 0; i < n; i += step) { xs.push(pos[i * stride]); zs.push(pos[i * stride + 2]); }
+    };
+    for (const t of this.tints) take(t.mesh.geometry.attributes.position.array as Float32Array, 3);
+    if (xs.length < 10) for (const b of this.buckets) if (!b.transparent && b.storey >= 0) take(b.pos, 3);
+    if (xs.length < 10) return null;
+    const n = xs.length;
+    const mx = xs.reduce((a, b) => a + b, 0) / n, mz = zs.reduce((a, b) => a + b, 0) / n;
+    let cxx = 0, czz = 0, cxz = 0;
+    for (let i = 0; i < n; i++) { const dx = xs[i] - mx, dz = zs[i] - mz; cxx += dx * dx; czz += dz * dz; cxz += dx * dz; }
+    const ang = 0.5 * Math.atan2(2 * cxz, cxx - czz);
+    const ux = Math.cos(ang), uz = Math.sin(ang);
+    let a0 = Infinity, a1 = -Infinity, b0 = Infinity, b1 = -Infinity;
+    for (let i = 0; i < n; i++) {
+      const a = xs[i] * ux + zs[i] * uz, b = -xs[i] * uz + zs[i] * ux;
+      a0 = Math.min(a0, a); a1 = Math.max(a1, a); b0 = Math.min(b0, b); b1 = Math.max(b1, b);
+    }
+    return { ang, long: a1 - a0, short: b1 - b0 };
+  }
+
+  /** The extent of the room floors (or, without rooms, the storeys' solids) along the horizontal direction (x, z): how
+   * deep the building looks from that side. 0 when there is nothing to measure. */
+  private depthAlong(x: number, z: number): number {
+    const l = Math.hypot(x, z);
+    if (l < 1e-6) return 0;
+    const ux = x / l, uz = z / l;
+    let a0 = Infinity, a1 = -Infinity;
+    const take = (pos: ArrayLike<number>) => {
+      const n = pos.length / 3;
+      const step = Math.max(1, Math.floor(n / 3000));
+      for (let i = 0; i < n; i += step) { const a = pos[i * 3] * ux + pos[i * 3 + 2] * uz; if (a < a0) a0 = a; if (a > a1) a1 = a; }
+    };
+    for (const t of this.tints) take(t.mesh.geometry.attributes.position.array as Float32Array);
+    if (!(a1 > a0)) for (const b of this.buckets) if (!b.transparent && !b.furniture && b.storey >= 0) take(b.pos);
+    return a1 > a0 ? a1 - a0 : 0;
   }
 
   /** People's floor names: '2.korrus' → 'Floor 2', 'Erdgeschoss' → 'Ground floor' (the model's own name otherwise). */
   private floorName(name: string): string {
-    const n = name.trim();
-    const m = n.match(/^(-?\d+)\s*\.?\s*(korrus|kerros|floor|etage|stock|og|plan|pietro|piętro|våning|vaning|patro|emelet|etaj)$/i);
-    if (m) return `Floor ${m[1]}`;
-    const k: [RegExp, string][] = [[/^erdgeschoss|^eg$|^ground/i, "Ground floor"], [/^dachgeschoss|^dg$|^attic|^pööning/i, "Attic"],
-      [/^kellergeschoss|^keller|^kelder|^basement|^untergeschoss|^ug$/i, "Basement"], [/^vundament|^foundation|^fundament/i, "Foundation"],
-      [/^katus|^roof|^dach$/i, "Roof"]];
-    for (const [re, out] of k) if (re.test(n)) return out;
-    return n;
+    return floorName(name);
   }
 
   private buildFloorLabels() {
@@ -446,18 +683,34 @@ export class Viewer3D {
     if (ids.length < 2) return;
     for (const id of ids) {
       const base = this.storeyBaseY.get(id)!;
-      const pts: THREE.Vector3[] = [];
+      let pts: THREE.Vector3[] = [];
+      const all: THREE.Vector3[] = [];
       for (const b of this.buckets) {
         if (b.storey !== id || b.transparent || b.furniture) continue;
         const step = Math.max(3, Math.floor(b.pos.length / 3 / 150) * 3);
-        for (let i = 0; i + 2 < b.pos.length; i += step) pts.push(new THREE.Vector3(b.pos[i], 0, b.pos[i + 2]));
+        for (let i = 0; i + 2 < b.pos.length; i += step) {
+          const p = new THREE.Vector3(b.pos[i], 0, b.pos[i + 2]);
+          all.push(p);
+          // W7 c4: only what an exploded floor shows (its band around the floor), so a ramp hanging down to the floor
+          // below (TU Wien EG) does not pull the label's column or centre off the floor
+          if (b.pos[i + 1] >= base - LOW_CUT && b.pos[i + 1] <= base + 1.3) pts.push(p);
+        }
       }
+      if (pts.length < 8) pts = all;
       if (!pts.length) continue;
       const el = document.createElement("div");
       el.className = "v3d-floor";
       const s = this.storeys.find((x) => x.id === id)!;
       el.textContent = this.floorName(s.name);
-      el.title = s.name;
+      // W7 c2: a floor's name shows that floor alone (the only way on a model without plan sheets, e.g. Duplex);
+      // 'Explode floors' in the card shows them all again
+      el.title = `${s.name}: show only this floor`;
+      el.setAttribute("role", "button");
+      el.tabIndex = 0;
+      const pick = () => this.setStorey(id);
+      el.addEventListener("click", pick);
+      el.addEventListener("keydown", (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); pick(); } });
+      el.addEventListener("pointerdown", (e) => e.stopPropagation());
       this.labelLayer.append(el);
       this.floorLabels.push({ el, storey: id, pts, y: base + 1.2 });
     }
@@ -465,23 +718,88 @@ export class Viewer3D {
 
   /** 'Explode floors' (W7): the floors with rooms lifted apart, each cut 1.3 m above its floor like a plan, the others
    * hidden; the camera looks down a little more. Off = stacked as built. */
-  setExploded(on: boolean) {
+  setExploded(on: boolean, animate = true) {
+    const prev = this.explode;
     const ids = on ? this.roomStoreys() : [];
     if (on && ids.length < 2) on = false;
     this.panel.setExploded(on);
     if (!on) {
       this.explode = null;
+      // stacked whole building: the slabs hide the room floors, so a lit room type would show nothing; let it go
+      if (this.activeStorey === null && this.typeFocus) { this.typeFocus = null; this.paintTints(); }
     } else {
       if (this.activeStorey !== null) this.activeStorey = null;
+      const sorted = ids.slice().sort((a, b) => this.storeyBaseY.get(a)! - this.storeyBaseY.get(b)!);
+      // the gap: about the building's depth (its short side), so a floor below shows most of itself under a ~45° view
+      const fp = this.footprint();
       const box = new THREE.Box3().setFromObject(this.root);
       const size = box.getSize(new THREE.Vector3());
-      const sorted = ids.slice().sort((a, b) => this.storeyBaseY.get(a)! - this.storeyBaseY.get(b)!);
-      const gap = Math.max(6, 0.45 * Math.min(size.x, size.z));
-      this.explode = new Map(sorted.map((id, i) => [id, { dy: i * gap, plane: new THREE.Plane(new THREE.Vector3(0, -1, 0), this.storeyBaseY.get(id)! + i * gap + 1.3) }]));
+      // W7 c4: and at least enough that ~38 % of each floor shows past the floor above it, from the floors' real depth
+      // along the view (the view is turned 30° toward the long axis, so a long thin block is deep: Smiley West 6.5 m
+      // deep looked 43 m deep, gap 6 m, 20 % of a floor visible; Barlad 32 %; Maleva 37 % = unchanged)
+      const b0 = this.storeyBaseY.get(sorted[0])!, bN = this.storeyBaseY.get(sorted[sorted.length - 1])!;
+      const hBar = sorted.length > 1 ? Math.max(0, (bN - b0) / (sorted.length - 1)) : 3;
+      const dir = this.explodeDir();
+      const depth = this.depthAlong(dir.x, dir.z);
+      const tanE = dir.y / Math.max(1e-6, Math.hypot(dir.x, dir.z));
+      // W7 c6: two floors can afford more of the lower one in view (Duplex: Level 2 hid the back third of Level 1)
+      const seen = sorted.length <= 2 ? 0.65 : 0.38;
+      const gap = Math.min(30, Math.max(6, 0.7 * (fp?.short ?? Math.min(size.x, size.z)), depth ? seen * depth * tanE - hBar : 0));
+      // floors evenly spaced (base + i × (mean storey height + gap)): two storeys whose bases are a few cm apart (Barlad's
+      // CTA / Ground Level, 7 cm) no longer sit one gap apart while the others sit a storey + a gap apart
+      const step = hBar + gap;
+      this.explode = new Map(sorted.map((id, i) => {
+        const base = this.storeyBaseY.get(id)!;
+        const dy = b0 + i * step - base;
+        const plane = new THREE.Plane(new THREE.Vector3(0, -1, 0), base + dy + 1.3);
+        const low = i > 0 ? new THREE.Plane(new THREE.Vector3(0, 1, 0), -(base + dy - LOW_CUT)) : null;
+        return [id, { dy, full: dy, plane, low, planes: [plane, low ?? NO_CUT] }];
+      }));
     }
-    this.look.setBands(this.explode ? [...this.explode].map(([id, e]) => ({ base: this.storeyBaseY.get(id)! + e.dy - 0.8, cut: e.plane.constant })) : null);
+    this.look.setBands(this.explode ? [...this.explode].map(([id, e]) => ({ base: this.storeyBaseY.get(id)! + e.dy - LOW_CUT, cut: e.plane.constant })) : null);
+    this.look.setShadowStrength(this.explode ? 0.45 : 1);
     this.updateMaterials();
-    this.frame(this.root, true);
+    this.frame(this.root, animate);
+    // the floors lift apart while the camera moves (same 650 ms ease); no camera tween (reduced motion) = no lift either
+    this.liftAnim = null;
+    if (this.explode && this.tween) {
+      this.applyLift(0);
+      this.liftAnim = { t0: this.tween.t0, dur: this.tween.dur };
+    } else if (!on && prev && this.tween && this.activeStorey === null) {
+      // W7 c5: 'Stack floors' brings the floors down with the camera (filmed: they snapped down at once while only the
+      // camera eased); they stay cut like plans until they land, then the building closes (endDrop)
+      this.explode = prev;
+      this.updateMaterials();
+      this.applyLift(1);
+      this.liftAnim = { t0: this.tween.t0, dur: this.tween.dur, down: true };
+    }
+  }
+
+  /** The floors have come down ('Stack floors'): stacked as built (ceilings back, walls full height, no cut bands). */
+  private endDrop() {
+    if (!this.explode) return;
+    this.explode = null;
+    this.look.setBands(null);
+    this.updateMaterials();
+    this.needsRender = true;
+  }
+
+  /** Exploded floors lifted to k (0 = stacked, 1 = full gap): positions, cut planes and the AO bands. */
+  private applyLift(k: number) {
+    const ex = this.explode;
+    if (!ex) { this.liftAnim = null; return; }
+    this.liftK = k;
+    for (const [id, e] of ex) {
+      e.dy = e.full * k;
+      e.plane.constant = this.storeyBaseY.get(id)! + e.dy + 1.3;
+      if (e.low) e.low.constant = -(this.storeyBaseY.get(id)! + e.dy - LOW_CUT);
+    }
+    for (const b of this.buckets) b.mesh!.position.y = ex.get(b.storey)?.dy ?? 0;
+    for (const t of this.tints) t.mesh.position.y = ex.get(t.storey)?.dy ?? 0;
+    for (const p of this.hlParts) for (const m of [p.mesh, p.xray]) if (m) m.position.y = ex.get(p.storey)?.dy ?? 0;
+    for (const m of this.caps.values()) if (m && m.visible) m.position.y = ex.get(m.userData.cap as number)?.dy ?? 0;
+    this.look.setBands([...ex].map(([id, e]) => ({ base: this.storeyBaseY.get(id)! + e.dy - LOW_CUT, cut: e.plane.constant })));
+    this.needsRender = true;
   }
 
   get isExploded() { return !!this.explode; }
@@ -489,17 +807,9 @@ export class Viewer3D {
   /** Exploded floors are seen from the LONG side of the footprint (its main axis from the room floors' vertices), a
    * quarter turn off square and ~45° from above, so a long slab building does not hide its floors behind each other. */
   private explodeDir(): THREE.Vector3 {
-    let n = 0, mx = 0, mz = 0, sxx = 0, szz = 0, sxz = 0;
-    for (const t of this.tints) {
-      const pos = t.mesh.geometry.attributes.position as THREE.BufferAttribute;
-      const step = Math.max(1, Math.floor(pos.count / 2000));
-      for (let i = 0; i < pos.count; i += step) { const x = pos.getX(i), z = pos.getZ(i); n++; mx += x; mz += z; sxx += x * x; szz += z * z; sxz += x * z; }
-    }
-    const fallback = new THREE.Vector3(0.6, 1.15, 0.9);
-    if (n < 10) return fallback;
-    mx /= n; mz /= n;
-    const cxx = sxx / n - mx * mx, czz = szz / n - mz * mz, cxz = sxz / n - mx * mz;
-    const ang = 0.5 * Math.atan2(2 * cxz, cxx - czz); // the long axis
+    const fp = this.footprint();
+    if (!fp) return new THREE.Vector3(0.6, 1.15, 0.9);
+    const ang = fp.ang; // the long axis
     // the side normal nearer the usual view (+x, +z), turned 30° toward the long axis
     let nx = -Math.sin(ang), nz = Math.cos(ang);
     if (nx * 0.6 + nz * 0.9 < 0) { nx = -nx; nz = -nz; }
@@ -530,6 +840,8 @@ export class Viewer3D {
     this.file = file;
     this.el.dataset.state = "loading";
     onProgress("downloading model…");
+    const T = { t0: performance.now(), t: performance.now() }, lap = (k: string) => { const n = performance.now(); this.loadStats[k] = Math.round(n - T.t); T.t = n; };
+    this.loadStats = {};
     const resp = await fetch(url);
     const total = Number(resp.headers.get("content-length") ?? 0);
     const reader = resp.body!.getReader();
@@ -548,6 +860,7 @@ export class Viewer3D {
       data.set(c, off);
       off += c.length;
     }
+    lap("downloadMs");
     onProgress("parsing IFC (web-ifc)…");
     await new Promise((r) => setTimeout(r, 30));
     const api = await ifcApi();
@@ -555,18 +868,39 @@ export class Viewer3D {
     this.api = api;
     this.modelID = api.OpenModel(data, { COORDINATE_TO_ORIGIN: true });
     this.readSpatialStructure();
+    lap("parseMs");
     onProgress("building geometry…");
     await new Promise((r) => setTimeout(r, 30));
     const byKey = new Map<string, Bucket>();
     const furn = new Map<number, boolean>();
     const ceil = new Map<number, boolean>();
-    const isCeiling = (id: number) => {
+    const typeOf = new Map<number, number>();
+    const tOf = (id: number): number => {
+      const known = typeOf.get(id);
+      if (known !== undefined) return known;
+      let t = 0;
+      try {
+        t = api.GetLineType(this.modelID, id);
+      } catch {
+        t = 0;
+      }
+      typeOf.set(id, t);
+      return t;
+    };
+    const isCeiling = (id: number, ySpan: () => number) => {
       let c = ceil.get(id);
       if (c === undefined) {
-        try {
-          c = api.GetLineType(this.modelID, id) === WebIFC.IFCCOVERING;
-        } catch {
-          c = false;
+        const t = tOf(id);
+        c = t === WebIFC.IFCCOVERING;
+        // W7 c6: a PITCHED roof (IfcRoof / IfcSlab ROOF over 1 m tall) goes with the ceilings: hidden on exploded and
+        // one-floor views (FZK-Haus's attic roof, cut at 1.3 m, left an eave band over half the ground floor), shown when
+        // stacked. Never by type alone: Maleva models its balcony FLOOR slabs as flat IfcRoof 'ARKATUS' (0.2 m) on every floor
+        if (!c && (t === WebIFC.IFCROOF || t === WebIFC.IFCSLAB)) {
+          let roof = t === WebIFC.IFCROOF;
+          if (!roof) {
+            try { roof = String(api.GetLine(this.modelID, id)?.PredefinedType?.value ?? "") === "ROOF"; } catch { roof = false; }
+          }
+          c = roof && ySpan() > 1.0;
         }
         ceil.set(id, c);
       }
@@ -587,14 +921,15 @@ export class Viewer3D {
       }
       return f;
     };
-    api.StreamAllMeshes(this.modelID, (mesh) => this.addMesh(mesh, (id, transparent) => {
+    api.StreamAllMeshes(this.modelID, (mesh) => this.addMesh(mesh, (id, transparent, ySpan) => {
       const storey = this.storeyOf.get(id) ?? -1;
       const f = isFurniture(id);
-      const c = !f && isCeiling(id);
-      const key = `${storey}:${transparent ? "t" : "o"}${f ? "f" : ""}${c ? "c" : ""}`;
+      const c = !f && isCeiling(id, ySpan);
+      const n = !f && !c && !transparent && THIN_TYPES.has(tOf(id));
+      const key = `${storey}:${transparent ? "t" : "o"}${f ? "f" : ""}${c ? "c" : ""}${n ? "n" : ""}`;
       let b = byKey.get(key);
       if (!b) {
-        b = { key, storey, transparent, furniture: f, ceiling: c, pos: [], nrm: [], col: [], idx: [], ranges: [] };
+        b = { key, storey, transparent, furniture: f, ceiling: c, thin: n, pos: [], nrm: [], col: [], idx: [], ranges: [] };
         byKey.set(key, b);
       }
       return b;
@@ -609,6 +944,7 @@ export class Viewer3D {
       return b;
     }));
     if (token !== this.loadToken) return;
+    lap("meshesMs");
     this.buckets = [...byKey.values()];
     for (const b of this.buckets) {
       const mat = new THREE.MeshLambertMaterial({
@@ -618,29 +954,394 @@ export class Viewer3D {
       clayify(mat, b.transparent, b.furniture, !!b.role);
       b.mesh = this.toMesh(b, mat);
       b.mesh.userData.bucket = b;
+      if (b.thin) b.mesh.userData.noAO = true;
       this.root.add(b.mesh);
     }
+    lap("bucketsMs");
     this.computeStoreyBases();
     this.buildTints();
     this.explode = null;
     this.panel.setExploded(false);
     this.look.setBands(null);
+    this.look.setShadowStrength(1);
     this.buildFloorLabels();
+    this.buildRoomLabels();
     this.panel.setExplodeAvailable(this.roomStoreys().length >= 2);
     this.updateMaterials();
     this.look.setGround(this.root);
     this.frame(this.root, false);
+    // W7 c2 (captain 21:10 'it looked plain'): stacked, the slabs hide every room colour and the building is a white box;
+    // so a building with >= 2 floors of rooms opens exploded in the customer view ('Stack floors' is one click, and
+    // remembered). A plan sheet's own floor (main.ts fillStoreys → setStorey(id)) stacks it again, as before.
+    // W7 c3: a model WITHOUT IfcSpace (Barlad, Frigento, most uploads from Revit) opens exploded too when >= 2 of its
+    // floors have walls: its floors cut like plans (walls, doors, glass) say more than a white box; MEP / structural
+    // models without walls on 2 floors stay stacked (a cut 1.3 m above the floor would hide ducts and beams)
+    const openExploded = this.opensExploded();
+    lap("lookMs"); // tints, floor + room labels, materials (W7's layer on top of the model)
+    this.loadStats.totalMs = Math.round(performance.now() - T.t0);
     this.el.dataset.state = "ready";
+    // after 'ready', so the camera tweens and the floors lift apart as the model appears (a plan sheet's floor, set by
+    // main.ts right after this resolves, stacks it again before the first frame is drawn)
+    if (openExploded) this.setExploded(true, true);
     onProgress("");
-    void this.buildEdges(token);
+    void this.buildEdges(token).then(() => this.warmHighlights(token, 0));
+  }
+
+  /** W7 c6: compile the answer materials' shaders while the model sits idle after loading: the first answer compiled 8
+   * programs in its first frames (23 ms on screen + 62 ms in the AO / halo frame, Maleva, GPU). Zero-area triangles
+   * with the lit, x-ray and room materials are drawn once on screen and once through the AO / halo passes (nothing
+   * visible changes), then the materials wait in the pool for the first answer. */
+  private warmHighlights(token: number, tries: number) {
+    if (token !== this.loadToken || !calmView() || this.hlParts.length || this.hlPool.size) return;
+    if (this.tween || this.liftAnim || this.needsRender) {
+      if (tries < 8) window.setTimeout(() => this.warmHighlights(token, tries + 1), 800);
+      return;
+    }
+    const c = new THREE.Box3().setFromObject(this.root).getCenter(new THREE.Vector3());
+    const g = new THREE.BufferGeometry();
+    g.setAttribute("position", new THREE.Float32BufferAttribute([c.x, c.y, c.z, c.x, c.y, c.z, c.x, c.y, c.z], 3));
+    g.setAttribute("normal", new THREE.Float32BufferAttribute([0, 1, 0, 0, 1, 0, 0, 1, 0], 3));
+    const mats: THREE.Material[] = [
+      this.takeMat("hl-rim", () => { const m = this.hlMat("hl"); rimGlow(m, 0.5); return m; }),
+      this.takeMat("xray", () => new THREE.MeshBasicMaterial({ transparent: true, opacity: 0.28, depthWrite: false,
+        depthFunc: THREE.GreaterDepth, side: THREE.DoubleSide })),
+      this.takeMat("space", () => this.hlMat("space")),
+    ];
+    // the section caps turn flat (no vertex colours) while an answer is lit: that variant too, kept alive by a material
+    // that is never disposed (a program lives while one material uses it)
+    this.warmCap ??= new THREE.MeshLambertMaterial({ vertexColors: false });
+    const meshes = [...mats, this.warmCap].map((m) => {
+      if (m !== this.warmCap) m.clippingPlanes = NO_CUTS; // as updateMaterials sets them on a lit answer (two planes each)
+      const x = new THREE.Mesh(g, m);
+      x.renderOrder = 10;
+      x.frustumCulled = false;
+      this.hlGroup.add(x);
+      return x;
+    });
+    const t0 = performance.now();
+    const p0 = this.renderer.info.programs?.length ?? 0;
+    this.look.setGlow(meshes);
+    try {
+      this.look.fast();
+      this.look.refine();
+    } finally {
+      for (const x of meshes) { this.hlGroup.remove(x); if (x.material !== this.warmCap) this.poolMat(x.material as THREE.Material); }
+      g.dispose();
+      this.look.setGlow([]);
+      this.needsRender = true;
+    }
+    this.warmStats = { ms: Math.round(performance.now() - t0), programs: (this.renderer.info.programs?.length ?? 0) - p0 };
+  }
+  private warmCap: THREE.MeshLambertMaterial | null = null;
+  /** dev: what warmHighlights cost and compiled */
+  warmStats: { ms: number; programs: number } | null = null;
+
+  /** How the model opens in the customer view: exploded when >= 2 floors have rooms (or walls), unless the visitor chose
+   * 'Stack floors' (rooms on one floor only, Gymzaal: exploded too, not a white box). */
+  private opensExploded(): boolean {
+    const roomFloors = new Set(this.tints.map((t) => t.storey)).size;
+    return calmView() && getLook() === "rooms" && !stackedByChoice() && this.roomStoreys().length >= 2
+      && (roomFloors >= 2 || this.wallStoreys() >= 2);
+  }
+
+  /** 'Start over' (captain 01:18, window event 'stoa:reset'): the 3D as first opened: no answer glow or pins, no pick, no
+   * lit room type or area ramp, the Rooms look, the explode / stack choice forgotten (exploded again when the model opens
+   * that way), the whole building framed. main.ts reopens the first sheet after dispatching (its floor then wins). */
+  reset() {
+    if (!this.el.isConnected || this.el.dataset.state !== "ready") return;
+    this.picked = null;
+    this.highlight([], false);
+    this.typeFocus = null;
+    this.areaIds = null;
+    try { localStorage.removeItem(EXPLODE_KEY); } catch { /* private window */ }
+    setLook("rooms"); // listeners: both 3D panes repaint
+    this.activeStorey = null;
+    this.liftAnim = null;
+    const ex = this.opensExploded();
+    if (ex || this.explode) this.setExploded(ex, false);
+    else { this.updateMaterials(); this.frame(this.root, false); }
+    this.paintTints();
+    this.updateLegend();
+    this.placeRoomLabels();
+    this.syncChip();
+  }
+
+  /** The chip for a selection made in the 3D (captain 01:16: like the page's marks chip): '85 rooms lit · Wet rooms ×'
+   * while the legend lights a room type, '1 door selected ×' while something is picked; × or Esc clears it. */
+  private syncChip() {
+    let text = "";
+    if (calmView() && this.picked) text = this.pickName ? `${this.pickName} selected` : `1 ${this.pickKind || "element"} selected`;
+    else if (calmView() && this.typeFocus && !this.ghost && !this.areaIds) {
+      let n = 0;
+      for (const t of this.tints) {
+        if (this.activeStorey !== null && t.storey !== this.activeStorey) continue;
+        for (const sp of t.spaces) if (sp.type === this.typeFocus) n++;
+      }
+      const label = ROOM_TYPES.find((t) => t.key === this.typeFocus)?.label ?? "";
+      text = `${n} ${n === 1 ? "room" : "rooms"} lit · ${label}`;
+    }
+    if (!text) { this.chip.hidden = true; return; }
+    if (this.chip.dataset.text !== text) {
+      this.chip.dataset.text = text;
+      const span = document.createElement("span");
+      span.textContent = text;
+      // the same pattern as the page's marks chip (W5 #marksChip: '46 doors marked · Hide × Esc'): × with its key
+      const x = document.createElement("button");
+      x.type = "button";
+      x.textContent = "× ";
+      const kbd = document.createElement("kbd");
+      kbd.textContent = "Esc";
+      x.append(kbd);
+      x.setAttribute("aria-label", "Clear");
+      x.title = "Clear (Esc)";
+      x.addEventListener("click", () => { if (!this.unpick()) this.setTypeFocus(null); });
+      this.chip.replaceChildren(span, x);
+    }
+    this.chip.hidden = false;
+    this.placeChip();
+    // W5's marks chip comes and goes on its own (an answer's 'Hide' / 'Show'): place this one again when it does
+    const mc = document.getElementById("marksChip");
+    if (mc && !this.chipObs) {
+      this.chipObs = new MutationObserver(() => { if (!this.chip.hidden) this.placeChip(); });
+      this.chipObs.observe(mc, { attributes: true, attributeFilter: ["hidden", "style"], childList: true });
+    }
+  }
+
+  /** The chip sits below the floating toolbar, the 'Ask about a floor' pill and the page's marks chip (W5 01:33: both
+   * chips are centred at the top) when they cover the pane's top. */
+  private placeChip() {
+    let top = 12;
+    const p = this.el.getBoundingClientRect();
+    for (const o of document.querySelectorAll<HTMLElement>("#toolbar, .feat-floor-btn, #marksChip")) {
+      if (o.hidden) continue;
+      const r = o.getBoundingClientRect();
+      if (r.height > 0 && r.bottom > p.top && r.top < p.top + 200 && r.right > p.left && r.left < p.right) top = Math.max(top, r.bottom - p.top + 8);
+    }
+    this.chip.style.top = `${Math.round(top)}px`;
   }
 
   /** Thin edges on the solid parts (W7, captain 'walls warm off-white with thin edges'): EdgesGeometry (creases > 35°)
    * per opaque bucket, built bucket by bucket in idle time after the model is shown, drawn as a child of the bucket
    * (same lift / cut / visibility). `?edges=0` turns them off. */
   private edgeStats = { ms: 0, segments: 0 };
+  /** dev: where a model's load time goes (download, web-ifc parse, meshes, buckets, the look layer), in ms */
+  loadStats: Record<string, number> = {};
+  // ---- section caps (W7 c3) -------------------------------------------------------------------------------------
+  // A floor cut by a clip plane (exploded floors, one floor shown) cuts its walls open: IFC solids have no face at the
+  // cut, so the hollow inside showed through the cut top (speckled; with AO a deep black slot: Duplex 'Interior -
+  // Partition (92mm Stud)'). Each cut floor gets a real cap: every wall-like solid's triangles are intersected with the
+  // cut plane on the CPU, the segments are chained into loops per solid and triangulated into one flat mesh just under
+  // the cut. It is opaque, so the AO sees a flat top too. Built in idle time, cached per (floor, cut height).
+  private caps = new Map<string, THREE.Mesh | null>();
+  private capQueue: { key: string; storey: number; cut: number }[] = [];
+  private capStats = { ms: 0, tris: 0, loops: 0, open: 0 };
+
+  /** The caps wanted now: each exploded floor at its plan cut, or the one floor shown at its clip height. */
+  private wantedCaps(): { key: string; storey: number; cut: number; dy: number }[] {
+    if (/[?&]caps=0\b/.test(location.search)) return [];
+    const out: { key: string; storey: number; cut: number; dy: number }[] = [];
+    if (this.explode) {
+      for (const [id, e] of this.explode) {
+        const cut = this.storeyBaseY.get(id)! + 1.3;
+        out.push({ key: `${id}:${cut.toFixed(3)}`, storey: id, cut, dy: e.dy });
+      }
+    } else if (this.activeStorey !== null) {
+      const cut = this.clipHeight();
+      if (cut !== null) out.push({ key: `${this.activeStorey}:${cut.toFixed(3)}`, storey: this.activeStorey, cut, dy: 0 });
+    }
+    return out;
+  }
+
+  /** Show / lift the caps that belong to the view, hide the rest; queue the missing ones. */
+  private syncCaps() {
+    const want = this.wantedCaps();
+    const on = new Map(want.map((w) => [w.key, w]));
+    // lighter while an answer is lit (the walls fade toward white then) and in the all-white Clay look
+    const flat = this.ghost && calmView() ? CAP_FADED_HEX : calmView() && getLook() === "clay" ? CAP_CLAY_HEX : null;
+    for (const [key, m] of this.caps) {
+      if (!m) continue;
+      const w = on.get(key);
+      m.visible = !!w;
+      if (w) m.position.y = this.explode?.get(w.storey)?.dy ?? 0;
+      const mat = m.material as THREE.MeshLambertMaterial;
+      if (mat.vertexColors !== !flat) { mat.vertexColors = !flat; mat.needsUpdate = true; }
+      mat.color.set(flat ?? "#ffffff");
+    }
+    const missing = want.filter((w) => !this.caps.has(w.key) && !this.capQueue.some((q) => q.key === w.key));
+    if (!missing.length) return;
+    const idle = this.capQueue.length === 0;
+    this.capQueue.push(...missing);
+    if (idle) this.nextCap(this.loadToken);
+  }
+
+  private nextCap(token: number) {
+    // several caps per idle slot (each is ~2-25 ms), so they do not wait behind the edge builder's slots
+    const run = () => {
+      if (token !== this.loadToken) return;
+      const t0 = performance.now();
+      let added = false;
+      while (this.capQueue.length && performance.now() - t0 < 40) {
+        const q = this.capQueue.shift()!;
+        const t1 = performance.now();
+        let mesh: THREE.Mesh | null = null;
+        try {
+          mesh = this.buildCap(q.storey, q.cut);
+        } catch (err) {
+          console.warn("section cap failed", err);
+        }
+        this.capStats.ms += Math.round(performance.now() - t1);
+        this.caps.set(q.key, mesh);
+        if (mesh) { this.root.add(mesh); added = true; }
+      }
+      if (added) {
+        this.syncCaps();
+        this.needsRender = true;
+      }
+      if (this.capQueue.length) this.nextCap(token);
+    };
+    // a plain task, not an idle callback: on a big model the edge builder's idle slots kept the caps waiting for seconds
+    // (Barlad, 5.3 M triangles); a slice is <= ~40 ms, so the page stays responsive
+    setTimeout(run, 0);
+  }
+
+  /** One floor's cap at local height `cut`: the opaque solids of that storey (not glass, furniture, ceilings) cut by the
+   * plane y = cut; null when nothing is cut. */
+  private buildCap(storey: number, cut: number): THREE.Mesh | null {
+    /** Does the edge from the chain's last point back to its first cross any of the chain's other edges? */
+    const crosses = (c: THREE.Vector2[]): boolean => {
+      const A = c[c.length - 1], B = c[0];
+      const ccw = (p: THREE.Vector2, q: THREE.Vector2, r: THREE.Vector2) => (q.x - p.x) * (r.y - p.y) - (q.y - p.y) * (r.x - p.x);
+      for (let i = 1; i + 2 < c.length; i++) {
+        const C = c[i], D = c[i + 1];
+        if (ccw(A, B, C) * ccw(A, B, D) < 0 && ccw(C, D, A) * ccw(C, D, B) < 0) return true;
+      }
+      return false;
+    };
+    const Q = 2000; // endpoints within 0.5 mm are the same point
+    const key = (x: number, z: number) => `${Math.round(x * Q)},${Math.round(z * Q)}`;
+    const out: number[] = [], col: number[] = [];
+    const base = new THREE.Color(CAP_HEX);
+    const y0 = cut - 0.004;
+    // solids are cut 1 cm above the plane: a wall whose top is AT the clip height (the one-floor view cuts at the next
+    // floor's base) keeps its own top face and gets no cap (cap and top 4 mm apart would z-fight from afar)
+    const cy = cut + 0.01;
+    for (const b of this.buckets) {
+      if (b.storey !== storey || b.transparent || b.furniture || b.ceiling) continue;
+      const P = b.pos, I = b.idx;
+      for (const r of b.ranges) {
+        // the cap's colour: this solid's role colour a step darker (CPU caps do not care how faces are wound, so
+        // doors, windows and railings are cut too: a door leaf reads as a thin wood line, like on a plan)
+        const v0 = I[r.start] * 3;
+        const [cr, cg, cb] = b.role && b.role.length > v0 + 2 ? [b.role[v0] * CAP_K, b.role[v0 + 1] * CAP_K, b.role[v0 + 2] * CAP_K] : [base.r, base.g, base.b];
+        const segs: number[] = [];
+        for (let k = r.start; k + 2 < r.start + r.count; k += 3) {
+          const a = I[k] * 3, bb = I[k + 1] * 3, c = I[k + 2] * 3;
+          const ya = P[a + 1] - cy, yb = P[bb + 1] - cy, yc = P[c + 1] - cy;
+          const sa = ya >= 0, sb = yb >= 0, sc = yc >= 0;
+          if (sa === sb && sb === sc) continue;
+          const pts: number[] = [];
+          const edge = (i: number, yi: number, j: number, yj: number) => {
+            const t = yi / (yi - yj);
+            pts.push(P[i] + t * (P[j] - P[i]), P[i + 2] + t * (P[j + 2] - P[i + 2]));
+          };
+          if (sa !== sb) edge(a, ya, bb, yb);
+          if (sb !== sc) edge(bb, yb, c, yc);
+          if (sc !== sa) edge(c, yc, a, ya);
+          if (pts.length === 4 && key(pts[0], pts[1]) !== key(pts[2], pts[3])) segs.push(pts[0], pts[1], pts[2], pts[3]);
+        }
+        const n = segs.length / 4;
+        if (n < 3) continue;
+        const ends = new Map<string, number[]>();
+        for (let i = 0; i < n; i++) for (const e of [0, 2]) {
+          const k = key(segs[i * 4 + e], segs[i * 4 + e + 1]);
+          const l = ends.get(k);
+          if (l) l.push(i); else ends.set(k, [i]);
+        }
+        const used = new Uint8Array(n);
+        // walk from (x, z) along unused segments; returns the points after (x, z) and whether it came back to `stop`
+        const walk = (x: number, z: number, stop: string): { pts: THREE.Vector2[]; closed: boolean } => {
+          const pts: THREE.Vector2[] = [];
+          for (let g = 0; g < n; g++) {
+            const k = key(x, z);
+            if (k === stop) return { pts, closed: true };
+            const next = ends.get(k)?.find((t) => !used[t]);
+            if (next === undefined) break;
+            used[next] = 1;
+            if (key(segs[next * 4], segs[next * 4 + 1]) === k) { x = segs[next * 4 + 2]; z = segs[next * 4 + 3]; }
+            else { x = segs[next * 4]; z = segs[next * 4 + 1]; }
+            pts.push(new THREE.Vector2(x, z));
+          }
+          return { pts, closed: false };
+        };
+        const loops: THREE.Vector2[][] = [], frags: THREE.Vector2[][] = [];
+        for (let s0 = 0; s0 < n; s0++) {
+          if (used[s0]) continue;
+          used[s0] = 1;
+          const a0 = new THREE.Vector2(segs[s0 * 4], segs[s0 * 4 + 1]), a1 = new THREE.Vector2(segs[s0 * 4 + 2], segs[s0 * 4 + 3]);
+          const f = walk(a1.x, a1.y, key(a0.x, a0.y));
+          if (f.closed) { loops.push([a0, a1, ...f.pts.slice(0, -1)]); continue; }
+          // open so far: also walk back from the start, so the fragment is the whole chain
+          const r = walk(a0.x, a0.y, "");
+          frags.push([...r.pts.reverse(), a0, a1, ...f.pts]);
+        }
+        // W7 c4: open chains (cracks / T-junctions in the solid's mesh; Frigento 33 of 121) are joined end to end when
+        // their ends are within 3 cm, and a chain is closed when its two ends are within 0.6 m and the closing edge
+        // crosses none of its own edges (a missing straight face); else it stays open (no cap, as before)
+        while (frags.length) {
+          let cur = frags.pop()!;
+          for (;;) {
+            let best = -1, bestD = 0.03, rev = false, front = false;
+            const e = cur[cur.length - 1], s = cur[0];
+            for (let i = 0; i < frags.length; i++) {
+              const f = frags[i];
+              const cands: [number, boolean, boolean][] = [[e.distanceTo(f[0]), false, false], [e.distanceTo(f[f.length - 1]), true, false],
+                [s.distanceTo(f[f.length - 1]), false, true], [s.distanceTo(f[0]), true, true]];
+              for (const [d, rv, fr] of cands) if (d < bestD) { bestD = d; best = i; rev = rv; front = fr; }
+            }
+            if (best < 0) break;
+            const f = frags.splice(best, 1)[0];
+            const g = rev ? f.slice().reverse() : f;
+            cur = front ? [...g, ...cur] : [...cur, ...g];
+          }
+          const gap = cur[0].distanceTo(cur[cur.length - 1]);
+          if (cur.length >= 3 && gap < 0.6 && !crosses(cur)) loops.push(gap < 1e-3 ? cur.slice(0, -1) : cur);
+          else this.capStats.open++;
+        }
+        for (const loop of loops) {
+          if (loop.length < 3 || Math.abs(THREE.ShapeUtils.area(loop)) < 1e-5) continue;
+          this.capStats.loops++;
+          for (const [i, j, k] of THREE.ShapeUtils.triangulateShape(loop, [])) {
+            const A = loop[i], B = loop[j], C = loop[k];
+            // wound to face up (+y): (B - A) x (C - A) has y = (B.z - A.z)(C.x - A.x) - (B.x - A.x)(C.z - A.z)
+            const up = (B.y - A.y) * (C.x - A.x) - (B.x - A.x) * (C.y - A.y) > 0;
+            const [U, V] = up ? [B, C] : [C, B];
+            out.push(A.x, y0, A.y, U.x, y0, U.y, V.x, y0, V.y);
+            col.push(cr, cg, cb, cr, cg, cb, cr, cg, cb);
+          }
+        }
+      }
+    }
+    if (!out.length) return null;
+    this.capStats.tris += out.length / 9;
+    const g = new THREE.BufferGeometry();
+    g.setAttribute("position", new THREE.Float32BufferAttribute(out, 3));
+    const nrm = new Float32Array(out.length);
+    for (let i = 1; i < nrm.length; i += 3) nrm[i] = 1;
+    g.setAttribute("normal", new THREE.BufferAttribute(nrm, 3));
+    g.setAttribute("color", new THREE.Float32BufferAttribute(col, 3));
+    g.computeBoundingSphere();
+    const m = new THREE.Mesh(g, new THREE.MeshLambertMaterial({ vertexColors: true }));
+    m.userData.cap = storey;
+    m.visible = false;
+    return m;
+  }
+
   private async buildEdges(token: number) {
     if (/[?&]edges=0\b/.test(location.search)) return;
+    // W7 c3: a very big model (Barlad: 5.3 M triangles) gets no edges: EdgesGeometry on one floor's bucket blocked the
+    // page for seconds after load (and held back the section caps); its own detail reads without them
+    const tris = this.buckets.reduce((n, b) => n + (b.transparent ? 0 : b.idx.length / 3), 0);
+    if (tris > 2e6) { this.edgeStats = { ms: 0, segments: -1 }; return; }
     const t0 = performance.now();
     let segs = 0;
     for (const b of this.buckets) {
@@ -655,17 +1356,35 @@ export class Viewer3D {
       lines.userData.edges = true;
       b.mesh.add(lines);
       b.edges = lines;
+      // W7 c5: cut and faded like its solid from its first frame (filmed on the GPU: while the floors lifted apart on
+      // load, the new edges were drawn uncut, full storey height, until the last bucket's edges were built)
+      this.edgeStyle(b);
+      this.needsRender = true;
     }
     this.edgeStats = { ms: Math.round(performance.now() - t0), segments: segs };
     this.updateMaterials();
+  }
+
+  /** A bucket's thin edges follow its solid: the same cut planes (exploded floors, one floor shown); faint on faded
+   * floors, lighter while an answer is lit, none in the expert view. */
+  private edgeStyle(b: Bucket) {
+    if (!b.edges) return;
+    const lm = b.edges.material as THREE.LineBasicMaterial;
+    const other = this.activeStorey !== null && b.storey !== this.activeStorey;
+    lm.opacity = !calmView() ? 0 : other ? 0.04 : this.ghost ? 0.3 : 0.55;
+    b.edges.visible = lm.opacity > 0;
+    lm.clippingPlanes = (b.mesh!.material as THREE.Material).clippingPlanes;
   }
 
   private clear() {
     this.clearHighlights();
     for (const b of this.buckets) if (b.edges) { b.edges.geometry.dispose(); (b.edges.material as THREE.Material).dispose(); }
     this.tints = [];
+    this.typeFocus = null;
     for (const f of this.floorLabels) f.el.remove();
     this.floorLabels = [];
+    for (const l of this.roomLabels) l.el.remove();
+    this.roomLabels = [];
     this.explode = null;
     for (const o of this.root.children) {
       const m = o as THREE.Mesh;
@@ -676,6 +1395,8 @@ export class Viewer3D {
     this.buckets = [];
     this.spaceBuckets.clear();
     this.elementBuckets.clear();
+    this.caps.clear(); // their meshes were root children (disposed above)
+    this.capQueue = [];
     this.guidToId.clear();
     this.idToGuid.clear();
     this.storeyOf.clear();
@@ -733,7 +1454,7 @@ export class Viewer3D {
     for (const id of parent.keys()) this.storeyOf.set(id, resolve(id));
   }
 
-  private addMesh(mesh: WebIFC.FlatMesh, bucketFor: (id: number, transparent: boolean) => Bucket) {
+  private addMesh(mesh: WebIFC.FlatMesh, bucketFor: (id: number, transparent: boolean, ySpan: () => number) => Bucket) {
     const api = this.api!;
     const id = mesh.expressID;
     const n = mesh.geometries.size();
@@ -743,7 +1464,17 @@ export class Viewer3D {
       const v = api.GetVertexArray(geom.GetVertexData(), geom.GetVertexDataSize());
       const ix = api.GetIndexArray(geom.GetIndexData(), geom.GetIndexDataSize());
       const t = pg.flatTransformation;
-      const b = bucketFor(id, pg.color.w < 0.99);
+      // how tall this piece is in the world (asked only for roof-like elements: a pitched roof is a ceiling, see load)
+      const ySpan = () => {
+        let lo = Infinity, hi = -Infinity;
+        for (let k = 0; k < v.length; k += 6) {
+          const y = t[1] * v[k] + t[5] * v[k + 1] + t[9] * v[k + 2] + t[13];
+          if (y < lo) lo = y;
+          if (y > hi) hi = y;
+        }
+        return hi > lo ? hi - lo : 0;
+      };
+      const b = bucketFor(id, pg.color.w < 0.99, ySpan);
       const base = b.pos.length / 3;
       const start = b.idx.length;
       const rc = b.key.startsWith("space:") ? null : this.roleColor(id, b);
@@ -848,17 +1579,44 @@ export class Viewer3D {
    * light → deep blue ramp by its floor area, with a legend in m²; null = back to room types. */
   private setAreaRamp(ids: number[] | null) {
     this.areaIds = ids;
+    if (ids) this.typeFocus = null;
+    this.paintTints();
+  }
+
+  /** The room floors' colours: room types; or an area answer's ramp; or one room type lit from the legend (spotColor). */
+  private paintTints() {
     for (const t of this.tints) {
       const attr = t.mesh.geometry.attributes.color as THREE.BufferAttribute;
-      (attr.array as Float32Array).set(t.typeCol);
+      const arr = attr.array as Float32Array;
+      arr.set(t.typeCol);
+      if (this.typeFocus && !this.areaIds) {
+        const on = spotColor(this.typeFocus, true), off = new Map<RoomType, THREE.Color>();
+        for (const s of t.spaces) {
+          const c = s.type === this.typeFocus ? on : (off.get(s.type) ?? off.set(s.type, spotColor(s.type, false)).get(s.type)!);
+          for (let v = s.v0; v < s.v1; v++) arr.set([c.r, c.g, c.b], v * 3);
+        }
+      }
       attr.needsUpdate = true;
     }
+    this.needsRender = true;
+    const ids = this.areaIds;
     if (!ids) return;
     const storeys = new Set(ids.map((id) => this.storeyOf.get(id) ?? -1));
-    const tints = this.tints.filter((t) => storeys.has(t.storey) || storeys.has(-1));
+    // ranked rooms on >= 2 floors = a whole-building ranking: every floor on the ramp (floor 5 kept its room-type colours
+    // under an area legend: 'five biggest rooms in the building' on Maleva); one floor: that floor, the others near white
+    const all = storeys.size >= 2 || storeys.has(-1);
+    const tints = all ? this.tints : this.tints.filter((t) => storeys.has(t.storey));
     const areas = tints.flatMap((t) => t.spaces.map((s) => s.area)).filter((a) => a >= 0.5);
     if (!areas.length) return;
     const min = Math.min(...areas), max = Math.max(...areas);
+    const off = new THREE.Color("#f2f1ee");
+    for (const t of this.tints) {
+      if (tints.includes(t)) continue;
+      const attr = t.mesh.geometry.attributes.color as THREE.BufferAttribute;
+      const arr = attr.array as Float32Array;
+      for (let v = 0; v < arr.length / 3; v++) arr.set([off.r, off.g, off.b], v * 3);
+      attr.needsUpdate = true;
+    }
     for (const t of tints) {
       const attr = t.mesh.geometry.attributes.color as THREE.BufferAttribute;
       const arr = attr.array as Float32Array;
@@ -871,29 +1629,69 @@ export class Viewer3D {
     this.rampRange = { min, max };
   }
   private rampRange: { min: number; max: number } | null = null;
+  /** the room type lit from the legend (W7 c2), null = all types */
+  private typeFocus: RoomType | null = null;
+
+  /** A legend row clicked: light every room of that type (its floors a deeper shade, the rest almost white), with its
+   * count and floor area in the card; in the stacked whole-building view the floors explode first, since the slabs
+   * hide the rooms. Not while an answer is lit (the card is dimmed then). */
+  private setTypeFocus(k: RoomType | null) {
+    // W7 c4 (UX S-M6): a type clicked while an answer or a pick is lit used to do nothing; the visitor asked for that
+    // type, so the 3D lets the answer's highlight go (the card stays; 'Clear marks' / a new answer behave as before)
+    if (k && (this.ghost || this.areaIds) && !this.unpick()) {
+      this.highlight([], false);
+      // c6: the page's marks chip (W5) still said '211 doors marked · Hide' while the 3D showed a room type instead:
+      // tell it the answer's marks are off in the 3D (it can offer 'Show 211 doors', which lights the answer again)
+      window.dispatchEvent(new CustomEvent("stoa:3d-marks-off", { detail: { why: "room type" } }));
+    }
+    if (k && (this.ghost || this.areaIds)) return;
+    this.typeFocus = k;
+    if (k && this.activeStorey === null && !this.explode && this.roomStoreys().length >= 2) this.setExploded(true);
+    this.paintTints();
+    this.updateLegend();
+    this.placeRoomLabels();
+    this.syncChip();
+  }
 
   /** The legend: room types of the floors in view (or the whole model), or the area ramp. */
   private updateLegend() {
     if (!this.panel) return; // the constructor's first theme pass runs before the panel exists
     const calm = calmView();
-    if (!calm || getLook() !== "rooms" || !this.tints.length) return this.panel.setLegend(null);
+    if (!calm || getLook() !== "rooms") return this.panel.setLegend(null);
+    // no room shapes at all (most Revit uploads, Barlad, Frigento): say why the floors are not coloured
+    if (!this.tints.length) {
+      return this.panel.setLegend(null, null, this.buckets.length && !this.spaceBuckets.size
+        ? "No room shapes (IfcSpace) in this model, so its floors are not coloured by use." : "");
+    }
     if (this.areaIds && this.rampRange) return this.panel.setLegend(null, { ...this.rampRange, title: "Room floor area (3D model)" });
     const n = new Map<RoomType, number>();
+    let focusArea = 0;
     for (const t of this.tints) {
       if (this.activeStorey !== null && t.storey !== this.activeStorey) continue;
-      for (const s of t.spaces) n.set(s.type, (n.get(s.type) ?? 0) + 1);
+      for (const s of t.spaces) {
+        n.set(s.type, (n.get(s.type) ?? 0) + 1);
+        if (s.type === this.typeFocus) focusArea += s.area;
+      }
     }
+    const focus = this.typeFocus; // its row stays (with 0) on a floor without that type, so a click can turn it off
     // stacked whole building: the slabs hide the room floors, say how to see them
     const hidden = this.activeStorey === null && !this.explode && this.roomStoreys().length >= 2;
-    this.panel.setLegend(ROOM_TYPES.filter((t) => n.get(t.key)).map((t) => ({ key: t.key, label: t.label, hex: t.hex, n: n.get(t.key)! })),
-      null, hidden ? "Pick a floor or explode the floors to see the rooms" : "");
+    const fmt = (v: number) => (v >= 100 ? Math.round(v).toLocaleString("en-US") : v.toFixed(1));
+    const where = this.activeStorey !== null ? "on this floor" : "in the model";
+    const k = focus ? (n.get(focus) ?? 0) : 0;
+    const note = focus ? `${k} ${k === 1 ? "room" : "rooms"} ${where}${k ? ` · ${fmt(focusArea)} m² floor area (3D model)` : ""}. Click again for all.`
+      : hidden ? "Click a room type to see it on every floor, or pick a floor" : "";
+    this.panel.setLegend(ROOM_TYPES.filter((t) => n.get(t.key) || t.key === focus).map((t) => ({ key: t.key, label: t.label, hex: t.hex, n: n.get(t.key) ?? 0, hint: t.hint })),
+      null, note, focus);
   }
 
   private computeStoreyBases() {
     this.storeyBaseY.clear();
+    this.storeyVerts.clear();
     const ys = new Map<number, number[]>();
     for (const b of this.buckets) {
       if (b.storey < 0 || b.transparent) continue;
+      if (!b.furniture) this.storeyVerts.set(b.storey, (this.storeyVerts.get(b.storey) ?? 0) + b.pos.length / 3);
       const l = ys.get(b.storey) ?? [];
       const step = Math.max(3, Math.floor(b.pos.length / 3 / 4000) * 3); // sample ≤ ~4k vertices per bucket
       for (let i = 1; i < b.pos.length; i += step) l.push(b.pos[i]);
@@ -908,10 +1706,14 @@ export class Viewer3D {
 
   /** World y where the active storey ends: the floor of the next storey above that has geometry. */
   private clipHeight(): number | null {
-    if (this.activeStorey === null) return null;
-    const base = this.storeyBaseY.get(this.activeStorey);
+    return this.activeStorey === null ? null : this.nextBaseY(this.activeStorey);
+  }
+
+  /** World y of the floor of the next storey above `id` that has geometry (null: none, or `id` has no base). */
+  private nextBaseY(id: number): number | null {
+    const base = this.storeyBaseY.get(id);
     if (base === undefined) return null;
-    const i = this.storeys.findIndex((s) => s.id === this.activeStorey);
+    const i = this.storeys.findIndex((s) => s.id === id);
     for (const s of this.storeys.slice(i + 1)) {
       const nb = this.storeyBaseY.get(s.id);
       if (nb !== undefined && nb > base) return nb;
@@ -937,16 +1739,19 @@ export class Viewer3D {
     if (!parts?.length) return null;
     const pos: number[] = [];
     const idx: number[] = [];
-    const remap = new Map<string, number>();
+    // one numeric map per bucket (c6: a '<bucket>:<vertex>' string per index cost most of highlight()'s 80-120 ms on a
+    // 211-door answer)
+    const remaps = new Map<Bucket, Map<number, number>>();
     for (const { b, r } of parts) {
+      let remap = remaps.get(b);
+      if (!remap) remaps.set(b, (remap = new Map<number, number>()));
       for (let k = r.start; k < r.start + r.count; k++) {
         const vi = b.idx[k];
-        const key = `${b.key}:${vi}`;
-        let ni = remap.get(key);
+        let ni = remap.get(vi);
         if (ni === undefined) {
           ni = pos.length / 3;
           pos.push(b.pos[vi * 3], b.pos[vi * 3 + 1], b.pos[vi * 3 + 2]);
-          remap.set(key, ni);
+          remap.set(vi, ni);
         }
         idx.push(ni);
       }
@@ -990,12 +1795,35 @@ export class Viewer3D {
     return this.guidToId.has(guid);
   }
 
+  /** Highlight materials go back to a pool for the next answer instead of being disposed (W7 c6): disposing a material
+   * frees its shader programs, so every answer compiled 8 programs again (the lit / x-ray materials, on screen and in the
+   * AO / halo pass), part of a 150-250 ms frame when an answer lit up. */
+  private hlPool = new Map<string, THREE.Material[]>();
+  private takeMat<T extends THREE.Material>(key: string, make: () => T): T {
+    const m = this.hlPool.get(key)?.pop() as T | undefined;
+    if (m) {
+      m.opacity = m.userData.baseOpacity as number;
+      return m;
+    }
+    const n = make();
+    n.userData.poolKey = key;
+    n.userData.baseOpacity = n.opacity;
+    return n;
+  }
+
+  private poolMat(mat: THREE.Material) {
+    const key = mat.userData.poolKey as string | undefined;
+    let pool = key ? this.hlPool.get(key) : undefined;
+    if (key && !pool) this.hlPool.set(key, (pool = []));
+    if (pool && pool.length < 32) { if (!pool.includes(mat)) pool.push(mat); } else mat.dispose();
+  }
+
   private clearHighlights() {
     for (const o of this.hlGroup.children) {
       const m = o as THREE.Mesh;
       // an x-ray twin shares its part's geometry: dispose() twice is harmless
       m.geometry.dispose();
-      (m.material as THREE.Material).dispose();
+      this.poolMat(m.material as THREE.Material);
     }
     this.hlGroup.clear();
     this.hlParts = [];
@@ -1008,8 +1836,12 @@ export class Viewer3D {
    * 300. In the customer view each part also gets an x-ray twin (drawn only where walls hide it, faint) and the parts
    * fade in floor by floor from the bottom (captain 15:40). */
   highlight(guids: string[], frame = true, contrast: Set<string> = new Set(), rank: Map<string, number> = new Map()): number {
+    this.picked = null; // an answer / another selection / main.ts closing the pick card replaces a pick (the pick handler sets it after)
     this.ensureGuidIndex();
     this.clearHighlights();
+    // W7 c5 (UX NEW-1): nothing lit = no numbered pins either; Esc / the eraser (main.ts clearMarks) took the glow away
+    // but left pins 1-5 floating on the roof. An answer re-applied after this (closing a pick) sets its pins again.
+    if (!guids.length && this.labels.length) this.setNumberGroups([]);
     const calm = calmView();
     const tmp = new THREE.MeshBasicMaterial();
     const parts = new Map<string, { key: string; storey: number; space: boolean; rank?: number; contrast: boolean; geoms: THREE.BufferGeometry[] }>();
@@ -1037,6 +1869,10 @@ export class Viewer3D {
     const order = new Map<number, number>();
     this.storeys.forEach((s, i) => order.set(s.id, i));
     const lit = [...parts.values()].sort((a, b) => (order.get(a.storey) ?? 99) - (order.get(b.storey) ?? 99));
+    // W7 c6: an answer on elements the exploded floors do not show (the roof storey, a storey without rooms, no storey):
+    // 'How tall is the building?' lit the roof's highest element, hidden, its pin floating beside floor 5. Stack the
+    // building (not the visitor's choice: nothing is stored)
+    if (this.explode && lit.some((p) => !this.explode!.has(p.storey))) this.setExploded(false, false);
     const floors = [...new Set(lit.map((p) => p.storey))];
     const reduced = matchMedia("(prefers-reduced-motion: reduce)").matches;
     const step = floors.length > 1 ? Math.min(170, 1100 / floors.length) : 0;
@@ -1047,17 +1883,22 @@ export class Viewer3D {
       if (!geom) continue;
       geom.computeBoundingBox();
       geom.computeBoundingSphere();
-      const mat = p.rank !== undefined ? rankMat(p.rank, p.space)
-        : this.hlMat(p.space ? "space" : p.contrast ? "contrast" : "hl");
-      if (calm && !p.space) rimGlow(mat, 0.5);
+      const rim = calm && !p.space;
+      const kind = p.space ? "space" : p.contrast ? "contrast" : "hl";
+      const mat = this.takeMat(`${p.rank !== undefined ? `rk${p.rank}${p.space ? "s" : ""}` : kind}${rim ? "-rim" : ""}`, () => {
+        const m = p.rank !== undefined ? rankMat(p.rank, p.space) : this.hlMat(kind);
+        if (rim) rimGlow(m, 0.5);
+        return m;
+      });
       const mesh = new THREE.Mesh(geom, mat);
       mesh.renderOrder = 10;
       const part: HlPart = { mesh, opacity: mat.opacity, xrayOpacity: 0, at: t0 + floors.indexOf(p.storey) * step, storey: p.storey };
       this.hlGroup.add(mesh);
       if (calm && !p.space) {
         // the x-ray twin: only where something nearer hides the element (depth GREATER), faint, no depth write
-        const xm = new THREE.MeshBasicMaterial({ color: mat.color, transparent: true, opacity: 0.28, depthWrite: false,
-          depthFunc: THREE.GreaterDepth, side: THREE.DoubleSide });
+        const xm = this.takeMat("xray", () => new THREE.MeshBasicMaterial({ transparent: true, opacity: 0.28, depthWrite: false,
+          depthFunc: THREE.GreaterDepth, side: THREE.DoubleSide }));
+        xm.color.copy(mat.color);
         const xray = new THREE.Mesh(geom, xm);
         xray.renderOrder = 11;
         part.xray = xray;
@@ -1161,19 +2002,59 @@ export class Viewer3D {
   }
 
   /** Show one storey (others faded); null shows all. */
+  /** Light one room group the way a legend click does (W7 c5, UX S-m2 / S-M6: a 'This floor at a glance' row clicked
+   * while the 3D is shown lights the same group in the same colour, instead of an answer in blue). `group` = the
+   * glance / legend label ('Wet rooms') or a key ('wet'); null = all groups again. Returns false (and changes nothing)
+   * when the model has no room of that group, so the caller can fall back to its 2D answer. */
+  lightType(group: string | null): boolean {
+    if (group === null) {
+      if (this.typeFocus) this.setTypeFocus(null);
+      return true;
+    }
+    const g = group.trim().toLowerCase();
+    const key = ROOM_TYPES.find((t) => t.key === g || t.label.toLowerCase() === g)?.key;
+    if (!key || !this.tints.some((t) => t.spaces.some((s) => s.type === key))) return false;
+    if (this.typeFocus !== key) this.setTypeFocus(key);
+    return true;
+  }
+
+  /** an answer is lit on a storey the exploded view hides (roof, no rooms, no storey): keep the building stacked */
+  private litOffExplode(): boolean {
+    if (!this.hlParts.length) return false;
+    const shown = new Set(this.roomStoreys());
+    return this.hlParts.some((p) => !shown.has(p.storey));
+  }
+
   setStorey(id: number | null) {
+    // W7 c6: the whole building comes back the way it opened (floors exploded, unless the visitor chose 'Stack floors')
+    // after one floor was shown: the '3D model' tab after a floor sheet, 'All storeys', an answer on several floors, and
+    // 'Start over' (main.ts reopens floor 1 after the reset, so the 3D tab then showed the building stacked)
+    if (id === null && this.activeStorey !== null && !this.explode && this.el.dataset.state === "ready" && this.opensExploded()
+      && !this.litOffExplode()) {
+      this.setExploded(true); // clears activeStorey; lifts the floors with the camera
+      return;
+    }
     this.activeStorey = id;
-    if (id !== null && this.explode) {
+    const wasExploded = id !== null && !!this.explode;
+    if (wasExploded) {
       // one floor shown = stacked again (the storey filter's cut + fade take over)
       this.explode = null;
       this.panel.setExploded(false);
       this.look.setBands(null);
+      this.look.setShadowStrength(1);
     }
     this.updateMaterials();
+    // the floors came down: what the camera framed (an answer's lit room, or the building) moved with them, so fit it
+    // again where it is now (an answer's highlight() frames before main.ts picks the answer's floor)
+    if (wasExploded) this.frame(this.lastFramed?.parent ? this.lastFramed : this.root, false);
   }
 
   private setGhost(on: boolean) {
     this.ghost = on;
+    if (on && this.typeFocus) {
+      this.typeFocus = null; // an answer takes over the colours (the legend's type focus ends)
+      this.paintTints();
+    }
     this.updateMaterials();
   }
 
@@ -1193,13 +2074,15 @@ export class Viewer3D {
     this.panel?.el.classList.toggle("faded", TINT_FADE.value > 0); // the legend dims with the floors it explains
     for (const t of this.tints) t.mesh.visible = rooms && (this.activeStorey === null || t.storey === this.activeStorey);
     this.updateLegend();
-    this.look?.setClip(clipY !== null ? [this.clipPlane] : null);
+    this.look?.setClip(clipY !== null ? this.oneCut : NO_CUTS);
     // x-ray twins belong to the calm look only (a switch to the expert view keeps the lit answer, without them)
     for (const p of this.hlParts) if (p.xray) p.xray.visible = calm && p.mesh.visible;
     for (const b of this.buckets) {
       const mat = b.mesh!.material as THREE.MeshLambertMaterial;
-      mat.clippingPlanes = clipY !== null && b.storey === this.activeStorey ? [this.clipPlane] : null;
       const other = this.activeStorey !== null && b.storey !== this.activeStorey;
+      // one floor shown: everything is cut at its ceiling, the faded floors below too (W7 c4: Maleva floor 1's tall
+      // elements, 0.1-17.4 m, floated as faint slabs in the sky above floor 2)
+      mat.clippingPlanes = clipY !== null ? this.oneCut : NO_CUTS;
       let opacity = b.transparent ? 0.35 : 1;
       if (other) opacity = 0.06;
       else if (this.ghost && !calm) opacity = b.transparent ? 0.15 : 0.32;
@@ -1210,20 +2093,14 @@ export class Viewer3D {
       // with a storey filter: hide storeys above it and elements without a storey (roof proxies, annotations)
       b.mesh!.visible = !(other && ((b.storey > -1 && this.storeyAbove(b.storey)) || b.storey === -1)) && (!b.furniture || this.showFurniture)
         && !(b.ceiling && this.activeStorey !== null);
-      if (b.edges) {
-        const lm = b.edges.material as THREE.LineBasicMaterial;
-        lm.opacity = !calm ? 0 : other ? 0.04 : this.ghost ? 0.3 : 0.55;
-        b.edges.visible = lm.opacity > 0;
-        lm.clippingPlanes = mat.clippingPlanes;
-      }
       // exploded floors: lifted, cut like a plan, ceilings and floors without rooms hidden
       const e = this.explode?.get(b.storey);
       b.mesh!.position.y = e?.dy ?? 0;
       if (this.explode) {
-        mat.clippingPlanes = e ? [e.plane] : null;
-        if (b.edges) (b.edges.material as THREE.Material).clippingPlanes = mat.clippingPlanes;
+        mat.clippingPlanes = e ? e.planes : NO_CUTS;
         if (!e || b.ceiling) b.mesh!.visible = false;
       }
+      this.edgeStyle(b);
     }
     for (const t of this.tints) {
       const e = this.explode?.get(t.storey);
@@ -1235,9 +2112,11 @@ export class Viewer3D {
       for (const m of [p.mesh, p.xray]) {
         if (!m) continue;
         m.position.y = e?.dy ?? 0;
-        (m.material as THREE.Material).clippingPlanes = e ? [e.plane] : null;
+        (m.material as THREE.Material).clippingPlanes = e ? e.planes : NO_CUTS;
       }
     }
+    this.syncCaps();
+    this.syncChip();
     this.needsRender = true;
   }
 
@@ -1257,6 +2136,19 @@ export class Viewer3D {
   }
 
   frame(obj: THREE.Object3D, animate = true) {
+    // W7 c6: floors lifting apart right now are measured where they will be: main.ts frameAll() right after an answer on
+    // several floors exploded them (setStorey(null)) fitted the still-stacked building (zoomed in, pins 4-5 off-screen)
+    if (!this.explode || !this.liftAnim || this.liftAnim.down) { this.fitCamera(obj, animate); return; }
+    const k0 = this.liftK;
+    this.applyLift(1);
+    try {
+      this.fitCamera(obj, animate);
+    } finally {
+      this.applyLift(k0);
+    }
+  }
+
+  private fitCamera(obj: THREE.Object3D, animate: boolean) {
     const box = new THREE.Box3().setFromObject(obj);
     if (box.isEmpty()) return;
     this.lastFramed = obj;
@@ -1281,8 +2173,19 @@ export class Viewer3D {
       const r = tb.getBoundingClientRect(), p = this.el.getBoundingClientRect();
       if (r.height > 0 && r.bottom > p.top && r.top < p.top + 60 && r.right > p.left && r.left < p.right) inset = Math.min(ph * 0.3, r.bottom - p.top + 8);
     }
-    const tanV = Math.tan((this.camera.fov * Math.PI) / 360) * (1 - inset / ph);
-    const tanH = Math.tan((this.camera.fov * Math.PI) / 360) * (this.camera.aspect || 1);
+    // W7 c5: on a phone the room legend card spans most of the pane's width at its bottom and hid Floor 1's end: fit
+    // into the band between the toolbar and the card (a desktop pane keeps the card beside the model, as before)
+    let insetB = 0;
+    if (calmView() && ph > 300 && this.panel?.el.isConnected && !this.panel.el.hidden) {
+      const r = this.panel.el.getBoundingClientRect(), p = this.el.getBoundingClientRect();
+      if (r.height > 0 && r.width > 0.5 * p.width && r.top < p.bottom && r.bottom > p.bottom - 40) insetB = Math.min(ph * 0.25, p.bottom - r.top + 8);
+    }
+    // W7 c4: exploded floors through a longer lens (30° instead of 45°): with a tall stack the top floors were seen at
+    // ~27° and the bottom ones at ~55° (TU Wien, 7 floors), so the lower floors hid each other; nearer to an axonometric,
+    // every floor is seen from about the same angle
+    const fov = this.explode ? EXPLODE_FOV : BASE_FOV;
+    const tanV = Math.tan((fov * Math.PI) / 360) * (1 - (inset + insetB) / ph);
+    const tanH = Math.tan((fov * Math.PI) / 360) * (this.camera.aspect || 1);
     const margin = obj === this.root ? 1.08 : 1.25;
     // fit on the geometry itself (sampled vertices, ≤ ~20k), not on the axis-aligned box: a building rotated on its
     // site has empty box corners that would leave the lit part small; the expanded box's corners keep the minimum size
@@ -1317,8 +2220,37 @@ export class Viewer3D {
       const depth = v.dot(fwd);
       dist = Math.max(dist, (Math.abs(v.dot(right)) * margin) / tanH - depth, (Math.abs(v.dot(up)) * margin) / tanV - depth);
     }
+    // W7 c4: keep the floor names' column (placeFloorLabels, right of the building) free: a model as wide as the pane
+    // (Smiley West) had the names on top of its floors. Only as much as needed: shift the model
+    // left while the left side has room, else back off; a model that already leaves the room (Maleva) does not move
+    const pw0 = this.el.clientWidth || 1;
+    // (not on a phone: there the model keeps the whole width and the names sit on the floors' ends, as before)
+    if (obj === this.root && calmView() && this.activeStorey === null && this.floorLabels.length >= 2 && !small && pw0 >= 600) {
+      const pw = pw0;
+      const lw = Math.max(60, ...this.floorLabels.map((f) => f.w ?? 90));
+      const rho = Math.min(0.3, (lw + 30) / pw); // the column's share of the pane's width
+      const screenX = () => {
+        let lo = Infinity, hi = -Infinity;
+        for (const p of pts) {
+          const v = p.clone().sub(c);
+          const x = v.dot(right) / ((dist + v.dot(fwd)) * tanH);
+          if (x < lo) lo = x;
+          if (x > hi) hi = x;
+        }
+        return [lo, hi];
+      };
+      let [lo, hi] = screenX(); // -1 … 1 across the pane
+      if (hi > 1 - 2 * rho) {
+        if (hi - lo > 2 - 2 * rho - 0.04) { // too wide to fit beside the column: back off, then measure again
+          dist *= (hi - lo) / (2 - 2 * rho - 0.04);
+          [lo, hi] = screenX();
+        }
+        const sx = Math.min(hi - (1 - 2 * rho), Math.max(0, lo + 0.98)); // move left by sx (never past the left edge)
+        if (sx > 0) c.addScaledVector(right, (sx / 2) * 2 * dist * tanH);
+      }
+    }
     // look a little above the centre so the elements sit in the middle of the free part (below the toolbar)
-    if (inset) c.addScaledVector(up, (inset / ph) * dist * Math.tan((this.camera.fov * Math.PI) / 360));
+    if (inset || insetB) c.addScaledVector(up, ((inset - insetB) / ph) * dist * Math.tan((fov * Math.PI) / 360));
     const p1 = c.clone().addScaledVector(dir, dist);
     // the clip range covers the whole move (from the current view to the new one)
     const was = this.camera.position.distanceTo(this.controls.target);
@@ -1327,11 +2259,12 @@ export class Viewer3D {
     this.camera.updateProjectionMatrix();
     const reduced = matchMedia("(prefers-reduced-motion: reduce)").matches;
     if (animate && !reduced && this.el.dataset.state === "ready" && this.el.offsetWidth > 0) {
-      this.tween = { t0: performance.now(), dur: 650, p0: this.camera.position.clone(), p1, c0: this.controls.target.clone(), c1: c };
+      this.tween = { t0: performance.now(), dur: 650, p0: this.camera.position.clone(), p1, c0: this.controls.target.clone(), c1: c, f0: this.camera.fov, f1: fov };
     } else {
       this.tween = null;
       this.camera.position.copy(p1);
       this.controls.target.copy(c);
+      if (this.camera.fov !== fov) { this.camera.fov = fov; this.camera.updateProjectionMatrix(); }
     }
     this.controls.update();
     this.needsRender = true;
@@ -1345,7 +2278,7 @@ export class Viewer3D {
   private belowCut(h: THREE.Intersection): boolean {
     const b = h.object.userData.bucket as Bucket | undefined;
     const e = b ? this.explode?.get(b.storey) : undefined;
-    return !e || h.point.y <= e.plane.constant;
+    return !e || (h.point.y <= e.plane.constant && (!e.low || h.point.y >= -e.low.constant));
   }
 
   /** The room whose tinted floor this ray hit (W7), or null. */
@@ -1387,7 +2320,7 @@ export class Viewer3D {
         this.ensureGuidIndex();
         const guid = this.idToGuid.get(room.id);
         const name = (guid && this.spaceTitle(guid)) || "Room";
-        const kind = ROOM_TYPES.find((t) => t.key === room.type)?.label ?? "";
+        const kind = roomTypeOne(room.type);
         tip.innerHTML = `<b></b><span></span>`;
         tip.querySelector("b")!.textContent = name;
         tip.querySelector("span")!.textContent = `${kind} · ${room.area >= 100 ? Math.round(room.area) : room.area.toFixed(1)} m²`;
@@ -1398,32 +2331,82 @@ export class Viewer3D {
     });
   }
 
+  /** Clear a pick made in the 3D view (W7 c4, UX S-B1): the model's colours come back and the page hides its panel
+   * (onUnpick). False when nothing was picked. */
+  unpick(): boolean {
+    if (!this.picked) return false;
+    this.picked = null;
+    this.highlight([], false);
+    this.onUnpick();
+    this.syncChip();
+    return true;
+  }
+
   private installPick() {
     this.installHover();
+    // W7 c4 (UX S-m8): a right-click in 3D did nothing visible (right-DRAG pans): a right-click without a drag shows how
+    // to move around, near the pointer, for ~2.5 s
+    {
+      let rd = { x: 0, y: 0 }, hintT = 0;
+      const hint = document.createElement("div");
+      hint.className = "v3d-tip v3d-hint"; // the hover tip's look
+      hint.textContent = "Drag to turn · right-drag to move · scroll to zoom";
+      hint.hidden = true;
+      this.renderer.domElement.addEventListener("pointerdown", (e) => { if (e.button === 2) rd = { x: e.clientX, y: e.clientY }; });
+      this.renderer.domElement.addEventListener("pointerup", (e) => {
+        if (e.button !== 2 || Math.abs(e.clientX - rd.x) + Math.abs(e.clientY - rd.y) > 4 || !calmView()) return;
+        const r = this.renderer.domElement.getBoundingClientRect();
+        if (!hint.isConnected) this.labelLayer.append(hint);
+        hint.hidden = false;
+        // above the pointer (the room tip sits below it)
+        hint.style.transform = `translate(${Math.max(8, Math.min(e.clientX - r.left - 40, r.width - 330))}px, ${Math.max(8, e.clientY - r.top - 44)}px)`;
+        clearTimeout(hintT);
+        hintT = window.setTimeout(() => { hint.hidden = true; }, 2500);
+      });
+    }
+    // Esc clears a pick while the 3D view is on screen (main.ts's Esc clears an answer's marks first, capture phase; a
+    // pick made without an answer was left greyed out). Not while typing, nor when a menu / dialog took the key.
+    document.addEventListener("keydown", (e) => {
+      // W7 c5 (captain 23:47 'Esc always deselects'): a lit legend room type goes too
+      if (e.key !== "Escape" || e.defaultPrevented || (!this.picked && !this.typeFocus) || this.el.offsetParent === null) return;
+      const t = e.target as HTMLElement | null;
+      if (t && (/^(INPUT|TEXTAREA|SELECT)$/.test(t.tagName) || t.isContentEditable)) return;
+      // an open menu / dialog / tool takes Esc for itself (the same list as main.ts's Esc)
+      if ([...document.querySelectorAll<HTMLElement>('[role="menu"], [role="dialog"], dialog[open], .measure.on, .feat-menu, .pc-menu, .rg-menu')]
+        .some((el) => !el.hidden && el.offsetParent !== null)) return;
+      if (!this.unpick() && this.typeFocus) this.setTypeFocus(null);
+    });
     const ray = new THREE.Raycaster();
     let down = { x: 0, y: 0 };
     this.renderer.domElement.addEventListener("pointerdown", (e) => (down = { x: e.clientX, y: e.clientY }));
     this.renderer.domElement.addEventListener("pointerup", (e) => {
-      if (Math.abs(e.clientX - down.x) + Math.abs(e.clientY - down.y) > 4 || !this.api) return;
+      // the primary button picks (W7 c4: a right-click picked too, and right-drag is the pan)
+      if (e.button !== 0 || Math.abs(e.clientX - down.x) + Math.abs(e.clientY - down.y) > 4 || !this.api) return;
       const r = this.renderer.domElement.getBoundingClientRect();
       ray.setFromCamera(new THREE.Vector2(((e.clientX - r.left) / r.width) * 2 - 1, -((e.clientY - r.top) / r.height) * 2 + 1), this.camera);
       const targets = this.buckets.filter((b) => b.mesh!.visible && (b.mesh!.material as THREE.Material).opacity > 0.1).map((b) => b.mesh!);
       // W7: a room's tinted floor picks the ROOM (IfcSpace), not the slab under it
       targets.push(...this.tints.filter((t) => t.mesh.visible).map((t) => t.mesh));
       const hit = ray.intersectObjects(targets, false).find((h) => !this.explode || this.belowCut(h));
-      if (!hit || hit.faceIndex == null) return;
+      // W7 c4 (UX S-B1): a click on nothing clears the pick (colours back, panel hidden)
+      if (!hit || hit.faceIndex == null) { this.unpick(); return; }
       const room = this.roomAt(hit);
       if (room) {
         this.ensureGuidIndex();
         const guid = this.idToGuid.get(room.id);
         const line = this.api.GetLine(this.modelID, room.id);
         if (!guid) return;
+        if (guid === this.picked) { this.unpick(); return; } // the same room again: deselect
         const props: Record<string, string> = {
           type: "IFCSPACE", name: line.Name?.value ?? "", longName: line.LongName?.value ?? "", GlobalId: guid,
           storey: this.storeys.find((s) => s.id === this.storeyOf.get(room.id))?.name ?? "",
-          "room type": ROOM_TYPES.find((t) => t.key === room.type)?.label ?? "", "floor area (3D model)": `${room.area.toFixed(2)} m²`,
+          "room type": roomTypeOne(room.type), "floor area": `${room.area.toFixed(2)} m² (3D model)`, // UX NEW-R5: the long key wrapped
         };
         this.highlight([guid], false);
+        this.picked = guid;
+        this.pickKind = "room";
+        this.pickName = this.spaceTitle(guid) ?? "";
+        this.syncChip();
         this.onPick(guid, this.spaceTitle(guid) ?? `Space ${props.name}`, props);
         return;
       }
@@ -1435,13 +2418,22 @@ export class Viewer3D {
       this.ensureGuidIndex();
       const line = this.api.GetLine(this.modelID, range.id);
       const type = this.api.GetNameFromTypeCode(line.type) ?? "";
+      // W7 c4 (W5 / UX S-B1): in the customer view a floor slab, covering, roof or the site is the background (zoomed in,
+      // every pixel is one): a click there clears a pick instead of picking 'Slab ARPÕRAND - 013'
+      if (calmView() && /^IFC(SLAB|COVERING|ROOF|SITE)/i.test(type)) { this.unpick(); return; }
       const props: Record<string, string> = {
         type, name: line.Name?.value ?? "", GlobalId: line.GlobalId?.value ?? "",
         storey: this.storeys.find((s) => s.id === this.storeyOf.get(range.id))?.name ?? "",
       };
       if (line.ObjectType?.value) props.objectType = line.ObjectType.value;
       if (line.Tag?.value) props.tag = line.Tag.value;
+      if (props.GlobalId && props.GlobalId === this.picked) { this.unpick(); return; } // the same element again: deselect
       this.highlight([props.GlobalId], false);
+      this.picked = props.GlobalId || null;
+      this.pickName = "";
+      this.pickKind = /DOOR/i.test(type) ? "door" : /WINDOW/i.test(type) ? "window" : /WALL/i.test(type) ? "wall" : /STAIR/i.test(type) ? "stair"
+        : /COLUMN/i.test(type) ? "column" : /BEAM/i.test(type) ? "beam" : /RAILING/i.test(type) ? "railing" : "element";
+      this.syncChip();
       this.onPick(props.GlobalId, `${type.replace(/^IFC/i, "")} ${props.name}`.trim(), props);
     });
   }

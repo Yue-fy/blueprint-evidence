@@ -95,6 +95,12 @@ def test_nonzero_count_is_left_alone():
     a.recognition = {"kind": "cubicasa_plan", "label": "raster floor plan (CubiCasa style)"}
     a.trace = a.trace[1:]  # no whole-plan rewrite (that case: test_whole_plan_count_is_not_the_facade_count)
     out = S.sanity_guard(DFE_Q, a)
+    # the zero rule / range rule leave a non-zero count alone; T1 c5 (captain 23:04): its only box is a searched area,
+    # so it is flagged 'not counted (no symbols located)' and capped (value kept)
+    assert out.value == 18 and out.missing[1:] == a.missing and out.trace[:len(a.trace)] == a.trace
+    assert out.missing[0].startswith(S.UNCOUNTED) and out.confidence == S.UNCOUNTED_CAP
+    a.evidence = [*a.evidence, Evidence(file="sheet1.r150.png", page=0, bbox=[20, 20, 30, 30], note="window")]
+    out = S.sanity_guard(DFE_Q, a)
     assert out.value == 18 and out.confidence == 0.55 and out.missing == a.missing and out.trace == a.trace
 
 
@@ -189,6 +195,9 @@ EXPERT_RULES = {
     "xr-20": "A facade of habitable rooms (classrooms, offices, bedrooms) has at least one window; a count of 0 must be "
              "flagged.",
     "xr-21": "Show the 90% range only when the drawing is in the calibration domain (CubiCasa5K flats).",
+    # xr-19: W5's web/src/measure.ts ('≈ ±N % (clicking accuracy)'); xr-36: stoa/trust/chaincheck.py (tests/test_t1_c4.py)
+    "xr-19": "State the measuring uncertainty from clicking accuracy with the result (≈ ±3 % for a hand-clicked area).",
+    "xr-36": "Check that the dimension strings add up to the printed overall dimension before using them (500 + 11000 + 500 = 12000).",
 }
 
 

@@ -3,10 +3,24 @@
   padding: 10px 12px; border-radius: 14px; border: 1px solid var(--line); background: var(--card-glass, rgba(255, 255, 255, .86)); color: var(--ink);
   font-size: 12px; line-height: 1.25; box-shadow: var(--shadow); backdrop-filter: saturate(180%) blur(20px); -webkit-backdrop-filter: saturate(180%) blur(20px); }
 #vp3d .look3d { bottom: 48px; } /* above the '3D generated from the floor plan' note */
+/* W7 c5 (UX NEW-14): in a narrow pane (side by side) the note ends before the 'Fixtures · 73' toggle on its right */
+#pane3d .p3d-note { max-width: calc(100% - 190px); box-sizing: border-box; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 body[data-view="expert"] .look3d { display: none; }
 .look3d-legend { display: grid; gap: 4px; }
 .look3d-legend[hidden] { display: none; }
 .look3d-item { display: grid; grid-template-columns: 12px 1fr auto; align-items: center; gap: 8px; }
+/* rows are buttons: a click lights that room type (W7 c2); the pressed row stays, the others dim */
+button.look3d-item { font: inherit; color: inherit; text-align: left; width: 100%; margin: 0 -6px; padding: 2px 6px; box-sizing: content-box;
+  border: 0; border-radius: 7px; background: transparent; cursor: pointer; transition: background .15s, opacity .2s; }
+button.look3d-item:hover { background: var(--fill); }
+button.look3d-item:focus-visible { outline: 2px solid var(--accent); outline-offset: 0; }
+button.look3d-item[aria-pressed="true"] { background: var(--fill); }
+button.look3d-item[aria-pressed="true"] span { font-weight: 600; }
+button.look3d-item[aria-pressed="true"] i { box-shadow: inset 0 0 0 1px rgba(0, 0, 0, .08), 0 0 0 2px var(--panel, #fff), 0 0 0 3px currentColor; }
+.look3d-legend.focused button.look3d-item:not([aria-pressed="true"]) { opacity: .5; }
+.look3d-legend.focused button.look3d-item:not([aria-pressed="true"]):hover { opacity: .85; }
+/* W7 c4 (UX S-M6): still clickable while an answer is lit (a type click lets the answer's 3D highlight go) */
+.look3d.faded .look3d-legend:hover { opacity: .9; }
 .look3d-item i { width: 12px; height: 12px; border-radius: 4px; box-shadow: inset 0 0 0 1px rgba(0, 0, 0, .08); }
 .look3d-item span { color: var(--ink); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .look3d-item b { font-weight: 500; color: var(--muted); font-variant-numeric: tabular-nums; }
@@ -23,9 +37,17 @@ body[data-view="expert"] .look3d { display: none; }
 .look3d-explode[hidden] { display: none; }
 @media (pointer: coarse) { .look3d-seg button, .look3d-explode { min-height: 36px; } }
 /* floor names beside the building (viewer3d floor labels) */
-.v3d-floor { position: absolute; left: 0; top: 0; font-size: 11.5px; font-weight: 600; color: var(--muted); white-space: nowrap; pointer-events: none;
-  padding: 2px 8px; border-radius: 999px; background: var(--card-glass, rgba(255, 255, 255, .86)); border: 1px solid var(--line); }
-@media (max-width: 700px) { .look3d { max-width: calc(100% - 24px); } .look3d-legend { grid-template-columns: 1fr 1fr; column-gap: 12px; } }
+.v3d-floor { position: absolute; left: 0; top: 0; font-size: 11.5px; font-weight: 600; color: var(--muted); white-space: nowrap;
+  padding: 2px 8px; border-radius: 999px; background: var(--card-glass, rgba(255, 255, 255, .86)); border: 1px solid var(--line);
+  pointer-events: auto; cursor: pointer; transition: color .15s, border-color .15s; } /* a click shows that floor alone */
+.v3d-floor:hover, .v3d-floor:focus-visible { color: var(--accent-ink); border-color: var(--accent); outline: none; }
+@media (max-width: 700px) {
+  .look3d { max-width: calc(100% - 24px); padding: 8px 10px; gap: 6px; font-size: 11px; }
+  .look3d-legend { grid-template-columns: 1fr 1fr; column-gap: 10px; gap: 2px 10px; }
+  .look3d-item { grid-template-columns: 10px 1fr; gap: 6px; }
+  .look3d-item i { width: 10px; height: 10px; border-radius: 3px; }
+  .look3d-item b, .look3d-note { display: none; }
+}
 /* hovering a room's floor (viewer3d installHover): name, type, area */
 .v3d-tip { position: absolute; left: 0; top: 0; pointer-events: none; padding: 6px 10px; border-radius: 10px; font-size: 12px; line-height: 1.3;
   background: var(--card-glass, rgba(255, 255, 255, .86)); color: var(--ink); border: 1px solid var(--line); box-shadow: var(--shadow);
@@ -36,3 +58,28 @@ body[data-view="expert"] .look3d { display: none; }
 body[data-view="expert"] .v3d-tip { display: none; }
 .look3d.faded .look3d-legend { opacity: .5; transition: opacity .3s var(--ease, ease); }
 .look3d-note { margin-top: 2px; color: var(--muted); font-size: 11.5px; white-space: normal; }
+/* room names on the floor of the storey shown (viewer3d placeRoomLabels) */
+.v3d-room { position: absolute; left: 0; top: 0; pointer-events: none; text-align: center; line-height: 1.15; white-space: nowrap; font-size: 11px;
+  /* on the model's floor, which stays light in both themes: dark ink with a white halo in light AND dark mode */
+  color: #1d1d1f; text-shadow: 0 0 3px #fff, 0 0 3px #fff, 0 0 6px #fff; }
+.v3d-room b { display: block; font-weight: 600; }
+.v3d-room span { display: block; font-size: 10px; color: #5f5f64; }
+body[data-view="expert"] .v3d-room { display: none !important; }
+/* W7 c4 (UX S-m8): how to move around in 3D, after a right-click without a drag */
+.v3d-hint { z-index: 4; color: var(--muted); }
+/* W7 c5 (captain 01:16): what is selected in the 3D, with a ×: '85 rooms lit · Wet rooms ×', '1 door selected ×' */
+/* c6: the same look as the page's marks chip (W5 .marks-chip, style.css): a dark pill, '× Esc' */
+.v3d-chip { position: absolute; left: 50%; top: 12px; transform: translateX(-50%); z-index: 4; display: inline-flex; align-items: center; gap: 10px;
+  max-width: calc(100% - 24px); box-sizing: border-box; padding: 5px 5px 5px 14px; border-radius: 999px; background: rgba(29, 29, 31, .86);
+  color: #fff; font-size: 13.5px; line-height: 1.2; box-shadow: 0 4px 18px rgba(0, 0, 0, .18);
+  backdrop-filter: blur(12px); -webkit-backdrop-filter: blur(12px); white-space: nowrap; }
+.v3d-chip[hidden] { display: none; }
+.v3d-chip span { overflow: hidden; text-overflow: ellipsis; font-variant-numeric: tabular-nums; }
+.v3d-chip button { flex: none; display: inline-flex; align-items: center; gap: 5px; min-height: 28px; padding: 0 10px; border: 0; border-radius: 999px;
+  background: rgba(255, 255, 255, .16); color: #fff; font: inherit; font-size: 15px; line-height: 1; cursor: pointer; }
+.v3d-chip button:hover { background: rgba(255, 255, 255, .26); }
+.v3d-chip button:focus-visible { outline: 3px solid var(--accent); outline-offset: 2px; }
+.v3d-chip kbd { font-family: inherit; font-size: 11px; font-weight: 500; padding: 2px 5px; border-radius: 4px; background: rgba(255, 255, 255, .18);
+  color: rgba(255, 255, 255, .85); }
+@media (pointer: coarse) { .v3d-chip button { min-height: 32px; } .v3d-chip kbd { display: none; } }
+body[data-view="expert"] .v3d-chip { display: none; }

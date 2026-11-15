@@ -109,15 +109,37 @@ def room_tags(path: str, page: int = 0, layer=None) -> list[RoomTag]:
 
 
 def dedupe(tags: list[RoomTag]) -> list[RoomTag]:
-    """One tag per room: the same number (or name + value) printed in several views -> keep the plan view's."""
+    """One tag per room: the same number (or name + value) printed in several views -> keep the plan view's. A name +
+    value repeated within ONE view is several rooms (G1 00:01: EFA 'ICT Classroom 62 m2' twice = two rooms, total 124,
+    not 62; repeated modules / dorm rooms): every tag of the chosen view is kept, except a copy printed on top of
+    another (centres within one text height: the same text drawn twice)."""
     rank = {"floor_plan": 0, "drawing": 1}
+
+    def key(t):
+        return t.number or (t.name or "").lower() + f"|{t.value:g}"
+
     best: dict = {}
     for t in tags:
-        key = t.number or (t.name or "").lower() + f"|{t.value:g}"
-        cur = best.get(key)
+        cur = best.get(key(t))
         if cur is None or rank.get(t.view_kind, 5) < rank.get(cur.view_kind, 5):
-            best[key] = t
-    return [t for t in tags if best.get(t.number or (t.name or "").lower() + f"|{t.value:g}") is t]
+            best[key(t)] = t
+    out: list[RoomTag] = []
+    kept: dict = {}
+    for t in tags:
+        b = best.get(key(t))
+        if t.number:
+            if b is t:
+                out.append(t)
+            continue
+        if b is None or t.view != b.view:
+            continue
+        cx, cy = (t.box[0] + t.box[2]) / 2, (t.box[1] + t.box[3]) / 2
+        h = max(1.0, min(t.box[2] - t.box[0], t.box[3] - t.box[1]))
+        if any(abs(cx - x) <= h and abs(cy - y) <= h for x, y in kept.get(key(t), [])):
+            continue
+        kept.setdefault(key(t), []).append((cx, cy))
+        out.append(t)
+    return out
 
 
 def scoped_tags(path: str, question: str, page: int = 0, layer=None) -> tuple[list[RoomTag], Scope | None]:

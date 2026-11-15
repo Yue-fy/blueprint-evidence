@@ -143,3 +143,24 @@ def test_verifier_withholds_a_weak_dimension_read_as_area():
     assert strong.value == 54.2  # only weak readings are withheld
     un = apply_verdict(Answer(value=3, unit="count", confidence=0.4), {"verdict": "unsure", "reason": ""})
     assert "because it gave no reason" in un.trace[-1]
+
+
+def test_facade_count_is_structured_evidence_gemini_does_not_replace_it():
+    # M1 22:16 (preview f420f958): west-facade windows 18 (gold) escalated as 'no confident structured count (facade)'
+    # and Gemini's single reading ≈ 10 was shown on top
+    from stoa.agent import vision as V
+    from stoa.contract import Answer, Evidence
+
+    a = Answer(value=18, unit="count", confidence=0.85, solver="pipeline/facade",
+               evidence=[Evidence(file="x.pdf", page=0, bbox=[0, 0, 1, 1], note="window 1")])
+    assert V.wanted(a, "How many windows are on the west facade of the classroom wing?", "/tmp/up/SEN.pdf") is None
+    assert "facade" in V.STRUCTURED
+
+
+def test_facade_of_a_named_room_is_its_scope():
+    from stoa.agent.facade import parse  # DR 22:12: 'north facade of the Multi-Purpose Hall' measured the whole building
+
+    a = parse("How many windows are on the north facade of the Multi-Purpose Hall?")
+    assert a.wing == ["multi-purpose", "hall"] and a.wing_text == "Multi-Purpose Hall"
+    assert parse("How many windows are on the west facade of the classroom wing?").wing == ["classroom"]
+    assert parse("How many doors are on the south side of the building?").wing == []

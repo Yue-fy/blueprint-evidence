@@ -64,6 +64,15 @@ export function fmtValue(a: Answer) {
   return String(a.value);
 }
 
+/** UX P2b-13: the customer view says no pixel scales ('perimeter 10.84 m at 1 m = 50.5 px from the scale bar' →
+ *  '… at the scale read from the scale bar'; '(50.55 px per m)' goes); the expert view keeps them. */
+export function pxless(t: string): string {
+  if (typeof document === "undefined" || document.body?.dataset.view === "expert") return t;
+  return t.replace(/\s+at 1 m = [\d.,]+ ?px(?= from\b)/gi, " at the scale read")
+    .replace(/\s+at 1 m = [\d.,]+ ?px\b/gi, "")
+    .replace(/\s*\(\s*[\d.,]+ ?px per m\s*\)/gi, "")
+    .replace(/[;,]?\s*[\d.,]+ ?px per m\b/gi, "");
+}
 /** "cross-check: … ✓/✗" lines from evidence notes and trace (D4: no contract change). */
 /** W4's room-segmentation reading on CubiCasa count answers (trace "room segmentation (pretrained CubiCasa5K): 3 bedroom
  *  region(s) = the answer ✓"; when it differs: "…: 1 sauna region(s); no boxes attached"): an independent second count. */
@@ -148,6 +157,9 @@ export function crossChecks(a: Answer, asks: string[] = []): { text: string; ok:
     // outline', 'our measurement is kept') neither confirms nor contradicts a measurement: no pill (EFA LRC 92.64 vs
     // Gemini 103.68); further off, or pointing at another place, is a disagreement (DfE scan kitchen 48.68 vs 40 → none)
     const off = est && sameUnit && Number.isFinite(value) && value > 0 ? Math.abs(Number(est[1].replace(/,/g, "")) / value - 1) : 0;
+    // a picture-only estimate of 0, or one beside our measured outline of the same room: not a second reading (UX B1/B2)
+    if (est && /\bits (?:own )?estimate\b/i.test(body) && (!(Number(est[1].replace(/,/g, "")) > 0)
+      || (sameUnit && off > 0.1 && quietEstimate(a, Number(est[1].replace(/,/g, "")), body)))) return [];
     if (ok && off > 0.1) {
       if (off <= 0.25 && !/points? OUTSIDE|another (room|place)/i.test(body)) return [];
       ok = false;
@@ -375,7 +387,7 @@ function evLabel(ev: Evidence[], g: { idx: number[]; first: number }, n: number,
   const projected = items.some((x) => /projected: not drawn/i.test(x.note ?? ""));
   const files = new Set(items.map((x) => x.file.split("/").pop()));
   const notIn = items.some((x) => /^NOT in the answer:/.test(x.note ?? ""));
-  return `<li class="ev-item${notIn ? " contrast" : ""}" data-i="${g.idx.find((i) => ev[i].bbox) ?? g.first}" title="${esc([...files].join(" · "))}"><span class="n">${n}</span><span class="t">${step}${esc(note.replace(/\s*\|\s*projected: not drawn on this plan\s*$/i, ""))}${projected ? `<span class="proj" title="Not drawn on this plan (cut at 1.2 m): box = the element's footprint from the IFC model">projected</span>` : ""}</span><span class="w">${where}</span></li>`;
+  return `<li class="ev-item${notIn ? " contrast" : ""}" data-i="${g.idx.find((i) => ev[i].bbox) ?? g.first}" title="${esc([...files].join(" · "))}"><span class="n">${n}</span><span class="t">${step}${esc(pxless(note).replace(/\s*\|\s*projected: not drawn on this plan\s*$/i, ""))}${projected ? `<span class="proj" title="Not drawn on this plan (cut at 1.2 m): box = the element's footprint from the IFC model">projected</span>` : ""}</span><span class="w">${where}</span></li>`;
 }
 
 /** A free-text answer about an IFC model whose element types were counted in the browser (main.ts sets a.checked):
@@ -667,6 +679,25 @@ const SYMBOL_TARGETS = new Set(["window", "door", "wc", "sink"]);
 /** `missing` without "no located evidence …" when the answer does carry located evidence (boxes or GUIDs). */
 const missingNow = (a: Answer) => (a.missing ?? []).filter((t) => !(/^no located evidence\b/i.test(t) && a.evidence.some((e) => e.bbox || e.ifc_guid))).map(tidyCut);
 
+/** UX 23:30 B1/B2: a second model's VISUAL estimate ('Gemini 3.1 Pro cross-check: its estimate 150.0 m2 points inside our
+ *  outline (same room); our measurement is kept') is not a second reading to put next to the hero when (a) it is 0 or
+ *  less (a failure, not an opinion: classrooms 'its estimate 0.0 m2'), or (b) our value is an outline MEASURED on the
+ *  drawing at a printed scale and the estimate points at the same room (DfE Multi-Purpose Hall 247.73 measured vs a
+ *  150 m² picture guess: a red '39 % apart' on guided step 1). It stays in 'How we worked it out' (the trace). An
+ *  estimate that points OUTSIDE our outline / at another room is still shown: our outline may be the wrong room. */
+export function quietEstimate(a: Answer, estimate: number, text: string): boolean {
+  if (!(estimate > 0)) return true;
+  const shapes = (a.evidence ?? []).filter((e) => ((e.polygon?.length ?? 0) >= 3 || (e.polyline?.length ?? 0) >= 2)
+    && /\b(traced|measured)\b[^;]*\bat 1\s?:\s?\d+/i.test(String(e.note ?? "")));
+  const measured = shapes.length > 0;
+  // pointing at another place counts against our outline only when ours is not anchored on the room's printed name
+  // (UX 23:44: the scanned Laundry 7.12 m², traced from its label 'Laundry', ≈ gold 7.0; Gemini's guess pointed elsewhere)
+  const anchored = shapes.some((e) => /^\s*'?[\p{L}][\p{L}\d .&\/-]{1,40}'?\s*:\s*[\d.,]+\s*(m²|m2|ft²|ft2|sf)(?!\w)/iu.test(String(e.note ?? "")));
+  if (/points? OUTSIDE|another (room|place)|different room/i.test(text) && !anchored) return false;
+  const t = (a.trace ?? []).map(String).join("\n");
+  const scaleGuessed = /\b(estimated|assumed|guessed) scale\b|scale (unknown|not found)|no (printed )?scale\b/i.test(t);
+  return measured && !scaleGuessed;
+}
 export const LOCATED_NOTE = /^(label reader|CubiCasa5K detector|door-swing reader): /;
 export interface Locator { solver: string; name: string; button: string; title: string; noun: string; args?: Record<string, unknown> }
 const NOUNS: Record<string, string> = { window: "windows", door: "doors", wc: "WC seats", sink: "sinks", wc_room: "WC room labels" };

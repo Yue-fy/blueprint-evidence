@@ -2,12 +2,14 @@
 
 **Ask a construction drawing a question in your own words. Get the number, see where it came from, and know how sure it is.**
 
-![The web app answers "What is the area of the laundry?" on an uploaded school floor plan with 7.03 m². The laundry is outlined on the plan, and the card shows the printed scale 1:200, the convention used and the cost tier "cheap".](docs/img/hero.png)
+![The web app answers "What is the area of the laundry?" on an uploaded school floor plan with 7.03 m². The laundry is outlined on the plan, and the card shows the printed scale 1:200, the convention used, the assumptions and the cost.](docs/img/hero.png)
 
 *"What is the area of the laundry?" asked on one of the sheets Stoa sent as an example of their test, uploaded as a
-plain PDF (web app at commit `0e541ec`). The answer is 7.03 m² (measured by hand: 7.0 m²) in 2.3 s. The room is
-traced from the wall lines at the scale printed on the sheet (1:200) and outlined on the plan, and the cost badge
-says "cheap": no AI model was needed. This sheet is one of the four we tuned on (see Results).
+plain PDF (web app on Saturday night, API at commit `c662016`). The answer is 7.03 m² (measured by hand: 7.0 m²) in
+2.6 s (this sheet's text had been read before). The room is traced from the wall lines at the scale printed on the
+sheet (1:200) and outlined on the plan; the card states the convention (net internal area, to the inner wall face) and
+its assumptions, and offers "Measure yourself". With the Private switch off, as here, the answer also made one
+Gemini call (about $0.004), and the cost line says so. This sheet is one of the four we tuned on (see Results).
 Drawing: Special School Plan Level 00 (SEN-DFE-XX-00-D-X-0201), UK Department for Education, from GOV.UK "A new model
 design for a special school". Contains public sector information licensed under the Open Government Licence v3.0.
 The sheet is bundled as [samples/dfe_school/plan.pdf](samples/dfe_school/plan.pdf).*
@@ -28,8 +30,8 @@ Team Hannah Family's submission to the Stoa challenge "Make Blueprints Talk" at 
   median of 79 s per answer).
 - **Says how sure it is.** The confidence is the measured hit rate of the method that produced the answer, on the
   data that method was measured on. On the dataset's sealed test (`bb94fe4`), answers marked as sure (confidence 0.8
-  or more) were right 98% of the time, and on the open questions about Stoa's sheets 78 of 80 (`f2cd8f1`; sheets we
-  tuned on). That does not carry over to new drawings: on held-out real drawings only 3 of
+  or more) were right 98% of the time, and on the open questions about Stoa's sheets 189 of 191 (`e4a166b`; from `4b62b93` on a
+  confidence map marks more answers as sure; 109 of 112 at `b8146dd`; sheets we tuned on). That does not carry over to new drawings: on held-out real drawings only 3 of
   7 sure answers were right (`0b6f25d`), so on your own drawings treat "sure" as a hint.
 - **Exports a takeoff.** Every answer of a visit becomes one CSV row (question, value, unit, how sure, sheet and
   page, method, evidence, where the data went), ready for a spreadsheet.
@@ -44,7 +46,7 @@ Team Hannah Family's submission to the Stoa challenge "Make Blueprints Talk" at 
 These run on top of the same answers and evidence, and are **off unless you switch them on**: on the API with
 `STOA_FEATURES=<name>,<name>` (or `all`), in the web app with `?features=<name>,<name>` (remembered in your
 browser; `?features=` with nothing switches them off again). On the API a feature that fails to load is
-skipped; in the web app one that fails switches itself off. The rest of the app keeps working.
+skipped; in the web app one that fails switches itself off. The rest of the app keeps working. The live demo during judging has 11 of them on: `privacy`, `region`, `corrections`, `project`, `takeoff`, `orderlist`, `conventions`, `checklist`, `report`, `selfcheck`, `xref`.
 
 | Feature | What it does | Parts |
 |---|---|---|
@@ -57,13 +59,17 @@ skipped; in the web app one that fails switches itself off. The rest of the app 
 | **Cross-references** (`xref`) | Callouts and sheet references become clickable, and answers follow them (a door's size leads to the door schedule sheet). | API + web |
 | **Projects** (`project`) | Upload several sheets of one building. Sheet roles and levels are recognised, building totals avoid double counting (sections, ceiling plans, duplicates; when a total is not safe you get the per-sheet values and the reason), and a review list keeps every answered quantity with a tick, your corrections and the open questions. | API + web |
 | **Privacy controls** (`privacy`) | A Private switch that keeps every step on your server, a line on each answer saying where its data went, what is stored where and for how long, and a button that deletes your uploaded files and the cached readings tied to them (caches it cannot tie to a file are listed, not skipped silently). | API + web |
-| **Many questions** (`batch`) | Paste a list of questions or drop a .csv / .xlsx file. Each one is answered on the open drawing, in a live table with the answer, how sure we are, the cost tier and a link to the evidence. With an 'expected' column it also reports how many answers match. | web |
+| **Order list** (`orderlist`) | Turns the quantity takeoff into what you would order: skirting as pieces of a stock length per room (plus waste), doors by size (the printed size tag, else measured from the door swing; a double door is one set of two leaves), floor covering by room type (plus waste). Defaults (10 % waste, 2.4 m lengths, 2.1 m door height) are labelled as defaults and can be changed; doubtful rooms are listed for checking by hand and left out of the totals. Every line outlines its evidence. Exports to CSV / XLSX. No model calls. | API + web |
+| **Measurement report** (`report`) | One click on an answer gives a print-ready A4 page: the drawing crop with the answer's outlines and marks, a small map of the whole sheet, the formula, the scale and where it came from, the convention, the assumptions, the method and code version, the date and a 'Checked by' line. It is built from the answer on screen: nothing is asked again and no model is called. | API + web |
+| **Check list** (`checklist`) | Ranks every takeoff row and every answer on the sheet by how likely it is to be wrong (from the reader's confidence, how well its evidence supports it, whether two methods agree, the trust map and whether the scale is confirmed; the weights are fitted on our own eval runs), so you check only what needs it: "Check these 6 of 149 first". Each row gives its reasons and zooms to its spot; a tick marks it checked and puts it back into the totals, and rows nobody has checked stay out of the totals. | API + web |
+| **Many questions** (`batch`) | Paste a list of questions (or several lines in the main question box), or drop a .txt / .csv / .xlsx / Word / PDF list, even a whole e-mail. Each question is answered on the open drawing (or on the drawing / sheet the list names) the same way as a typed one, in a live table with the answer, how sure we are, the cost, the time and a link to the evidence; exports to CSV / Excel / a report with pictures. Whole-floor answers are checked against the sheet's own room-by-room takeoff, and with an 'expected' column it reports how many answers match, by kind (areas, lengths, counts). | web |
+| **Measuring conventions** (`conventions`) | Switches over the quantity takeoff: floor area net (the default), to wall centre lines or gross; skirting with or without wet rooms; door openings deducted or not; doors counted as sets or as leaves. A switch recounts every room and total at once and shows the change against the default; every exported row names its convention. | web |
 
 ## Results
 
 All numbers come from our eval tool (`python -m stoa.eval`). Counts must be exact; areas, lengths and volumes must be
 within 2%. Each row names its mode and the commit it was measured on (on the `night` branch of our
-[workspace repository](https://github.com/Yue-fy/Junction_Hannah_family)). **Private** = local models only, every
+[workspace repository](https://github.com/Yue-fy/Junction_Hannah_family)). The code in this repository is commit `2a764ce` of that branch, and every commit named below is in its history. The live demo during judging runs `75f9ee4`, an earlier commit of this code, with the Private switch on by default (private mode). **Private** = local models only, every
 hosted model off; **hybrid** = with the Gemini 3.1 Pro escalation and the Nemotron check on. Except in the dataset's
 sealed test, every file is uploaded alone under a meaningless name, as Stoa will test. Method and caveats: [docs/RESULTS.md](docs/RESULTS.md).
 
@@ -72,17 +78,18 @@ bound for a new drawing, not a forecast.
 
 | Test | Mode | Result | Commit |
 |---|---|---|---|
-| Stoa's own four example sheets: 90 questions in Stoa's kinds (room and type areas, baseboards, slab areas, door counts, piping) | private | **86.7%** (78/90): vector PDFs 38/41, Stoa's PNG copies 40/49 | `f2cd8f1` |
+| Stoa's own four example sheets: 90 questions in Stoa's kinds (room and type areas, baseboards, slab areas, door counts, piping) | private | **91.1%** (82/90): vector PDFs 38/41, Stoa's PNG copies 44/49 (the same answers at `b8146dd` and `4b62b93`) | `e4a166b` |
 | Same 90 questions: Gemini 3.1 Pro asked directly / Qwen3-VL-8B asked directly, without our pipeline | hosted / local | 61%, no evidence / 26% | |
-| Real drawings from outside the dataset, development set (168 questions) | private | 70.8% (119/168) | `e3a1d9f` |
+| Real drawings from outside the dataset, development set (168 questions) | private | 70.2% (118/168), as at `aff2f1f`; 71.4% at `f2cd8f1` | `b8146dd` |
+| Stoa's four example sheets, 20 numeric questions measured by hand by our teammate (each with a written method). She answered the 12 on three of the sheets after the d29 code was built | private | **19/20** with the door detector our gates use, **20/20** with the newer one the live demo runs; 18/20 at `aff2f1f`, 16/20 at `f2cd8f1`, and 8/12 on those 12 there, before her four misses were fixed from her answers | `4b62b93` |
 
 **Files nobody tuned on.** Run only by our gatekeeper, who saw aggregates, never rows. These are the better forecast.
 
 | Test | Mode | Result | Commit |
 |---|---|---|---|
-| Sibling sheets of Stoa's four drawing sets, with line-only school plans and image copies (173 questions) | private | **58.4%** (101/173); 41.3% (59/143) at `1795365` | `f2cd8f1` |
-| Real drawings from outside the dataset, held-out set (120 questions on other files) | private | **50.8%** (61/120); 51.7% at `e3a1d9f` | `f2cd8f1` |
-| Real drawings, held-out set (105 questions; the same code and rows scored 49.5% private) | hybrid | **64.8%** | `fc0927a` |
+| Sibling sheets of Stoa's four drawing sets, with line-only school plans and image copies (173 questions) | private | **64.7%** (112/173); 61.3% at `b8146dd`, 58.4% at `aff2f1f`, 41.3% (59/143) at `1795365` | `e4a166b` |
+| Real drawings from outside the dataset, held-out set (120 questions on other files) | private | **49.2%** (59/120); 50.8% at `f2cd8f1`, 51.7% at `e3a1d9f` | `aff2f1f` |
+| Real drawings, held-out set (105 questions; the same product code and rows scored 48.6% private, `02a7a4d`) | hybrid | **64.8%** | `fc0927a` |
 | For reference: Gemini 3.1 Pro asked directly, first version of the real-drawing set (125 questions) | hosted | 43.8%, no evidence | `9e1c725` |
 | Stoa dataset, sealed test split: 2,000 scored of 2,199 questions (the 199 free-text answers are not scored), run twice in total | private | 87.7% micro, 79.7% weighted | `bb94fe4` |
 
@@ -90,19 +97,19 @@ bound for a new drawing, not a forecast.
 
 | Test | Mode | Result | Commit |
 |---|---|---|---|
-| Simulated scans of the sheets we tuned on: 91 questions, each asked on a 200 or 300 dpi scanned PNG and on an image-only PDF of its sheet, with skew, blur and faded lines (182 answers) | private | **40%** (73/182): PNGs 35/91, image-only PDFs 38/91; areas 31%, lengths 42%, counts 54%. The same questions on the vector sheets: 60 of 68 right | `12b136d` |
+| Simulated scans of the sheets we tuned on: 91 questions, each asked on a 200 or 300 dpi scanned PNG and on an image-only PDF of its sheet, with skew, blur and faded lines (182 answers) | private | **54%** (99/182): PNGs 49/91, image-only PDFs 50/91; areas 55%, lengths 46%, counts 62%; 40% at `12b136d`. The same 91 questions on the vector sheets: 79 right. Measured on a re-run, with each scan's text already read once; a first upload of a scan can do worse | `f2cd8f1` |
 | Simulated scans of development sheets (image-only PDFs and PNGs at 200 dpi with skew, blur and faded lines), 20 questions drawn at random by our internal audit | private | **20%** (4/20); on 10 matched questions, 6/10 on the clean originals against 1/10 on their scans | `1795365` |
 | Phone photos of development sheets, same audit; and the 5 phone-photo questions of the development set | private | 0/4; 4/5 | `1795365`; `e3a1d9f` |
 
 Read together: on the four sheets we tuned on, our private pipeline answers more questions right than a frontier model
-asked directly (87% against 61%) and points at where almost every answer came from. On files nobody tuned on it gets
-just over half right (58% on sibling sheets, 51% on other real drawings), and on scans it mostly fails: 40% on scanned
-copies of the very sheets we tuned on, where their vector originals get 88%. Within the tuned sheets, pictures are
+asked directly (91% against 61%) and points at where almost every answer came from. On files nobody tuned on it gets
+about half right (65% on sibling sheets, 49% on other real drawings), and on scans about half: 54% on scanned
+copies of the very sheets we tuned on (40% at `12b136d`), where their vector originals get 87%. Within the tuned sheets, pictures are
 harder than vector PDFs: on Stoa's PNG copy of the slab plan the slab areas by type and the panel count are still
-wrong, though they are right on its PDF. On 15 unseen line-only school plans like the DfE sheet, 78 of 129 room-area,
-perimeter and label-count questions are right (`12b136d`, private; 13% at `098d71e`). Not every gain on the files we
+wrong, though they are right on its PDF. On 15 unseen line-only school plans like the DfE sheet, 77 of 129 room-area,
+perimeter and label-count questions are right (`aff2f1f`, private; 79 at `f2cd8f1`, 13% at `098d71e`). Not every gain on the files we
 looked at transfers (at `517b67b`: development rows we tuned on all afternoon 78%, rows added later 54%, held-out
-files 49%), while the Gemini escalation does transfer on real drawings (+15 points on the held-out set, `fc0927a`).
+files 49%), while the Gemini escalation does transfer on real drawings (+16 points on the held-out set, `fc0927a`).
 
 "Evidence on 99% of answers" (in [docs/RESULTS.md](docs/RESULTS.md)) counts answers that point at a location on the
 sheet. It does not mean the location supports the value: in our audit of `1795365`, 7 of 10 count answers with
@@ -123,8 +130,9 @@ or `unlocated`, with the reason. Weak spots are listed in
 At `0b6f25d` (private), 1,000 questions cost an estimated $0.03 on the dataset's dev split and $0.28 on the real
 drawings, with the drawings' text layers already read. These figures do not apply to new uploads. On Stoa-style
 sheets in private mode, with the CPU time of our text recognition (OCR) counted too, 1,000 questions cost about
-$0.25 on vector PDFs, $1.60 on PNG pictures and $6 to $10 on scans, where reading the text is about 80% of the cost
-(`ed95f26`, `a486439`); the hosted step raises vector PDFs to about $2. The first question on a new sheet is the
+$0.13 on vector PDFs, $0.89 on PNG pictures and $2.38 on phone photos (`b8146dd`; $0.25 and $1.60 at `ed95f26`), each
+sheet's one-time text reading billed to its first question as if nothing had been read before, and $6 to $10 on scans,
+where reading the text is about 80% of the cost (`ed95f26`, `a486439`); the hosted step raises vector PDFs to about $2. The first question on a new sheet is the
 costly one: about $0.01 on Stoa's sheets (`76f8f94`). On a scan it is also slow: in our audit, with nothing read
 before, a first answer took 4 to 5 minutes at the median and 12 minutes at p95 (`1795365`); later questions on the
 same sheet take about 9 s at the median. Per input: [docs/RESULTS.md](docs/RESULTS.md#cost-by-input). On the
@@ -132,42 +140,50 @@ sealed test, 56% of answers needed no model call at all. Gemini 3.1 Pro asked di
 
 ## Cost, latency and data governance
 
-You decide where a drawing may go. In the web app, the **Private** switch in the top bar (off by default, or open
-the page with `?private=1`) keeps every question on our server, and each answer says where its data went:
+You decide where a drawing may go. In the web app, the **Private** switch in the top bar (on by default; a visitor
+who switches it off, or opens the page with `?private=0`, allows Gemini and Nemotron for unsure answers, and the
+browser remembers that) keeps every question on our server, and each answer says where its data went:
 "Stayed on our server", or "Data: our server · Gemini (Google)" (or NVIDIA Nemotron, or Verda in the EU).
 On the server, the same modes are settings; every mode runs the same code.
 
 | Mode | Where the drawing goes | Settings | Held-out real drawings (same code `fc0927a`, same 105 questions): right / mean time / cost per 1,000 questions |
 |---|---|---|---|
-| **Private** | Nowhere. It stays on your server: the readers run on its CPU, Qwen3-VL-8B on its GPU | the **Private** switch; on the server `STOA_PRIVATE=1` (or `STOA_API_GEMINI=0 STOA_API_VERIFY=0`) | 49.5% / 7.7 s / under $1 |
-| **Hybrid** (the API's default when keys are set) | As private, plus, for unsure answers only: an image of the sheet to Google (Gemini 3.1 Pro) and an evidence crop to NVIDIA (Nemotron) | `GEMINI_API_KEY`, `NVIDIA_API_KEY` | 64.8% / 28 s / about $8 |
+| **Private** | Nowhere. It stays on your server: the readers run on its CPU, Qwen3-VL-8B on its GPU | the **Private** switch; on the server `STOA_PRIVATE=1` (or `STOA_API_GEMINI=0 STOA_API_VERIFY=0`) | 48.6% / 4.7 s / under $1 |
+| **Hybrid** (the API's default when keys are set) | As private, plus, for unsure answers only: images of the sheet (for counts also its four quarters, zoomed), the question and our readers' results to Google (Gemini 3.1 Pro); the sheet with the evidence marked and a zoomed crop of it, the question and our answer to NVIDIA (Nemotron) | `GEMINI_API_KEY`, `NVIDIA_API_KEY` | 64.8% / 28 s / about $8 |
 | **EU only** | As private, on a GPU server rented in Finland (Verda) with confidential computing: the GPU is attested and the drawing stays encrypted while in use | `LLM_BASE_URL` pointing at that server | the same accuracy as private on our own machine (dataset dev 89.05% on both, `f551070`); the whole dataset, 127,044 questions, in 17 min for €0.75 |
 | **No GPU** | The readers run on your machine; the steps meant for the local model go to Google (Gemini 3 Flash) | `STOA_MODE=api`, `GEMINI_API_KEY` | not measured on this set; on 16 scored dataset dev questions that use the local model, 13 against 14 locally |
 
-Private and hybrid were measured on the same code and the same 105 held-out questions (`fc0927a`). On Stoa's own
-90 example questions, private mode answers 86.7% right (`f2cd8f1`), in 7.6 s on average over all 249 open stoa-like
-questions (p95 32 s, with each sheet's text already read once, on a machine shared with other jobs; 81.1% in 9.5 s at
-`1795365`); the first question on a new sheet costs
+Private and hybrid were measured on the same product code and the same 105 held-out questions (`02a7a4d` /
+`fc0927a`). On Stoa's own 90 example questions, private mode answers 91.1% right (`e4a166b`), in 4.0 s on average over
+all 401 open stoa-like questions (median 1.6 s, p95 15 s, with each sheet's text already read once, on a machine shared
+with other jobs; 5.0 s at `4b62b93`, 7.0 s at `b8146dd`,
+81.1% in 9.5 s at `1795365`); the first question on a new sheet costs
 about $0.010 (mostly local GPU time to read the sheet's text once), each further one $0.0006.
 
 - **Every answer says what it used.** The web app shows where its data went next to its time and cost tier. Its
   cost record counts hosted calls separately from local GPU time, and its assumptions name any hosted model that
-  read the drawing ("read by Gemini 3.1 Pro from the drawing image"). Private mode needs the local model: on a
+  read the drawing ("read by Gemini 3.1 Pro from the drawing image"). An answer to an upload is also checked at the
+  network layer: its trace lists the outside hosts the server reached while answering ("network: this answer reached
+  …") and any connection private mode refused, and it is flagged when it says "local" but the network saw an outside
+  host. Private mode needs the local model: on a
   server without a GPU it answers with the geometry readers only.
 - **On Stoa's own sheets the hosted step adds little.** In the web app (`1795365`) it got 11 of 17 right against
   12 of 17 for our own reading before it: it overrode 6 right readings of ours and missed 6 chances to fix a wrong
   one, and 15 of 18 answers became "expensive". Since then a value read from the drawing's own geometry or text is
-  kept over a vision reading. On the same code and rows (`f2cd8f1`, the Gemini answers replayed from the gate's cache)
-  the hybrid scores 81 of Stoa's 90 questions against 78 for private mode (3 won, 0 lost), and 201 against 198 of
-  all 249 open questions (4 won, 1 lost), at about four times the recorded cost ($3.34 against $0.87 per 1,000 on the
-  90). Private mode gives up little there.
+  kept over a vision reading. On the same code and rows (`4b62b93`, the Gemini answers replayed from the cache of earlier
+  live calls) the hybrid scores 315 against 314 of all 381 open questions (1 won, 0 lost), at about 2.3 times the
+  recorded cost ($1.04 against $0.45 per 1,000); 106 of the 381 had no cached reply and stayed private, so the hybrid's
+  share is a lower bound. At `aff2f1f` both modes scored 82 of Stoa's 90 questions (81 against 78 at `f2cd8f1`) and 250
+  against 249 of 316. Private mode gives up nothing measurable there.
 - **Storage and processing are two different things.** Uploads are *stored* on the server that runs the web app,
   and so are the caches built from them (uploads in `STOA_UPLOADS`, a temporary folder by default); our code never
   trains on them. Where they are *processed* depends on the mode: only private and EU-only keep every step on servers
   you run. In private mode this is enforced under the code too: while `STOA_PRIVATE=1`, every stoa process refuses
   network connections and name lookups to any address outside this machine, private networks and Tailscale
-  (`stoa/netguard.py`; EU-only also allows Verda; tested end to end in `tests/test_t2_private_e2e.py`).
-  In hybrid and no-GPU modes, parts of the drawing (a page image, an evidence crop) go to the hosted
+  (`stoa/netguard.py`; EU-only also allows Verda; tested end to end in `tests/test_t2_private_e2e.py`). A port on
+  this machine that forwards elsewhere counts as outside too: an ssh tunnel, or a local service whose settings name an
+  outside `*_REMOTE_URL` (`tests/test_t2_netguard_relay.py`).
+  In hybrid and no-GPU modes, parts of the drawing (page images, zoomed quarters or an evidence crop) and text read from it go to the hosted
   providers named above, and their terms apply to what they receive.
 
 Details, sources and the confidential-computing setup:
@@ -222,7 +238,9 @@ a dataset file.
 
 **(a) API-only mode: no GPU.** The geometry readers run on your CPU. Steps meant for the local model go to a hosted
 model instead (Gemini 3 Flash by default) when `GEMINI_API_KEY` is set; `NVIDIA_API_KEY` is optional. With no key at
-all, IFC, CAD and vector-PDF questions still work (the bundled samples need no key).
+all, IFC, CAD and vector-PDF questions still work (the bundled samples need no key). Gemini calls are capped per day (200 by default,
+`GEMINI_MAX_CALLS_PER_DAY`), as the hackathon key required; raise the cap for your own key, or the model steps
+stop for the rest of the day.
 
 ```bash
 export STOA_MODE=api        # GEMINI_API_KEY=... for scans, photos and other drawings with nothing to parse
@@ -278,9 +296,12 @@ The main settings are in `.env.example`. Every environment variable the code rea
 | `deploy/` | Docker image, Google Cloud Run and Verda GPU scripts (no credentials) |
 | `tests/` | pytest suite |
 | `samples/` | Three small bundled examples: a Swiss Dwellings plan (PDF, DXF, PNG; CC BY 4.0), the FZK-Haus IFC model (KIT) and one of Stoa's example sheets, a UK DfE school plan at 1:200 (Open Government Licence); `samples/examples/README.md` lists the start view's example sheets |
-| `docs/` | [RESULTS.md](docs/RESULTS.md), [ARCHITECTURE.md](docs/ARCHITECTURE.md), [DATA_AND_LICENCES.md](docs/DATA_AND_LICENCES.md), [CONTRACT.md](docs/CONTRACT.md) (API, data shapes), [CONFIGURATION.md](docs/CONFIGURATION.md) (every environment variable) |
+| `docs/` | [RESULTS.md](docs/RESULTS.md), [ARCHITECTURE.md](docs/ARCHITECTURE.md), [DATA_AND_LICENCES.md](docs/DATA_AND_LICENCES.md), [VERDA.md](docs/VERDA.md) (Verda process), [CONTRACT.md](docs/CONTRACT.md) (API, data shapes), [CONFIGURATION.md](docs/CONFIGURATION.md) (every environment variable) |
 
 ## Tech challenge notes
+
+How we meet Stoa's four criteria (accuracy, verifiable reasoning, creativity, low inference cost) and the full
+Gemini, NVIDIA and Verda texts: [SUBMISSION.md](SUBMISSION.md). The Verda process document: [docs/VERDA.md](docs/VERDA.md).
 
 - **Google Gemini.** Gemini 3.1 Pro is the hosted escalation for uploads. When no geometry reader is sure of a
   count or a length, Gemini reads the drawing. It must return boxes for what it counted (up to 200 are kept, and an answer with fewer boxes than its count

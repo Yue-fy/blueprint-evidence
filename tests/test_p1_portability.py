@@ -301,3 +301,60 @@ def test_hosted_call_has_a_deadline(monkeypatch):
         llm.chat("hi", backend="nvidia", deadline=3.0, cache=False)
     assert time.time() - t0 < 4.5
     assert calls and all(t <= 3.0 for t in calls)
+
+
+# --- X1 23:27: a file's one-time reading (text layer) is split from the question's own cost -------------------------
+def test_file_reading_marks_prep_and_tier_uses_the_question_part():
+    from stoa.contract import CostMeter, record_cost
+
+    with CostMeter() as m:
+        record_cost(llm_calls=2, llm_tokens_in=4000, llm_tokens_out=200, gpu_seconds=0.36)  # the question's own calls
+        with cost.file_reading():
+            record_cost(llm_calls=130, llm_tokens_in=480_000, llm_tokens_out=8800, gpu_seconds=28.0)
+            with cost.file_reading():  # nested readings are marked once
+                record_cost(cpu_seconds=10.0)
+    c = m.cost.model_dump()
+    assert c["llm_calls"] == 132 and c["prep_llm_calls"] == 130 and c["prep_cpu_seconds"] == 10.0  # totals unchanged
+    q = cost.question_part(c)
+    assert q["llm_calls"] == 2 and q["llm_tokens_in"] == 4000 and q["cpu_seconds"] == 0
+    t = cost.tier(c)
+    assert t["tier"] == "in-between" and t["file_reading"]["tier"] == "expensive"
+    assert "once" in t["why"] and "130 model calls" in t["why"]
+    b = cost.breakdown(c)
+    assert b["usd"] == pytest.approx(b["prep_usd"] + b["question_usd"]) and b["prep_usd"] > 10 * b["question_usd"]
+    assert "one-time reading" in cost.describe(c)
+    assert cost.tier({k: v for k, v in c.items() if not k.startswith("prep_")})["tier"] == "expensive"  # old rows: as before
+
+
+def test_file_reading_memo_hit_marks_nothing():
+    import time
+
+    from stoa.contract import CostMeter
+
+    with CostMeter() as m:
+        with cost.file_reading():
+            time.sleep(0.01)  # an in-process memo hit: time passes, nothing is billed
+    assert not cost.prep_part(m.cost.model_dump()) and cost.tier(m.cost.model_dump())["tier"] == "cheap"
+    with cost.file_reading():  # outside any meter: a no-op
+        pass
+
+
+def test_cli_waits_for_a_whole_trace_unless_told(capsys):
+    """P1 00:50: the UI's 90 s trace wait relies on a long-lived worker finishing the trace in the background; a CLI
+    process exits after its answers, so `ask` / `answer` default to STOA_TRACE_WAIT=600 (an explicit value wins)."""
+    import os
+
+    from stoa import cli
+
+    old = os.environ.pop("STOA_TRACE_WAIT", None)
+    try:
+        assert cli.main(["intent", "How many doors are there?"]) == 0
+        assert os.environ["STOA_TRACE_WAIT"] == "600"
+        os.environ["STOA_TRACE_WAIT"] = "5"
+        assert cli.main(["intent", "How many doors are there?"]) == 0
+        assert os.environ["STOA_TRACE_WAIT"] == "5"
+    finally:
+        os.environ.pop("STOA_TRACE_WAIT", None)
+        if old is not None:
+            os.environ["STOA_TRACE_WAIT"] = old
+    capsys.readouterr()

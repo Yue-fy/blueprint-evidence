@@ -19,6 +19,7 @@ are the printed numbers, their positions and the sum. Kill switch: STOA_O1_CHAIN
 from __future__ import annotations
 
 import os
+import os
 import re
 import statistics
 from dataclasses import dataclass, field
@@ -127,7 +128,8 @@ class Pair:
     notes: list[str] = field(default_factory=list)
 
     def describe(self) -> str:
-        segs = " + ".join(d.item.text.strip() for d in self.run)
+        segs = " + ".join((f"[{d.item.text.strip()} not read]" if getattr(d.item, "tile", 0) == -1 else
+                           d.item.text.strip()) for d in self.run)
         u = f" ({self.int_unit})" if self.int_unit else ""
         return f"'{self.total.item.text.strip()}' = {segs}{u} = {self.value:g} {self.unit}"
 
@@ -211,6 +213,126 @@ def verified(tl) -> list[Pair]:
                         k, spread = _spacing(run, vals, axis)
                         pairs.append(Pair(axis, T, run, round(tv, 4), unit, iu, k, spread))
     return pairs
+
+
+# O1 c15 (X1 sl-301, EFA superblock PNG): OCR read 10 of the 11 '7,200' bay strings under '79,200' (one blank at
+# x ~1227 px), so the chain never summed and the VLM's own '33,000' (the upper floor's chain) answered @0.3. A total
+# whose chain lacks exactly ONE interior segment string is accepted when the gap between the two strings around the
+# hole is as wide as the missing value (total - the read segments) needs at the scale the other segments' spacing
+# gives, and the total sits over the middle of the whole chain. Used only for overall-dimension answers (never for a
+# scale from chains), at GAP_CONF. Kill switch STOA_O1_CHAIN_GAP=0.
+CHAIN_GAP = os.environ.get("STOA_O1_CHAIN_GAP", "1") != "0"
+GAP_CONF = 0.6  # the total and all but one of its segments are printed; the hole's width fits the missing value
+GAP_FIT = 0.08  # the hole's pixel width must match the inferred segment within this (relative)
+GAP_K_SPREAD = 0.12  # the other neighbour steps' px per unit must agree within this (relative to their median)
+GAP_MID = 0.08  # the total's string must sit within this share of the chain's span of the chain's middle
+
+
+def _gap_fit(run: list[Dim], vals: list[float], tv: float, axis: str, along_t: float):
+    """(hole index a, missing value, relative hole-width error, px per unit) when the run read with exactly one segment
+    missing between run[a] and run[a+1] sums to tv and the strings' spacing says so; else None."""
+    x = tv - sum(vals)
+    if len(run) < 4 or x <= 0 or not (0.25 * min(vals) <= x <= 3 * max(vals)):
+        return None
+    pos = [(d.item.cx if axis == "row" else d.item.cy) for d in run]
+    steps = [(pos[i + 1] - pos[i]) / ((vals[i] + vals[i + 1]) / 2) for i in range(len(run) - 1)]
+    best_fit = None
+    for a in range(len(run) - 1):
+        others = [s for i, s in enumerate(steps) if i != a]
+        if len(others) < 3 or min(others) <= 0:
+            continue
+        k = statistics.median(others)
+        if max(abs(s - k) for s in others) > GAP_K_SPREAD * k:
+            continue
+        want = k * (vals[a] / 2 + x + vals[a + 1] / 2)
+        err = abs((pos[a + 1] - pos[a]) - want) / want
+        if err > GAP_FIT:
+            continue
+        start, end = pos[0] - k * vals[0] / 2, pos[-1] + k * vals[-1] / 2
+        if abs(along_t - (start + end) / 2) > GAP_MID * (end - start):
+            continue
+        if best_fit is None or err < best_fit[2]:
+            best_fit = (a, x, err, k)
+    return best_fit
+
+
+def gap_pairs(tl, have: list[Pair] | None = None) -> list[Pair]:
+    """Totals with no strict pair (verified) whose chain is missing exactly one interior segment string (_gap_fit).
+    The missing segment is a synthetic string (tile -1, never evidence) at the hole's centre."""
+    from stoa.solvers.raster.textlayer import TextItem
+
+    if not CHAIN_GAP:
+        return []
+    ds = dims_of(tl.items)
+    if len(ds) < 5:
+        return []
+    done = {id(p.total) for p in (have or [])} | {id(p.total.item) for p in (have or [])}
+    size = statistics.median(_size(d) for d in ds)
+    tol = max(4.0, 0.6 * size)
+    reach = max(8 * size, 0.02 * max(tl.size))
+    out: list[Pair] = []
+    for axis in ("row", "col"):
+        key = (lambda d: d.item.cy) if axis == "row" else (lambda d: d.item.cx)
+        along = (lambda d: d.item.cx) if axis == "row" else (lambda d: d.item.cy)
+        for L in _lines(ds, axis, tol):
+            if len(L) < 4:
+                continue
+            line_key = statistics.fmean(key(d) for d in L)
+            for T in ds:
+                if id(T.item) in done or T in L or not (tol < abs(key(T) - line_key) <= reach):
+                    continue
+                found = None
+                for i in range(len(L)):
+                    for j in range(i + 4, min(len(L), i + 13) + 1):
+                        run = L[i:j]
+                        if len({d.family for d in run}) != 1 or run[0].family != T.family:
+                            continue
+                        if not (along(run[0]) - tol <= along(T) <= along(run[-1]) + tol):
+                            continue
+                        if T.family == "ft":
+                            vals, tv, unit, iu = [d.value for d in run], T.value, "ft", None
+                        else:
+                            iu = _int_unit(run + [T])
+                            vals, tv, unit = [_metres(d, iu) for d in run], _metres(T, iu), "m"
+                        if tv <= max(vals) or not (1.5 <= (tv * 0.3048 if T.family == "ft" else tv) <= 400):
+                            continue
+                        fit = _gap_fit(run, vals, tv, axis, along(T))
+                        if fit is not None and (found is None or fit[2] < found[0][2]):
+                            found = (fit, run, vals, tv, unit, iu)
+                if found is None:
+                    continue
+                (a, x, err, k), run, vals, tv, unit, iu = found
+                same = next((d for d, v in zip(run, vals) if abs(v - x) <= max(0.005 * x, 1e-6)), None)
+                c = (run[a].item.cx if axis == "row" else run[a].item.cy) + k * (vals[a] + x) / 2
+                b = list(run[a].item.box)
+                half = (b[2] - b[0]) / 2 if axis == "row" else (b[3] - b[1]) / 2
+                box = [c - half, b[1], c + half, b[3]] if axis == "row" else [b[0], c - half, b[2], c + half]
+                if same is not None:
+                    text = same.item.text.strip()
+                elif unit == "ft":
+                    ft, inch = divmod(round(x * 12), 12)
+                    text = f"{ft}'-{inch}\""
+                else:  # in the chain's own unit (mm / cm integers, else metres)
+                    text = f"{round(x * 1000)}" if iu == "mm" else f"{round(x * 100)}" if iu == "cm" else f"{x:g}"
+                ghost = Dim(TextItem(text=text, box=box, tile=-1), same.value if same is not None else x,
+                            same.kind if same is not None else ("ftin" if unit == "ft" else "dec"))
+                full = run[:a + 1] + [ghost] + run[a + 1:]
+                fvals = vals[:a + 1] + [x] + vals[a + 1:]
+                if not any(d.kind in ("int", "thou") for d in full + [T]):
+                    iu = None
+                kk, spread = _spacing(full, fvals, axis)
+                p = Pair(axis, T, full, round(tv, 4), unit, iu, kk, spread)
+                p.notes.append(f"one segment string was not read (between '{run[a].item.text.strip()}' and "
+                               f"'{run[a + 1].item.text.strip()}'): {x:g} {unit} inferred from the total"
+                               + (f" (= the printed '{text}' beside it)" if same is not None else "")
+                               + f"; the gap's width fits it within {100 * err:.0f}%")
+                out.append(p)
+                done.add(id(T.item))
+    return out
+
+
+def _inferred(p: Pair) -> bool:
+    return any(getattr(d.item, "tile", 0) == -1 for d in p.run)
 
 
 def best(pairs: list[Pair], axis: str) -> Pair | None:
@@ -372,15 +494,25 @@ _DIMWORD = re.compile(r"\b(dimension(?:ed|s)?|dimension strings?|ma(?:ß|ss)kett
 _DEPTH = re.compile(r"\b(deep|depth|front to back|tief\w*|syvä\w*|syvyys|profond\w*|profondità|djup\w*|fondo)\b", re.I)
 _WIDTH = re.compile(r"\b(wide|width|breit\w*|levey\w*|leveä\w*|largeur|large|largh\w*|ancho|anchura|bredd|bred)\b", re.I)
 _LONG = re.compile(r"\b(long|length|lang|länge|pituus|pitkä|longueur|lunghezza|lungo|largo|längd|lång)\b", re.I)
-_AREA = re.compile(r"\b(area|enclose[sd]?|footprint|square (?:feet|foot|met(?:re|er)s?)|m²|m2|ft²|sq\.? ?ft|"
+_AREA = re.compile(r"\b(areas?|enclose[sd]?|footprints?|square (?:feet|foot|met(?:re|er)s?)|m²|m2|ft²|sq\.? ?ft|"
                    r"fläche|grundfläche|pinta-ala|superficie|surface|yta)\b", re.I)
 _NOT_OVERALL = re.compile(r"\b(tall|high|height|hoch|höhe|korkeus|hauteur|altezza|thick\w*|dick\w*|stärke|paksu\w*|"
                           r"épaisseur|spessore|rooms?|zimmer|raum|räume|huone\w*|kitchen|küche|bath\w*|bedroom\w*|"
                           r"porch\w*|veranda|terrace|terrasse|garage|carport|stair\w*|treppe\w*|corridor|hallway|flur|"
                           r"lobby|doors?|t[üu]r\w*|windows?|fenster|walls?|wand|wände|seinä\w*|riser\w*|steps?|"
                           r"plot|site|lot|grundstück|tontti|parcel|pip\w*|duct\w*|cabl\w*|beams?|columns?|slabs?|railings?|fences?|"
-                          r"units?|apartments?|flats?|wohnung\w*|asun\w*|levels?|stor(?:e)?y|stories|floors?\s+\d)\b", re.I)
+                          r"units?|apartments?|flats?|wohnung\w*|asun\w*|levels?|stor(?:e)?y|stories|floors?\s+\d|"
+                          # T1 22:42 (S-100F): 'footprint of the generator set foundation' -> the sheet's overall 27000 x
+                          # 15522; an element's footprint is not the building's
+                          # ('foundation' alone stays: 'overall length of the foundation' = the building's)
+                          r"pads?|plinths?|tanks?|equipment|generators?|gen\s*sets?|gensets?|pumps?|machines?|vaults?|"
+                          r"pits?|sumps?)\b", re.I)
 # the pipeline normalises 'the house' to 'this floor plan' ("How deep is this floor plan from front to back?")
+# O1 c12 (X1 sl-296/302, EFA superblock): 'How deep is the main teaching block from north to south, overall?' = the
+# printed 37,850 chain. A 'block' is a building only with an explicit overall word (several blocks: 'the sports block'
+# alone is one of them, not the plan's overall chain).
+BLOCK = os.environ.get("STOA_O1_BLOCK", "1") != "0"
+_BLOCK = re.compile(r"\b(block|blocks|trakt\w*|rakennusosa\w*|bloc|blocco|blocket)\b", re.I)
 _PLAN_SUBJECT = re.compile(r"\b(?:how\s+(?:long|wide|deep)|(?:length|width|depth))\s+(?:is|of)\s+(?:this|the|that)\s+"
                            r"(?:floor\s*)?plan\b", re.I)
 _COL_SIDE = re.compile(r"\b(left|right|links|rechts|vasem\w*|oike\w*|gauche|droite|sinistr\w*|destr\w*|"
@@ -457,7 +589,8 @@ def question_kind(question: str) -> tuple[str, str | None] | None:
     q = _NEG.sub(" ", _PAREN.sub(" ", question))
     if _NOT_OVERALL.search(q):
         return None
-    overall = bool(_OVERALL.search(q) and (_BUILDING.search(q) or _DIMWORD.search(q) or re.search(r"\bplan\b", q, re.I)))
+    overall = bool(_OVERALL.search(q) and (_BUILDING.search(q) or _DIMWORD.search(q) or re.search(r"\bplan\b", q, re.I)
+                                          or BLOCK and _BLOCK.search(q)))
     building = bool(_BUILDING.search(q) or _PLAN_SUBJECT.search(q))
     if not (overall or building):
         return None
@@ -503,11 +636,19 @@ def _ev(img_path: str, p: Pair, page: int = 0) -> list[Evidence]:
                    note=f"overall dimension '{p.total.item.text.strip()}' = {p.value:g} {p.unit} (= the sum of its "
                         f"chain)")]
     ev += [Evidence(file=img_path, page=page, bbox=[round(x, 1) for x in d.item.box], bbox_space="image_px",
-                    note=f"chain segment '{d.item.text.strip()}'") for d in p.run[:12]]
+                    note=f"chain segment '{d.item.text.strip()}'") for d in p.run[:12]
+           if getattr(d.item, "tile", 0) != -1]  # an inferred (unread) segment is not a mark on the drawing
     return ev
 
 
 def _conf(p: Pair, base: float) -> tuple[float, list[str]]:
+    if _inferred(p):
+        base = min(base, GAP_CONF)
+        miss = [f"{p.notes[0] if p.notes else 'one chain segment string was not read'}: check that segment on the "
+                "drawing"]
+        if p.spread is not None and p.spread > SPREAD_BAD:
+            return min(base, SPACING_BAD_CONF), miss
+        return base, miss
     if p.spread is not None and p.spread > SPREAD_BAD:
         return min(base, SPACING_BAD_CONF), [f"the printed segments' spacing on the drawing does not fit their values "
                                              f"(off by up to {100 * p.spread:.0f}% of the chain): it may be read out of order"]
@@ -532,6 +673,7 @@ def overall_answer(img_path: str, question: str, tl, solver: str = "raster") -> 
     if part_side(question) and not line_side(question):
         return None  # 'how wide is the pump room part (left)': a part of the plan, not its overall dimension
     pairs = verified(tl)
+    pairs = pairs + gap_pairs(tl, pairs)
     if not pairs:
         return None
     row, col = best(pairs, "row"), best(pairs, "col")

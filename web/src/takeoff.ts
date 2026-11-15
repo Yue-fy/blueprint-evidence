@@ -49,6 +49,20 @@ export function updateShown(hero: HTMLElement | null, question: string, path: st
   if (sure) r.sure = sure;
 }
 
+/** F1 23:17: 'Clear selection' / 'Clear all' in the Measure tool leave no trace: the rows its 'Save to takeoff' made on
+ *  that file (their questions), and with scope 'all' every row a measurement made there (method 'measure/…'). Returns
+ *  how many rows went. */
+export function dropRows(path: string, questions: string[], all = false): number {
+  const qs = new Set(questions.map((q) => q.trim().toLowerCase()));
+  const before = rows.length;
+  for (let i = rows.length - 1; i >= 0; i--) {
+    const r = rows[i];
+    if (r.path !== path) continue;
+    if (qs.has(r.question.trim().toLowerCase()) || (all && /^measure\//i.test(r.method))) rows.splice(i, 1);
+  }
+  return before - rows.length;
+}
+
 export const takeoffCount = () => rows.length;
 /** This visit's answers, read-only copies (F2 21:03: the takeoff panel's Export adds them as section 'visit'). */
 export const takeoffRows = (): TakeoffRow[] => rows.map((r) => ({ ...r }));

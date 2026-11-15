@@ -356,17 +356,92 @@ def _runs(row: list[tuple[float, T.TextItem]]) -> list[list[tuple[float, T.TextI
     return out
 
 
+# O1 c10 (W6 20:27, phone photos): OCR glues a tick or stray mark to a label ("0'7'" for 0' on the AFCEC dorm photo) -> no
+# 0 -> no bar. A feet label followed by <= 3 junk characters keeps its number, its box cut to the label's share of the
+# characters (the centre moves onto the printed label: 2758 -> 2741 px; W6 measured the 0 at 2736).
+_JUNK_TAIL = re.compile(r"^(\s*\d{1,5}\s*['’])(\S{1,3})$")
+BAR_FIX = os.environ.get("STOA_O1_BAR_FIX", "1") != "0"
+# single fixes off: STOA_O1_BAR_OFF="junk,feet,tilt,nozero,loo" (comma list)
+BAR_OFF = {x.strip() for x in os.environ.get("STOA_O1_BAR_OFF", "").split(",") if x.strip()}
+
+
+def _fix(name: str) -> bool:
+    return BAR_FIX and name not in BAR_OFF
+
+
+# O1 c15 (F2 00:59, CubiCasa Finnish flat asunto-2h-kk-s.png: no bar on the sheet): two stray labels '0' and '60' took
+# their unit from the area tag '13.0 m²' beside them -> 'scale bar 0-60 m', 10.5 px per m (true ~70). A 2-label run (or
+# one without its 0) is a bar only with a unit, and an area tag names a room's area, not a bar's length unit; bars of
+# >= 3 labels may still take the unit SYSTEM from it (EFA '0 1 … 10' next to 'TARGET: 4831m²'). Off:
+# STOA_O1_BAR_OFF=areaunit
+_AREA_TAG = re.compile(r"m²|m\^?2\b|ft²|ft\^?2\b|sq\.?\s*(?:ft|m)\b|square|neliö|quadrat", re.I)
+
+
+def _label_of(it: T.TextItem) -> tuple[T.TextItem, re.Match] | None:
+    m = _LABEL.match(it.text)
+    if m:
+        return it, m
+    j = _JUNK_TAIL.match(it.text) if _fix("junk") else None
+    if j is None or re.fullmatch(r"\d{1,2}\s*(?:\"|”|'')", j.group(2)):  # 20'6" is a dimension, not a label + junk
+        return None
+    k = len(j.group(1)) / max(1, len(it.text))
+    w = it.box[2] - it.box[0]
+    cut = T.TextItem(j.group(1).strip(), [it.box[0], it.box[1], it.box[0] + k * w, it.box[3]], it.tile)
+    m = _LABEL.match(cut.text)
+    return (cut, m) if m else None
+
+
+def _nozero_ok(run: list, units: dict) -> bool:
+    """A run without its 0 label may stand for a bar (W6's DfE photo '10m' '20m') only when it looks like a bar's
+    labels and nothing else: 2-4 labels, EVERY one carrying a unit word itself ('10m', not a feet mark: "10'" "15'" is
+    how dimension strings print on HABS sheets), values whole multiples of the first (10 20, 5 10 20; not 3 7 / 14 20)."""
+    if not _fix("nozero") or not 2 <= len(run) <= 4:
+        return False
+    if not all(units.get(id(it)) and not str(it.text).rstrip().endswith(("'", "’")) for _, it in run):
+        return False
+    v0 = run[0][0]
+    return v0 > 0 and all(abs(v / v0 - round(v / v0)) < 1e-6 for v, _ in run)
+
+
+def _tilted_row(row: list, nums: list, ha: float, used: set) -> list:
+    """O1 c10 (W6 20:27, AFCEC dorm photo): on a photo the bar's labels drift down the row (0' at y 2378, 80' at 2400:
+    22 px over 455 px, more than 0.6 label heights) and the far label fell out. Extend the row along the line through
+    its labels (slope <= 0.1, i.e. <= ~6°): labels within 0.6 label heights of that line join it."""
+    xs = [it.cx for _, it, _ in row]
+    ys = [it.cy for _, it, _ in row]
+    if max(xs) - min(xs) < 1e-6:
+        return row
+    mx, my = statistics.fmean(xs), statistics.fmean(ys)
+    sxx = sum((x - mx) ** 2 for x in xs)
+    d = sum((x - mx) * (y - my) for x, y in zip(xs, ys)) / sxx if sxx else 0.0
+    if abs(d) > 0.1:
+        return row
+    have = {id(it) for _, it, _ in row}
+    span = max(xs) - min(xs)
+    extra = [(v, it, u) for v, it, u in nums
+             if id(it) not in have and id(it) not in used and 0.5 < (it.box[3] - it.box[1]) / max(ha, 1e-6) < 2.0
+             and abs(it.cy - (my + d * (it.cx - mx))) < 0.6 * max(ha, it.box[3] - it.box[1])
+             and min(abs(it.cx - min(xs)), abs(it.cx - max(xs))) < 1.5 * span + 20 * ha]
+    if not extra:
+        return row
+    return sorted(row + extra, key=lambda t: t[1].cx)
+
+
 def _bars_from_items(items: list[T.TextItem], all_items: list[T.TextItem], source: str,
                      unit_hint: tuple[str | None, str] = (None, "")) -> list[Bar]:
     nums = []
-    for it in items:
-        m = _LABEL.match(it.text)
-        if not m:
+    for it0 in items:
+        got = _label_of(it0)
+        if got is None:
             continue
+        it, m = got
         tail = m.group(2).strip()
-        if tail and unit_of(tail) is None:
+        u = unit_of(tail) if tail else None
+        if u is None and _fix("feet") and tail in ("'", "’"):
+            u = "ft"  # O1 c10 (W6 20:27): "20'" -> tail "'" (a feet mark: unit_of needs the digit before it)
+        if tail and u is None:
             continue
-        nums.append((float(m.group(1).replace(",", ".")), it, unit_of(tail) if tail else None))
+        nums.append((float(m.group(1).replace(",", ".")), it, u))
     used: set[int] = set()
     bars: list[Bar] = []
     nums.sort(key=lambda t: t[1].cy)
@@ -378,6 +453,8 @@ def _bars_from_items(items: list[T.TextItem], all_items: list[T.TextItem], sourc
                if abs(it.cy - a.cy) < 0.6 * max(ha, it.box[3] - it.box[1]) and id(it) not in used
                and 0.5 < (it.box[3] - it.box[1]) / max(ha, 1e-6) < 2.0]
         row.sort(key=lambda t: t[1].cx)
+        if _fix("tilt") and len(row) >= 2:
+            row = _tilted_row(row, nums, ha, used)
         if len(row) < 2:
             continue
         units = {id(it): u for _, it, u in row}
@@ -390,11 +467,36 @@ def _bars_from_items(items: list[T.TextItem], all_items: list[T.TextItem], sourc
                 span = xs[-1] - xs[0]
                 # labels on one bar: no huge gaps relative to the label size, and the values start at (or cross) 0
                 gaps = [b - a_ for a_, b in zip(xs, xs[1:])]
-                if min(vals) > 0 or span < 4 * h or max(gaps) > 40 * h:
+                # O1 c10 (W6 20:27, DfE photo tilted 20°: '10m' '20m' read, the lone '0' missed): a run without its 0
+                # is kept with the 0 extrapolated, only with a unit and only if the DRAWN bar confirms it (bars())
+                nozero = min(vals) > 0
+                if (nozero and not _nozero_ok(run, units)) or span < 4 * h or max(gaps) > 40 * h:
                     continue
                 b, a_, res = _fit(vals, xs)
+                dropped = None
+                if _fix("loo") and len(run) >= 4 and (b <= 0 or res > max(3.0, 0.03 * span)):
+                    # O1 c10 (W6 20:27, S-100F photo): two OCR boxes overlap ('500' 2939-2984, '1000' 2976-3017), so
+                    # one label's centre is off and the whole row failed: the best fit with one label left out (never
+                    # the 0, >= 3 labels kept)
+                    best = None
+                    for k in range(len(run)):
+                        if run[k][0] == 0.0:
+                            continue
+                        sub = run[:k] + run[k + 1:]
+                        sv, sx = [v for v, _ in sub], [it.cx for _, it in sub]
+                        b2, a2, r2 = _fit(sv, sx)
+                        if b2 > 0 and r2 <= max(3.0, 0.03 * (sx[-1] - sx[0])) and (best is None or r2 < best[0]):
+                            best = (r2, k, b2, a2)
+                    if best is not None:
+                        res, k, b, a_ = best
+                        dropped = run[k][1].text
+                        run = run[:k] + run[k + 1:]
+                        vals, xs = [v for v, _ in run], [it.cx for _, it in run]
+                        span = xs[-1] - xs[0]
                 if b <= 0 or res > max(3.0, 0.03 * span):
                     continue
+                if nozero and (a_ < 0 or a_ > xs[0] - 1.5 * h or xs[0] - a_ > 40 * h):
+                    continue  # the extrapolated 0 must lie left of the first label, on the sheet
                 # unit: on a label ('20 m'), else the nearest unit word around the row, else the caller's hint
                 unit, utext = next(((units[id(it)], it.text) for _, it in run if units.get(id(it))), (None, ""))
                 if unit is None:
@@ -404,6 +506,8 @@ def _bars_from_items(items: list[T.TextItem], all_items: list[T.TextItem], sourc
                         u = unit_of(it.text)
                         if u is None or _LABEL.match(it.text) and not it.text.strip()[-1:].isalpha():
                             continue
+                        if (len(run) == 2 or nozero) and _fix("areaunit") and _AREA_TAG.search(it.text):
+                            continue  # a room's area tag ('13.0 m²') cannot be what admits a 2-label run (O1 c15)
                         if len(it.text) > 40 or any(it is r for _, r in run):
                             continue
                         dy = abs(it.cy - run[0][1].cy)
@@ -414,12 +518,31 @@ def _bars_from_items(items: list[T.TextItem], all_items: list[T.TextItem], sourc
                         _, unit, utext = min(cands)
                     else:
                         unit, utext = unit_hint
-                if len(run) == 2 and unit is None:  # a 2-label bar needs a unit
+                if (len(run) == 2 or nozero) and unit is None:  # a 2-label bar / a bar without its 0 needs a unit
                     continue
+                # a unit known only from feet marks ("0'" "2'", a dimension string's way of printing): a 2-label run
+                # must be confirmed by the drawn bar, and never a run left of a 0 (O1 c10 bar check: '-15 -2 0')
+                feet_only = _fix("feet") and all(str(it.text).rstrip().endswith(("'", "’")) for _, it in run
+                                                if units.get(id(it)))
+                feet_only = feet_only and any(units.get(id(it)) for _, it in run) and \
+                    not any(unit_of(str(it.text).replace("'", " ").replace("’", " ")) for _, it in run)
+                if feet_only and min(vals) < 0:
+                    continue
+                need_drawn = nozero or (feet_only and len(run) == 2)
                 box = [min(it.box[0] for _, it in run), min(it.box[1] for _, it in run),
                        max(it.box[2] for _, it in run), max(it.box[3] for _, it in run)]
-                bars.append(Bar(unit=unit, px_per_unit=b, labels=[(v, it.cx, it.box) for v, it in run], box=box,
-                                residual=res, source=source, unit_text=utext))
+                labels = [(v, it.cx, it.box) for v, it in run]
+                notes = [f"label '{dropped}' left out: its box does not fit the other labels"] if dropped else []
+                if nozero:
+                    f0 = run[0][1]
+                    w0 = f0.box[2] - f0.box[0]
+                    labels = [(0.0, a_, [a_ - w0 / 2, f0.box[1], a_ + w0 / 2, f0.box[3]]), *labels]
+                    box[0] = min(box[0], a_ - w0 / 2)
+                    notes.append(f"no '0' label read: the bar's 0 is extrapolated from the labels (x {a_:.0f} px) and "
+                                 "kept only because the drawn bar confirms it")
+                bars.append(Bar(unit=unit, px_per_unit=b, labels=labels, box=box, residual=res,
+                                source=source + ("+nozero" if need_drawn else "") + ("+loo" if dropped else ""),
+                                unit_text=utext, notes=notes))
                 used.update(id(it) for _, it in run)
                 break
     return bars
@@ -459,53 +582,60 @@ def snap(path: str, bar: Bar, img: Image.Image | None = None) -> Bar:
     xa, xb = int(max(0, x0 - 3 * h - lw)), int(min(W, x1 + 3 * h + lw))
     thr = min(160, int(np.percentile(g[int(bar.box[1]):int(bar.box[3]) + 1, xa:xb], 5)) + 60) if xb > xa else 160
     best = None
-    for side in ("below", "above"):
-        if side == "below":
-            ya, yb = int(bar.box[3] + 1), int(min(H, bar.box[3] + 2.5 * h + 2))
-        else:
-            ya, yb = int(max(0, bar.box[1] - 2.5 * h - 2)), int(bar.box[1] - 1)
-        if yb - ya < 2:
-            continue
-        band = g[ya:yb, xa:xb] < thr
-        rows = band.sum(axis=1)
-        # rows dark over a good part of the label span = the bar's lines/fill (a stepped HABS bar alternates between
-        # two rows, so each covers ~half); rows that run on through both margins are a frame or separator line
-        span = max(1.0, x1 - x0)
-        ml, mr = int(max(1, x0 - lw - xa)), int(max(1, xb - (x1 + lw)))
-        through = (band[:, :ml].mean(axis=1) > 0.5) & (band[:, -mr:].mean(axis=1) > 0.5)
-        good = (rows >= 0.2 * span) & ~through
-        # the bar is the first block of rows next to the labels: stop at the first blank row after it
-        order = range(len(rows)) if side == "below" else range(len(rows) - 1, -1, -1)
-        seen = False
-        for r in order:
-            if seen and rows[r] < 3:
-                good[r:] = False if side == "below" else good[r:]
-                if side == "above":
-                    good[:r + 1] = False
-                break
-            seen = seen or bool(good[r])
-        if not good.any():
-            continue
-        cols = band[good].any(axis=0)
-        # longest run of dark columns, tolerating gaps of <= 2 px
-        runs, start, gap = [], None, 0
-        for i, c in enumerate(np.append(cols, False)):
-            if c:
-                if start is None:
-                    start = i
-                gap, last = 0, i
-            elif start is not None:
-                gap += 1
-                if gap > 2 or i == len(cols):
-                    runs.append((start, last))
-                    start, gap = None, 0
-        if not runs:
-            continue
-        ra, rb = max(runs, key=lambda r: r[1] - r[0])
-        ra, rb = ra + xa, rb + xa
-        tol = max(lw + h, 0.12 * span)  # VLM label boxes can be ~10% off; the drawn ends are the measurement
-        if abs(ra - x0) <= tol and abs(rb - x1) <= tol and (best is None or rb - ra > best[1] - best[0]):
-            best = (ra, rb + 1, side, ya, yb)
+    # O1 c10 (W6 20:27, DfE photo tilted 20°): the bar is a thin grey line (grey 99-150 after JPEG) the dark-ink
+    # threshold (~110 there) misses; one more pass with a looser threshold when the first finds nothing — only for a bar
+    # whose 0 was extrapolated (it is dropped without the drawn bar). Not for the others: on the AFCEC photo the loose
+    # pass merged the 'SCALE : 1" = 40'-0"' text under the bar into the run (5.91 px/ft vs 5.75 by hand; labels 5.72).
+    for thr in ((thr, max(thr, 185)) if _fix("nozero") and "+nozero" in bar.source else (thr,)):
+        if best is not None:
+            break
+        for side in ("below", "above"):
+            if side == "below":
+                ya, yb = int(bar.box[3] + 1), int(min(H, bar.box[3] + 2.5 * h + 2))
+            else:
+                ya, yb = int(max(0, bar.box[1] - 2.5 * h - 2)), int(bar.box[1] - 1)
+            if yb - ya < 2:
+                continue
+            band = g[ya:yb, xa:xb] < thr
+            rows = band.sum(axis=1)
+            # rows dark over a good part of the label span = the bar's lines/fill (a stepped HABS bar alternates between
+            # two rows, so each covers ~half); rows that run on through both margins are a frame or separator line
+            span = max(1.0, x1 - x0)
+            ml, mr = int(max(1, x0 - lw - xa)), int(max(1, xb - (x1 + lw)))
+            through = (band[:, :ml].mean(axis=1) > 0.5) & (band[:, -mr:].mean(axis=1) > 0.5)
+            good = (rows >= 0.2 * span) & ~through
+            # the bar is the first block of rows next to the labels: stop at the first blank row after it
+            order = range(len(rows)) if side == "below" else range(len(rows) - 1, -1, -1)
+            seen = False
+            for r in order:
+                if seen and rows[r] < 3:
+                    good[r:] = False if side == "below" else good[r:]
+                    if side == "above":
+                        good[:r + 1] = False
+                    break
+                seen = seen or bool(good[r])
+            if not good.any():
+                continue
+            cols = band[good].any(axis=0)
+            # longest run of dark columns, tolerating gaps of <= 2 px
+            runs, start, gap = [], None, 0
+            for i, c in enumerate(np.append(cols, False)):
+                if c:
+                    if start is None:
+                        start = i
+                    gap, last = 0, i
+                elif start is not None:
+                    gap += 1
+                    if gap > 2 or i == len(cols):
+                        runs.append((start, last))
+                        start, gap = None, 0
+            if not runs:
+                continue
+            ra, rb = max(runs, key=lambda r: r[1] - r[0])
+            ra, rb = ra + xa, rb + xa
+            tol = max(lw + h, 0.12 * span)  # VLM label boxes can be ~10% off; the drawn ends are the measurement
+            if abs(ra - x0) <= tol and abs(rb - x1) <= tol and (best is None or rb - ra > best[1] - best[0]):
+                best = (ra, rb + 1, side, ya, yb)
     if best is None:
         bar.notes.append("drawn bar not found next to the labels: px/unit from the label positions (approximate)")
         return bar
@@ -567,11 +697,16 @@ def bars(path: str, backend: str = "local", reread: bool = True, layer: T.TextLa
                     got[0].notes.insert(0, "labels re-read in a 4x crop (the text layer's label boxes did not fit "
                                            "the drawn bar)")
                     out[k] = got[0]
+    # a bar whose 0 was extrapolated stands only on the drawn bar (snap '+drawn'); two numbers with a unit in a row
+    # are no scale bar on their own
+    out = [b for b in out if "+nozero" not in b.source or "+drawn" in b.source]
     if img is not None:
         out += _vertical_bars(path, tl, img, [b.box for b in out])
     _resolve_ft_m(out)
     _resolve_unknown(out, tl)
-    out.sort(key=lambda b: (-len(b.labels), b.residual / max(1.0, b.labels[-1][1] - b.labels[0][1])))
+    # a bar fitted with one label left out ranks after a complete one with as many labels (HABS pr0030: an m bar
+    # 0 1 3 would have replaced the ft bar 0 5 10 the answers used; they agree within 1.3 %)
+    out.sort(key=lambda b: (-len(b.labels), "+loo" in b.source, b.residual / max(1.0, b.labels[-1][1] - b.labels[0][1])))
     _CACHE[key] = out
     return out
 

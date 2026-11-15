@@ -156,3 +156,34 @@ def test_image_lines_use_the_pdf_of_a_render(tmp_path):
     assert src and src[1] == 2.0
     lines = _image_lines(str(tmp_path / "sheet.r144.png"))
     assert [t for t, _ in lines][:2] == ["FP-1", "FP-2"] and lines[0][1][0] > 100  # pdf_pt x 2 = render px
+
+
+def test_no_area_crosscheck_on_a_located_reading_from_a_native_vector_page(tmp_path, monkeypatch):
+    # P1 21:25: 34 cached cross-checks on native vector pages never moved a value; pictures / traced copies keep it
+    import pymupdf
+    import pytest
+
+    import stoa.formats.normalize as N
+    if not hasattr(N, "native_vector_pdf"):
+        pytest.skip("P1's native_vector_pdf (night-P1 8f07a51) is not on this branch yet")
+
+    d = pymupdf.open()
+    pg = d.new_page(width=842, height=595)
+    sh = pg.new_shape()
+    for i in range(1500):
+        sh.draw_line((20 + i % 800, 20 + (i * 7) % 550), (40 + i % 780, 30 + (i * 11) % 540))
+    sh.finish(width=0.3)
+    sh.commit()
+    pg.insert_text((60, 60), "LAUNDRY 7.03 m2   KITCHEN 35.61 m2   SCALE 1:200 @ A1")
+    pdf = str(tmp_path / "plan.pdf")
+    d.save(pdf)
+    ev = [Evidence(file=pdf, page=0, bbox=[0, 0, 10, 10], bbox_space="pdf_pt")]
+    ours = Answer(value=7.03, unit="m2", confidence=0.55, solver="pipeline/plan_rooms", evidence=ev)
+    assert V.wanted(ours, "What is the area of the laundry?", pdf) is None
+    unlocated = Answer(value=7.03, unit="m2", confidence=0.55, solver="pipeline/plan_rooms")
+    assert V.wanted(unlocated, "What is the area of the laundry?", pdf).startswith("area cross-check")
+    traced = tmp_path / "plan.vec6.pdf"
+    traced.write_bytes(open(pdf, "rb").read())
+    assert V.wanted(ours, "What is the area of the laundry?", str(traced)).startswith("area cross-check")
+    monkeypatch.setenv("STOA_VECTOR_XCHECK", "1")
+    assert V.wanted(ours, "What is the area of the laundry?", pdf).startswith("area cross-check")

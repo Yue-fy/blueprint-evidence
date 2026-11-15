@@ -16,14 +16,15 @@ import { OrbitControls } from "three/examples/jsm/controls/OrbitControls.js";
 import { mergeGeometries } from "three/examples/jsm/utils/BufferGeometryUtils.js";
 import type { Evidence } from "./types";
 import { matchEvidence, planGeo, type BBox, type PlanGeo, type PlanRoom, type Pt } from "./plangeo";
-import { Look3D, LookPanel, MAX_DPR, ROOM_HEX, ROOM_TYPES, getLook, onLook, roomType, type RoomType } from "./look3d";
+import { Look3D, LookPanel, MAX_DPR, ROOM_HEX, ROOM_TYPES, areaColor, getLook, keyLight, onLook, roomType, roomTypeOne, setLook, spotColor, type RoomType } from "./look3d";
 
 type Plan3DGeo = PlanGeo;
 
 const HL = new THREE.Color("#0071e3");
-/** the server's room kinds (stoa/geometry/plan3d.py room_kind) in the shared room types; 'outdoor' is not a type */
-const SERVER_KIND: Record<string, RoomType> = { bedroom: "bedroom", living: "living", kitchen: "kitchen", bath: "wet",
-  corridor: "circulation", storage: "storage" };
+/** the server's room kinds (stoa/geometry/plan3d.py room_kind: Balkon / Sitzplatz / Garten … = outdoor) in the shared
+ * room types */
+const SERVER_KIND: Record<string, RoomType> = { bedroom: "living", living: "living", kitchen: "kitchen", bath: "wet",
+  corridor: "circulation", storage: "storage", outdoor: "outdoor" };
 /** a plan room's type: its printed name (look3d.roomType), else the server's kind from the same name ('Zimmer' etc.) */
 function planRoomType(r: PlanRoom): RoomType {
   const t = roomType(r.name);
@@ -51,6 +52,8 @@ export class Plan3D {
   private geo: Plan3DGeo | null = null;
   private targets: Target[] = [];
   private needsRender = true;
+  /** the key light: follows the camera (look3d.keyLight) */
+  private sun!: THREE.DirectionalLight;
   private labelLayer = document.createElement("div");
   private labels: { el: HTMLElement; p: THREE.Vector3 }[] = [];
   private pins: { el: HTMLElement; p: THREE.Vector3 }[] = [];
@@ -65,6 +68,10 @@ export class Plan3D {
   private roomTypes: RoomType[] = [];
   private panel: LookPanel;
   private lit = false;
+  /** the room type lit from the legend (W7 c2), null = all types */
+  private typeFocus: RoomType | null = null;
+  /** a ranked area answer ('biggest room'): every room's floor on a light → deep blue ramp by its plan area (W7 c2) */
+  private rampRange: { min: number; max: number } | null = null;
   /** hover (W7): the merged floor + wall meshes and each room's vertex range in the floor mesh */
   private floorMesh: THREE.Mesh | null = null;
   private wallMesh: THREE.Object3D | null = null;
@@ -99,17 +106,39 @@ export class Plan3D {
     this.scene.add(new THREE.HemisphereLight(0xffffff, 0x9aa3b0, 2.0));
     const sun = new THREE.DirectionalLight(0xfffaf2, 1.6);
     sun.position.set(-30, 60, 40);
+    this.sun = sun;
     this.root.add(this.furn);
     this.scene.add(sun, this.root, this.hl);
     new ResizeObserver(() => this.resize()).observe(el);
     this.panel = new LookPanel(el);
+    this.panel.onType = (k) => {
+      // W7 c6 (as the IFC 3D, UX S-M6): a type clicked while an answer is lit lets the answer's 3D marks go and lights
+      // the type (it did nothing: the legend looked clickable but was dimmed); the page's marks chip offers 'Show' then
+      if (k && (this.lit || this.rampRange)) {
+        this.setEvidence([], []);
+        window.dispatchEvent(new CustomEvent("stoa:3d-marks-off", { detail: { why: "room type" } }));
+      }
+      this.typeFocus = k;
+      this.applyLook();
+    };
     onLook(() => this.applyLook());
+    // W7 c5 (captain 01:18 'Start over', window event 'stoa:reset'): as first opened: no answer marks, no lit room type
+    // or area ramp, the Rooms look, the whole plan framed
+    window.addEventListener("stoa:reset", () => {
+      if (!this.el.isConnected || this.el.dataset.state !== "ready") return;
+      this.setEvidence([], []);
+      this.typeFocus = null;
+      setLook("rooms");
+      this.applyLook();
+      this.frameAll();
+    });
     this.installHover();
     (window as unknown as { __p3d: Plan3D }).__p3d = this; // dev hook (like __v3d): __p3d.stats() for the perf note
     const loop = () => {
       requestAnimationFrame(loop);
       this.controls.update();
       if (this.needsRender) {
+        keyLight(this.sun, this.camera, this.controls.target);
         this.look.fast();
         this.needsRender = false;
         this.place();
@@ -166,6 +195,8 @@ export class Plan3D {
     this.floorTypeCol = null;
     this.roomTypes = [];
     this.lit = false;
+    this.typeFocus = null;
+    this.rampRange = null;
   }
 
   private shape(pts: Pt[]) {
@@ -214,7 +245,7 @@ export class Plan3D {
       if (!tip.isConnected) this.labelLayer.append(tip);
       if (shown !== fr!.i) {
         const type = planRoomType(room);
-        const kind = ROOM_TYPES.find((t) => t.key === type)?.label ?? "";
+        const kind = roomTypeOne(type);
         const name = [room.name, room.number].filter(Boolean).join(" ") || "Room";
         // DXF metres; `unit` is the apartment the room belongs to ('A')
         const area = room.area > 0 ? ` · ${room.area >= 100 ? Math.round(room.area) : room.area.toFixed(1)} m²` : "";
@@ -240,17 +271,40 @@ export class Plan3D {
       const clay = new THREE.Color(CLAY_FLOOR), white = new THREE.Color("#f3f2ef");
       for (let i = 0; i < arr.length; i += 3) {
         const c = rooms ? new THREE.Color(this.floorTypeCol[i], this.floorTypeCol[i + 1], this.floorTypeCol[i + 2]) : clay.clone();
-        if (rooms && this.lit) c.lerp(white, 0.7);
+        if (rooms && this.lit && !this.rampRange) c.lerp(white, 0.7);
         arr[i] = c.r; arr[i + 1] = c.g; arr[i + 2] = c.b;
       }
+      // a ranked area answer: every room by its plan area (light → deep blue), slivers and unknown areas near white
+      const ramp = rooms ? this.rampRange : null;
+      if (ramp) this.floorRanges.forEach((fr) => {
+        const r = this.geo?.rooms[fr.i];
+        const c = r && r.area >= 0.5 ? areaColor(r.area, ramp.min, ramp.max) : new THREE.Color("#f3f2ef");
+        for (let v = fr.v0; v < fr.v1; v++) arr.set([c.r, c.g, c.b], v * 3);
+      });
+      // a room type lit from the legend: its floors a deeper shade, the others almost white
+      const focus = rooms && !this.lit && !ramp ? this.typeFocus : null;
+      if (focus) this.floorRanges.forEach((fr, k) => {
+        const c = spotColor(this.roomTypes[k], this.roomTypes[k] === focus);
+        for (let v = fr.v0; v < fr.v1; v++) arr.set([c.r, c.g, c.b], v * 3);
+      });
       attr.needsUpdate = true;
     }
-    this.panel.el.classList.toggle("faded", rooms && this.lit);
+    this.panel.el.classList.toggle("faded", rooms && this.lit && !this.rampRange);
     if (!rooms || !this.roomTypes.length) this.panel.setLegend(null);
+    else if (this.rampRange) this.panel.setLegend(null, { ...this.rampRange, title: "Room floor area (from the plan)" });
     else {
+      // unnamed slivers between wall lines (< 0.5 m², 16 of 22 'other' on the Swiss floor) are not rooms to count
+      const sliver = (k: number) => { const r = this.geo?.rooms[this.floorRanges[k]?.i]; return !!r && !r.name && r.area < 0.5; };
       const n = new Map<RoomType, number>();
-      for (const t of this.roomTypes) n.set(t, (n.get(t) ?? 0) + 1);
-      this.panel.setLegend(ROOM_TYPES.filter((t) => n.get(t.key)).map((t) => ({ key: t.key, label: t.label, hex: t.hex, n: n.get(t.key)! })));
+      this.roomTypes.forEach((t, k) => { if (!sliver(k)) n.set(t, (n.get(t) ?? 0) + 1); });
+      const focus = this.typeFocus && n.get(this.typeFocus) ? this.typeFocus : null;
+      let note = "";
+      if (focus) {
+        const area = this.floorRanges.reduce((s, fr, k) => s + (this.roomTypes[k] === focus ? Math.max(0, this.geo?.rooms[fr.i]?.area ?? 0) : 0), 0);
+        const k = n.get(focus)!;
+        note = `${k} ${k === 1 ? "room" : "rooms"} on this floor${area > 0 ? ` · ${area >= 100 ? Math.round(area).toLocaleString("en-US") : area.toFixed(1)} m² (from the plan)` : ""}. Click again for all.`;
+      }
+      this.panel.setLegend(ROOM_TYPES.filter((t) => n.get(t.key)).map((t) => ({ key: t.key, label: t.label, hex: t.hex, n: n.get(t.key)!, hint: t.hint })), null, note, focus);
     }
     this.needsRender = true;
   }
@@ -385,8 +439,10 @@ export class Plan3D {
   }
 
   /** Light up what the answer's evidence boxes; numbers[k] = the evidence index that carries number k+1; `soft` = room
-   *  numbers that ARE the answer without being evidence (the rooms a corridor's doors lead to): a light tint. */
-  setEvidence(evidence: Evidence[], numbers: number[], soft: string[] = []): number {
+   *  numbers that ARE the answer without being evidence (the rooms a corridor's doors lead to): a light tint; `rank` =
+   *  the evidence indexes of a ranking answer ('biggest room', customer.rankOf): when they are >= 2 rooms, every room's
+   *  floor is coloured by its area (light → deep blue, legend in m²) and the ranked rooms carry their numbers. */
+  setEvidence(evidence: Evidence[], numbers: number[], soft: string[] = [], rank: number[] | null = null): number {
     this.hl.traverse((o) => { const m = o as THREE.Mesh; if (m.geometry && !m.userData.shared) m.geometry.dispose(); });
     this.hl.clear();
     for (const p of this.pins) p.el.remove();
@@ -398,6 +454,9 @@ export class Plan3D {
       const t = this.match(ev);
       if (t && !hit.has(t)) hit.set(t, i);
     });
+    const ranked = new Set((rank ?? []).map((i) => (evidence[i] ? this.match(evidence[i]) : null)).filter((t): t is Target => t?.kind === "room"));
+    const areas = ranked.size >= 2 ? geo.rooms.filter((r) => r.area >= 0.5 && r.poly.length >= 3).map((r) => r.area) : [];
+    const ramp = areas.length >= 2 ? { min: Math.min(...areas), max: Math.max(...areas) } : null;
     const glow = new THREE.MeshLambertMaterial({ color: HL, emissive: HL, emissiveIntensity: 0.35, transparent: true, opacity: 0.9 });
     const veil = new THREE.MeshLambertMaterial({ color: HL, emissive: HL, emissiveIntensity: 0.3, transparent: true, opacity: 0.22, depthWrite: false });
     const tint = new THREE.MeshLambertMaterial({ color: HL, emissive: HL, emissiveIntensity: 0.2, transparent: true, opacity: 0.35, depthWrite: false });
@@ -406,6 +465,7 @@ export class Plan3D {
       this.hl.add(this.prism(r.poly, 0.025, 0.05, tint));
     });
     for (const t of hit.keys()) {
+      if (t.kind === "room" && ramp) continue; // the area ramp colours every room; the ranked ones carry their numbers
       if (t.kind === "room") {
         const r = geo.rooms[t.i];
         this.hl.add(this.prism(r.poly, 0.025, 0.06, glow));
@@ -438,12 +498,17 @@ export class Plan3D {
       this.pins.push({ el, p: t.top.clone() });
     });
     // W7: an answer fades the room colours (the accent blue stands out); no answer = full room colours again
-    if (this.lit !== hit.size > 0) {
+    if (this.lit !== hit.size > 0 || (this.rampRange === null) !== (ramp === null)) {
       this.lit = hit.size > 0;
+      this.rampRange = ramp;
+      if (this.lit) this.typeFocus = null; // an answer takes over the colours
+      this.applyLook();
+    } else if (ramp) {
+      this.rampRange = ramp;
       this.applyLook();
     }
     const boxes = [...hit.keys()].map((t) => t.bbox);
-    if (boxes.length) {
+    if (boxes.length && !ramp) {
       const u: BBox = [Math.min(...boxes.map((b) => b[0])), Math.min(...boxes.map((b) => b[1])), Math.max(...boxes.map((b) => b[2])), Math.max(...boxes.map((b) => b[3]))];
       this.frame(grow(u, 2.5), 1.15);
     } else this.frame(geo.bbox, 1.08);

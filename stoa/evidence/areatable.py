@@ -26,7 +26,7 @@ from stoa.contract import Answer, Evidence
 
 SOLVER = "area_table"
 FT2_M2 = 0.09290304
-_VAL = re.compile(r"^(?P<v>\d{1,3}(?:,\d{3})+|\d+(?:\.\d+)?)\s*(?P<u>SF|S\.F\.|SQ\.?\s*FT\.?|FT²|FT2|m²|m2|sqm|qm)$", re.I)
+_VAL = re.compile(r"^(?:[=:]\s*)?(?P<v>\d{1,3}(?:,\d{3})+|\d+(?:\.\d+)?)\s*(?P<u>SF|S\.F\.|SQ\.?\s*FT\.?|FT²|FT2|m²|m2|sqm|qm)$", re.I)
 _AREA_Q = re.compile(r"\b(area|square (?:feet|foot|met\w*)|sq\.? ?(?:ft|m)|sf|m²|m2|how (?:big|large)|size|footage)\b",
                      re.I)
 _SUM_Q = re.compile(r"\b(total|all|across|combined|together|sum|altogether|overall|in total)\b", re.I)
@@ -45,18 +45,40 @@ _SYN = {"dorm": "dormitory", "dorms": "dormitory", "dormitories": "dormitory", "
         "hallways": "circulation", "rooms": "room", "spaces": "space", "areas": "area", "1st": "first", "2nd": "second",
         "3rd": "third", "4th": "fourth", "stairs": "stair", "utilities": "utility", "northern": "north",
         "southern": "south", "eastern": "east", "western": "west", "storey": "floor", "story": "floor", "level": "floor"}
+# T1 21:57: '… of the second floor in square metres? (sheet A-2)' made '2' the subject and took 'EXTERIOR STAIR (1/2 SF)'
+_SHEET_REF = re.compile(r"\(?\b(?:on |of |from )?(?:sheet|drawing|dwg\.?|blatt|piirustus)\s+(?:no\.?\s*)?"
+                        r"[A-Z]{0,3}[-‐.]?\d+[A-Z]?(?:\.\d+)?\)?|\(\s*[A-Z]{1,3}[-‐]\d{1,4}[A-Z]?\s*\)", re.I)
 _INCL = re.compile(r"\b(?:including|incl\.?|inclusive of|with its|together with|plus its)\b.*$", re.I)
+# H 23:51 (h)/(i), X1 22:22 (1): 'Total circulation space?', 'How much circulation area is there?', 'the circulation
+# area on this floor' (no 'total'), 'counting its circulation and utility space', 'total common AREA' = the COMMON SPACE
+# row (E1_TABLE_WORDING=0: the 23:55 behaviour)
+TABLE_WORDING = __import__("os").environ.get("E1_TABLE_WORDING", "1") != "0"
+_SPACE_Q = re.compile(r"\b(?:how much|total|combined|sum of|amount of)\b[^?]{0,40}\bspace\b|\bspace\s+(?:total|in total)\b",
+                      re.I)
+_INCL2 = re.compile(r"\b(?:including|incl\.?|inclusive of|with its|together with|plus its|counting(?:\s+in)?(?:\s+its)?|"
+                    r"as well as|along with)\b.*$", re.I)
+_WHOLE_Q = re.compile(r"\b(?:on|of|in|across)\s+(?:this|the|the whole|the entire)\s+(?:floor|level|storey|story|plan|sheet|"
+                      r"building)\b|\bhow much\b[^?]*\b(?:is there|are there|in total)\b", re.I)
 
 
 def _norm(w: str) -> str:
     w = w.lower().strip(".,:;()'\"")
-    return _SYN.get(w, w)
+    if w in _SYN or w in _STOP or w in _SCOPE or w in _QUAL or len(w) < 5 or w.endswith(("ss", "us", "is")):
+        return _SYN.get(w, w)
+    # plurals fold to the row's singular ('the two ground catchments' / 'the rainsheds', HAER hi0822 C3)
+    f = w[:-3] + "y" if w.endswith("ies") else w[:-1] if w.endswith("s") else w
+    return _SYN.get(f, f)
 
 
 def _wordset(s: str) -> set[str]:
     # H 19:23: 'm²' was tokenised to 'm' (so _STOP's 'm2' never matched and a question '… in m²?' found no row) and
     # possessives stayed one token ('west wing's' != 'wing')
     s = re.sub(r"(\w)['’]s\b", r"\1", s.replace("²", "2").replace("³", "3"))
+    # accents folded on both sides: OCR's 'GROUND CÄTCHMENT GC1' (HAER hi0822 scan) and Finnish / German labels were cut
+    # at every non-ASCII letter ('c', 'tchment')
+    import unicodedata
+
+    s = unicodedata.normalize("NFKD", s).encode("ascii", "ignore").decode()
     return {_norm(w) for w in re.findall(r"[A-Za-z0-9]+(?:'[a-z]+)?", s)} - {""}
 
 
@@ -163,7 +185,8 @@ def _suspect(rs: tuple, tl, box, words: bool = True) -> list[str]:
     return why
 
 
-_VALISH = re.compile(r"^[\d,.]*\d\s*(?:SF|S\.F\.|SQ\.?\s*FT\.?|FT²|FT2|m²|m2)$", re.I)
+_VALISH = re.compile(r"^(?:[=:]\s*)?[\d,.]*\d\s*(?:SF|S\.F\.|SQ\.?\s*FT\.?|FT²|FT2|m²|m2)$", re.I)
+_UNIT_END = re.compile(r"(?:\d|^)\s*(?:SF|S\.F\.|SQ\.?\s*FT\.?|FT²|FT2|m²|m2)$", re.I)
 TABLE_OCR = bool(int(__import__("os").environ.get("E1_TABLE_OCR", "1")))
 
 
@@ -171,7 +194,9 @@ def _table_box(tl) -> tuple | None:
     """Image px box of a printed area table: >= 3 'N SF' / 'N m²' values right-aligned in one column (clipped reads
     like ',095 SF' count) + the labels on their rows to the left (within a quarter of the sheet), padded."""
     W, H = tl.size
-    vals = [it for it in tl.items if _VALISH.match(str(it.text).strip())]
+    # any item ENDING in an area unit lines up in the value column: 'TOTAL = 266,035 SQ FT' read as one item, a bare
+    # 'SQ FT' whose number was lost (HAER hi0822 scan render)
+    vals = [it for it in tl.items if _VALISH.match(str(it.text).strip()) or _UNIT_END.search(str(it.text).strip())]
     if len(vals) < 3:
         return None
     col = max(([u for u in vals if abs(u.box[2] - v.box[2]) <= 0.015 * W] for v in vals), key=len)
@@ -213,10 +238,19 @@ def _crop_rows(path: str, tl, box) -> tuple:
             "E1" / "tablecrop"
         d_.mkdir(parents=True, exist_ok=True)
         f = d_ / f"{Path(path).stem[:40]}.{tag}.png"
+        key = f"{T.file_tag(path)}|{Path(path).name}"
+        if not (f.exists() and ocr.cached(str(f))):
+            # the text layer grows between calls (OCR merged in), so the table box shifts by a few px: reuse an
+            # already-read crop of the same image whose box overlaps this one >= 80 % (IoU) instead of a new 7-25 s read
+            got = _near_crop(d_, Path(path).stem[:40], key, b, ocr)
+            if got is not None:
+                f, b = got
+                box = (b[0] / fx, b[1] / fy, b[2] / fx, b[3] / fy)
         if not f.exists():
             tmp = f.with_suffix(".tmp.png")
             im.crop(b).save(tmp)
             os.replace(tmp, f)
+        _box_note(f, key, b)
         cached = ocr.cached(str(f))
         d = ocr.read(str(f))
         if not cached:
@@ -225,6 +259,20 @@ def _crop_rows(path: str, tl, box) -> tuple:
             record_cost(cpu_seconds=float(d.get("seconds", 0.0)))
     except Exception:  # noqa: BLE001 — no OCR, no table: the caller keeps its answer
         return ()
+    rows = _crop_pair(d, box, fx, fy)
+    if not rows:  # this crop's read pairs into nothing (HAER hi0822 C3 tight crop: 23 items, 0 rows): an overlapping
+        # crop of the same image that was read already may (the padded one: 5 rows)
+        try:
+            got = _near_crop(d_, Path(path).stem[:40], key, b, ocr, exclude=f)
+            if got is not None:
+                b2 = got[1]
+                rows = _crop_pair(ocr.read(str(got[0])), (b2[0] / fx, b2[1] / fy, b2[2] / fx, b2[3] / fy), fx, fy)
+        except Exception:  # noqa: BLE001
+            rows = ()
+    return rows
+
+
+def _crop_pair(d: dict, box, fx: float, fy: float) -> tuple:
     items = []
     for it in d.get("items", []):
         if it.get("rot") or it.get("score", 1.0) < 0.6:
@@ -232,6 +280,45 @@ def _crop_rows(path: str, tl, box) -> tuple:
         x0, y0, x1, y1 = (float(v) for v in it["box"])
         items.append((str(it["text"]), [box[0] + x0 / fx, box[1] + y0 / fy, box[0] + x1 / fx, box[1] + y1 / fy]))
     return _pair(_item_lines(items), left_only=True)
+
+
+def _box_note(f, key: str, b) -> None:
+    """Sidecar '<crop>.box.json' {key, b}: lets a later call with a slightly shifted box find this crop."""
+    import json
+
+    try:
+        sc = f.with_name(f.name[:-4] + ".box.json")
+        if not sc.exists():
+            sc.write_text(json.dumps({"key": key, "b": list(b)}))
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _near_crop(d_, stem: str, key: str, b, ocr, exclude=None):
+    """(crop path, its box) of an OCR'd crop of the same image (key) whose box has IoU >= 0.8 with b, else None."""
+    import json
+
+    best = None
+    try:
+        for sc in d_.glob(f"{stem}.*.box.json"):
+            try:
+                j = json.loads(sc.read_text())
+            except Exception:  # noqa: BLE001
+                continue
+            if j.get("key") != key:
+                continue
+            cb = tuple(int(v) for v in j["b"])
+            ix = max(0, min(b[2], cb[2]) - max(b[0], cb[0])) * max(0, min(b[3], cb[3]) - max(b[1], cb[1]))
+            un = (b[2] - b[0]) * (b[3] - b[1]) + (cb[2] - cb[0]) * (cb[3] - cb[1]) - ix
+            iou = ix / un if un > 0 else 0.0
+            f = sc.with_name(sc.name[:-len(".box.json")] + ".png")
+            if exclude is not None and f == exclude:
+                continue
+            if iou >= 0.8 and f.exists() and ocr.cached(str(f)) and (best is None or iou > best[0]):
+                best = (iou, f, cb)
+    except Exception:  # noqa: BLE001
+        return None
+    return None if best is None else (best[1], best[2])
 
 
 def _item_lines(items) -> list:
@@ -311,11 +398,39 @@ def _pair(lines: list, max_gap: float | None = None, left_only: bool = False) ->
         unit = "m2" if re.match(r"m|sqm|qm", m.group("u"), re.I) else "ft2"
         box = [round(min(bb[0], best[2][0]), 1), round(min(bb[1], best[2][1]), 1),
                round(max(bb[2], best[2][2]), 1), round(max(bb[3], best[2][3]), 1)]
-        out.append((label, v, unit, tuple(box), best[1].rstrip().endswith(("=", ":"))))
+        eq = best[1].rstrip().endswith(("=", ":")) or t.lstrip()[:1] in "=:"  # '= 40,228 SQ FT' (HAER hi0822)
+        if not eq and horiz:  # the '=' read as its own item between label and value ('=', OCR 'II')
+            eq = any(t3.strip() in ("=", ":", "II", "=:") and b3[0] >= best[2][2] - 2 and b3[2] <= bb[0] + 2 and
+                     min(a1, b3[3]) - max(a0, b3[1]) > 0 for t3, b3, _d3 in lines)
+        out.append((label, v, unit, tuple(box), eq, m.group("v"), tuple(bb)))
+    out = _dedupe(out)
     # a TABLE: several 'LABEL =' rows (room tags stacked over their values never pair this way)
     if len(out) < 3 or sum(1 for r in out if r[4] or re.search(r"\btotal\b", r[0], re.I)) < 3:
         return ()
     return tuple(r[:4] for r in out)
+
+
+def _overlap(a, b) -> float:
+    """Intersection over the SMALLER box."""
+    iw, ih = min(a[2], b[2]) - max(a[0], b[0]), min(a[3], b[3]) - max(a[1], b[1])
+    if iw <= 0 or ih <= 0:
+        return 0.0
+    sm = min((a[2] - a[0]) * (a[3] - a[1]), (b[2] - b[0]) * (b[3] - b[1]))
+    return iw * ih / sm if sm > 0 else 0.0
+
+
+def _dedupe(out: list) -> list:
+    """One printed row read twice (overlapping OCR tiles / a crop read over a layer): T1 21:59, AFCEC PNG 'G DORMITORY =
+    6,095 SF' and 'G DORMITORY = 5 SF' (the same row, boxes ~90 % overlapping) were BOTH summed -> 18,477 from 4 rows.
+    Rows whose VALUE boxes overlap (>= 50 % of the smaller), or with the same label and row boxes >= 80 % overlapping, are
+    one row: the reading with the most digits stays."""
+    keep: list = []
+    for r in sorted(out, key=lambda r: -len(re.sub(r"\D", "", r[5]))):
+        if any(_overlap(r[6], k[6]) >= 0.5 or (r[0].lower() == k[0].lower() and _overlap(r[3], k[3]) >= 0.8)
+               for k in keep):
+            continue
+        keep.append(r)
+    return [r for r in out if any(r is k for k in keep)]
 
 
 def _verify(rs) -> tuple[list, list]:
@@ -368,62 +483,132 @@ def answer(path: str, question: str, page: int = 0) -> Answer | None:
         return None
 
 
+def _table_title(path: str, page: int, rs: tuple, is_pdf: bool) -> set:
+    """Words of the table's own TITLE: a line ending in ':' just above the first row, over the rows' left part ('CATCHMENT
+    AREA:' over RAINSHED #43 / #241, GROUND CATCHMENT GC1 / GC2, TOTAL on HAER hi0822 sheet C3: every row is a catchment,
+    'total catchment area' = the TOTAL row 266,035, 'catchment area of building 241' = the RAINSHED #241 row). Only on
+    a one-section table (at most one TOTAL row) — section titles of a multi-section table would be given to every row."""
+    if not rs or sum(1 for r in rs if re.search(r"\btotal\b", r[0], re.I)) > 1:
+        return set()
+    try:
+        if is_pdf:
+            from stoa.evidence.linework import text_lines
+
+            items = text_lines(path, page)
+        else:
+            tl = _cached_layer(path)
+            items = [(str(it.text), it.box) for it in tl.items] if tl is not None else []
+    except Exception:  # noqa: BLE001
+        return set()
+    x0, y0, x1 = min(r[3][0] for r in rs), min(r[3][1] for r in rs), max(r[3][2] for r in rs)
+    hs = sorted(r[3][3] - r[3][1] for r in rs)
+    h = hs[len(hs) // 2]
+    best = None
+    for t, b in items:
+        t = str(t).strip()
+        if not t.endswith(":") or not re.search(r"[A-Za-z]{3,}", t):
+            continue
+        if not (y0 - 3 * h <= b[3] <= y0 + 0.3 * h) or b[2] < x0 - 2 * h or b[0] > x0 + 0.5 * (x1 - x0):
+            continue
+        d = y0 - b[3]
+        if best is None or d < best[0]:
+            best = (d, t)
+    return _content(best[1].rstrip(":")) - {"area", "areas"} if best else set()
+
+
 def _answer(path: str, question: str, page: int) -> Answer | None:
     from stoa.data import abspath
 
     q = question
-    if not _AREA_Q.search(q) or re.search(r"\b(how many|number of)\b(?!\s+(?:square|sq))", q, re.I):
+    area_q = _AREA_Q.search(q) or (TABLE_WORDING and _SPACE_Q.search(q))
+    if not area_q or re.search(r"\b(how many|number of)\b(?!\s+(?:square|sq|sf\b|ft2|ft²|m2|m²))", q, re.I):
         return None
     pdf = str(abspath(path))
     is_pdf = pdf.lower().endswith(".pdf")
     if not is_pdf and not re.search(r"\.(png|jpe?g|tiff?|webp|bmp)$", pdf, re.I):
         return None
     rs = rows(pdf, page) if is_pdf else image_rows(path)
+    scan = None
+    if is_pdf and not rs and page == 0:
+        # a SCANNED PDF (no text): the upload's render '<stem>.scan.png' beside it has the text layer (HAER hi0822 C3 as
+        # a PDF: area_tags summed two loose tags = 91,228 for 'total catchment area'); boxes go back to the PDF's pt
+        from pathlib import Path
+
+        sp = Path(pdf).with_name(Path(pdf).stem + ".scan.png")
+        if sp.exists():
+            rs_img = image_rows(str(sp))
+            if rs_img:
+                try:
+                    import pymupdf
+                    from PIL import Image
+
+                    with pymupdf.open(pdf) as d_:
+                        w_pt = d_[0].rect.width
+                    with Image.open(sp) as im_:
+                        w_px = im_.size[0]
+                    k = w_pt / w_px
+                    scan = (str(sp), rs_img)
+                    rs = tuple((lab, v, u, tuple(round(c * k, 1) for c in b)) for lab, v, u, b in rs_img)
+                except Exception:  # noqa: BLE001
+                    rs = ()
     if not rs:
         return None
-    qw = _wordset(_INCL.sub(" ", q)) - _STOP
+    tw = _table_title(scan[0], page, scan[1], False) if scan else _table_title(path, page, rs, is_pdf)
+    img = not is_pdf or scan is not None  # values as read from a picture's text
+
+    def _cont(r) -> set:  # a row's words + its table's title ('CATCHMENT AREA:' over 'RAINSHED #241 = 45,929 SQ FT')
+        return _content(r[0]) | tw
+    qw = _wordset((_INCL2 if TABLE_WORDING else _INCL).sub(" ", _SHEET_REF.sub(" ", q))) - _STOP
+    # 'area' and 'space' name the same thing in a row label: 'the total common area' = 'TOTAL COMMON SPACE'
+    qw_rows = qw | {"space"} if TABLE_WORDING and re.search(r"\b[a-z]{3,}\s+areas?\b", q, re.I) else qw
     subject = qw - _SCOPE - _QUAL - {"room", "space"} if not ({"common"} & qw) else qw - _SCOPE - _QUAL
+    if re.search(r"\bground\s+(?!floor|level|stor|plan)\w", q, re.I):  # 'ground catchment' / 'ground source': not a floor
+        subject |= {"ground"}
     quals = qw & _QUAL
     totals = [r for r in rs if re.search(r"\btotal\b", r[0], re.I) and not re.search(r"\bsubtotal\b", r[0], re.I)]
     pick: list = []
     how = ""
     qual_cap = None
-    cands = [r for r in totals if _content(r[0]) and _content(r[0]) <= qw and subject <= _content(r[0])]
+    cands = [r for r in totals if _cont(r) and _cont(r) <= qw_rows and subject <= _cont(r)]
     if cands:
-        best = max(len(_content(r[0])) for r in cands)
-        top = [r for r in cands if len(_content(r[0])) == best]
+        best = max(len(_cont(r)) for r in cands)
+        top = [r for r in cands if len(_cont(r)) == best]
         if len(top) == 1:
             pick, how = top, f"the printed table row '{top[0][0]}'"
     if not pick and not subject and re.search(r"\b(this|the|whole|entire)\s+(floor|level|storey|story|sheet|plan)\b",
                                               q, re.I):
         # 'the total area of this floor': the one floor-wide TOTAL row ('TOTAL FIRST FLOOR' on the A-1 sibling)
-        fl = [r for r in totals if _content(r[0]) & {"floor"} and
-              _content(r[0]) <= {"floor", "first", "second", "third", "fourth", "ground", "upper", "lower", "basement"}]
+        fl = [r for r in totals if _cont(r) & {"floor"} and
+              _cont(r) <= {"floor", "first", "second", "third", "fourth", "ground", "upper", "lower", "basement"}]
         if len(fl) == 1:
             pick, how = fl, f"the printed table row '{fl[0][0]}' (this sheet's floor)"
     if not pick and subject:
-        hits = [r for r in rs if subject <= _content(r[0]) and not re.search(r"\b(sub)?total\b", r[0], re.I)]
+        hits = [r for r in rs if subject <= _cont(r) and not re.search(r"\b(sub)?total\b", r[0], re.I)]
         if quals:
-            hits = [r for r in hits if quals & _content(r[0]) or not (_QUAL & _content(r[0]))]
-            if any(quals & _content(r[0]) for r in hits):
-                hits = [r for r in hits if quals & _content(r[0])]
+            hits = [r for r in hits if quals & _cont(r) or not (_QUAL & _cont(r))]
+            if any(quals & _cont(r) for r in hits):
+                hits = [r for r in hits if quals & _cont(r)]
             elif hits:
                 # QA 20:10 / H 20:00: 'dormitory of the NORTH wing' took a row 'DORMITORY' that names no wing. On a table
                 # that names wings elsewhere ('TOTAL WEST WING') that row lost its wing in the read: abstain. On a table
                 # that names no wing at all the row may still be the one: answer, but say so and stay low.
-                if any(_QUAL & _content(r[0]) for r in rs):
+                if any(_QUAL & _cont(r) for r in rs):
                     return None
                 qual_cap = (0.3, f"the table names no {' / '.join(sorted(quals))} part; its only matching row is "
                                  f"taken for it")
-        if not is_pdf and any(_frag(w, sw) for r in rs if r not in hits for w in _content(r[0]) for sw in subject):
+        if img and any(_frag(w, sw) for r in rs if r not in hits for w in _cont(r) for sw in subject):
             return None  # a cut label of the asked type ('RMITORY' for dormitory): the rows found are not all of them
         if len(hits) == 1:
             pick, how = hits, f"the printed table row '{hits[0][0]}'"
         elif len(hits) > 1 and (_SUM_Q.search(q) or len(hits) <= 6):
-            if not _SUM_Q.search(q) and not re.search(r"\b(wings|floors|levels|spaces|areas|rooms)\b", q, re.I):
+            whole = TABLE_WORDING and not quals and _WHOLE_Q.search(q)
+            if not _SUM_Q.search(q) and not re.search(r"\b(wings|floors|levels|spaces|areas|rooms)\b", q, re.I) \
+                    and not whole:
                 return None  # 'the circulation area' with four circulation rows and no 'total': ambiguous
             pick = hits
             how = f"sum of {len(hits)} printed table rows naming {', '.join(sorted(subject))}"
+            if whole and not _SUM_Q.search(q):
+                how += " (the whole floor's: no wing or part was named)"
     if not pick:
         return None
     units = {r[2] for r in pick}
@@ -441,22 +626,22 @@ def _answer(path: str, question: str, page: int) -> Answer | None:
         val, unit = (round(total, 2), src_unit)
     terms = " + ".join(f"{r[1]:,.0f}" if r[1] == int(r[1]) else f"{r[1]:g}" for r in pick)
     su = "SF" if src_unit == "ft2" else "m²"
-    ev = [Evidence(file=path, page=page, bbox=list(r[3]), bbox_space="pdf_pt" if is_pdf else "image_px", exact=is_pdf,
-                   note=f"{r[0][:48]} = {r[1]:,.0f} {su} (printed area table" + ("" if is_pdf else ", read from the "
+    ev = [Evidence(file=path, page=page, bbox=list(r[3]), bbox_space="pdf_pt" if is_pdf else "image_px", exact=not img,
+                   note=f"{r[0][:48]} = {r[1]:,.0f} {su} (printed area table" + ("" if not img else ", read from the "
                    "image's text") + ")") for r in pick]
-    conf = (0.85 if len(pick) == 1 else 0.75) if is_pdf else (0.7 if len(pick) == 1 else 0.6)  # image: values as read
+    conf = (0.85 if len(pick) == 1 else 0.75) if not img else (0.7 if len(pick) == 1 else 0.6)  # image: values as read
     assumptions = [f"{how}: {terms} {su}" + (f" = {total:,.0f} {su}" if len(pick) > 1 else ""),
                    "areas as printed in the sheet's own area table (not measured)"]
     ok, bad = _verify(rs)
     check = ""
     if ok and not bad:
         check = f"table check: its {len(ok)} TOTAL rows add up to the rows above them ✓"
-        if not is_pdf:
+        if img:
             conf += 0.1  # every total of the read table adds up: the values were read right
     elif bad:
         check = (f"table check: {len(bad)} of {len(ok) + len(bad)} TOTAL rows do not add up as read "
                  f"({bad[0][0][:24]} = {bad[0][1]:,.0f})")
-        if not is_pdf:  # X1 20:38 (AFCEC 300-dpi scan): a row lost in the read makes a SUM short (12,380 of 18,472)
+        if img:  # X1 20:38 (AFCEC 300-dpi scan): a row lost in the read makes a SUM short (12,380 of 18,472)
             conf = min(conf, 0.3 if len(pick) > 1 or _SUM_Q.search(q) else 0.5)
             assumptions.append("some of the table's totals do not add up as read: a row may be missing or misread")
     if qual_cap is not None:
@@ -468,7 +653,8 @@ def _answer(path: str, question: str, page: int) -> Answer | None:
                            f"{'m²' if unit == 'm2' else 'SF'}")
     return Answer(value=val, unit=unit, confidence=conf, evidence=ev, solver=SOLVER, assumptions=assumptions,
                   missing=[], trace=[f"area_table: {len(rs)} printed 'LABEL = value' rows on the sheet"
-                                     + ("" if is_pdf else " (from the image's text layer)") + f"; {how}"]
+                                     + ("" if not img else " (from the image's text layer)" if not scan else
+                                        " (from the scanned page's text layer)") + f"; {how}"]
                   + ([check] if check else []))
 
 

@@ -16,8 +16,8 @@
  },
  {
   "file": "examples/afcec-dormitory-A-2-second-floor.png",
-  "q": "How many dorm rooms are on this floor?",
-  "note": "A US dormitory drawn in feet and inches: the number comes from the sheet's own printed tables."
+  "q": "What is the total circulation area?",
+  "note": "A US dormitory drawn in feet: the circulation area is the sum of the sheet's own printed area table, each row marked, in square feet and m²."
  },
  {
   "file": "data/ifc_models/bsc-esplanades_1807-ep-ar-v18_plan-01-1-korrus.pdf",

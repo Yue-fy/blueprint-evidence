@@ -317,7 +317,7 @@ class Agent:
     def _find_text(self, path: str, words: str, ev: list[Evidence]) -> str:
         pdf = self._pdf(path)
         if not pdf:
-            return "no text layer (not a PDF)"
+            return self._find_text_image(path, words, ev)
         import fitz
 
         hits = []
@@ -335,6 +335,26 @@ class Agent:
         if not hits:
             return f"'{words}' not found in the text layer"
         return f"{len(hits)} hit(s): " + " | ".join(f"p{p}: {t}" for p, _, t in hits[:6])
+
+    def _find_text_image(self, path: str, words: str, ev: list[Evidence]) -> str:
+        """D1 21:30 (HAER piping scans): find_text said 'no text layer (not a PDF)' on images although raster had read
+        a 202-item text layer -> search the image's own text layer (the OCR / VLM lines raster and label_count use)."""
+        try:
+            from stoa.solvers.label_count import _image_lines
+
+            lines = _image_lines(str(abspath(path))) or ()
+        except Exception:  # noqa: BLE001
+            lines = ()
+        if not lines:
+            return "no text layer read for this image yet (use look)"
+        w = re.sub(r"\s+", " ", words).strip().lower()
+        hits = [(t, bb) for t, bb in lines if w and w in re.sub(r"\s+", " ", t).lower()]
+        for t, bb in hits[:4]:
+            ev.append(Evidence(file=path, page=0, bbox=[round(float(x), 1) for x in bb], bbox_space="image_px",
+                               note=f"text '{words}'"))
+        if not hits:
+            return f"'{words}' not found in the image's text layer ({len(lines)} lines read)"
+        return f"{len(hits)} hit(s) in the image's text layer: " + " | ".join(t[:80] for t, _ in hits[:6])
 
     def _look(self, path: str, question: str) -> Answer:
         from stoa.solvers import get_solver

@@ -16,6 +16,7 @@ VLM layer.
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 import os
@@ -255,6 +256,15 @@ def read(path: str) -> dict:
                 try:
                     if f.exists() and _cache_on():
                         d = json.loads(f.read_text())
+                    elif _cache_on() and NEG_TTL > 0 and mark.exists() and \
+                            time.time() - mark.stat().st_mtime < NEG_TTL:
+                        # O1 c10 (X1 21:32: first answers on a cold 2-page scanned PDF took 486-501 s): a question that
+                        # WAITED on this lock while another process's read went over the budget used to start its own
+                        # read and wait the whole budget again (serial 120 s waits per worker and page). The marker the
+                        # other process just left counts here too (the background read may still land).
+                        raise RuntimeError(f"OCR skipped: this file's read went over its {TIMEOUT:.0f} s budget "
+                                           f"{time.time() - mark.stat().st_mtime:.0f} s ago (a background read may "
+                                           "still land)")
                     else:
                         try:
                             d = _run(p, f if _cache_on() else None)
@@ -273,6 +283,10 @@ def read(path: str) -> dict:
                             pass
                 finally:
                     fcntl.flock(lockf, fcntl.LOCK_UN)
+        # O1 c12: short vertical dimension strings read upside down -> re-read turned (sidecar cache; vfix.py)
+        from stoa.ocr import vfix
+
+        d = vfix.apply(path, d)
         _mem[p] = d
         return d
 
@@ -297,11 +311,115 @@ def area_units(items: list) -> tuple[list, int]:
     return out, n
 
 
+VOCAB = os.environ.get("STOA_O1_VOCAB", "1") != "0"
+_VTOK = re.compile(r"[A-Za-z]{5,}")
+_GLUED = re.compile(r"\b([A-Z]{2,5})(\d{1,3})\b")
+_INT_AREA = re.compile(r"^\s*\d{1,4}\s?(m²|m2)\s*$", re.I)
+_INT_AREA_MISREAD = re.compile(r"^\s*(\d{1,4})\s?m[1lI|][2²]\s*$")
+
+
+def _dl1(a: str, b: str) -> bool:
+    """Damerau-Levenshtein distance exactly 1 (one substitution, insertion, deletion or adjacent swap)."""
+    if a == b or abs(len(a) - len(b)) > 1:
+        return False
+    if len(a) == len(b):
+        d = [k for k in range(len(a)) if a[k] != b[k]]
+        return len(d) == 1 or (len(d) == 2 and d[1] == d[0] + 1 and a[d[0]] == b[d[1]] and a[d[1]] == b[d[0]])
+    s, t = (a, b) if len(a) < len(b) else (b, a)
+    k = 0
+    while k < len(s) and s[k] == t[k]:
+        k += 1
+    return s[k:] == t[k + 1:]
+
+
+def _respell(tok: str, word: str) -> str:
+    """`tok` spelled as `word`, in tok's own letter case. A token that is the word plus ONE letter at either end
+    ('SCALEA', 'SHEETC' of 'SHEETC8', 'OFRAME') is the word and a separate letter run together: split, never drop it
+    (a doubled letter, 'STANDD' / 'EEXISTING', is a stutter: dropped)."""
+    lo, w = tok.lower(), word.lower()
+    head = tail = ""
+    if len(lo) == len(w) + 1 and lo.startswith(w) and lo[-1] != w[-1]:
+        tail = " " + tok[-1]
+    elif len(lo) == len(w) + 1 and lo.endswith(w) and lo[0] != w[0]:
+        head = tok[0] + " "
+    core = tok[1:] if head else tok[:-1] if tail else tok
+    if core.isupper():
+        out = w.upper()
+    elif core.islower():
+        out = w
+    elif core[:1].isupper() and core[1:].islower():
+        out = w.capitalize()
+    else:
+        out = word
+    return f"{head}{out}{tail}"
+
+
+def sheet_vocab(items: list) -> tuple[list, int]:
+    """O1 c14 (X1 00:27): on X1's EFA colour-sheet scans the OCR FOUND every room tag but misread a few of a repeated
+    word ('Engilsh 3', 'Eaglish 9' among 'English 1..8'), glued a tag family's number ('MFL1' / 'MFL3' among
+    'MFL 2' / 'MFL 5') and read one '55 m2' as '55m12' -> area_tags summed 6 of 9 English rooms (330 for 495). The
+    sheet itself says what the word is. Three consensus repairs, the reading's own text kept in nothing but the line:
+    (1) a token of >= 5 letters that is no dictionary word, printed <= 2 times, one edit (Damerau) from exactly one
+        dictionary word printed >= 3 times as often on the sheet -> that word (its most common spelling);
+    (2) 'ABC1' -> 'ABC 1' when the sheet prints 'ABC <number>' with a space >= 2 times;
+    (3) an integer 'NN m12' -> 'NN m2' on a sheet with >= 3 clean integer 'NN m2' labels.
+    Without a word list (1) is off. STOA_O1_VOCAB=0 turns all three off. -> (items, number of lines changed)."""
+    if not VOCAB or len(items) < 5:
+        return items, 0
+    from collections import Counter
+
+    from stoa.ocr import quality
+
+    W = quality.words()
+    texts = [i.text for i in items]
+    cnt = Counter(t.lower() for s in texts for t in _VTOK.findall(s))
+    forms: dict[str, Counter] = {}
+    for s in texts:
+        for t in _VTOK.findall(s):
+            forms.setdefault(t.lower(), Counter())[t] += 1
+    frequent = [w for w, c in cnt.items() if c >= 3 and W is not None and w in W]
+    fix: dict[str, str] = {}
+    if W is not None and frequent:
+        for w, c in cnt.items():
+            if c > 2 or w in W:
+                continue
+            cands = [f for f in frequent if cnt[f] >= 3 * c and _dl1(w, f)]
+            if len(cands) == 1:
+                fix[w] = forms[cands[0]].most_common(1)[0][0]
+    spaced = Counter(m.group(1) for s in texts for m in re.finditer(r"\b([A-Z]{2,5}) \d{1,3}\b", s))
+    n_int = sum(1 for s in texts if _INT_AREA.match(s))
+    out, n = [], 0
+    for i in items:
+        t = i.text
+        if fix:
+            t = _VTOK.sub(lambda m: _respell(m.group(0), fix[m.group(0).lower()]) if m.group(0).lower() in fix
+                          else m.group(0), t)
+        t = _GLUED.sub(lambda m: f"{m.group(1)} {m.group(2)}" if spaced[m.group(1)] >= 2 else m.group(0), t)
+        if n_int >= 3:
+            m = _INT_AREA_MISREAD.match(t)
+            if m:
+                t = f"{m.group(1)} m2"
+        if t != i.text:
+            i = type(i)(text=t, box=i.box, tile=getattr(i, "tile", 0))
+            n += 1
+        out.append(i)
+    return out, n
+
+
 def charge(d: dict) -> None:
     """Bill one reading (like the VLM layer: once per process, also when read from the disk cache = cold-run
     accounting; 0 GPU, 0 LLM tokens). P1 20:57: a reading with the engine's measured `cpu_s` (all threads) is charged
     exactly that through stoa.cost.record_cpu; older cached readings (no cpu_s) or a checkout without record_cpu keep
     record_cost(cpu_seconds=<engine wall seconds>) as before."""
+    try:  # P1 (X1 23:27): one reading of the whole FILE; its cost is marked prep_* (stoa.cost.file_reading)
+        from stoa.cost import file_reading
+    except ImportError:
+        file_reading = contextlib.nullcontext
+    with file_reading():
+        _charge(d)
+
+
+def _charge(d: dict) -> None:
     cpu = d.get("cpu_s")
     if cpu:
         try:
@@ -327,10 +445,16 @@ def text_layer(path: str, min_score: float = MIN_SCORE):
     items = [TextItem(text=fix_text(i["text"]), box=[float(v) for v in i["box"]], tile=0) for i in d["items"]
              if i.get("score", 1.0) >= min_score]
     items, n_fix = area_units(items)
+    read_items = items
+    items, n_voc = sheet_vocab(items)
     tl = TextLayer(path=path, size=tuple(d["size"]), items=items, tiles=1, calls=0, tokens_in=0, tokens_out=0,
                    seconds=float(d.get("seconds", 0.0)))
     if n_fix:
         tl.notes.append(f"{n_fix} room-area label(s) read as m³ / m on a sheet of m² labels: taken as m²")
+    if n_voc:
+        tl.read_items = read_items  # as read: layer choices (textlayer._richness) judge the reading, not the repair
+        tl.notes.append(f"{n_voc} OCR line(s) spelled as the sheet prints that word elsewhere ('Engilsh 3' among "
+                        "'English 1..8', 'MFL1' among 'MFL 2')")
     charge(d)
     nv = sum(1 for i in d["items"] if i.get("rot"))
     tl.notes.append(f"text read by {d.get('engine', 'PP-OCRv6')} on CPU ({len(items)} lines"

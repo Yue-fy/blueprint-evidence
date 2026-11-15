@@ -1,6 +1,7 @@
 /**
  * The photo (or a rendered PDF page) with the evidence drawn on it, for a phone: pinch to zoom, drag to pan when
- * zoomed, double-tap to zoom in/out, single tap = a point for the scale / room tools. The SVG overlay lives in the
+ * zoomed, double-tap to zoom in/out, single tap = a point for the scale / room tools (no tool: onIdleTap, after the
+ * double-tap window; UX 00:10 S-M9 'a tap on the plan does nothing'), long-press = onLongPress. The SVG overlay lives in the
  * image's own pixel space (viewBox = natural size), so evidence boxes / polygons in image_px are drawn as they come.
  */
 const NS = "http://www.w3.org/2000/svg";
@@ -13,6 +14,9 @@ export interface Mark {
   label?: string;
   approx?: boolean;
   tone?: "answer" | "user" | "muted";
+  /** a poly's value tag goes just below this point (image px: x, the bottom of the printed name) instead of on the
+   *  centroid, where it covered the room's printed name (UX S-M9: '16.3 m²' over 'Store') */
+  tagBelow?: Pt;
 }
 
 export class PhotoView {
@@ -28,11 +32,24 @@ export class PhotoView {
   private tx = 0;
   private ty = 0;
   private fitS = 1;
+  /** px at the top of the view that a pill covers (the marks pill: UX 02:15, it hid the dorm's first mark): fit and
+   *  zoom frame the picture below it, and panning may move the picture's top edge down to it */
+  topInset = 0;
+  private top(ch: number) {
+    return Math.min(Math.max(0, this.topInset), ch * 0.3);
+  }
   private marks: Mark[] = [];
   private ptrs = new Map<number, { x: number; y: number }>();
-  private gesture: { x: number; y: number; s: number; tx: number; ty: number; d: number; cx: number; cy: number; moved: boolean; t: number } | null = null;
+  private gesture: { x: number; y: number; s: number; tx: number; ty: number; d: number; cx: number; cy: number; moved: boolean; t: number; long?: boolean } | null = null;
   private lastTap = 0;
+  private pressTimer = 0;
+  private idleTimer = 0;
+  /** a tap while a tool is on (scale / room / length): fired at once */
   onTap: ((x: number, y: number) => void) | null = null;
+  /** a single tap with no tool on (image px), fired once the double-tap window has passed */
+  onIdleTap: ((x: number, y: number) => void) | null = null;
+  /** a finger held still for LONG_MS (or a right-click): image px + the screen point */
+  onLongPress: ((x: number, y: number, clientX: number, clientY: number) => void) | null = null;
 
   constructor(el: HTMLElement) {
     this.el = el;
@@ -52,6 +69,13 @@ export class PhotoView {
     el.addEventListener("pointermove", (e) => this.move(e));
     el.addEventListener("pointerup", (e) => this.up(e));
     el.addEventListener("pointercancel", (e) => this.up(e, true));
+    // a mouse right-click is the desktop's long-press (the phone page opened on a laptop)
+    el.addEventListener("contextmenu", (e) => {
+      e.preventDefault();
+      if (!this.onLongPress || this.onTap) return;
+      const [x, y] = this.toImage(e.clientX, e.clientY);
+      if (x >= 0 && y >= 0 && x <= this.w && y <= this.h) this.onLongPress(x, y, e.clientX, e.clientY);
+    });
     el.addEventListener("wheel", (e) => {
       e.preventDefault();
       const r = el.getBoundingClientRect();
@@ -68,7 +92,7 @@ export class PhotoView {
       cw0 = cw;
       ch0 = ch;
       if (!zoomed) return this.fit(false);
-      this.fitS = Math.min(cw / this.w, ch / this.h);
+      this.fitS = Math.min(cw / this.w, (ch - this.top(ch)) / this.h);
       this.set(Math.max(this.s, this.fitS), cw / 2 - mid[0] * this.s, ch / 2 - mid[1] * this.s, false);
     }).observe(el);
   }
@@ -98,16 +122,18 @@ export class PhotoView {
   fit(animate = true) {
     const cw = this.el.clientWidth, ch = this.el.clientHeight;
     if (!this.w || !cw || !ch) return;
-    this.fitS = Math.min(cw / this.w, ch / this.h);
-    this.set(this.fitS, (cw - this.w * this.fitS) / 2, (ch - this.h * this.fitS) / 2, animate);
+    const top = this.top(ch);
+    this.fitS = Math.min(cw / this.w, (ch - top) / this.h);
+    this.set(this.fitS, (cw - this.w * this.fitS) / 2, top + (ch - top - this.h * this.fitS) / 2, animate);
   }
 
   /** Zoom so the box [x0, y0, x1, y1] (image px) fills most of the view, never closer than 6x the fit. */
   zoomTo(b: number[], animate = true) {
     const cw = this.el.clientWidth, ch = this.el.clientHeight;
     const bw = Math.max(8, b[2] - b[0]), bh = Math.max(8, b[3] - b[1]);
-    const s = Math.min(this.fitS * 6, Math.max(this.fitS, Math.min((cw * 0.7) / bw, (ch * 0.7) / bh)));
-    this.set(s, cw / 2 - ((b[0] + b[2]) / 2) * s, ch / 2 - ((b[1] + b[3]) / 2) * s, animate);
+    const top = this.top(ch), ah = ch - top;
+    const s = Math.min(this.fitS * 6, Math.max(this.fitS, Math.min((cw * 0.7) / bw, (ah * 0.7) / bh)));
+    this.set(s, cw / 2 - ((b[0] + b[2]) / 2) * s, top + ah / 2 - ((b[1] + b[3]) / 2) * s, animate);
   }
 
   setMarks(m: Mark[]) {
@@ -141,8 +167,9 @@ export class PhotoView {
     // keep the image inside the view: no panning into empty space
     const cw = this.el.clientWidth, ch = this.el.clientHeight;
     const iw = this.w * s, ih = this.h * s;
+    const top = this.top(ch);
     tx = iw <= cw ? (cw - iw) / 2 : Math.min(0, Math.max(cw - iw, tx));
-    ty = ih <= ch ? (ch - ih) / 2 : Math.min(0, Math.max(ch - ih, ty));
+    ty = ih <= ch - top ? top + (ch - top - ih) / 2 : Math.min(top, Math.max(ch - ih, ty));
     this.s = s;
     this.tx = tx;
     this.ty = ty;
@@ -160,9 +187,22 @@ export class PhotoView {
 
   private down(e: PointerEvent) {
     if (!this.w) return;
+    if (e.pointerType === "mouse" && e.button !== 0) return; // a right-click: the contextmenu handler
     this.el.setPointerCapture(e.pointerId);
     this.ptrs.set(e.pointerId, { x: e.clientX, y: e.clientY });
     this.begin();
+    window.clearTimeout(this.pressTimer);
+    if (this.ptrs.size === 1 && this.onLongPress && !this.onTap) {
+      const cx = e.clientX, cy = e.clientY;
+      this.pressTimer = window.setTimeout(() => {
+        const g = this.gesture;
+        if (!g || g.moved || this.ptrs.size !== 1 || !this.onLongPress || this.onTap) return;
+        g.long = true; // the finger's lift is not a tap
+        window.clearTimeout(this.idleTimer);
+        const [x, y] = this.toImage(cx, cy);
+        if (x >= 0 && y >= 0 && x <= this.w && y <= this.h) this.onLongPress(x, y, cx, cy);
+      }, LONG_MS);
+    }
   }
 
   private begin() {
@@ -183,6 +223,7 @@ export class PhotoView {
     const cx = p.reduce((a, q) => a + q.x, 0) / p.length - r.left, cy = p.reduce((a, q) => a + q.y, 0) / p.length - r.top;
     if (Math.hypot(cx - g.x, cy - g.y) > 8) g.moved = true;
     if (!g.moved) return;
+    window.clearTimeout(this.pressTimer);
     let s = g.s;
     if (p.length > 1 && g.d > 0) {
       const d = Math.hypot(p[0].x - p[1].x, p[0].y - p[1].y);
@@ -201,9 +242,11 @@ export class PhotoView {
       return;
     }
     this.gesture = null;
-    if (cancel || !g || g.moved || performance.now() - g.t > 600) return;
+    window.clearTimeout(this.pressTimer);
+    if (cancel || !g || g.moved || g.long || performance.now() - g.t > 600) return;
     const now = performance.now();
     if (!this.onTap && now - this.lastTap < 320) {
+      window.clearTimeout(this.idleTimer); // the first tap was half of a double tap: no idle tap
       // double tap: zoom in 2.5x at the point, or back to the whole sheet
       const r = this.el.getBoundingClientRect();
       if (this.s > this.fitS * 1.4) this.fit();
@@ -215,9 +258,14 @@ export class PhotoView {
       return;
     }
     this.lastTap = now;
-    if (this.onTap) {
-      const [x, y] = this.toImage(e.clientX, e.clientY);
-      if (x >= 0 && y >= 0 && x <= this.w && y <= this.h) this.onTap(x, y);
+    const [x, y] = this.toImage(e.clientX, e.clientY);
+    if (x < 0 || y < 0 || x > this.w || y > this.h) return;
+    if (this.onTap) this.onTap(x, y);
+    else if (this.onIdleTap) {
+      window.clearTimeout(this.idleTimer);
+      this.idleTimer = window.setTimeout(() => {
+        if (!this.onTap) this.onIdleTap?.(x, y);
+      }, 330);
     }
   }
 
@@ -259,7 +307,7 @@ export class PhotoView {
       let at: Pt | null = null;
       if (m.kind === "dot") at = m.pts[0];
       else if (m.kind === "box" && m.pts.length > 1) at = [Math.min(m.pts[0][0], m.pts[1][0]), Math.min(m.pts[0][1], m.pts[1][1])];
-      else if (m.kind === "poly" && m.pts.length > 2) at = centroid(m.pts);
+      else if (m.kind === "poly" && m.pts.length > 2) at = m.tagBelow ?? centroid(m.pts);
       else if (m.kind === "line" && m.pts.length > 1) at = [(m.pts[0][0] + m.pts[m.pts.length - 1][0]) / 2, (m.pts[0][1] + m.pts[m.pts.length - 1][1]) / 2];
       if (m.kind === "line" || (m.kind === "dot" && !m.label)) {
         for (const q of m.kind === "line" ? [m.pts[0], m.pts[m.pts.length - 1]] : m.pts) {
@@ -275,12 +323,15 @@ export class PhotoView {
       const short = m.label.length <= 2;
       const wpx = short ? 26 : 12 + m.label.length * 9;
       const x = m.kind === "box" ? -wpx / 2 : -wpx / 2;
-      const y = m.kind === "box" ? -30 : -14;
+      const y = m.kind === "box" ? -30 : m.kind === "poly" && m.tagBelow ? 3 : -14;
       g.innerHTML = `<rect x="${x}" y="${y}" width="${wpx}" height="26" rx="13" class="tag ${tone}"/><text x="0" y="${y + 18}" class="tag-t" text-anchor="middle">${m.label.replace(/[&<>]/g, "")}</text>`;
       this.pinsG.append(g);
     }
   }
 }
+
+/** how long a finger rests on the plan before it is a long-press (iOS's own is ~500 ms) */
+const LONG_MS = 550;
 
 export function centroid(pts: Pt[]): Pt {
   let a = 0, cx = 0, cy = 0;

@@ -162,9 +162,11 @@ project is sold or run as a paid service:
   (text layer, OCR, page renders, model replies) are cached on the same server, under `.stoa/` (or
   `JUNCTION_SHARED`), `STOA_CACHE` and `STOA_LLM_CACHE_DIR` (see [CONFIGURATION.md](CONFIGURATION.md)). Our code
   never trains on uploads.
-- **Kept.** Nothing expires on its own: files stay until the operator deletes them (a temporary folder may also be
-  cleared when the machine restarts). A deployment for customers should set a retention period and clear old
-  uploads on a schedule.
+- **Kept.** By default nothing expires on its own: files stay until the operator deletes them (a temporary folder may
+  also be cleared when the machine restarts). With the optional `privacy` feature on, `STOA_UPLOAD_TTL_HOURS=<h>`
+  deletes each upload, with the readings tied to it, once its newest file is more than h hours old (checked every
+  `STOA_UPLOAD_SWEEP_MIN` minutes, default 15); a folder holding a `.keep` file and the shared example sheets are never
+  expired. A deployment for customers should set it.
 - **Deleted.** With the optional `privacy` feature on (`STOA_FEATURES=privacy`), the app's Privacy panel shows
   what is stored where and has a **Delete my files** button (`POST /feat/privacy/delete`): it removes the upload, its
   format copies and the cached readings tied to it, and lists the caches it cannot tie to the file (model replies and
@@ -172,7 +174,8 @@ project is sold or run as a paid service:
   operator deletes the upload's folder. Either way the hash-named caches must be cleared separately, or kept
   short-lived.
 - **Processed.** In private and EU-only mode every step runs on servers you run. In hybrid mode an unsure answer
-  may send a page image or an evidence crop to Google or NVIDIA, and every answer says where its data went (see
+  may send page images (zoomed quarters for counts), an evidence crop and text read from the sheet to Google or
+  NVIDIA ([what each step sends](RESULTS.md#cost-latency-and-data-governance)), and every answer says where its data went (see
   [Cost, latency and data governance](../README.md#cost-latency-and-data-governance)).
 
 For a pilot, write these down with the customer before the first drawing arrives: where the files live, for how

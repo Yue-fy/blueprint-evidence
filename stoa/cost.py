@@ -20,6 +20,13 @@ decode 1k tok/s on the shared vLLM), not HTTP latency, because latency includes 
 Hosted calls are priced per model when stoa.llm records `api_usd` on the call; rows written before that (or by a
 solver that reports only tokens) fall back to the generic hosted rate.
 
+One-time readings of a FILE (X1 23:27): the text layer of a picture / scan (VLM tiles or OCR) is read once per file and
+shared by every question about it, but it is billed to the question that first needs it in a process (cache hits too,
+so warm and cold runs cost the same). Readers wrap such a reading in `with file_reading(): ...`: its cost still goes
+into the totals (llm_calls, gpu_seconds, ... = cold-run accounting, the eval's $/1k unchanged) and is ALSO recorded
+under 'prep_<field>'. question_part(c) = the totals minus the prep part; the cost tier is that question's own work, and
+breakdown() gives 'prep_usd' (the file's reading) next to 'question_usd'.
+
 Every rate can be overridden from the environment, so a reader can re-price a run with their own numbers:
     STOA_GPU_USD_PER_HOUR=1.20 python -m stoa.eval ...            # a cheaper GPU
     STOA_API_PRICES='{"gemini-3-flash-preview": [0.5, 3.0]}'       # $ per 1M tokens in / out
@@ -27,6 +34,7 @@ Every rate can be overridden from the environment, so a reader can re-price a ru
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 
@@ -96,6 +104,52 @@ def _g(c: dict, k: str) -> float:
     return v if isinstance(v, (int, float)) and not isinstance(v, bool) else 0
 
 
+# Fields a one-time file reading can carry; each also appears as 'prep_<field>' (the part spent reading the file).
+PREP_FIELDS = ("llm_calls", "llm_tokens_in", "llm_tokens_out", "gpu_seconds", "api_calls", "api_tokens_in",
+               "api_tokens_out", "api_usd", "cpu_seconds", "wall_seconds")
+
+
+def prep_part(c: dict) -> dict:
+    """The one-time reading of the file inside a question's cost dict, as an ordinary cost dict ({} when none)."""
+    return {k: _g(c, f"prep_{k}") for k in PREP_FIELDS if _g(c, f"prep_{k}")}
+
+
+def question_part(c: dict) -> dict:
+    """The question's own work: the totals minus the file's one-time reading (prep_*); other fields kept as they are."""
+    p = prep_part(c)
+    if not p:
+        return dict(c)
+    out = {k: v for k, v in c.items() if not str(k).startswith("prep_")}
+    for k, v in p.items():
+        base = _g(c, k)
+        out[k] = max(0, round(base - v, 6)) if isinstance(base, float) or isinstance(v, float) else max(0, base - v)
+    return out
+
+
+@contextlib.contextmanager
+def file_reading():
+    """Wrap a reading that is done once per FILE and shared by every question on it (a picture's text layer, the OCR
+    of a scan): everything recorded inside still counts in the question's totals, and is also recorded as 'prep_*'.
+    Nested readings are marked once. No-op outside a CostMeter (or on a contract without one)."""
+    try:
+        from stoa.contract import CostMeter, record_cost
+    except ImportError:  # pragma: no cover
+        yield None
+        return
+    m = CostMeter()
+    with m:
+        yield m
+    c = m.cost.model_dump()
+    c["wall_seconds"] = c.get("wall_seconds") or round(getattr(m, "wall_seconds", 0.0), 3)
+    add = {}
+    for k in PREP_FIELDS:  # what a nested file_reading already marked is not marked again
+        v = (_g(c, k) - _g(c, f"prep_{k}")) if k != "wall_seconds" else (_g(c, k) - _g(c, "prep_wall_seconds"))
+        if v > 0:
+            add[f"prep_{k}"] = round(v, 6) if isinstance(v, float) else v
+    if any(k != "prep_wall_seconds" for k in add):  # only time passed (a memo hit): nothing to mark
+        record_cost(**add)
+
+
 def gpu_seconds_billed(c: dict) -> float:
     """GPU seconds we charge. Solvers that time local LLM calls by HTTP latency include queueing on the
     shared server (00:30: 30.9 s reported for a 1.6k-in/205-out call that needs ~0.27 s). So when a row has
@@ -120,7 +174,12 @@ def breakdown(c: dict) -> dict:
         local_out = max(0, _g(c, "llm_tokens_out") - _g(c, "api_tokens_out"))
         gpu += (local_in * LOCAL_USD_PER_MTOK[0] + local_out * LOCAL_USD_PER_MTOK[1]) / 1e6
     cpu = core_seconds(c) * CPU_USD_PER_HOUR / 3600
-    return {"gpu_usd": gpu, "api_usd": api, "cpu_usd": cpu, "usd": gpu + api + cpu}
+    out = {"gpu_usd": gpu, "api_usd": api, "cpu_usd": cpu, "usd": gpu + api + cpu}
+    p = prep_part(c)
+    prep = breakdown(p)["usd"] if p else 0.0  # the file's one-time reading (prep_* holds no prep_* itself)
+    out["prep_usd"] = min(prep, out["usd"])
+    out["question_usd"] = out["usd"] - out["prep_usd"]
+    return out
 
 
 def service_core_seconds(c: dict) -> float:
@@ -178,7 +237,9 @@ def describe(c: dict) -> str:
     b = breakdown(c)
     return (f"${b['usd']:.5f} = GPU ${b['gpu_usd']:.5f} ({gpu_seconds_billed(c):.2f} s at ${GPU_USD_PER_HOUR:.2f}/h)"
             f" + API ${b['api_usd']:.5f} ({int(_g(c, 'api_calls'))} calls) + CPU ${b['cpu_usd']:.5f}"
-            f" ({core_seconds(c):.0f} core-s)")
+            f" ({core_seconds(c):.0f} core-s)"
+            + (f"; of which ${b['prep_usd']:.5f} = the file's one-time reading ({int(_g(c, 'prep_llm_calls'))} model"
+               f" calls), shared by every question on that file" if b["prep_usd"] else ""))
 
 
 # ------------------------------------------------------------------------------------------- cost tier (badge)
@@ -199,7 +260,25 @@ _ORDER = ("cheap", "in-between", "expensive")
 
 
 def tier(c: dict) -> dict:
-    """{'tier': 'cheap' | 'in-between' | 'expensive', 'label', 'why'} for one answer's cost dict."""
+    """{'tier': 'cheap' | 'in-between' | 'expensive', 'label', 'why'} for one answer's cost dict: the question's own
+    work (question_part). A one-time reading of the file (prep_*) is said in 'why' and given as 'file_reading' (its own
+    tier and size), because it is paid once per file, not per question."""
+    p = prep_part(c)
+    if not p:
+        return _tier(c)
+    t = _tier(question_part(c))
+    f = _tier(p)
+    n, tok = int(_g(p, "llm_calls")), int(_g(p, "llm_tokens_in") + _g(p, "llm_tokens_out"))
+    what = (f"{n} model call{'s' if n != 1 else ''}, {tok:,} tokens" if n or tok
+            else f"{service_core_seconds(p) / 60:.0f} core-minutes of text recognition")
+    t["why"] = f"{t['why']}; not counted here: the file's one-time reading ({what}, {f['label'].lower()}), done once " \
+               f"and shared by every question on this file"
+    t["file_reading"] = {"tier": f["tier"], "label": f["label"], "llm_calls": n, "tokens": tok,
+                         "usd": round(breakdown(p)["usd"], 6)}
+    return t
+
+
+def _tier(c: dict) -> dict:
     calls, tokens = int(_g(c, "llm_calls")), int(_g(c, "llm_tokens_in") + _g(c, "llm_tokens_out"))
     api = breakdown(c)["api_usd"]
     hosted = int(_g(c, "api_calls"))
