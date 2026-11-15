@@ -54,7 +54,7 @@ first"); one click makes an A4 measurement report. Our expert needed a median of
 totals without double counting, cross-checks across formats. One switch changes the measuring convention (net, wall
 centre lines, gross). The takeoff becomes an order list. Corrections are remembered as "Measured by you". Ask about
 a box drawn on part of a sheet; door sizes follow the sheet's references to the door schedule. Paste a list of
-questions and get a table (add ?features=batch to the demo link). In the repository: the cost of a revision.
+questions and get a table (add ?features=batch to the demo link). Compare two issues of a sheet: every change marked and priced (sample 'Primary school, first floor: two issues compared').
 
 **4. Low inference cost.** Private by default. Cheap deterministic readers first (CAD, IFC, PDF geometry, schedules, OCR), our fine-tuned
 Qwen3-VL-8B on our own GPU next, Gemini 3.1 Pro and NVIDIA Nemotron only for unsure answers and only when you allow
@@ -189,9 +189,8 @@ not separate right from wrong, so it is shown, not applied.
 - Character counts (`wc -m`, 02:5x): see the 'Field lengths' line at the end; all fields are under their limits.
 - Features named as live in the Description / test steps are the ones the demo API (:8100, 016824ef's answer code since S0's swap E at 04:13;
   STOA_FEATURES unchanged, read from the :8100 and :5180 processes at 04:32) has: privacy, region, corrections, project, takeoff, orderlist, conventions, checklist,
-  report, selfcheck, xref. Off: revcompare (revision cost), batch (question lists), trust_map.
-  Revision cost (revcompare), trust map and question lists (batch) are in the repository but off in
-  the demo; the Description says so in one line. If the final swap turns any of them on, that line can go.
+  report, selfcheck, xref, and since 05:31 revcompare (revision cost; S0 swap H). Off: batch (question lists), trust_map.
+  Trust map and question lists (batch) are in the repository but off in the demo.
 - The demo opens in Private mode (S0 D62 5, since 75f9ee4e), so Nemotron and Gemini run only after a visitor switches
   Private off (step 4 says so; the NVIDIA text's 'Running in the demo' line says the same). NVIDIA asks that Nemotron
   run in the working solution: worth one check that the demo with Private off reaches it.
