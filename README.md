@@ -81,7 +81,7 @@ bound for a new drawing, not a forecast.
 | Stoa's own four example sheets: 90 questions in Stoa's kinds (room and type areas, baseboards, slab areas, door counts, piping) | private | **91.1%** (82/90): vector PDFs 38/41, Stoa's PNG copies 44/49 (the same answers at `b8146dd` and `4b62b93`) | `e4a166b` |
 | Same 90 questions: Gemini 3.1 Pro asked directly / Qwen3-VL-8B asked directly, without our pipeline | hosted / local | 61%, no evidence / 26% | |
 | Real drawings from outside the dataset, development set (168 questions) | private | 70.2% (118/168), as at `aff2f1f`; 71.4% at `f2cd8f1` | `b8146dd` |
-| Stoa's four example sheets, 20 numeric questions measured by hand by our teammate (each with a written method). She answered the 12 on three of the sheets after the d29 code was built | private | **19/20** with the door detector our gates use, **20/20** with the newer one the live demo runs; 18/20 at `aff2f1f`, 16/20 at `f2cd8f1`, and 8/12 on those 12 there, before her four misses were fixed from her answers | `4b62b93` |
+| Stoa's four example sheets, 20 numeric questions measured by hand by our teammate (each with a written method). She answered the 12 on three of the sheets after the d29 code was built | private | **19/20** with the door detector our gates use, **20/20** with the newer one the live demo runs; 18/20 at `aff2f1f`, 16/20 at `f2cd8f1`, and 8/12 on those 12 there, before her four misses were fixed from her answers | `4b62b93`, `75f9ee4` |
 
 **Files nobody tuned on.** Run only by our gatekeeper, who saw aggregates, never rows. These are the better forecast.
 

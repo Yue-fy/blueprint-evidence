@@ -434,6 +434,9 @@ the web app's answer worker (`strace -f -e connect`) over four private answers o
 count, a pump count, a slab area; no hosted call counted) showed 11 connections, all to this machine (the local model
 and the door detector), and no name lookup. The same room question with Private off looked up Google and connected
 to it. The trace covers the worker's processes; the API process is covered by `tests/test_t2_private_e2e.py`.
+The example drawings of the start view are answered by the API itself: there the Private switch turns every hosted
+step off (15 of 15 test questions on the freeze build: no hosted call, no outside connection), and the network is
+closed under the code only when the server runs with `STOA_PRIVATE=1`.
 
 On the server, `STOA_PRIVATE=1` (or the pipeline argument `private=1`) turns every hosted step off for all
 questions, and `STOA_EU_ONLY=1` with it still allows Verda's EU text model. The last line of every answer's
@@ -849,7 +852,11 @@ from the morning audit all still hold on d31. On byte-new copies of the four she
 the d32 answer code (`d0514b4`), the web app's "Many questions" list on byte-new copies scores 19 of 20 too, private
 and with no hosted call: DfE 8 of 8 in 10 s, S-100F 4 of 4, M-101A 4 of 4 in 2 s with no model call at all, AFCEC 3 of
 4 (the north-wing doors are now counted from the drawn door symbols, 36 against her 34 with the gates' detector,
-instead of guessed; the first question on a new copy waits about 50 s for the detector). The 18 and
+instead of guessed; the first question on a new copy waits about 50 s for the detector). On the released demo build
+(`75f9ee4`, with the newer door detector the live demo runs) the same list on byte-new copies scores 20 of 20, private and
+with no hosted call: DfE 8 of 8 in 15 s, S-100F 4 of 4 in 10 s, AFCEC 4 of 4 in 53 s (the north wing's 34 doors counted
+from the drawn door symbols), M-101A 4 of 4 in 2 s; 12 of the 20 answers needed no model at all. The list is off by
+default in the live demo; add `?features=batch` to its link to use it. The 18 and
 19 are not independent tests, because those fixes were made from her answers; the independent figure stays 8 of 12
 above. What it
 shows is the loop: an expert's hand answer and method on the customer's own sheet became a fix the same evening, with
@@ -861,13 +868,16 @@ Finnish door-count wording (a whole-sheet guess) and four wordings of the north-
 `20261114-233445-upload-human-a809` (scored 17 of 20 at first, because the eval read her "6,095" ft² as 6.095; the
 scorer is fixed since).
 
-With the d32 answer code (`4b62b93`, private, no hosted model) the numbers are: **19 of 20** with the door detector
+With the d32 answer code (`4b62b93`, private, no hosted model; the released demo build `75f9ee4` gives identical values and
+confidences) the numbers are: **19 of 20** with the door detector
 the gates use and **20 of 20** with the newer detector (v5) the live demo runs, which counts the north wing's 34 doors
 at confidence 0.71; with v2 that count is 36, marked as a rough count (confidence 0.26). Over her 20 answers the right
 ones average confidence 0.81 and the wrong one 0.26 (Brier 0.053; 0.158 on d31). On the 46 other wordings 43 are
 right (the 3 misses are north-wing wordings on the gates' detector; the Finnish door question now gives her 115), on
 byte-new copies 19 of 20, and through the real web upload page in Private mode 19 of 20. Her 19 backed verdicts from
-the morning audit all still hold. Still not an independent test: the independent figure stays 8 of 12.
+the morning audit all still hold. Still not an independent test: the independent figure stays 8 of 12. Of the 43 rules
+and conventions we took from her written methods, 35 are in the demo build, 6 partly, 1 not done and 1 not yet
+reported on; 14 of them cite her rule in our code or tests.
 
 ## Internal audit: a random sample of the shipped demo
 
