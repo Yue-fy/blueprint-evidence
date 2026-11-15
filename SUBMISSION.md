@@ -138,7 +138,7 @@ The process, the numbers and the path to scale: [docs/VERDA.md](docs/VERDA.md).
 **Ambition.** We used Verda to do what our shared dev box cannot: score every change on Stoa's *whole* dataset
 (127,044 questions on 5,939 drawings) instead of a 2,000-question sample, and train our own vision model overnight.
 One RTX PRO 6000 answered all 127,044 questions in 17.2 minutes for €0.75 (82.6% right; counts exact, areas ±2%).
-We re-ran the full set on each night's integration code (82.61%, then 82.64% on the final gate code, every
+We re-ran the full set on each night's integration code (82.61%, 82.64%, then 82.65% on the final demo code, every
 deterministic reader identical). On spot A100s we trained a door/window symbol detector from 557,376 free synthetic
 boxes, then fine-tuned it six times as real sheets exposed failures (scans, sliding / folding doors, pipework).
 

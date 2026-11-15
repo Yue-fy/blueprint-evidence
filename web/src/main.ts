@@ -561,15 +561,12 @@ function marksWhat(a: Answer, k: number): string {
   const t = String(a.intent?.target ?? "").toLowerCase();
   const known = !!t && !/^(unknown|element|other|thing|item|object)s?$/.test(t);
   if (a.intent?.task === "count" && typeof a.value === "number") {
-    // UX F-9: a count read from the whole image with fewer boxes drawn ('16 doors marked' over 5 boxes) → '5 of 16 doors'
-    // (one box = a printed figure / a region, not one of the items: left as it was)
-    const part = k >= 2 && k < a.value ? `${k.toLocaleString("en")} of ` : "";
-    if (known) return `${part}${fmtValue(a)} ${targetNoun(a.intent?.target, a.value)}`;
+    if (known) return `${fmtValue(a)} ${targetNoun(a.intent?.target, a.value)}`;
     // UX P2b-1: '5 unknowns marked' for 'How many check valves (CV)?': the card's own words ('check valves (CV) on this
     // drawing'), else '5 places'
     const sen = (document.querySelector("#hero .hero-sentence")?.textContent ?? "").trim()
       .replace(/\s+(?:on|in|of)\s+(?:this|the)\s+(?:drawing|sheet|plan|page|whole building|building|model)\b.*$/i, "").trim();
-    return sen && sen.length <= 48 && !/\d/.test(sen) ? `${part}${fmtValue(a)} ${sen}` : `${part}${fmtValue(a)} places`;
+    return sen && sen.length <= 48 && !/\d/.test(sen) ? `${fmtValue(a)} ${sen}` : `${fmtValue(a)} places`;
   }
   // UX P2b-11: 'rooms on each floor' (a list per floor) marked 285 rooms twice (plan box + 3D element): 'The 285 rooms'
   if (a.intent?.task === "count" && known) return `The ${k} ${targetNoun(a.intent?.target, k)}`;

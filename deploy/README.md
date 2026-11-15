@@ -61,16 +61,6 @@ then CHECK that the gate (not something else) owns the port: `curl -s http://127
 are used by another project; never `tailscale funnel reset`). The gate used :8140 until 18:10 on 14 Nov; V1's door
 detector (no password) listens there now, so an old command would have published it. Tested through it: browser sign-in, uploads, a 12 MB IFC byte-exact, /api.
 
-**Login page at the final swap (UX NEW-5, 15 Nov 00:53):** the gate running on :8190 since 14 Nov 20:44 (pid 3749088,
-started from `junction-wt/demo/deploy`, i.e. demo code 1eedc72b) still shows the OLD page ('Blueprints Talk', green
-button, 'Team Hannah Family · Junction 2026'). The new page ('B · Blueprint Evidence', the app's blue + Inter, a visible
-'Password' label, 'enter the password you were given', empty submit 400 'Enter the password.') is P1 a1d2f55b, in
-d31 / d32 and in night once S0 merges d31. A Python process keeps the code it started with, so it shows only after the
-gate is restarted from the final demo worktree: `kill 3749088`, then from `junction-wt/demo/deploy` (same command as
-before) `python gate.py --upstream http://127.0.0.1:5180 --port 8190 --password-file ~/.stoa_gate`, and check
-`curl -s http://127.0.0.1:8190/__gate/health` and `curl -s http://127.0.0.1:8190/__gate/login | grep -o '<title>[^<]*'`
-('Blueprint Evidence: sign in'). Agents never restart it (captain's demo).
-
 ## 1. Batch answers (what Stoa can run on their hidden set)
 
 Input = the dataset's `questions.jsonl` format: one `{"path": "data/<source>/<file>", "question": "..."}` per line

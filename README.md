@@ -69,7 +69,7 @@ skipped; in the web app one that fails switches itself off. The rest of the app 
 
 All numbers come from our eval tool (`python -m stoa.eval`). Counts must be exact; areas, lengths and volumes must be
 within 2%. Each row names its mode and the commit it was measured on (on the `night` branch of our
-[workspace repository](https://github.com/Yue-fy/Junction_Hannah_family)). The code in this repository is commit `016824e` of that branch, and every commit named below is in its history. The live demo during judging runs this same code, with the Private switch on by default (private mode). **Private** = local models only, every
+[workspace repository](https://github.com/Yue-fy/Junction_Hannah_family)). The code in this repository is commit `a5834c8` of that branch, and every commit named below is in its history. The live demo during judging runs this same code, with the Private switch on by default (private mode). **Private** = local models only, every
 hosted model off; **hybrid** = with the Gemini 3.1 Pro escalation and the Nemotron check on. Except in the dataset's
 sealed test, every file is uploaded alone under a meaningless name, as Stoa will test. Method and caveats: [docs/RESULTS.md](docs/RESULTS.md).
 
