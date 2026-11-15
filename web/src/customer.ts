@@ -7,7 +7,8 @@
 import { agentAsks, crossChecks, fmtValue, pxless, quietEstimate, setAnswer, unitLabel, type SetRow } from "./card";
 import { dataLineHtml, geminiRan, geminiRead } from "./governance";
 import { manualTime } from "./manual-time";
-import { floorName, PROJECTS, projectOf, type Project } from "./projects";
+import { CLAIMS } from "./claims";
+import { FEATURE_TILES, floorName, PROJECTS, projectOf, type Project } from "./projects";
 import { floorName as storeyWords } from "./floornames";
 import type { Answer, Kg } from "./types";
 
@@ -55,27 +56,87 @@ export function landingHtml(privacyPanel = false): string {
       <span class="pc-contents">${esc(p.contents)}</span>
       <span class="pc-ask">“${esc(p.chips[0])}”</span>
     </button>`;
+  // captain 05:22 REVISION CASE: six cards, simple → complex; F5's revision pair (medium) takes the piping plan's place.
+  // The piping card stays in the page, hidden, as the stand-in when this server does not serve the pair (main.ts).
+  const rev = FEATURE_TILES.find((t) => t.id === "dfe-revision");
+  const revCard = rev ? `<button type="button" class="proj-card feat-tile" data-project="${esc(rev.id)}" data-link="${esc(rev.link)}" data-needs="${esc(rev.needs)}" data-standin="usace-m101a">
+      <span class="pc-thumb"><img src="/api/feat/revcompare/demo/dfe630/thumb.png" alt="" loading="lazy" onerror="this.closest('.proj-card')?.classList.add('no-thumb'); this.remove()"></span>
+      <span class="pc-kind">Two issues of one sheet<span class="pc-level lv-medium">Medium</span></span>
+      <span class="pc-name">Primary school, first floor: two issues compared</span>
+      <span class="pc-place">DfE baseline design · what changed, and what it costs</span>
+      <span class="pc-facts">${rev.facts.map(esc).join(" · ")}</span>
+    </button>` : "";
+  const base = PROJECTS.filter((p) => !p.more);
+  const piping = base.find((p) => p.id === "usace-m101a");
+  const five = base.filter((p) => p !== piping).slice(0, 5).map(card);
+  const gallery = [...five.slice(0, 3), revCard || (piping ? card(piping) : ""), ...(revCard && piping ? [card(piping).replace('class="proj-card"', 'class="proj-card" hidden')] : []), ...five.slice(3)];
   return `<div class="landing-inner">
-    <header class="landing-hero">
-      <h1 class="lh-title">Ask your drawings.</h1>
-      <p class="lh-sub">Answers that show where on the drawing they come from.</p>
-    </header>
-    <section class="dropzone" id="landDrop" role="button" tabindex="0" aria-label="Upload your own drawing">
-      <svg class="dz-ico" viewBox="0 0 48 48" aria-hidden="true"><path d="M12 30v8h24v-8" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/><path d="M24 31V9M15 18l9-9 9 9" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/></svg>
-      <div class="dz-title">Drop a drawing or a whole set</div>
-      <div class="dz-sub">A floor plan or sheet as PDF, a scan or a phone photo of a print, a 3D building model or a CAD drawing <span class="dz-fmt">(PDF, JPG, PNG, HEIC, IFC, DWG, DXF, SVG)</span></div>
-      <span class="dz-btn">Choose files</span>
-      <div class="dz-more">Then ask in your own words, in any language: areas, lengths, counts.
-        A plan dropped with its 3D model or CAD file is read together. A whole building? Drop all its sheets at once:
-        each one is labelled with its floor.</div>
-      <div class="dz-status" id="landStatus" hidden></div>
+    <section class="lh-top">
+      <header class="landing-hero">
+        <h1 class="lh-title">Ask your drawings.</h1>
+        <p class="lh-sub">Answers that show where on the drawing they come from.</p>
+        <div class="lh-ctas">
+          <button type="button" class="lh-btn primary" data-act="tour"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8 5.5v13l10.5-6.5z" fill="currentColor"/></svg><span class="lb-wide">Watch the 60-second guided demo</span>${__HAS_MOBILE__ ? `<span class="lb-phone">Open the phone version</span>` : ""}</button>
+          <button type="button" class="lh-btn secondary" data-act="samples">Try a sample</button>
+        </div>
+      </header>
+      <figure class="lh-shot">
+        <button type="button" class="lh-shot-btn" data-act="hero-sample" title="Open this answer in the app">
+          <span class="lh-ans">
+            <span class="lh-q">“How many doors on this floor?”</span>
+            <span class="lh-num">36</span>
+            <span class="lh-what">doors on the 2nd floor</span>
+            <span class="lh-pill"><i aria-hidden="true"></i>Very sure</span>
+            <span class="lh-meta">Answered in 0.1 s · cheap, no AI</span>
+          </span>
+          <span class="lh-plan"><img src="./landing/hero-apartment-doors.webp" width="258" height="564" alt="The floor plan with every door boxed in blue; numbered dots mark the answer's places"></span>
+        </button>
+        <figcaption>A real answer from the app</figcaption>
+      </figure>
+      <section class="dropzone" id="landDrop" role="button" tabindex="0" aria-label="Upload your own drawing">
+        <svg class="dz-ico" viewBox="0 0 48 48" aria-hidden="true"><path d="M12 30v8h24v-8" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/><path d="M24 31V9M15 18l9-9 9 9" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/></svg>
+        <div class="dz-title">Drop a drawing or a whole set</div>
+        <div class="dz-sub">PDF, scan, photo, CAD or IFC</div>
+        <span class="dz-btn">Choose files</span>
+        <div class="dz-status" id="landStatus" hidden></div>
+      </section>
     </section>
-    <h2>Or explore a sample project.</h2>
-    <div class="proj-grid six">${PROJECTS.filter((p) => !p.more).slice(0, 6).map(card).join("")}</div>
+    <section class="proof" aria-label="How well it works">
+      <div class="proof-grid">${CLAIMS.map((c) => `<div class="pf-tile"><div class="pf-big">${esc(c.big)}</div><div class="pf-text">${esc(c.line ?? c.text).replace(/ · /g, "&nbsp;· ")}</div></div>`).join("")}</div>
+      <p class="proof-link"><button type="button" class="link" data-act="measured">How we measured ›</button></p>
+    </section>
+    <section class="tools" aria-labelledby="toolsH">
+      <h2 id="toolsH">What you can do.</h2>
+      <div class="tool-grid">${TOOLS.map((t) => `<button type="button" class="tool-tile" data-tool="${t.id}"${t.id === "orderlist" ? " hidden" : ""}><span class="tt-ico" aria-hidden="true"><svg viewBox="0 0 24 24">${t.icon}</svg></span><span class="tt-name">${esc(t.name)}</span><span class="tt-line">${esc(t.line)}</span></button>`).join("")}</div>
+    </section>
+    <h2 id="samplesH">Or explore a sample project.</h2>
+    <div class="proj-grid six">${gallery.join("")}</div>
     ${__HAS_MOBILE__ ? `<p class="landing-phone"><a href="./mobile.html">On a phone? Open the phone page</a></p>` : ""}
-    <p class="landing-foot">Your files are stored on this server only, in a temporary folder${privacyPanel ? ", until you press ‘Delete my files’ (privacy panel)" : ""}. They are read by our own readers and models running here; when an answer is unsure and Private is off, images of the page, the question, the proposed answer and text read from the sheet may go to Google Gemini or NVIDIA Nemotron — each answer says where its data went. With <b>Private</b> on, nothing leaves this server: every outside model is switched off while it answers. Sample drawings and models are public (credits under each project). Answers point to where they come from on the drawing (or say when they could not), so you can check them.</p>
+    <details class="landing-foot">
+      <summary>Private by default: your files stay on this server, and nothing leaves it while Private is on. <span class="lf-more">Details</span></summary>
+      <p>Your files are stored on this server only, in a temporary folder${privacyPanel ? ", until you press ‘Delete my files’ (privacy panel)" : ""}. They are read by our own readers and models running here; when an answer is unsure and Private is off, images of the page, the question, the proposed answer and text read from the sheet may go to Google Gemini or NVIDIA Nemotron — each answer says where its data went. With <b>Private</b> on, nothing leaves this server: every outside model is switched off while it answers. Sample drawings and models are public (credits under each project). Answers point to where they come from on the drawing (or say when they could not), so you can check them.</p>
+    </details>
+    <p class="landing-credits">Credits: drawing in the example answer: Swiss Dwellings v3.0.0 (Archilyse AG), CC BY 4.0. Each sample project names its own source.</p>
   </div>`;
 }
+/** captain 05:00 Sun (prompts/LANDING.md 3): six tools, one line each; main.ts showLanding opens a sample with the tool. */
+export const TOOLS: { id: string; name: string; line: string; icon: string }[] = [
+  { id: "takeoff", name: "Takeoff to Excel", line: "Rooms, doors, windows in Excel.",
+    icon: `<rect x="3" y="4" width="18" height="16" rx="2"/><path d="M3 10h18M3 15h18M9 4v16"/>` },
+  { id: "revisions", name: "Compare revisions", line: "What changed, and what it costs.",
+    icon: `<circle cx="18" cy="18" r="3"/><circle cx="6" cy="6" r="3"/><path d="M13 6h3a2 2 0 0 1 2 2v7"/><path d="M11 18H8a2 2 0 0 1-2-2V9"/>` },
+  // shown instead of 'Compare revisions' only when this server does not serve F5's revision pair (captain 05:18 / 05:22; main.ts)
+  { id: "orderlist", name: "Order list", line: "What to order, with waste.",
+    icon: `<path d="M6 2h12l2 4H4z"/><path d="M4 6v14a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V6"/><path d="M9 11h6M9 15h6"/>` },
+  { id: "3d", name: "3D view", line: "The same answer, marked in 3D.",
+    icon: `<path d="M12 3 20 7.5v9L12 21 4 16.5v-9z"/><path d="M4 7.5 12 12l8-4.5M12 12v9"/>` },
+  { id: "phone", name: "On site with your phone", line: "Photograph a print, ask on site.",
+    icon: `<rect x="7" y="2" width="10" height="20" rx="2"/><path d="M11 18h2"/>` },
+  { id: "fix", name: "Fix it yourself", line: "Trace a room; the answer follows.",
+    icon: `<path d="M17 3a2.8 2.8 0 0 1 4 4L7.5 20.5 2 22l1.5-5.5z"/><path d="m15 5 4 4"/>` },
+  { id: "report", name: "Measurement report (PDF)", line: "Drawing crop, scale, formula, sign-off.",
+    icon: `<path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><path d="M14 2v6h6M8 13h8M8 17h5"/>` },
+];
 /** captain 22:56: one even grid of 6 samples, simple → complex, each with a small difficulty tag (no 'More examples'
  *  row; F5's revision pair stays reachable by its link ?features=revcompare&revdemo=dfe630) */
 const LEVEL_LABEL: Record<NonNullable<Project["level"]>, string> = { simple: "Simple", medium: "Medium", complex: "Complex" };

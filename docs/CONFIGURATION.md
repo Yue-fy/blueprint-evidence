@@ -266,6 +266,7 @@ Tuning and experiment switches. Read the module named in the last column for wha
 | `STOA_G1_TAKEOFF` | `1` | `stoa/pipeline.py` |
 | `STOA_G1_TYPE_TAG_ROUTE` | `1` | `stoa/pipeline.py` |
 | `STOA_G1_WHOLE_PLAN` | `1` | `stoa/pipeline.py` |
+| `STOA_GATE_OPEN_FILE` | `~/.stoa_gate_open` | `deploy/gate.py` |
 | `STOA_GATE_PASSWORD` | empty | `deploy/gate.py` |
 | `STOA_GEMINI_BELOW` | `0.5` | `stoa/agent/escalate.py` |
 | `STOA_GEMINI_PLANNER` | `gemini-3.1-pro-preview` | `stoa/agent/gemini.py` |

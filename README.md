@@ -14,7 +14,11 @@ Drawing: Special School Plan Level 00 (SEN-DFE-XX-00-D-X-0201), UK Department fo
 design for a special school". Contains public sector information licensed under the Open Government Licence v3.0.
 The sheet is bundled as [samples/dfe_school/plan.pdf](samples/dfe_school/plan.pdf).*
 
-Demo video: [video link]
+Demo video (2:28): https://youtu.be/G-aLb5OFr9Y · Launch film (90 s): https://youtu.be/alYQhzlKdLo
+
+Live demo (no password): https://aalto-trx50-ai-top.tailaec1b5.ts.net:10000
+
+Cost: ≈ €0.005 per 1,000 questions (all 127,044 dataset questions for €0.63 on one Verda GPU).
 
 Team Hannah Family's submission to the Stoa challenge "Make Blueprints Talk" at Junction 2026.
 
@@ -26,8 +30,8 @@ Team Hannah Family's submission to the Stoa challenge "Make Blueprints Talk" at 
 - **Points at its evidence.** When a reader locates what it used, the answer shows it on the 2D drawing: a box per
   object it counted, the outline of a measured room, the measured line. In a 3D IFC model, the counted elements light
   up. An answer whose evidence was not located says so. A location is not a proof: it shows where to look, and a
-  human still has to check that it supports the number (a teammate checking 34 answers on our review page took a
-  median of 79 s per answer).
+  human still has to check that it supports the number (in our expert calibration, checking 34 answers on our review
+  page took a median of 79 s per answer).
 - **Says how sure it is.** The confidence is the measured hit rate of the method that produced the answer, on the
   data that method was measured on. On the dataset's sealed test (`bb94fe4`), answers marked as sure (confidence 0.8
   or more) were right 98% of the time, and on the open questions about Stoa's sheets 189 of 191 (`e4a166b`; from `4b62b93` on a
@@ -46,7 +50,7 @@ Team Hannah Family's submission to the Stoa challenge "Make Blueprints Talk" at 
 These run on top of the same answers and evidence, and are **off unless you switch them on**: on the API with
 `STOA_FEATURES=<name>,<name>` (or `all`), in the web app with `?features=<name>,<name>` (remembered in your
 browser; `?features=` with nothing switches them off again). On the API a feature that fails to load is
-skipped; in the web app one that fails switches itself off. The rest of the app keeps working. The live demo during judging has 11 of them on: `privacy`, `region`, `corrections`, `project`, `takeoff`, `orderlist`, `conventions`, `checklist`, `report`, `selfcheck`, `xref`.
+skipped; in the web app one that fails switches itself off. The rest of the app keeps working. The live demo during judging has 12 of them on: `privacy`, `region`, `corrections`, `project`, `takeoff`, `orderlist`, `conventions`, `checklist`, `report`, `selfcheck`, `xref`, `revcompare`.
 
 | Feature | What it does | Parts |
 |---|---|---|
@@ -69,7 +73,7 @@ skipped; in the web app one that fails switches itself off. The rest of the app 
 
 All numbers come from our eval tool (`python -m stoa.eval`). Counts must be exact; areas, lengths and volumes must be
 within 2%. Each row names its mode and the commit it was measured on (on the `night` branch of our
-[workspace repository](https://github.com/Yue-fy/Junction_Hannah_family)). The code in this repository is commit `a5834c8` of that branch, and every commit named below is in its history. The live demo during judging runs this same code, with the Private switch on by default (private mode). **Private** = local models only, every
+[workspace repository](https://github.com/Yue-fy/Junction_Hannah_family)). The code in this repository is commit `353b779` of that branch, and every commit named below is in its history. The live demo during judging runs this same code, with the Private switch on by default (private mode). **Private** = local models only, every
 hosted model off; **hybrid** = with the Gemini 3.1 Pro escalation and the Nemotron check on. Except in the dataset's
 sealed test, every file is uploaded alone under a meaningless name, as Stoa will test. Method and caveats: [docs/RESULTS.md](docs/RESULTS.md).
 
@@ -81,7 +85,7 @@ bound for a new drawing, not a forecast.
 | Stoa's own four example sheets: 90 questions in Stoa's kinds (room and type areas, baseboards, slab areas, door counts, piping) | private | **91.1%** (82/90): vector PDFs 38/41, Stoa's PNG copies 44/49 (the same answers at `b8146dd`, `4b62b93` and `e4a166b`) | `1389c6a` |
 | Same 90 questions: Gemini 3.1 Pro asked directly / Qwen3-VL-8B asked directly, without our pipeline | hosted / local | 61%, no evidence / 26% | |
 | Real drawings from outside the dataset, development set (168 questions) | private | 70.2% (118/168), as at `aff2f1f`; 71.4% at `f2cd8f1` | `b8146dd` |
-| Stoa's four example sheets, 20 numeric questions measured by hand by our teammate (each with a written method). She answered the 12 on three of the sheets after the d29 code was built | private | **19/20** with the door detector our gates use, **20/20** with the newer one the live demo runs; 18/20 at `aff2f1f`, 16/20 at `f2cd8f1`, and 8/12 on those 12 there, before her four misses were fixed from her answers | `4b62b93`, `75f9ee4`, `1389c6a` |
+| Expert calibration: Stoa's four example sheets, 20 numeric questions measured by hand (each with a written method). The 12 on three of the sheets were answered after the d29 code was built | private | **19/20** with the door detector our gates use, **20/20** with the newer one the live demo runs; 18/20 at `aff2f1f`, 16/20 at `f2cd8f1`, and 8/12 on those 12 there, before four misses were fixed from the hand measurements | `4b62b93`, `75f9ee4`, `1389c6a` |
 
 **Files nobody tuned on.** Run only by our gatekeeper, who saw aggregates, never rows. These are the better forecast.
 
@@ -150,7 +154,7 @@ On the server, the same modes are settings; every mode runs the same code.
 |---|---|---|---|
 | **Private** | Nowhere. It stays on your server: the readers run on its CPU, Qwen3-VL-8B on its GPU | the **Private** switch; on the server `STOA_PRIVATE=1` (or `STOA_API_GEMINI=0 STOA_API_VERIFY=0`) | 48.6% / 4.7 s / under $1 |
 | **Hybrid** (the API's default when keys are set) | As private, plus, for unsure answers only: images of the sheet (for counts also its four quarters, zoomed), the question and our readers' results to Google (Gemini 3.1 Pro); the sheet with the evidence marked and a zoomed crop of it, the question and our answer to NVIDIA (Nemotron) | `GEMINI_API_KEY`, `NVIDIA_API_KEY` | 64.8% / 28 s / about $8 |
-| **EU only** | As private, on a GPU server rented in Finland (Verda) with confidential computing: the GPU is attested and the drawing stays encrypted while in use | `LLM_BASE_URL` pointing at that server | the same accuracy as private on our own machine (dataset dev 89.05% on both, `f551070`); the whole dataset, 127,044 questions, in 17 min for €0.75 |
+| **EU only** | As private, on a GPU server rented in Finland (Verda) with confidential computing: the GPU is attested and the drawing stays encrypted while in use | `LLM_BASE_URL` pointing at that server | the same accuracy as private on our own machine (dataset dev 89.05% on both, `f551070`); ≈ €0.005 per 1,000 questions (all 127,044 dataset questions for €0.63 on one Verda GPU, `b8146dd`) |
 | **No GPU** | The readers run on your machine; the steps meant for the local model go to Google (Gemini 3 Flash) | `STOA_MODE=api`, `GEMINI_API_KEY` | not measured on this set; on 16 scored dataset dev questions that use the local model, 13 against 14 locally |
 
 Private and hybrid were measured on the same product code and the same 105 held-out questions (`02a7a4d` /
@@ -314,8 +318,10 @@ Gemini, NVIDIA and Verda texts: [SUBMISSION.md](SUBMISSION.md). The Verda proces
   reasoning and a crop of the evidence, and agrees or disagrees. When it disagrees with an answer that has no
   located evidence, the confidence is halved; the value never changes. The web app shows its verdict as a second
   opinion. As a counter it was worse than our LoRA, so it does not count.
-- **Verda.** We scored the whole Stoa dataset (127,044 questions on 5,939 drawings) in 17.2 minutes on one Verda
-  RTX PRO 6000 GPU with confidential computing, for €0.75 (82.6% of 126,208 scored questions, commit `f551070`).
+- **Verda.** ≈ €0.005 per 1,000 questions (all 127,044 dataset questions for €0.63 on one Verda GPU): the final gate
+  code scored 82.6% of the whole Stoa dataset (127,044 questions on 5,939 drawings) in 34.8 minutes on one Verda A100
+  spot GPU (`b8146dd`). An earlier run on an RTX PRO 6000 with confidential computing took 17.2 minutes for €0.75
+  (`f551070`).
   On our shared workstation the same run would take hours. The scripts are in `deploy/verda/`.
 
 ## Credits and licences

@@ -9,7 +9,10 @@ models, slow answers up to 15 min). It never touches the upstream process.
     # or: --password-file ~/.stoa_gate (one line, chmod 600). Never pass the password on the command line.
 
 Open without a password: GET /__gate/health (gate + upstream status, for the watchdog and Funnel checks).
-Login: /__gate/login (form). Logout: /__gate/logout. Failed logins are rate-limited (--max-fails per 10 min per client).
+OPEN MODE (captain 05:15 Sun, no password for judges): while the file $STOA_GATE_OPEN_FILE (default ~/.stoa_gate_open)
+exists, every request passes without a password; delete the file to close the gate again (checked per request, no
+restart). Login: /__gate/login (form), or one click: /__gate/k/<link key> (key = HMAC of the password, printed by --print-link;
+it changes when the password changes; never logged). Logout: /__gate/logout. Failed logins are rate-limited (--max-fails per 10 min per client).
 """
 
 from __future__ import annotations
@@ -22,6 +25,7 @@ import html
 import http.client
 import json
 import os
+import re
 import sys
 import threading
 import time
@@ -78,8 +82,10 @@ class Gate:
         self.host, self.port = u.hostname or "127.0.0.1", u.port or 80
         self.password = password
         self.token = hmac.new(password.encode(), b"stoa-gate-v1", hashlib.sha256).hexdigest()
+        self.link = hmac.new(password.encode(), b"stoa-gate-link-v1", hashlib.sha256).hexdigest()[:24]
         self.timeout = timeout
         self.max_fails = max_fails
+        self.open_file = os.path.expanduser(os.environ.get("STOA_GATE_OPEN_FILE", "~/.stoa_gate_open"))
         self.fails: dict[str, list[float]] = {}
         self.lock = threading.Lock()
 
@@ -104,7 +110,8 @@ def make_handler(g: Gate):
         server_version = "stoa-gate"
 
         def log_message(self, fmt, *args):  # one line per request; never headers, cookies or bodies
-            sys.stderr.write(f"{time.strftime('%H:%M:%S')} {self._client()} {fmt % args}\n")
+            msg = re.sub(r"/__gate/k/[^\s\"?]*", "/__gate/k/***", fmt % args)  # the link key is a password
+            sys.stderr.write(f"{time.strftime('%H:%M:%S')} {self._client()} {msg}\n")
 
         def _client(self) -> str:
             xf = self.headers.get("X-Forwarded-For", "") if hasattr(self, "headers") and self.headers else ""
@@ -112,6 +119,8 @@ def make_handler(g: Gate):
 
         # ---------------------------------------------------------------- auth
         def _authed(self) -> bool:
+            if os.path.exists(g.open_file):  # open mode: no password (judging day)
+                return True
             for part in (self.headers.get("Cookie") or "").split(";"):
                 k, _, v = part.strip().partition("=")
                 if k == COOKIE and hmac.compare_digest(v, g.token):
@@ -155,11 +164,30 @@ def make_handler(g: Gate):
                     c.close()
                 except Exception as e:  # noqa: BLE001
                     up = f"down ({type(e).__name__})"
-                self._send(200, json.dumps({"gate": "ok", "upstream": up}).encode(), "application/json")
+                self._send(200, json.dumps({"gate": "ok", "upstream": up, "open": os.path.exists(g.open_file)}).encode(),
+                           "application/json")
                 return True
             if path == "/__gate/logout":
                 self._send(302, b"", extra={"Location": "/__gate/login",
                                             "Set-Cookie": f"{COOKIE}=; Path=/; Max-Age=0; HttpOnly; SameSite=Lax"})
+                return True
+            if path.startswith("/__gate/k/"):  # one-click link for judges (captain 04:55)
+                key = path[len("/__gate/k/"):].strip("/")
+                client = self._client()
+                if g.limited(client):
+                    self._login_page("/", "Too many attempts. Wait 10 minutes.", 429)
+                    return True
+                if not hmac.compare_digest(key.encode(), g.link.encode()):
+                    g.failed(client)
+                    self._login_page("/", "This link is not valid. Enter the password.", 401)
+                    return True
+                nxt = urllib.parse.parse_qs(query).get("next", ["/"])[0]
+                if not nxt.startswith("/") or nxt.startswith("//"):
+                    nxt = "/"
+                cookie = f"{COOKIE}={g.token}; Path=/; Max-Age=604800; HttpOnly; SameSite=Lax"
+                if self._secure():
+                    cookie += "; Secure"
+                self._send(303, b"", extra={"Location": nxt, "Set-Cookie": cookie})
                 return True
             if path == "/__gate/login":
                 nxt = urllib.parse.parse_qs(query).get("next", ["/"])[0]
@@ -290,6 +318,7 @@ def main(argv=None) -> int:
     ap.add_argument("--timeout", type=float, default=900, help="seconds to wait for the demo (slow answers)")
     ap.add_argument("--max-fails", type=int, default=20, help="failed logins per client per 10 min before a 429 (if the "
                     "tunnel hides client addresses this is shared by everyone: keep the password strong, not this low)")
+    ap.add_argument("--print-link", action="store_true", help="print the one-click path /__gate/k/<key> and exit")
     a = ap.parse_args(argv)
     pw = Path(a.password_file).expanduser().read_text().splitlines()[0].strip() if a.password_file \
         else os.environ.get("STOA_GATE_PASSWORD", "")
@@ -297,6 +326,9 @@ def main(argv=None) -> int:
         print("set a password of at least 8 characters: $STOA_GATE_PASSWORD or --password-file", file=sys.stderr)
         return 2
     g = Gate(a.upstream, pw, a.timeout, a.max_fails)
+    if a.print_link:
+        print(f"/__gate/k/{g.link}")
+        return 0
     try:
         srv = ThreadingHTTPServer((a.host, a.port), make_handler(g))
     except OSError as e:  # never let a Funnel point at whatever else owns the port

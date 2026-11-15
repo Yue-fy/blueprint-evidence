@@ -1155,7 +1155,7 @@ body[data-view="customer"] #ask textarea, body[data-view="customer"].answered #a
     --glass: rgba(29, 29, 31, 0.72); --card-glass: rgba(28, 28, 30, 0.86); --shadow: 0 4px 24px rgba(0, 0, 0, 0.5); --shadow-lift: 0 10px 34px rgba(0, 0, 0, 0.6);
     --canvas-3d: #1c1c1e;
     --cfff-fg: #ffffff;
-    --c0062c4-fg: #0071e3;
+    --c0062c4-fg: #0a84ff;
     --c0077ed-bg: #0d86ff;
     --c145f35-fg: #cde9d9;
     --c1d2b3a-fg: #dbe1e7;
@@ -1806,3 +1806,157 @@ body[data-view="customer"] #pane2d > .feat-bar { max-width: var(--fbroom, calc(1
 body[data-view="customer"] #toolbar.tight .seg button { padding-left: 9px; padding-right: 9px; }
 body[data-view="customer"] #toolbar.tighter > #sheetTabs { flex: 1 1 auto; min-width: 0; overflow-x: auto; overflow-y: hidden; scrollbar-width: thin; }
 body[data-view="customer"] #toolbar.tighter > #sheetTabs button { flex: 0 0 auto; }
+/* ---- captain 05:00 Sun (prompts/LANDING.md): the first screen sells in 30 s — hero with a real answer, proof strip,
+   six tools; the upload box stays right below the hero; the privacy paragraph is one line + Details ---- */
+.lh-top { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 48px; align-items: center; margin: 0 0 40px; }
+.lh-top .landing-hero { text-align: left; margin: 0; }
+.lh-top .lh-title, .lh-top .lh-sub, .pf-text, .lh-shot figcaption { text-wrap: balance; }
+.lh-top .landing-hero .lh-title { font-size: 56px; }
+/* UX L-m4 (REPORT-LANDING Pass 2): the proof strip on the first screen at 1440x900. The upload box is the hero grid's third
+   child: on wide screens a compact box under the hero's buttons, in the left column's empty space beside the answer image
+   (the image keeps its size: UX M-4 legibility); <= 1100 px it spans the row below as before; phones: hero, image, box. */
+.lh-top { grid-template-areas: "hero shot" "drop drop"; }
+.lh-top > .landing-hero { grid-area: hero; }
+.lh-top > .lh-shot { grid-area: shot; }
+.lh-top > .dropzone { grid-area: drop; margin: 0; }
+@media (min-width: 1101px) {
+  .landing-inner { padding-top: 40px; }
+  .lh-top { grid-template-areas: ". shot" "hero shot" "drop shot" ". shot"; grid-template-rows: 1fr auto auto 1fr; row-gap: 0; margin-bottom: 28px; }
+  .lh-top > .dropzone { margin-top: 28px; display: grid; grid-template-columns: 36px minmax(0, 1fr) auto; column-gap: 14px; row-gap: 6px;
+    align-items: center; justify-items: start; text-align: left; padding: 18px 20px 18px; border-radius: 20px; }
+  .lh-top > .dropzone .dz-ico { grid-column: 1; grid-row: 1; width: 36px; height: 36px; }
+  .lh-top > .dropzone .dz-title { grid-column: 2; grid-row: 1; font-size: 20px; line-height: 1.25; }
+  .lh-top > .dropzone .dz-btn { grid-column: 3; grid-row: 1; margin: 0; min-height: 44px; padding: 0 18px; font-size: 16px; }
+  .lh-top > .dropzone .dz-sub { grid-column: 1 / -1; max-width: none; font-size: 14.5px; line-height: 1.45; }
+  .lh-top > .dropzone .dz-more { grid-column: 1 / -1; max-width: none; margin: 0; font-size: 13px; }
+  .lh-top > .dropzone .dz-status { grid-column: 1 / -1; width: 100%; margin-top: 6px; }
+}
+.lh-ctas { display: flex; flex-wrap: wrap; gap: 12px; margin-top: 28px; }
+.lh-btn { display: inline-flex; align-items: center; gap: 8px; min-height: 48px; padding: 0 22px; border: 0; border-radius: 999px; font: inherit;
+  font-size: 17px; font-weight: 600; cursor: pointer; transition: transform .15s var(--ease), filter .15s var(--ease); }
+.lh-btn svg { width: 18px; height: 18px; flex: none; }
+.lh-btn.primary { background: var(--accent); color: #fff; }
+.lh-btn.secondary { background: var(--fill); color: var(--ink); }
+.lh-btn:hover { filter: brightness(1.06); }
+.lh-btn:active { transform: scale(.98); }
+.lh-shot { margin: 0; }
+.lh-shot-btn { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 0.9fr); align-items: center; gap: 8px; width: 100%; padding: 22px;
+  border: 0; border-radius: 24px; background: var(--panel); color: var(--ink); font: inherit; text-align: left; cursor: pointer;
+  box-shadow: var(--shadow-lift); transition: transform .25s var(--ease), box-shadow .25s var(--ease); }
+.lh-shot-btn:hover { transform: translateY(-2px); }
+.lh-ans { display: flex; flex-direction: column; align-items: flex-start; gap: 6px; padding: 0 8px; min-width: 0; }
+.lh-q { font-size: 15px; line-height: 1.35; color: var(--muted); }
+.lh-num { font-size: 96px; line-height: 1; font-weight: 700; letter-spacing: -0.04em; font-variant-numeric: tabular-nums; margin-top: 6px; }
+.lh-what { font-size: 21px; line-height: 1.25; font-weight: 500; }
+.lh-pill { display: inline-flex; align-items: center; gap: 8px; margin-top: 10px; padding: 6px 14px; border-radius: 999px; background: var(--ok-soft); color: var(--ok);
+  font-size: 16px; font-weight: 600; }
+.lh-pill i { width: 9px; height: 9px; border-radius: 50%; background: var(--ok-dot); }
+.lh-meta { margin-top: 6px; font-size: 14px; color: var(--muted); }
+.lh-plan { display: block; border-radius: 14px; background: #fff; padding: 6px; }
+.lh-plan img { display: block; width: 100%; height: auto; max-height: 470px; object-fit: contain; }
+.lh-shot figcaption { margin-top: 10px; font-size: 13px; line-height: 1.4; color: var(--muted); text-align: center; }
+/* captain SPRINT-0550 trim: sample cards = category + level, title, one source line (no scale / units line); credits line */
+.landing .pc-facts { display: none; }
+.landing-credits { margin: 6px auto 0; max-width: 820px; text-align: center; font-size: 12px; line-height: 1.5; color: var(--muted); }
+.proof { margin: 0 0 44px; }
+.proof-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 16px; }
+.pf-tile { background: var(--panel); border-radius: 20px; box-shadow: var(--shadow); padding: 22px 22px 20px; display: flex; flex-direction: column; gap: 4px; }
+.pf-big { white-space: nowrap; font-size: 34px; line-height: 1.1; font-weight: 700; letter-spacing: -0.02em; color: var(--ink); font-variant-numeric: tabular-nums; }
+.pf-text { font-size: 17px; line-height: 1.35; font-weight: 600; color: var(--ink); }
+.pf-small { margin-top: 2px; font-size: 13px; line-height: 1.4; color: var(--muted); }
+.proof-link { margin: 14px 0 0; text-align: center; }
+.proof-link .link { display: inline-flex; align-items: center; min-height: 44px; padding: 0 10px; font-size: 16px; font-weight: 600; text-decoration: none; }
+.proof-link .link:hover { text-decoration: underline; }
+.tools { margin: 0 0 48px; }
+.tool-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 16px; }
+.tool-tile { display: grid; grid-template-columns: 44px minmax(0, 1fr); grid-template-rows: auto auto; column-gap: 14px; row-gap: 2px; align-items: center;
+  text-align: left; min-height: 88px; padding: 18px 20px; border: 0; border-radius: 20px; background: var(--panel); color: var(--ink); font: inherit;
+  box-shadow: var(--shadow); cursor: pointer; transition: transform .25s var(--ease), box-shadow .25s var(--ease); }
+.tool-tile:hover { transform: translateY(-2px); box-shadow: var(--shadow-lift); }
+.tool-tile:active { transform: scale(.98); }
+.tool-tile.busy { cursor: progress; opacity: .7; }
+.tt-ico { grid-row: 1 / span 2; width: 44px; height: 44px; border-radius: 12px; display: grid; place-items: center; background: var(--accent-soft); color: var(--accent); }
+.tt-ico svg { width: 22px; height: 22px; fill: none; stroke: currentColor; stroke-width: 1.6; stroke-linecap: round; stroke-linejoin: round; }
+.tt-name { font-size: 17px; font-weight: 600; letter-spacing: -0.01em; }
+.tt-line { font-size: 14px; line-height: 1.4; color: var(--muted); }
+details.landing-foot { margin: 36px auto 0; max-width: 820px; text-align: center; font-size: 14px; color: var(--muted); }
+details.landing-foot > summary { list-style: none; cursor: pointer; display: inline-flex; flex-wrap: wrap; justify-content: center; align-items: center; gap: 6px;
+  min-height: 44px; padding: 0 10px; border-radius: 12px; }
+details.landing-foot > summary::-webkit-details-marker { display: none; }
+details.landing-foot .lf-more { color: var(--c0062c4-fg); font-weight: 600; }
+details.landing-foot[open] .lf-more { display: none; }
+details.landing-foot > p { margin: 8px 0 0; font-size: 13px; line-height: 1.5; }
+@media (max-width: 1100px) {
+  .lh-top { gap: 32px; }
+  .lh-top .landing-hero .lh-title { font-size: 46px; }
+  .pf-big { font-size: 28px; }
+  .pf-tile { padding: 18px 16px; }
+  .tool-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
+@media (max-width: 900px) { .proof-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+@media (max-width: 760px) {
+  .landing-inner { padding: 32px 16px 40px; }
+  .lh-top { grid-template-columns: minmax(0, 1fr); grid-template-areas: "hero" "shot" "drop"; gap: 24px; margin-bottom: 28px; }
+  .lh-top .landing-hero { text-align: center; }
+  .lh-top .landing-hero .lh-title { font-size: 40px; }
+  .lh-top .landing-hero .lh-sub { font-size: 18px; }
+  .lh-ctas { justify-content: center; margin-top: 20px; }
+  .lh-btn { font-size: 16px; padding: 0 18px; }
+  .lh-btn.primary { width: 100%; justify-content: center; }
+  .pf-tile { padding: 16px 14px; border-radius: 18px; }
+  .pf-big { font-size: 26px; }
+  .pf-text { font-size: 15px; }
+  .proof-grid, .tool-grid { gap: 12px; }
+  .landing h2 { font-size: 24px; }
+}
+@media (max-width: 560px) { .tool-grid { grid-template-columns: minmax(0, 1fr); } .tool-tile { min-height: 76px; padding: 14px 16px; } }
+@media (prefers-reduced-motion: reduce) { .lh-btn, .lh-shot-btn, .tool-tile { transition: none; } }
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) .lh-shot-btn { box-shadow: 0 0 0 1px rgba(255, 255, 255, .14), var(--shadow); }
+}
+/* phone 390 px (LANDING.md 5): 'Blueprint Evidence' never truncates; the top bar gives way on its right instead */
+@media (max-width: 600px) {
+  .topbar { padding: 0 12px; }
+  .topbar .tb-name { flex: 1 0 auto; overflow: visible; }
+  .topbar h1 { overflow: visible; text-overflow: clip; }
+}
+@media (max-width: 440px) { body[data-view="customer"] .topbar .view-toggle { display: none; } }
+/* the accuracy page shows the landing's four claims: '≈ €0.005' stays on one line in a quarter-width tile */
+.bench.customer .bc-tile .v { font-size: clamp(28px, 2.3vw, 44px); white-space: nowrap; }
+#samplesH { scroll-margin-top: 20px; }
+/* UX 05:12 M-2 / M-3: one short line over the drawing after a landing tool tile */
+.land-toast { position: fixed; left: 50%; bottom: 28px; transform: translateX(-50%); z-index: 70; display: flex; align-items: center; gap: 12px;
+  max-width: min(620px, calc(100vw - 32px)); padding: 12px 12px 12px 18px; border-radius: 16px; background: var(--ink); color: var(--bg);
+  font-size: 15px; line-height: 1.4; box-shadow: var(--shadow-lift); cursor: pointer; }
+.land-toast[hidden] { display: none; }
+.land-toast button { flex: none; width: 36px; height: 36px; border: 0; border-radius: 50%; background: rgba(128, 128, 128, .28); color: inherit; font: inherit; cursor: pointer; }
+@media (prefers-reduced-motion: no-preference) { .land-toast:not([hidden]) { animation: mcIn .25s ease-out; } }
+.pf-part { display: inline; }
+@media (min-width: 761px) { .pf-part { display: block; } .pf-sep { display: none; } }
+@media (max-width: 760px) {
+  .lh-shot-btn { padding: 14px; gap: 6px; border-radius: 20px; }
+  .lh-num { font-size: 64px; }
+  .lh-what { font-size: 17px; }
+  .lh-q, .lh-meta { font-size: 13px; }
+  .lh-pill { font-size: 14px; padding: 5px 11px; }
+  .lh-ans { padding: 0 2px; }
+}
+/* UX 05:13: the landing's 'Watch' button reads 'Open the phone version' on a phone (main.ts sends it to mobile.html) */
+.lh-btn .lb-phone { display: none; }
+@media (max-width: 760px) { .lh-btn .lb-phone { display: inline; } .lh-btn .lb-phone ~ .lb-wide, .lh-btn .lb-wide:has(+ .lb-phone) { display: none; } }
+.tool-tile[hidden] { display: none; }
+/* UX 05:13 L-M5: the tour caption's own 'Next ›', and the autoplay bar */
+#tourNote .tour-next { pointer-events: auto; margin-left: 12px; min-height: 32px; padding: 0 14px; border: 0; border-radius: 999px; background: rgba(255, 255, 255, .92);
+  color: #1d1d1f; font: inherit; font-size: 14px; font-weight: 600; cursor: pointer; white-space: nowrap; }
+#tourNote .tour-next:hover { background: #fff; }
+#tourNote.auto { position: relative; overflow: hidden; }
+#tourNote .tour-prog { position: absolute; left: 0; bottom: 0; height: 3px; width: 100%; background: rgba(255, 255, 255, .7); transform-origin: left;
+  animation-name: tourProg; animation-timing-function: linear; animation-fill-mode: forwards; }
+@keyframes tourProg { from { transform: scaleX(0); } to { transform: scaleX(1); } }
+@media (prefers-reduced-motion: reduce) { #tourNote .tour-prog { animation: none; transform: scaleX(1); opacity: .5; } }
+.proj-card[hidden] { display: none !important; }
+/* UX 05:21 MINOR: on a phone the tool toast spans the screen (it was a 190 px column on the right) */
+@media (max-width: 760px) { .land-toast { left: 16px; right: 16px; transform: none; max-width: none; } .land-toast:not([hidden]) { animation: none; } }
+/* hidden on the live demo (captain 21:2x): the drawing-vs-3D 'Differences found' panel lists mismatches that are not real errors */
+.diffs { display: none !important; }
+#diffPill, .diffs-pill, :has(> .dp-n) { display: none !important; }

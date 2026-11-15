@@ -13,6 +13,8 @@ const NEW_DRAWINGS = {
   inTen: 5,
   detail: "held-out sibling sheets 53 %, real drawings 51 %; scans and phone photos lower: 4 of 20 and 0 of 4 in the audit",
 };
+import { CLAIMS, DATASET_OVERALL as ALL } from "./claims";
+
 const esc = (s: unknown) => String(s ?? "").replace(/[&<>"']/g, (c) => `&#${c.charCodeAt(0)};`);
 
 type Run = {
@@ -61,9 +63,6 @@ function customerHtml(b: Bench): string {
   if (!p) return "";
   const main = t ?? p;
   const inTen = (x?: number | null) => (x === null || x === undefined ? "–" : String(Math.round(x * 10)));
-  const cents = main.usd_per_1k_q !== null && main.usd_per_1k_q !== undefined ? main.usd_per_1k_q * EUR_PER_USD * 100 : null;
-  const centsTxt = cents === null ? "–" : cents < 1 ? "under 1 cent" : `about ${Math.round(cents)} cent${Math.round(cents) === 1 ? "" : "s"}`;
-  const cal = main.calibration ?? p.calibration;
   const det = main.by_tier?.deterministic ?? p.by_tier?.deterministic;
   const share = det?.share ?? null;
   const shareWords = share === null ? "" : share >= 0.5 ? "Over half" : share >= 0.33 ? "A third" : `${Math.round(share * 100)}%`;
@@ -78,16 +77,11 @@ function customerHtml(b: Bench): string {
     <div class="bc-head"><h2>How accurate is it?</h2><button class="bn-close" aria-label="Close">✕</button></div>
     <p class="bc-lead">About <b>${inTen(main.accuracy)} in 10</b> answers right on the dataset's sealed test${vlm ? ` — a general AI model gets about <b>${inTen(vlm.accuracy)} in 10</b>` : ""}.
       <b>On new drawings from elsewhere, expect about ${NEW_DRAWINGS.inTen} in 10</b> (${esc(NEW_DRAWINGS.detail)}): that is why answers point to where they come from and say how sure they are.</p>
-    <div class="bc-tiles">
-      <div class="bc-tile"><div class="v">${pct(main.accuracy, 0)}</div><div class="k">Right answers</div>
-        <div class="s">${main.n.toLocaleString("en")} questions of the dataset's sealed test (its drawings kept apart while we built it; same collections)</div></div>
-      ${cal?.hi_conf_acc ? `<div class="bc-tile"><div class="v">${pct(cal.hi_conf_acc, 0)}</div><div class="k">Right on its most confident answers</div>
-        <div class="s">about ${inTen(cal.hi_conf_share)} in 10 answers are in this group (confidence 0.8 or more; on the dataset — new drawings give fewer sure answers); the others ask you to check</div></div>` : ""}
-      <div class="bc-tile"><div class="v">${cents === null ? "–" : cents < 1 ? "&lt;1¢" : `${Math.round(cents)}¢`}</div><div class="k">Per 1,000 questions</div>
-        <div class="s">${centsTxt} in computing cost on the dataset: mostly rules on a normal computer (scans and photos need text recognition and cost more)</div></div>
-      ${share !== null ? `<div class="bc-tile"><div class="v">${pct(share, 0)}</div><div class="k">${shareWords} answered with no AI</div>
-        <div class="s">read straight from the drawing's own lines, text and model data</div></div>` : ""}
-    </div>
+    <div class="bc-tiles">${CLAIMS.map((c) => `<div class="bc-tile"><div class="v">${esc(c.big)}</div><div class="k">${esc(c.text)}</div>
+        <div class="s">${esc(c.small)}</div></div>`).join("")}</div>
+    <p class="bc-note">The first three are measured on all 127,044 questions of the dataset (the final demo code, every question once,
+      on a Verda A100, no outside model): ${ALL.pct} of all ${ALL.scored} scored questions right (scanned apartment plans ${ALL.scanPct}). ‘Sure’ = confidence 0.8 or more; the answer card says ‘Very sure’ from 0.9 (${ALL.veryN} answers, ${ALL.veryPct} right). The cost is the GPU time of that run. Scans and phone
+      photos need text recognition and cost more. Private is on by default: while it is on, no outside model is called. ${share !== null ? `${shareWords} of the answers need no AI at all: they are read straight from the drawing’s own lines, text and model data.` : ""}</p>
     ${vlm && kinds.length ? `<div class="bc-chart"><h3>Our system vs. a general AI model</h3>
       <div class="bc-legend"><span><i class="ours"></i>Blueprint Evidence</span><span><i class="gen"></i>A general AI model (reads the image, no tools)</span></div>
       ${kinds.map((k) => `<div class="bc-row"><div class="bc-kind">${esc(KIND[k])}</div>

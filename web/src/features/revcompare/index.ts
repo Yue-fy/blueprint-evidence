@@ -155,7 +155,10 @@ function savePrices(p: Record<string, number>) {
     /* private window: prices last for this visit only */
   }
 }
-const OFF_MSG = "Revision compare is not switched on on this server (STOA_FEATURES=revcompare or all).";
+// visitor words (the demo shows it when an old ?features=revcompare link meets a server without it); the operator
+// hint goes to the console
+const OFF_MSG = "Revision compare isn't switched on on this server.";
+const OFF_HINT = "revcompare: the server has it off; start the API with STOA_FEATURES=…,revcompare (or all)";
 const NET_MSG = "Couldn't reach the server (it may be restarting for a moment).";
 /** An error in words: a dropped connection anywhere (our calls, the app's upload) reads as NET_MSG. */
 const msgOf = (e: unknown) => {
@@ -309,7 +312,7 @@ registerFeature("revcompare", (api: FeatureApi) => {
   /** A notice at the bottom of the screen for the one-click example while no drawing is open: the panel sits behind
    *  the landing page then, so its progress and errors would be invisible (UX M11: a failed first click did nothing). */
   let toastEl: HTMLDivElement | null = null;
-  function toast(msg: string | null, again?: () => void) {
+  function toast(msg: string | null, again?: () => void, closable = !!again) {
     if (!msg) {
       toastEl?.remove();
       toastEl = null;
@@ -321,7 +324,7 @@ registerFeature("revcompare", (api: FeatureApi) => {
       toastEl.setAttribute("role", "status");
       document.body.append(toastEl);
     }
-    toastEl.innerHTML = `<span>${esc(msg)}</span>${again ? `<button type="button" data-again>Try again</button>` : ""}${again ? `<button type="button" data-x aria-label="Close">×</button>` : ""}`;
+    toastEl.innerHTML = `<span>${esc(msg)}</span>${again ? `<button type="button" data-again>Try again</button>` : ""}${closable ? `<button type="button" data-x aria-label="Close">×</button>` : ""}`;
     toastEl.querySelector("[data-again]")?.addEventListener("click", () => { toast(null); again?.(); });
     toastEl.querySelector("[data-x]")?.addEventListener("click", () => toast(null));
   } // the visitor hid the marks ('Hide marks', Esc, the panel closed); a pick or a new compare shows them
@@ -824,7 +827,9 @@ registerFeature("revcompare", (api: FeatureApi) => {
       error = msgOf(e);
       panel.open();
       render(panel.el);
-      if (!api.file()) toast(`Couldn't open the example. ${error}`, () => void runDemo(id));
+      if (error === OFF_MSG) console.info(OFF_HINT);
+      // nothing to try again when the feature is off: just a close button
+      if (!api.file()) toast(`Couldn't open the example. ${error}`, error === OFF_MSG ? undefined : () => void runDemo(id), true);
       else toast(null);
     }
   }

@@ -17,7 +17,7 @@ import "./features"; // feature plug-ins (append-only list in web/src/features/i
 import tourSteps from "../fixtures/tour.json";
 import tourCustomer from "../fixtures/tour-customer.json";
 import { agrees, clarifyOf, wholeOutline, perSheet, printedDims, printedReading, printedSum, rivalReading, secondChoiceAnswer, type ClarifyOpt, diffQuestion, diffsHtml, heroHtml, isGuess, needsMeasuring, readerGuess, SCALE_PILL, roomPhrases, sizeCheck, calm, heroLoadingHtml, initialView, landingHtml, numbered, numberMax, connectionInfo, projectDifferences, spreadOf, approxEvidence, projectOf, PROJECTS, saveView, kindChoices, rankOf, recognitionHtml, recognitionMenuHtml, recognitionOf, type Difference, type FloorGroup, type Recognition, type View } from "./customer";
-import { chipsForSheet, floorName, markOwnUpload, ownUploadList, projectById, revisionExample, sameSheet, type Project } from "./projects";
+import { chipsForSheet, FEATURE_TILES, floorName, markOwnUpload, ownUploadList, projectById, revisionExample, sameSheet, type Project } from "./projects";
 import { dxfToPdf, matchEvidence, planGeo, type PlanGeo } from "./plangeo";
 import { Measure, doorScaleOf, fmtM, printedScaleOf, scaleFromAnswer, scaleGuessed, scaleLabel, type Scale } from "./measure";
 
@@ -936,9 +936,15 @@ function fitToolbar() {
   }
   window.addEventListener("resize", () => requestAnimationFrame(fitToolbar));
 }
+/** the accuracy page was opened from the landing's 'How we measured': closing it shows the landing again */
+let benchFromLanding = false;
 // while the accuracy report is open (customer view), the left panel shows a short caption instead of the last answer
 new MutationObserver(() => {
   const open = !$("bench").hidden;
+  if (!open && benchFromLanding) {
+    benchFromLanding = false;
+    if (isCustomer()) showLanding(true);
+  }
   document.body.classList.toggle("bench-open", open);
   $("benchCaption").hidden = !open;
   marksChip(); // UX 02:27: the chip belongs to the plan, not to the accuracy report
@@ -2211,6 +2217,8 @@ document.addEventListener("keydown", (e) => {
 });
 /** UX 23:30 M16: the guided demo can be left (× on its caption, or Next after the last step: back to the projects). */
 function endTour() {
+  tourAuto = false;
+  window.clearTimeout(tourTimer);
   tourStep = -1;
   const note = $("tourNote");
   note.innerHTML = "";
@@ -2218,7 +2226,36 @@ function endTour() {
   if (isCustomer()) v2d.insetTop = 64;
   $("tourBtn").textContent = "Guided demo";
 }
-$("tourBtn").addEventListener("click", async () => {
+/** UX 05:13 L-M5: 'Watch the 60-second guided demo' PLAYS the tour: after each step has finished loading, the next one
+ *  follows after TOUR_DWELL ms (a thin bar in the caption shows it); any click or key elsewhere pauses it (the caption's
+ *  'Next ›' still steps). The top bar's 'Guided demo' stays manual. */
+let tourAuto = false;
+let tourTimer = 0;
+const TOUR_DWELL = 7000;
+function tourPause() {
+  if (!tourAuto) return;
+  tourAuto = false;
+  window.clearTimeout(tourTimer);
+  $("tourNote").querySelector(".tour-prog")?.remove();
+  $("tourNote").classList.remove("auto");
+}
+document.addEventListener("pointerdown", (e) => {
+  if (tourAuto && !(e.target as HTMLElement).closest?.(".tour-next, [data-act=tour]")) tourPause();
+}, true);
+document.addEventListener("keydown", () => tourPause(), true);
+$("tourBtn").addEventListener("click", () => {
+  window.clearTimeout(tourTimer);
+  $("tourNote").querySelector(".tour-prog")?.remove();
+  void tourGo().finally(() => {
+    if (!tourAuto || tourStep < 0) return;
+    if (tourStep >= tourList().length - 1) return void (tourAuto = false); // the last step (accuracy) stays on screen
+    const note = $("tourNote");
+    note.classList.add("auto");
+    note.insertAdjacentHTML("beforeend", `<i class="tour-prog" style="animation-duration:${TOUR_DWELL}ms" aria-hidden="true"></i>`);
+    tourTimer = window.setTimeout(() => { if (tourAuto && tourStep >= 0) $("tourBtn").click(); }, TOUR_DWELL);
+  });
+});
+async function tourGo() {
   if (!tourBack && tourStep === tourList().length - 1) {
     endTour();
     $("bench").hidden = true; // UX F-5: ▸ after 7/7 left the Accuracy report open over the projects
@@ -2234,10 +2271,15 @@ $("tourBtn").addEventListener("click", async () => {
   $("tourBtn").textContent = `Demo ${tourStep + 1}/${tourList().length} ▸`;
   const note = $("tourNote");
   note.hidden = false;
-  note.innerHTML = `<b>${tourStep + 1}/${tourList().length}</b> ${esc(t.note)}<button type="button" class="tour-x" aria-label="End the guided demo" title="End the guided demo">×</button>`;
+  note.innerHTML = `<b>${tourStep + 1}/${tourList().length}</b> ${esc(t.note)}<button type="button" class="tour-next" title="Next step (→)">${tourStep === tourList().length - 1 ? "Done" : "Next ›"}</button><button type="button" class="tour-x" aria-label="End the guided demo" title="End the guided demo">×</button>`;
   note.querySelector(".tour-x")?.addEventListener("click", (e) => {
     e.stopPropagation();
+    tourPause();
     endTour();
+  });
+  note.querySelector(".tour-next")?.addEventListener("click", (e) => {
+    e.stopPropagation();
+    $("tourBtn").click();
   });
   // the caption sits under the floating Plan / 3D bar: the auto-zoom keeps the marks below it
   if (isCustomer()) v2d.insetTop = 64 + Math.ceil(note.getBoundingClientRect().height) + 16;
@@ -2255,7 +2297,7 @@ $("tourBtn").addEventListener("click", async () => {
   if (mode && !document.querySelector<HTMLButtonElement>(`#modes button[data-mode="${mode}"]`)?.disabled) setMode(mode);
   if (t.second) document.querySelector<HTMLButtonElement>("#card .second-btn")?.click();
   if (t.locate) document.querySelector<HTMLButtonElement>("#card .locate-btn")?.click();
-});
+}
 
 // --- customer view (default) / expert view ------------------------------------------------------------------
 let view: View = initialView();
@@ -2364,7 +2406,9 @@ $("privBtn").addEventListener("click", () => setPrivate(!privacy.on, true, true)
   // Gemini; P1: local = 99.7 % of the hybrid's accuracy): Private is the DEFAULT, Gemini / NVIDIA is the visitor's opt-in
   // (the button; '?private=0' links too). A visitor who switched it off WITH THE BUTTON keeps that (PRIV_KEY = '0').
   // T2 03:38: a '?private=0' link opened by someone who never chose it says so ('Private mode is off …'), never silently.
-  setPrivate(u !== null ? u === "1" : stored !== "0", u === "0" && stored !== "0");
+  // T2 c11: only the two values this page writes are a link's choice; anything else (?private=yes, =true, =on, a typo)
+  // falls back to the default rule (Private on unless this visitor switched it off), never silently off
+  setPrivate(u === "0" ? false : u === "1" ? true : stored !== "0", u === "0" && stored !== "0");
 }
 
 // the guided demo from the top bar also works from the home page
@@ -2380,6 +2424,8 @@ function showLanding(on: boolean) {
   if (!on && !el.hidden) pushAppEntry();
   el.hidden = !on;
   if (!on) return;
+  const toast = document.getElementById("landToast");
+  if (toast) toast.hidden = true;
   el.innerHTML = landingHtml(enabledFeature("privacy"));
   // UX C-4: the visitor's own drawings of this visit stay one click away after '‹ Projects' (a judge who uploads, then
   // peeks at a sample, lost the file); one tile per upload (a dropped set: its first sheet opens its pager)
@@ -2406,8 +2452,46 @@ function showLanding(on: boolean) {
       <p class="dz-op">For the operator: restart the server with JUNCTION_VENV set (${esc(c.error ?? "")}).</p>`;
   });
   el.querySelector<HTMLButtonElement>("[data-act=tour]")?.addEventListener("click", () => {
+    // UX 05:13 BLOCKER L-B1: the desktop tour does not fit a phone (its caption is a 90 px column, its only 'next' is
+    // hidden): there the button opens the phone page's own flow and says so
+    if (__HAS_MOBILE__ && window.matchMedia("(max-width: 760px)").matches) return void (window.location.href = "./mobile.html");
     showLanding(false);
+    if (tourStep >= 0) endTour();
+    tourAuto = true;
     $("tourBtn").click();
+  });
+  // captain 05:00 Sun (prompts/LANDING.md): 'Try a sample' scrolls to the samples; the hero's real answer opens itself;
+  // 'How we measured' opens the customer accuracy page (over that sample, so the page has a drawing behind it)
+  el.querySelector<HTMLButtonElement>("[data-act=samples]")?.addEventListener("click", () => {
+    const h = el.querySelector<HTMLElement>("#samplesH");
+    const reduce = window.matchMedia?.("(prefers-reduced-motion: reduce)").matches;
+    h?.scrollIntoView({ behavior: reduce ? "auto" : "smooth", block: "start" });
+    el.querySelector<HTMLElement>(".proj-card")?.focus({ preventScroll: true });
+  });
+  const heroSample = (q: string) => {
+    const p = projectById("swiss");
+    return p ? openProject(p, 0, q) : Promise.resolve();
+  };
+  el.querySelector<HTMLButtonElement>("[data-act=hero-sample]")?.addEventListener("click", () => void heroSample("How many doors on this floor?"));
+  el.querySelector<HTMLButtonElement>("[data-act=measured]")?.addEventListener("click", async () => {
+    if (!state.file) await heroSample("");
+    else showLanding(false);
+    if ($("bench").hidden) $("benchBtn").click();
+    benchFromLanding = true; // UX 05:12 (b): ✕ / Esc / 'Back' go back to the landing, not to an empty sheet
+  });
+  el.querySelectorAll<HTMLButtonElement>(".tool-tile").forEach((b) => b.addEventListener("click", () => void openTool(b.dataset.tool ?? "", b)));
+  // captain 05:22: revcompare is ON in the demo: the 'Compare revisions' tile and the gallery's revision card open F5's
+  // pair. A server without it: the tile becomes 'Order list' and the card gives its place back to the piping plan.
+  void fetch("/api/feat/revcompare/demo", { cache: "no-store" }).then((r) => (r.ok ? r.json() : null)).catch(() => null).then((j) => {
+    const ok = !!j && j.available !== false && (!Array.isArray(j.demos) || j.demos.some((d: { id?: string; available?: boolean }) => d.id === "dfe630" && d.available !== false));
+    if (ok) return;
+    const rev = el.querySelector<HTMLElement>('.tool-tile[data-tool="revisions"]'), ord = el.querySelector<HTMLElement>('.tool-tile[data-tool="orderlist"]');
+    if (rev && ord) { rev.hidden = true; ord.hidden = false; }
+    el.querySelectorAll<HTMLElement>(".proj-card.feat-tile[data-standin]").forEach((c) => {
+      c.hidden = true;
+      const s = el.querySelector<HTMLElement>(`.proj-card[data-project="${CSS.escape(c.dataset.standin ?? "")}"]`);
+      if (s) s.hidden = false;
+    });
   });
   el.querySelector<HTMLButtonElement>("[data-act=expert]")?.addEventListener("click", () => {
     showLanding(false);
@@ -2426,7 +2510,7 @@ function showLanding(on: boolean) {
   });
   // a feature's own demo tile (F5's revision pair): shown only when its route says it is on; a click opens its link
   el.querySelectorAll<HTMLButtonElement>(".proj-card.feat-tile").forEach((b) => {
-    void fetch(b.dataset.needs ?? "", { cache: "no-store" }).then(async (r) => {
+    if (!b.dataset.standin) void fetch(b.dataset.needs ?? "", { cache: "no-store" }).then(async (r) => {
       const j = r.ok ? await r.json().catch(() => ({})) : null;
       b.hidden = !j || j.available === false;
     }).catch(() => undefined);
@@ -2442,6 +2526,75 @@ $("projectsBtn").addEventListener("click", () => {
   endTour();
   showLanding(true);
 });
+/** One short line over the drawing after a landing tool tile opened a sample (UX 05:12 M-2 / M-3); click or 14 s hides it. */
+function landToast(msg: string) {
+  let t = document.getElementById("landToast");
+  if (!t) {
+    t = document.createElement("div");
+    t.id = "landToast";
+    t.className = "land-toast";
+    t.setAttribute("role", "status");
+    document.body.append(t);
+    t.addEventListener("click", () => (t!.hidden = true));
+  }
+  t.innerHTML = `<span>${esc(msg)}</span><button type="button" aria-label="Close">✕</button>`;
+  t.hidden = false;
+  const mine = msg;
+  setTimeout(() => { if (t && t.textContent?.startsWith(mine.slice(0, 20))) t.hidden = true; }, 14000);
+}
+/** A landing tool tile (captain 05:00 Sun, LANDING.md 3): open a sample with that tool when a route exists, else the
+ *  sample. The tools are plug-in buttons (#featBar / the answer's actions); they appear once the sheet (and, for the
+ *  report, its answer) is on screen, so wait for them a few seconds and leave the sample open if they never come. */
+async function openTool(tool: string, tile: HTMLElement) {
+  const waitClick = async (sel: string, ms = 15000) => {
+    const t0 = performance.now();
+    while (performance.now() - t0 < ms) {
+      const b = document.querySelector<HTMLButtonElement>(sel);
+      if (b && !b.hidden && !b.disabled) return void b.click();
+      await new Promise((r) => setTimeout(r, 250));
+    }
+  };
+  const sample = (id: string, q = "") => {
+    const p = projectById(id);
+    return p ? openProject(p, 0, q) : Promise.resolve();
+  };
+  tile.classList.add("busy");
+  try {
+    if (tool === "phone" && __HAS_MOBILE__) return void (window.location.href = "./mobile.html");
+    if (tool === "revisions") {
+      // F5's real DfE revision pair, when its route is served (off on some servers): else the school sample
+      const j = await fetch("/api/feat/revcompare/demo", { cache: "no-store" }).then((r) => (r.ok ? r.json() : null)).catch(() => null);
+      if (j && j.available !== false) return void (window.location.href = FEATURE_TILES[0]?.link ?? "./?revdemo=dfe630");
+      await sample("dfe-school");
+      // UX 05:12 M-2: never a silent stand-in: say why there is no comparison on screen
+      return landToast("Comparing two issues is switched off on this server today, so this opens a sample drawing instead. Ask about it the usual way.");
+    }
+    if (tool === "takeoff") {
+      await sample("dfe-school");
+      return void (await waitClick('#featBar .feat-btn[data-feature="takeoff"][data-id="takeoff"]'));
+    }
+    if (tool === "3d") {
+      await sample("esplanades");
+      return void (await waitClick('#modes button[data-mode="3d"]', 8000));
+    }
+    if (tool === "orderlist") {
+      await sample("dfe-school");
+      return void (await waitClick('#featBar .feat-btn[data-feature="orderlist"][data-id="orderlist"]'));
+    }
+    if (tool === "fix") {
+      await sample("swiss", "How big is apartment B?");
+      // UX 05:12 M-3: the tools are on the right-click menu (long-press on touch), so say where they are
+      return landToast(`${matchMedia("(pointer: coarse)").matches ? "Press and hold" : "Right-click"} a room on the plan to trace or edit its outline, or a door to take it out of the count or add one we missed: the answer follows.`);
+    }
+    if (tool === "report") {
+      await sample("swiss", "How many doors on this floor?");
+      return void (await waitClick('#hero .hero-act[data-feature="report"][data-id="report"], #featBar .feat-btn[data-feature="report"][data-id="report"]'));
+    }
+    await sample("swiss");
+  } finally {
+    tile.classList.remove("busy");
+  }
+}
 /** UX 23:30 M1: browser Back from a project returned to about:blank (every step replaces the history entry). Leaving the
  *  projects page pushes ONE entry; Back pops it and shows the projects again; Forward reloads that entry's URL (file + q). */
 let appEntry = false;

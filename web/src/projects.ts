@@ -123,7 +123,7 @@ export const FEATURE_TILES: FeatureTile[] = [
   { id: "dfe-revision", name: "Primary school, first floor · two issues", place: "Department for Education baseline designs, England, 2014",
     facts: ["Issued twice", "Classrooms 62 → 55 m²"], contents: "Two versions of one sheet", ask: "What changed between the two versions?",
     credit: "Education Funding Agency (DfE) baseline designs, 2014, Open Government Licence v3.0",
-    link: "?features=revcompare&revdemo=dfe630", needs: "/api/feat/revcompare/demo" },
+    link: "./?revdemo=dfe630", needs: "/api/feat/revcompare/demo" }, // no ?features= (UX 05:04: a remembered list switches the rest off)
 ];
 
 /** UX M11 (F5 23:39): the revision example uploads its two files under fixed names (stoa/features/revcompare.py
