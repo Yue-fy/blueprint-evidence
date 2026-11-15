@@ -304,6 +304,8 @@ The main settings are in `.env.example`. Every environment variable the code rea
 
 ## Tech challenge notes
 
+Full texts for the Verda, Google Gemini and NVIDIA Nemotron tracks: [docs/TECH_CHALLENGES.md](docs/TECH_CHALLENGES.md).
+
 How we meet Stoa's four criteria (accuracy, verifiable reasoning, creativity, low inference cost) and the full
 Gemini, NVIDIA and Verda texts: [SUBMISSION.md](SUBMISSION.md). The Verda process document: [docs/VERDA.md](docs/VERDA.md).
 

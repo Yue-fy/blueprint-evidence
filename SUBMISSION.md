@@ -75,9 +75,10 @@ sets of 25+ pages do not always find the right page. The first answer on a new s
 
 **Ambition.** We used Verda to do what our shared dev box cannot: score every change on Stoa's *whole* dataset
 (127,044 questions on 5,939 drawings) instead of a 2,000-question sample, and train our own vision model overnight.
-One RTX PRO 6000 answered all 127,044 questions in 17.2 minutes for €0.75 (82.6% right; counts exact, areas ±2%).
-We re-ran the full set on each night's integration code (82.61%, 82.64%, then 82.65% on the final demo code, every
-deterministic reader identical). On spot A100s we trained a door/window symbol detector from 557,376 free synthetic
+One RTX PRO 6000 answered all 127,044 questions in 17.2 minutes for €0.75 (counts exact, areas ±2%).
+We re-ran the full set on each night's integration code as a regression gate; the final demo code took 34.8 min on a
+spot A100 for €0.63, ≈ €0.005 per 1,000 questions, every deterministic reader identical, and the answers it marks as
+sure were right 98.3% of the time. On spot A100s we trained a door/window symbol detector from 557,376 free synthetic
 boxes, then fine-tuned it six times as real sheets exposed failures (scans, sliding / folding doors, pipework).
 
 **Fit.** *GPU instances*: RTX PRO 6000 is our dev GPU, so numbers transfer 1:1, and the `.CC` variant keeps drawings
@@ -90,7 +91,7 @@ client creates one instance, ships a git bundle, runs, and a watcher pulls the r
 vs the previous model, every clean control unchanged). Exam path at scale: every dataset file uploaded alone, the
 way Stoa tests; on the final code (11,891-question sample) accuracy held and confident-wrong answers fell from 244 to under 60.
 GPU offload prototype: our detector service sends a new sheet to a GPU twin on Verda: 15 s instead of 4+ min for a
-6,000 px scan, identical boxes; one script brings a twin up in 293 s. Spend: ≈ €28 of the €200 credits by 03:20 Sun (≈ €30 when the last instance is deleted at 05:10).
+6,000 px scan, identical boxes; one script brings a twin up in 293 s. Spend: ≈ €30 of the €200 credits; the last instance was deleted at 05:20 Sun.
 
 **Path to scale.** Questions are independent per drawing. One RTX PRO 6000 + 30 vCPU serves 123–135 dataset questions/s,
 so we add GPUs together with their vCPUs (8 GPUs ≈ 8×); a 10× larger question set is a ~€8 job. A fresh upload
@@ -103,8 +104,8 @@ retraining as a scheduled spot job.
 instance, ships our code, downloads Stoa's public dataset next to the GPU, runs the job, and a watcher pulls the
 results and deletes the instance. On one RTX PRO 6000 with confidential computing in Finland, our whole pipeline
 (Qwen3-VL-8B with our own LoRA, served by vLLM) answered all 127,044 dataset questions in 17 minutes for €0.75, so
-every change can be scored on the full set; the final gate code scored 82.64% there (34.8 min on an A100, €0.63),
-with every deterministic reader identical. On A100 spot instances we trained the door and window symbol detector
+every change can be scored on the full set; the final code ran there in 34.8 min on an A100 for €0.63 (≈ €0.005 per
+1,000 questions), with every deterministic reader identical. On A100 spot instances we trained the door and window symbol detector
 behind door counts on uploads, from free synthetic labels, and fine-tuned it for scans. Process document:
 docs/VERDA.md in the repository.
 
