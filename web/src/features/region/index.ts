@@ -31,6 +31,7 @@ const SUGGEST: { label: string; q: string }[] = [
   { label: "How many windows in this area?", q: "How many windows are in this area?" },
   { label: "Total area of the rooms in here", q: "What is the total area of the rooms in this area?" },
   { label: "Area of the room in here", q: "What is the area of the room in this area?" },
+  { label: "Size of the room in here (length × width)", q: "What are the dimensions of this room?" },
 ];
 
 const css = (el: HTMLElement, s: Partial<CSSStyleDeclaration>) => Object.assign(el.style, s);

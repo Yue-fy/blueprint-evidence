@@ -174,8 +174,7 @@ def test_a_view_title_counted_as_a_room_is_doubted():
 
 def test_uncounted_count_with_a_high_own_confidence_keeps_it_below_very_sure():
     from stoa.trust import sanity as SA
-    a = _ans(1, [], conf=0.97, unit="count", solver="pipeline/vlm_lora",
-             trace=['recognised: {"kind": "cubicasa_plan", "confidence": 0.99}', "intent: count bathroom [drawing] (lang en)"])
+    a = _ans(1, [], conf=0.97, unit="count", solver="pipeline/vlm_lora", trace=["intent: count bathroom [drawing] (lang en)"])
     a = SA.uncounted_guard("How many bathrooms are there?", a) if hasattr(SA, "uncounted_guard") else a
     a = S.mark_support("How many bathrooms are there?", a)
     assert (a.support or {}).get("state") == "unlocated"

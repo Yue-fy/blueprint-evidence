@@ -163,6 +163,14 @@ def _unused_classes(question: str, ans: Answer) -> set[str]:
             if any(re.match(r"\s+(?:\w+\s+)?(?:" + rx[t].pattern + ")", nxt, re.I) for t in named if t != r):
                 named.discard(r)
                 break
+            if os.environ.get("STOA_G1_ROOM_SCOPE", "1") != "0" and re.match(r"\W*how many\b", question, re.I) and \
+                    re.search(r"\b(?:does|do|did|has|have|in|into|inside|within|of|to|for|from|at|off|serving)\s+(?:the|"
+                              r"this|that|each|every|our|a|an)\s+(?:\w+\s+)?$", question[:m.start()], re.I) and \
+                    any(rx[t].search(question[:m.start()]) for t in named if t != r and t not in _ROOMISH):
+                # DR 02:04: 'How many doors does the kitchen have?' -> openings 4 = gold was flagged 'never mentions
+                # kitchen' and sent to the agent: the room after does / in / into the … is the count's scope
+                named.discard(r)
+                break
     if len(named) < 2:
         return set()
     text = " ".join([*map(str, ans.trace), *(e.note or "" for e in ans.evidence)])
@@ -736,6 +744,11 @@ _COUNT_FILLER = re.compile(
     r"totalt|combien|de|d|y|a|il|dans|le|la|les|sur|dessin|sont|au|total|quant[ie]|ci|sono|nel|nella|disegno|pianta|"
     r"in totale|cu[áa]nt[oa]s|hay|en|el|plano|hoeveel|zijn|er|op|tekening|het)\b", re.I)
 
+# 'whole' / 'entire' in fi / sv / de / fr: 'koko pohjapiirustuksessa' = on the whole plan (F4 02:59: doors 10 @0.2 vlm_lora
+# instead of openings 115, only because 'koko' was left over)
+_WHOLE_FILLER = re.compile(r"\b(?:koko|kokonaan|kaiken|kaikkiaan|hela|helt|ganze[nmrs]?|gesamte[nmrs]?|entier|enti[èe]re|"
+                           r"tout|toute)\b", re.I)
+
 
 def _opening_count_english(question: str) -> str | None:
     """F4 20:20 (a): 'Kuinka monta ovea piirustuksessa on?' (DfE PDF) never reached openings / door_detect (their
@@ -766,6 +779,8 @@ def _opening_count_english(question: str) -> str | None:
     rest = re.sub(r'"[^"]{2,40}"', " ", hinted)
     rest = re.sub(rf"\b(?:{_OPENING_WORDS[kind]})\b", " ", rest, flags=re.I)
     rest = _COUNT_FILLER.sub(" ", rest)
+    if os.environ.get("STOA_G1_WHOLE_PLAN", "1") != "0":  # F4 02:59 'Kuinka monta ovea koko pohjapiirustuksessa on?'
+        rest = _WHOLE_FILLER.sub(" ", rest)
     if re.search(r"[A-Za-zÀ-ÿ]{2,}|\d", rest) or len(gloss) > 1:
         return None
     if not re.search(r"\b(?:kuinka monta|montako|wie viele|hur m[åa]nga|combien|quant[ie]|cu[áa]nt[oa]s|hoeveel|"
@@ -1013,6 +1028,130 @@ def _paren_english_area(question: str) -> str | None:
     if _WING_WORDS.search(rest):
         return None  # a wing named some other way: the translator keeps it
     return f"What is the floor area of the {name}{unit}?"
+
+
+_AREA_CUE_ML = re.compile(r"wie gro(?:ß|ss)|fl[äa]che|quadratmeter\w*|kuinka (?:suuri|iso|laaja)|pinta-?ala\w*|neli[öo]\w*|"
+                          r"hur stor|\byta\b|ytan\b|kvadratmeter|kvadrat|superficie|surface|quelle est la taille|grandeur|"
+                          r"quanto [èe] grande|m²|\bm2\b|ft²|\bft2\b|neli[öo]jalka\w*|quadratfu(?:ß|ss)\w*|kvadratfot", re.I)
+_AREA_FILLER_ML = re.compile(r"\b(?:wie|viele?|hat|ist|der|die|das|des|dem|den|in|im|auf|von|vom|gro(?:ß|ss)|kuinka|on|"
+                             r"mik[äa]|mit[äa]|paljonko|onko|har|"
+                             r"suuri|iso|laaja|t[äa]m[äa]n|piirustuksen|piirustuksessa|kuvassa|hur|stor|[äa]r|det|den|"
+                             r"p[åa]|ritningen|planen|i|quelle|est|la|le|de|du|taille|quanto|[èe]|grande|il|lo|della|"
+                             r"del|plan|grundriss|zeichnung|neli[öo]metrein[äa]|neli[öo]metri[äa]|quadratmetern|"
+                             r"kvadratmeter|square|metres|meters|m²|m2|ft²|ft2)\b", re.I)
+
+
+def _gloss_english_area(question: str) -> str | None:
+    """X1 02:24 (d31 -> d32 loss on the wild sealed set, kind only; public repro MFC A-103 'Wie groß ist der Abstellraum in
+    Quadratmetern?' -> intent 'area room (lang de)', no translation (a rule language), area_tags abstains on German cues,
+    raster 165.92 @0.39; the English 'storage room' -> area_tags @0.89): a non-English AREA question whose only content
+    is ONE glossary room word plus area cues / filler -> 'What is the floor area of the <English room>?', so it takes the
+    same reader path as its English twin. Uploads and dataset alike (the rewrite only names the room); kill switch."""
+    from stoa.llm import lang_guess
+    from stoa.router.intent import parse
+
+    if os.environ.get("STOA_G1_GLOSS_AREA", "1") == "0" or lang_guess(question) == "en":
+        return None
+    if not _AREA_CUE_ML.search(question) or parse(question).task != "area":
+        return None
+    hinted, gloss = _room_gloss(question)
+    if len(gloss) != 1:
+        return None
+    rest = _AREA_CUE_ML.sub(" ", re.sub(r'"[^"]*"', " ", hinted))  # cue words first: 'pinta-ala' is no Spanish 'ala'
+    if re.search(r"\d|,|\b(?:und|och|ja|et|e|y|en|and|plus|sowie|samt|ohne|ilman|utan|sans|senza|ausser|außer|paitsi)\b",
+                 rest, re.I) or _TOTAL_WORDS.search(rest) or _WING_WORDS.search(rest) or \
+            any(re.search(p, rest, re.I) for p in _OPENING_WORDS.values()):
+        return None
+    left = [w for w in re.findall(r"[^\W\d_]+", _AREA_FILLER_ML.sub(" ", rest))]
+    if left:  # another content word (a qualifier, a second object): the translator keeps it
+        return None
+    unit = (" in square feet" if re.search(r"ft²|\bft2\b|sq\.? ?ft|neli[öo]jalka|quadratfu|kvadratfot", question, re.I)
+            else "")
+    return f"What is the floor area of the {gloss[0][1]}{unit}?"
+
+
+# F4 02:59 (Stoa's DfE L00 PDF, cold upload, Private): the English 'What is the total floor area of this plan?' = footprint
+# GIA 1,670.8 @0.86 in 0.6 s, but 'Mikä on tämän pohjapiirustuksen kokonaispinta-ala?' -> agent 1200 @0.44, 'Mikä on
+# kerroksen kokonaispinta-ala?' -> agent 55.72, 'Mikä on pohjapiirustuksen pinta-ala?' -> plan_rooms 16.04 @0.62 (a room),
+# 'Vad är planens totala yta?' -> plan_rooms 51.29 @0.77, 'Wie groß ist die Gesamtfläche des Grundrisses?' -> raster 1200:
+# no reader of the whole sheet reads fi / sv / de whole-plan wordings. Every token must be one of these classes.
+_WP_AREA = (r"kokonais(?:pinta-?)?ala\w*|(?:lattia)?pinta-?ala\w*|kerrosala\w*|bruttoala\w*|huoneistoala\w*|neli[öo]\w*|"
+            r"yta|ytan|golvyta\w*|totalyta\w*|bruttoarea\w*|bruttoyta\w*|v[åa]ningsyta\w*|bostadsyta\w*|"
+            r"fl[äa]che|gesamtfl[äa]che\w*|grundfl[äa]che\w*|geschossfl[äa]che\w*|bruttogeschossfl[äa]che\w*|"
+            r"bruttogrundfl[äa]che\w*|bgf|quadratmeter\w*|kvadratmeter\w*|m2|m²|ft2|ft²|gro(?:ß|ss)|stor|suuri|iso|laaja|"
+            r"surface|superficie")
+_WP_GROSS = re.compile(r"kerrosala|bruttoala|bruttoarea|bruttoyta|bruttogeschoss|bruttogrund|\bbgf\b", re.I)
+_WP_TOTAL = r"koko|kokonais\w*|yhteens[äa]|total[ae]?|totalt|hela|gesamt\w*|ganze[nmrs]?|insgesamt|sammanlag\w*|tout|toute"
+_WP_PLAN = (r"pohjapiirustu\w*|pohjapiirro\w*|piirustu\w*|pohja[n]?|kerro(?:s|ksen|kseen|ksessa|kselle)|taso[n]?|"
+            r"plan|planen|planens|plans|planet|planets|ritning\w*|planritning\w*|pohjakuva\w*|v[åa]ning\w*|grundriss\w*|geschoss\w*|etage|"
+            r"stockwerk\w*|zeichnung|plancher|niveau")
+_WP_APT = r"asunno\w*|asunto\w*|huoneisto\w*|l[äa]genhet\w*|wohnung\w*|appartement\w*"
+_WP_FILL = (r"mik[äa]|mit[äa]|on|t[äa]m[äa]n|t[äa]m[äa]|paljonko|kuinka|vad|[äa]r|den|det|hur|wie|ist|die|der|des|das|"
+            r"dem|von|vom|im|in|auf|i|p[åa]|f[öo]r|av|of|quelle|est|la|le|de|du|square|metres|meters|dieser|diese|dieses|diesem|diesen|"
+            r"denna|detta|t[äa]ss[äa]|cette|ce|cet|"
+            r"neli[öo]metrein[äa]|neli[öo]metri[äa]|quadratmetern|kvadratmeter")
+_WP_TOKEN = re.compile(rf"(?:{_WP_AREA}|{_WP_TOTAL}|{_WP_PLAN}|{_WP_APT}|{_WP_FILL})", re.I)
+
+
+def _whole_plan_english_area(question: str) -> str | None:
+    """A non-English AREA question about the WHOLE plan / floor / flat (no room named, no number, every word an area
+    cue, a 'total / whole' word, a plan / floor word, an apartment word or filler) -> the English wording the sheet
+    readers answer: 'What is the total floor area of this plan?' ('kerrosala' / 'bruttoala' / BGF / bruttoarea: gross),
+    or '... of this apartment?' when only the flat is named. Needs a total, plan or apartment word ('Mikä on pinta-ala?'
+    alone stays as asked). Kill switch STOA_G1_WHOLE_PLAN=0."""
+    from stoa.llm import lang_guess
+    from stoa.router.intent import parse
+
+    if os.environ.get("STOA_G1_WHOLE_PLAN", "1") == "0" or lang_guess(question) == "en":
+        return None
+    if parse(question).task not in ("area", "text") or _room_gloss(question)[1]:
+        return None  # 'text': sv 'Vad är den totala golvytan på planen?' (the parser misses 'golvytan'; tokens decide)
+    toks = re.findall(r"[^\W_]+(?:-[^\W_]+)*|[²]", question.lower())
+    toks = [t for t in toks if t != "²"]
+    if not toks or any(re.search(r"\d", t) and t not in ("m2", "ft2") for t in toks):
+        return None
+    if not all(_WP_TOKEN.fullmatch(t) for t in toks):
+        return None
+    has = {k: any(re.fullmatch(rx, t, re.I) for t in toks) for k, rx in (("area", _WP_AREA), ("total", _WP_TOTAL),
+                                                                          ("plan", _WP_PLAN), ("apt", _WP_APT))}
+    # the total / plan / flat is inside the compound: 'kokonaispinta-ala' / 'Gesamtfläche' / 'totalyta' = total area,
+    # 'kerrosala' / 'bruttoala' / BGF = a whole floor's gross area, 'huoneistoala' = the flat's area
+    has["total"] = has["total"] or any(re.match(r"kokonais|gesamt|total", t, re.I) for t in toks)
+    has["plan"] = has["plan"] or bool(_WP_GROSS.search(question))
+    has["apt"] = has["apt"] or any(re.match(r"huoneistoala|bostadsyta", t, re.I) for t in toks)
+    area_word = any(re.fullmatch(_WP_AREA, t, re.I) and not re.fullmatch(r"gro(?:ß|ss)|stor|suuri|iso|laaja", t, re.I)
+                    for t in toks)
+    if not (area_word or (has["area"] and has["apt"])) or not (has["total"] or has["plan"] or has["apt"]):
+        return None
+    unit = (" in square feet" if re.search(r"ft²|\bft2\b|neli[öo]jalka|quadratfu|kvadratfot", question, re.I) else "")
+    if has["apt"] and not has["plan"]:
+        return f"What is the total floor area of this apartment{unit}?"
+    kind = "gross" if _WP_GROSS.search(question) else "total"
+    return f"What is the {kind} floor area of this plan{unit}?"
+
+
+_BARE_TOTAL_Q = re.compile(
+    r"^\s*(?:(?:what\s+is|what'?s|how\s+big\s+is|how\s+large\s+is|(?:can\s+you\s+)?(?:give|tell)\s+me|calculate|"
+    r"find)\s+)?(?:the\s+)?total\s+(?P<k>area|size|square\s+footage|sq\.?\s*ft|square\s+met(?:re|er)s)"
+    r"(?:\s+(?:of|on|for|in)\s+(?:this|the)\s+(?:whole\s+|entire\s+)?(?:plan|drawing|sheet|floor\s*plan|layout|page))?"
+    r"(?:\s+in\s+(?P<u>square\s+(?:metres|meters|feet)|m2|m²|sq\.?\s*ft|ft2|ft²|sf))?\s*[?.!]*\s*$", re.I)
+
+
+def _bare_total_area(question: str) -> str | None:
+    """'What is the total area?' / 'Total area of this drawing?' / 'What's the total square footage?' (English, nothing
+    else named) on Stoa's DfE L00 PDF -> agent 1200 @0.44, while 'What is the total floor area of this plan?' = footprint
+    1,670.8 @0.86: VP's footprint reads only 'floor area' / plan wordings. The bare total of a sheet is its total floor
+    area -> that wording. OFF by default (STOA_G1_BARE_TOTAL=1 turns it on), measured 03:25 on 7 sheets (upload, Gemini
+    off): DfE L00 agent 1200 -> 1,670.8, CC5K 9540 agent 44.7 -> 33.5 (gold), EFA d7c5a1e97b area_tags 2139 (tag sum) ->
+    2302 (printed First-floor GIFA), but AFCEC A-101 area_tags 3,275 ft2 (both modules' tags) -> footprint 184.4 m2 (one
+    module's outline only): turn on once footprint covers every plan view of a sheet."""
+    if os.environ.get("STOA_G1_BARE_TOTAL", "0") != "1" or os.environ.get("STOA_G1_WHOLE_PLAN", "1") == "0":
+        return None
+    m = _BARE_TOTAL_Q.match(question or "")
+    if not m:
+        return None
+    feet = re.search(r"feet|ft|footage|\bsf\b", (m.group("k") or "") + " " + (m.group("u") or ""), re.I)
+    return f"What is the total floor area of this plan{' in square feet' if feet else ''}?"
 
 
 def _ask_context(path: str, picked):
@@ -1509,7 +1648,14 @@ def _area_product(question: str, ans: Answer) -> Answer:
     if ans.value is None or isinstance(ans.value, bool) or not isinstance(ans.value, str) or \
             os.environ.get("STOA_G1_AXB", "1") == "0":
         return ans
+    if (ans.solver or "").split("/")[-1] in (*_GUESSERS, "agent", "gemini_agent"):
+        return ans
     v = ans.value.strip()
+    if float(ans.confidence or 0) <= SHAPE_CAP and not re.search(r"\d\s*['’]", v):
+        # QA 02:02 (DfE L00 1920-px screenshot): '20m by 20m' @low = the scale bar's labels, not a printed room size:
+        # never multiplied into a 400 m² (a low-confidence feet-inch pair is a printed dimension string: kept, d1-aw29o
+        # raster "60'-0'' x 50'-0''" @0.3 -> 3000 ft² = gold)
+        return ans
     if "\n" in v or len(v) > 80 or not _AXB_AREA_Q.search(question) or _AXB_SIDE_Q.search(question):
         return ans
     head = re.sub(r"\([^)]*\)", " ", v).strip(" ;,.")
@@ -1654,7 +1800,15 @@ _FLOOR_AREA_Q = re.compile(r"^\W*(?:what(?:'s| is)|how (?:big|large|much)(?: is)
 _ROOMS_Q = re.compile(r"^\W*how many rooms(?:\s+(?:are|is) (?:there|shown|drawn))?(?:\s+(?:on|in)\s+(?:this|the)\s+"
                       r"(?:plan|floor|drawing|sheet|level|page))?(?:\s+(?:are|is) (?:there|shown|drawn))?\W*$", re.I)
 _LARGEST_Q = re.compile(r"\b(?:largest|biggest)\s+room\b", re.I)
+# PR cycle 6: a question that names ONE apartment ("the largest room in apartment A", "der Wohnung C") is not a
+# whole-floor question; the sheet-wide takeoff / plan_rooms cannot tell which rooms form that apartment
+_APARTMENT_REF = re.compile(r"\b(?i:apartments?|flats?|wohnung(?:en)?|whg\.?|appartements?|appartamento|lägenhet|asunto)"
+                            r"\s*(?:[A-Z]{1,2}\d{0,2}|\d{1,3}[A-Z]?)\b")
 _NOT_A_ROOM_TYPES = ("circulation",)  # a corridor / lobby / stair is a space, not 'the largest room'
+# F4 01:55 (IFC duplex upload, F2's 'ifc model' takeoff): 'How big is the largest room?' = 'Roof R301' 135.15 m² (room_type
+# 'other'): a roof / attic / void / shaft / outdoor space is not a room
+_NOT_A_ROOM_NAME = re.compile(r"(?i)\b(?:roofs?|attic|void|shaft|riser|terrace|balcon(?:y|ies)|canopy|plenum|"
+                              r"crawl\s*space|patio|porch|carport)\b")
 
 
 def _takeoff_rows(st: dict, quantity: str = "area") -> list[dict]:
@@ -1722,6 +1876,8 @@ def _takeoff_floor(question: str, path: str, task: str) -> Answer | None:
             else "largest" if task == "area" and _LARGEST_Q.search(q) else None)
     if kind is None:
         return None
+    if _APARTMENT_REF.search(question) or _APARTMENT_REF.search(q):  # PR c6: one apartment, not the whole floor
+        return None
     st, summ = _takeoff_of(path)
     if not isinstance(st, dict) or not summ or summ.get("printed") or summ.get("printed_by_type"):
         return None
@@ -1740,7 +1896,8 @@ def _takeoff_floor(question: str, path: str, task: str) -> Answer | None:
     head = f"this sheet's finished takeoff (F2: {rooms.get('measured', len(rows))} of {rooms.get('labelled', '?')} room " \
            f"labels measured{f', scale {sc}' if sc else ''})"
     if kind == "largest":
-        cand = [r for r in rows if rtype(str(r.get("item") or "")) not in _NOT_A_ROOM_TYPES]
+        cand = [r for r in rows if rtype(str(r.get("item") or "")) not in _NOT_A_ROOM_TYPES and not
+                _NOT_A_ROOM_NAME.search(str(r.get("item") or ""))]
         if not cand:
             return None
         r = max(cand, key=lambda r: float(r["value"]))
@@ -3044,6 +3201,15 @@ class Pipeline(BaseSolver):
         pe = _paren_english_area(question)
         if pe is not None:
             return pe, f"read by the rules as \"{pe}\" (the room's English name was given in parentheses)", None
+        ga = _gloss_english_area(question)
+        if ga is not None:
+            return ga, f"read by the rules as \"{ga}\" (an area question naming one room; room name from the glossary)", None
+        wp = _whole_plan_english_area(question)
+        if wp is not None:
+            return wp, f"read by the rules as \"{wp}\" (an area question about the whole plan; no translation model)", None
+        bt = _bare_total_area(question)
+        if bt is not None:
+            return bt, f"read as \"{bt}\" (the total area of a sheet = its total floor area)", None
         tc = _terse_count(question)
         if tc is not None:
             return tc, f"read as \"{tc}\" (a keyword-only count question)", None

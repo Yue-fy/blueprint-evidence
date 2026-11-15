@@ -16,9 +16,9 @@ plus Gemini 3.1 Pro and NVIDIA Nemotron for unsure answers only.
 
 | What we measured | Mode | Result | Code |
 |---|---|---|---|
-| Stoa's four example sheets, 90 questions in Stoa's own kinds (room and type areas, baseboards, slab areas, door counts, piping) | private | **91.1%** (82 / 90) | `e4a166b` |
+| Stoa's four example sheets, 90 questions in Stoa's own kinds (room and type areas, baseboards, slab areas, door counts, piping) | private | **91.1%** (82 / 90) | `1389c6a` |
 | The same 90 questions asked directly to Gemini 3.1 Pro / Qwen3-VL-8B, without our pipeline | hosted / local | 61%, no evidence / 26% | |
-| Sibling sheets of Stoa's four drawing sets that nobody tuned on (173 questions, scored by our gatekeeper, aggregates only) | private | **64.7%** (112 / 173; 61.3% at `b8146dd`) | `e4a166b` |
+| Sibling sheets of Stoa's four drawing sets that nobody tuned on (173 questions, scored by our gatekeeper, aggregates only) | private | **65.3%** (113 / 173; 64.7% at `e4a166b`, 61.3% at `b8146dd`) | `1389c6a` |
 | 20 numeric questions on Stoa's sheets measured by hand by our teammate, each with a written method | private | **19 / 20** (20 / 20 with the door detector the live demo runs); not independent, since her misses were fixed from her answers: 8 of 12 on the questions she answered after that code was built | `4b62b93`; `f2cd8f1` |
 | Real drawings from outside the dataset, held out (105 questions; the same product code and rows) | private / hybrid | 48.6% / **64.8%** | `02a7a4d` / `fc0927a` |
 | Stoa dataset, sealed test split (2,000 scored questions) | private | **87.7%** micro, 79.7% weighted | `bb94fe4` |
@@ -152,7 +152,7 @@ client creates one instance, ships a git bundle, runs, and a watcher pulls the r
 vs the previous model, every clean control unchanged). Exam path at scale: every dataset file uploaded alone, the
 way Stoa tests; on the final code (11,891-question sample) accuracy held and confident-wrong answers fell from 244 to under 60.
 GPU offload prototype: our detector service sends a new sheet to a GPU twin on Verda: 15 s instead of 4+ min for a
-6,000 px scan, identical boxes; one script brings a twin up in 293 s. Spend: ≈ €26 of the €200 credits by 02:00 Sun.
+6,000 px scan, identical boxes; one script brings a twin up in 293 s. Spend: ≈ €28 of the €200 credits by 03:20 Sun (≈ €30 when the last instance is deleted at 05:10).
 
 **Path to scale.** Questions are independent per drawing. One RTX PRO 6000 + 30 vCPU serves 123–135 dataset questions/s,
 so we add GPUs together with their vCPUs (8 GPUs ≈ 8×); a 10× larger question set is a ~€8 job. A fresh upload

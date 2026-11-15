@@ -661,6 +661,10 @@ _ROOM_NAME_Q = re.compile(r"(?i)\b(?:what|which)\s+(?:room|space)\s+is\s+(?:this
 _PERIM_Q = re.compile(r"(?i)\b(?:perimeter|skirting|baseboards?|base\s*boards?|(?:wall|cove|rubber|vinyl)\s+base)\b")
 _ROOM_Q = {"perimeter": "What is the perimeter of the {name}?", "skirting": "How much skirting for the {name}?",
            "area": "What is the area of the {name}?"}
+# 'How wide is this room?' / 'What are the dimensions of this room?': the sides of the room's own outline (a room word
+# is required: 'how long is it here' over a wall is not a room question)
+_DIMS_Q = re.compile(r"(?i)\b(?:how\s+(?:wide|long|deep)|width|depth|length|dimensions?|measurements?)\b")
+_ROOM_WORD = re.compile(r"(?i)\b(?:room|space)\b(?!s)")
 
 
 def _rooms_mode(question: str) -> str:
@@ -677,6 +681,8 @@ def _rooms_mode(question: str) -> str:
     m = _PERIM_Q.search(question)
     if m:
         return "perimeter" if m.group(0).lower() == "perimeter" else "skirting"
+    if _DIMS_Q.search(question) and _ROOM_WORD.search(question) and not _MANY_ROOMS.search(question):
+        return "dims"
     return ""
 
 
@@ -732,10 +738,127 @@ def ask_rooms(abs_path: str, question: str, reg: Region, solve: Callable, mode: 
     labels = room_labels(abs_path, reg)
     if not labels:
         return None
+    if mode == "dims":
+        return room_dims(abs_path, question, reg, solve, labels)
     tmpl = _ROOM_Q.get(mode, _ROOM_Q["area"])
     pick = mode if mode in ("list", "max", "min") else ("sum" if _MANY_ROOMS.search(question) else "one")
     ans, _rejected = ask_by_labels(abs_path, question, reg, solve, labels, template=tmpl, pick=pick)
+    per = _PERIM_Q.search(question) if mode in ("max", "min") else None
+    if per and ans is not None and isinstance(ans.value, str):
+        # 'the perimeter of the largest room in here' answered the room's NAME: rank by area, then ask that room's
+        # perimeter / skirting by name on the full sheet
+        sub = "perimeter" if per.group(0).lower() == "perimeter" else "skirting"
+        best = [lab for lab in labels if lab["text"] == ans.value][:1]
+        out, _ = ask_by_labels(abs_path, question, reg, solve, best, template=_ROOM_Q[sub], pick="one") if best \
+            else (None, None)
+        if out is None:
+            return ans
+        u = _U.get(str(out.unit or "").lower(), out.unit or "")
+        out.assumptions = [ans.assumptions[0], f"the {best[0]['text']}'s {sub}: {out.value:g} {u}, measured as if you had "
+                           "asked for it by name".replace(" :", ":")]
+        out.missing = [*ans.missing, *out.missing]
+        out.trace = [*ans.trace, *out.trace[1:]]
+        out.confidence = round(min(float(out.confidence or 0), float(ans.confidence or 0)), 3)
+        _sum_cost(out, [ans.cost, out.cost])
+        return out
     return ans
+
+
+def _min_rect_sides(pts: list) -> tuple[float, float] | None:
+    """(short, long) sides of the smallest rectangle around the points (convex hull, one try per hull edge)."""
+    import math
+
+    p = sorted({(float(x), float(y)) for x, y in pts})
+    if len(p) < 3:
+        return None
+
+    def cross(o, a, b):
+        return (a[0] - o[0]) * (b[1] - o[1]) - (a[1] - o[1]) * (b[0] - o[0])
+
+    lo, hi = [], []
+    for q in p:
+        while len(lo) >= 2 and cross(lo[-2], lo[-1], q) <= 0:
+            lo.pop()
+        lo.append(q)
+    for q in reversed(p):
+        while len(hi) >= 2 and cross(hi[-2], hi[-1], q) <= 0:
+            hi.pop()
+        hi.append(q)
+    hull = lo[:-1] + hi[:-1]
+    best = None
+    for i in range(len(hull)):
+        (x1, y1), (x2, y2) = hull[i], hull[(i + 1) % len(hull)]
+        t = math.atan2(y2 - y1, x2 - x1)
+        c, s = math.cos(t), math.sin(t)
+        us = [x * c + y * s for x, y in hull]
+        vs = [-x * s + y * c for x, y in hull]
+        a, b = max(us) - min(us), max(vs) - min(vs)
+        if best is None or a * b < best[0] * best[1]:
+            best = (a, b)
+    return (min(best), max(best)) if best and min(best) > 0 else None
+
+
+def _poly_area(pts: list) -> float:
+    return abs(sum(pts[i][0] * pts[(i + 1) % len(pts)][1] - pts[(i + 1) % len(pts)][0] * pts[i][1]
+                   for i in range(len(pts)))) / 2
+
+
+def room_dims(abs_path: str, question: str, reg: Region, solve: Callable, labels: list[dict]):
+    """'How wide / long is this room?' / 'What are the dimensions of this room?': the room in the region asked by name
+    (its area, as ask_by_labels), then the sides of the smallest rectangle around ITS OWN outline at the sheet's scale,
+    checked against that area (a room that does not fill its rectangle is said so). None = no outline to read."""
+    from stoa.contract import Answer, Evidence
+
+    ans, _rejected = ask_by_labels(abs_path, question, reg, solve, labels, template=_ROOM_Q["area"], pick="one")
+    if ans is None:
+        return None
+    polys = [e for e in ans.evidence if e.polygon and len(e.polygon) >= 4 and e.bbox_space in (None, reg.space)]
+    if not polys:
+        return None
+    e = polys[0]
+    sides = _min_rect_sides(e.polygon)
+    m_per_u, why = _outline_scale(abs_path, reg)
+    if not sides or not m_per_u:
+        return None
+    w, ln = sides[0] * m_per_u, sides[1] * m_per_u
+    eb = _ev_box(e) or [0, 0, 0, 0]
+    name = next((lab["text"] for lab in labels if eb[0] <= _centre(lab["box"])[0] <= eb[2]
+                 and eb[1] <= _centre(lab["box"])[1] <= eb[3]), labels[0]["text"])
+    fill = _poly_area(e.polygon) / (sides[0] * sides[1])
+    area = None
+    try:
+        from stoa.pipeline import _TO_SI
+
+        area = float(ans.value) * _TO_SI.get(str(ans.unit or "m2").lower(), ("area", 1.0))[1]
+    except (TypeError, ValueError, ImportError):
+        pass
+    agree = area is not None and abs(w * ln * fill - area) <= 0.05 * area
+    imperial = str(ans.unit or "").lower() in ("ft2", "ft²", "sf", "sq ft", "sqft") or \
+        bool(re.search(r"(?i)\b(?:feet|foot|ft)\b", question))
+    k, u = (1 / 0.3048, "ft") if imperial else (1.0, "m")
+    W, L = round(w * k, 2), round(ln * k, 2)
+    if re.search(r"(?i)\bhow\s+(?:wide|deep)\b|\bwidth\b|\bdepth\b", question):
+        value, unit = W, u
+    elif re.search(r"(?i)\bhow\s+long\b|\blength\b", question):
+        value, unit = L, u
+    else:
+        value, unit = f"{L:g} {u} × {W:g} {u}", None
+    conf = min(float(ans.confidence or 0), 0.7) * (1.0 if fill >= 0.93 and (agree or area is None) else 0.6)
+    ev = Evidence(file=e.file, page=e.page, bbox=e.bbox, bbox_space=e.bbox_space, polygon=e.polygon,
+                  note=f"{name}: {L:g} {u} × {W:g} {u}", exact=bool(getattr(e, "exact", False)))
+    out = Answer(value=value, unit=unit, confidence=round(conf, 3), evidence=[ev], solver="region/room_dims",
+                 trace=[*ans.trace, f"region: '{name}' outline {sides[0]:.1f} × {sides[1]:.1f} units x {m_per_u:.5g} m "
+                                    f"({why}); fills {fill:.0%} of that rectangle"])
+    shape = "a rectangle" if fill >= 0.93 else \
+        f"not a rectangle (its outline fills {fill:.0%} of the {L:g} × {W:g} {u} rectangle around it)"
+    out.assumptions = [f"the {name} in {_where(reg)}: {L:g} {u} long × {W:g} {u} wide, the sides of its outline "
+                       f"at {why or 'the sheet scale'}; it is {shape}"]
+    if area is not None:
+        out.assumptions.append(f"check: its area {float(ans.value):g} {_U.get(str(ans.unit).lower(), ans.unit or '')} "
+                               + ("agrees with the outline" if agree else "differs from the outline's"))
+    out.missing = list(ans.missing)
+    out.cost = ans.cost
+    return out
 
 
 def ask_by_labels(abs_path: str, question: str, reg: Region, solve: Callable, labels: list[dict],
@@ -1908,10 +2031,102 @@ def _image_to_pdf(ans, abs_path: str, page: int, zoom: float) -> None:
                 setattr(e, attr, [[x * z, y * z] for x, y in pts])
 
 
+# 'How many doors does this room have?' / 'How many windows are in this room?': the room's own count, asked by its name
+_ROOM_ITEMS_Q = re.compile(r"(?i)^\s*(?:how\s+many|number\s+of|count(?:\s+the)?)\s+(?P<what>(?:[a-z][\w-]*\s+)?[a-z][\w-]*s)\s+"
+                           r"(?:does|do|has|have|are|is|in|on|of|for|lead|open)\b[^?]*?\b(?:this|the|that|my)\s+"
+                           r"(?:room|space)\b(?!s)")
+
+_NOT_ITEMS = re.compile(r"(?i)\b(?:rooms?|spaces?|met(?:re|er)s?|feet|foot|ft|inch(?:es)?|mm|cm|sq|square|cubic|linear|"
+                        r"lineal|running|people|persons|occupants|users|hours|days|years|levels|storeys|stor(?:ey|ie)s)\b")
+
+
+def count_in_room(abs_path: str, question: str, reg: Region, solve: Callable):
+    """The room in the region (the printed name nearest its middle, no reader) asked by name on the full sheet: 'How
+    many doors does the Laundry have?' (pipeline/openings 1 @0.76 with its mark; the masked copy's raster read said 4 in
+    62 s). Kept only if the answer's marks lie at the region; None = no name / no number / marks elsewhere."""
+    from stoa.contract import Answer
+
+    m = _ROOM_ITEMS_Q.match(question.strip())
+    if not m or _NOT_ITEMS.search(m.group("what")):
+        return None
+    what = m.group("what").strip()
+    labs = room_labels(abs_path, reg, limit=200, distinct=False)
+    if not labs:
+        return None
+    cx, cy = _centre(reg.bbox)
+    best = min(labs, key=lambda lab: (_centre(lab["box"])[0] - cx) ** 2 + (_centre(lab["box"])[1] - cy) ** 2)
+    name = best["text"]
+    others = list(dict.fromkeys(lab["text"] for lab in labs if lab["text"] != name))
+    # a name printed more than once on the sheet is ambiguous by name (DfE 5-room box: 'Store', one of several, got
+    # vlm_lora 2 @0.20 with no marks, 19 s): the box's own marks answer instead
+    whole = parse_region({"page": reg.page, "space": reg.space, "bbox": [-1e7, -1e7, 1e7, 1e7]})
+    if whole is None or sum(lab["text"] == name for lab in room_labels(abs_path, whole, limit=500, distinct=False)) != 1:
+        return None
+    q = f"How many {what} does the {name} have?"
+    a = solve(abs_path, q)
+    if not isinstance(a, Answer):
+        a = Answer.model_validate(a)
+    try:
+        n = float(a.value)
+    except (TypeError, ValueError):
+        return None
+    paths = {abs_path, str(Path(abs_path).resolve())}
+    x0, y0, x1, y1 = reg.bbox
+    gx, gy = 0.5 * (x1 - x0), 0.5 * (y1 - y0)
+    near_box = [x0 - gx, y0 - gy, x1 + gx, y1 + gy]
+    boxes = [b for b in (_ev_box(e) for e in a.evidence if _same_file(e.file, paths)
+                         and (e.page in (None, reg.page) or reg.space == "image_px")) if b]
+    near = [b for b in boxes if _iou_any(b, near_box)]
+    if boxes and not near:
+        return None  # its marks are elsewhere: another room with that name
+    out = a.model_copy(deep=True)
+    out.solver = f"region/room:{a.solver}"
+    out.confidence = round(min(float(a.confidence or 0), 0.75 if not others else 0.6), 3)
+    out.trace = [f"region: {reg.describe(coords=True)}", f"region: the room in it = '{name}' (its printed name); "
+                 f"asked '{q}' on the whole sheet -> {n:g} ({a.solver})", *a.trace]
+    out.assumptions = [f"the room in {_where(reg)}: {name} (the name printed "
+                       f"{'in it' if not others else 'nearest its middle'})",
+                       f"counted as if you had asked for the {name} by name", *a.assumptions]
+    if others:
+        out.missing = [*out.missing, f"also named in {_where(reg)}: " + ", ".join(others[:8])
+                       + f" (ask 'How many {what} does the {others[0]} have?' for another one)"]
+    return out
+
+
+def _iou_any(a, b) -> bool:
+    return min(a[2], b[2]) > max(a[0], b[0]) and min(a[3], b[3]) > max(a[1], b[1])
+
+
 def _scoped(path: str, question: str, reg: Region, solve: Callable):
     """The strategies (outline / printed tags / room labels / masked copy) on one readable file."""
     if _OUTLINE_Q.search(question):
         return outline_measure(path, question, reg, _user_ppm(solve))
+    m = _ROOM_ITEMS_Q.match(question.strip())
+    if m and not _NOT_ITEMS.search(m.group("what")):
+        try:
+            ans = count_in_room(path, question, reg, solve)
+            if ans is not None and ans.value in (0, 0.0):
+                # 'none' by name against marked items inside the box (DfE PNG laundry: room_graph 0 @0.65 by name, the
+                # whole sheet's door marks put 1 in the box = the PDF's 1): the marks win, both said
+                marks = ask_by_marks(path, f"How many {m.group('what')} are in this area?", reg, solve)
+                if marks is not None and float(marks.value or 0) > 0:
+                    one = float(marks.value) == 1
+                    w = re.sub(r"s$", "", m.group("what")) if one else m.group("what")
+                    marks.assumptions = [f"asked by name it said 0 ({ans.solver}), but {marks.value:g} marked {w} "
+                                         f"{'lies' if one else 'lie'} inside {_where(reg)}: counted",
+                                         *marks.assumptions]
+                    marks.confidence = round(min(float(marks.confidence or 0), 0.5), 3)
+                    ans = marks
+            if ans is None:  # no room to name safely: the items in the box, from the whole sheet's marks, said so
+                ans = ask_by_marks(path, f"How many {m.group('what')} are in this area?", reg, solve)
+                if ans is not None:
+                    ans.assumptions = [f"no single named room to ask about in {_where(reg)}: counted the "
+                                       f"{m.group('what')} inside {_where(reg)}", *ans.assumptions]
+                    ans.confidence = round(min(float(ans.confidence or 0), 0.5), 3)
+        except Exception:  # noqa: BLE001 — the marks / masked copy still answer
+            ans = None
+        if ans is not None:
+            return ans
     mode = _rooms_mode(question)
     if mode:
         try:
@@ -1978,6 +2193,7 @@ def with_region(abs_path: str, question: str, region, solve: Callable, force: bo
             ans.trace = [str(t).replace(png, abs_path) for t in ans.trace]
         else:
             ans = _scoped(abs_path, question, reg, solve)
+        ans = _asked_unit(question, ans)
         if ans.solver != "region/outline":  # the outline answer's evidence IS the drawn polygon
             # 'the box you drew' / 'the outline you drew' (the card's words): a note naming a 'region' / 'room' is
             # traced as a room by the web's outlineAreas (the DfE hall box lit the hall AND the store strip beside it)
@@ -1991,6 +2207,18 @@ def with_region(abs_path: str, question: str, region, solve: Callable, force: bo
         a.missing = [*a.missing, f"could not limit the answer to the region you drew ({type(e).__name__}: {e}); "
                                  "this is the whole sheet's reading"]
         return a
+
+
+def _asked_unit(question: str, ans):
+    """The unit the visitor named ('How many square feet is this room?'): the per-room answers are asked by name in the
+    sheet's own unit (DfE laundry 7 m² for a square-feet question), so the pipeline's own conversion runs on the region's
+    answer too (a no-op when it already is in that unit)."""
+    try:
+        from stoa.pipeline import _to_asked_unit
+
+        return _to_asked_unit(question, ans)
+    except Exception:  # noqa: BLE001
+        return ans
 
 
 def _user_ppm(solve) -> float | None:

@@ -69,6 +69,7 @@ Tuning and experiment switches. Read the module named in the last column for wha
 | `E1_BRIDGE_M` | `2.5` | `stoa/evidence/linework.py` |
 | `E1_CANON_WORDS` | `1` | `stoa/evidence/lineplan.py` |
 | `E1_COUNT_EXACT` | `1` | `stoa/evidence/lineplan.py` |
+| `E1_COUNT_NO_TITLES` | `1` | `stoa/evidence/lineplan.py` |
 | `E1_DASH_GAP_PT` | `4.0` | `stoa/evidence/slabs.py` |
 | `E1_DEBUG_GRID` | unset | `stoa/evidence/slabs.py` |
 | `E1_DIM_GRID` | `0` | `stoa/evidence/slabs.py` |
@@ -76,6 +77,7 @@ Tuning and experiment switches. Read the module named in the last column for wha
 | `E1_DOOR_LEAVES` | `1` | `stoa/evidence/linework.py` |
 | `E1_DOOR_SEMI` | `1` | `stoa/evidence/linework.py` |
 | `E1_DROP_DASHED` | `1` | `stoa/evidence/linework.py` |
+| `E1_EXACT_FIRST` | `1` | `stoa/evidence/lineplan.py` |
 | `E1_FACE_SNAP` | `1` | `stoa/evidence/linework.py` |
 | `E1_FACE_SNAP_CUT_PT` | `3.5` | `stoa/evidence/linework.py` |
 | `E1_FACE_SNAP_MIN` | `0.9` | `stoa/evidence/linework.py` |
@@ -84,13 +86,18 @@ Tuning and experiment switches. Read the module named in the last column for wha
 | `E1_HATCH_RINGS` | `1` | `stoa/evidence/slabs.py` |
 | `E1_HATCH_RING_PT` | `2.5` | `stoa/evidence/slabs.py` |
 | `E1_KEEP_SEPARATIONS` | `1` | `stoa/evidence/linework.py` |
+| `E1_LABEL_LINES` | `4` | `stoa/evidence/lineplan.py` |
 | `E1_MAIN_EXT` | `1` | `stoa/evidence/slabs.py` |
+| `E1_NUM_PICK` | `1` | `stoa/evidence/lineplan.py` |
 | `E1_NUM_PT_TRACED` | `20.0` | `stoa/evidence/slabs.py` |
 | `E1_OCR_BLOCKS` | `1` | `stoa/evidence/slabs.py` |
 | `E1_OCR_FOLD` | `1` | `stoa/evidence/lineplan.py` |
 | `E1_PHRASE_SUM` | `1` | `stoa/evidence/lineplan.py` |
 | `E1_POCKET_GUARD` | `1` | `stoa/evidence/lineplan.py` |
+| `E1_PRINTED_TAG` | `1` | `stoa/evidence/lineplan.py` |
+| `E1_PRINTED_TAG_TOL` | `0.2` | `stoa/evidence/lineplan.py` |
 | `E1_QUAL_CLASH` | `1` | `stoa/evidence/lineplan.py` |
+| `E1_RECESS_AREA` | `1` | `stoa/evidence/lineplan.py` |
 | `E1_RECESS_CUT` | `1` | `stoa/evidence/lineplan.py` |
 | `E1_RECESS_LEAVES` | `1` | `stoa/evidence/lineplan.py` |
 | `E1_RECESS_PERIM` | `1` | `stoa/evidence/lineplan.py` |
@@ -98,6 +105,7 @@ Tuning and experiment switches. Read the module named in the last column for wha
 | `E1_REVEAL_CUT` | `1` | `stoa/evidence/linework.py` |
 | `E1_REVEAL_W` | `0.8,1.6` | `stoa/evidence/lineplan.py` |
 | `E1_RING_FIX` | `0` | `stoa/evidence/linework.py` |
+| `E1_ROOM_EXACT` | `1` | `stoa/evidence/lineplan.py` |
 | `E1_ROW_KEY` | `1` | `stoa/evidence/textground.py` |
 | `E1_SKIRT_REVEALS` | `0` | `stoa/evidence/lineplan.py` |
 | `E1_SLAB_WORDING` | `1` | `stoa/evidence/slabs.py` |
@@ -172,6 +180,7 @@ Tuning and experiment switches. Read the module named in the last column for wha
 | `STOA_DR_DET_MAX_QUEUE` | `4` | `stoa/solvers/openings.py` |
 | `STOA_DR_DET_TIMEOUT` | `30` / `25` | `stoa/features/takeoff.py`, `stoa/solvers/openings.py` |
 | `STOA_DR_EACH` | `1` | `stoa/solvers/openings.py` |
+| `STOA_DR_EXACT_LABEL` | `1` | `stoa/solvers/openings.py` |
 | `STOA_DR_EXCLUDE` | `1` | `stoa/solvers/openings.py` |
 | `STOA_DR_EXTERIOR` | `0` | `stoa/solvers/openings.py` |
 | `STOA_DR_FACE_PEN` | `1` | `stoa/solvers/openings.py` |
@@ -181,14 +190,17 @@ Tuning and experiment switches. Read the module named in the last column for wha
 | `STOA_DR_KEYPLAN` | `1` | `stoa/solvers/openings.py` |
 | `STOA_DR_MULLION` | `1` | `stoa/solvers/openings.py` |
 | `STOA_DR_ODD` | `1` | `stoa/solvers/openings.py` |
+| `STOA_DR_PARTITION` | `1` | `stoa/solvers/openings.py` |
 | `STOA_DR_PLAN_TITLE` | `1` | `stoa/solvers/openings.py` |
 | `STOA_DR_REPEAT` | `1` | `stoa/solvers/openings.py` |
+| `STOA_DR_ROOM_XCHECK` | `0` | `stoa/solvers/openings.py` |
 | `STOA_DR_SCALE_BAND` | `1` | `stoa/solvers/openings.py` |
 | `STOA_DR_SCAN_BOTH` | `1` | `stoa/solvers/openings.py` |
 | `STOA_DR_SCATTER` | `1` | `stoa/solvers/openings.py` |
 | `STOA_DR_SCHEDULE` | `1` | `stoa/solvers/openings.py` |
 | `STOA_DR_SCHED_DROP` | `1` | `stoa/solvers/openings.py` |
 | `STOA_DR_SLIDING` | `1` | `stoa/solvers/openings.py` |
+| `STOA_DR_STACK` | `1` | `stoa/solvers/openings.py` |
 | `STOA_DR_TANGENT_OWN` | `1` | `stoa/solvers/openings.py` |
 | `STOA_DR_TRACE` | `1` | `stoa/solvers/openings.py` |
 | `STOA_DR_TYPED` | `1` | `stoa/solvers/openings.py` |
@@ -231,21 +243,29 @@ Tuning and experiment switches. Read the module named in the last column for wha
 | `STOA_FEATURES` | empty | `stoa/agent/click.py`, `stoa/features/__init__.py`, `stoa/features/corrections.py` (+5) |
 | `STOA_FEAT_CACHE` | `Path(tempfile.gettempdir()) / "stoa-feat"` | `stoa/features/privacy.py`, `stoa/features/revcompare.py` |
 | `STOA_G1_AGENT_TYPE` | `1` | `stoa/pipeline.py` |
+| `STOA_G1_APT_HEADLINE` | `1` | `stoa/solvers/area_tags.py` |
 | `STOA_G1_AXB` | `1` | `stoa/pipeline.py` |
+| `STOA_G1_BARE_ROOM` | `1` | `stoa/solvers/label_count.py` |
+| `STOA_G1_BARE_TOTAL` | `0` | `stoa/pipeline.py` |
 | `STOA_G1_COLD_GUESS` | `1` | `stoa/pipeline.py` |
+| `STOA_G1_GLOSS_AREA` | `1` | `stoa/pipeline.py` |
 | `STOA_G1_GROSS_NET` | `1` | `stoa/pipeline.py` |
+| `STOA_G1_LIST_ANS` | `1` | `stoa/agent/vision.py` |
 | `STOA_G1_LIVING` | `1` | `stoa/pipeline.py` |
 | `STOA_G1_NAME_LIST` | `1` | `stoa/solvers/area_tags.py` |
 | `STOA_G1_OCR_DOUBT` | `1` | `stoa/solvers/piping_image.py` |
 | `STOA_G1_ONE_ROOM` | `1` | `stoa/agent/click.py` |
+| `STOA_G1_OPENING_SIZE` | `1` | `stoa/router/intent.py` |
 | `STOA_G1_PRIVATE_WHY` | `1` | `stoa/pipeline.py` |
 | `STOA_G1_QUAL` | `1` | `stoa/solvers/label_count.py` |
+| `STOA_G1_ROOM_SCOPE` | `1` | `stoa/pipeline.py`, `stoa/router/intent.py` |
 | `STOA_G1_ROW_KEYS` | `1` | `stoa/solvers/area_tags.py` |
 | `STOA_G1_SCHOOL` | `1` | `stoa/pipeline.py` |
 | `STOA_G1_SETTLED` | `1` | `stoa/agent/vision.py` |
 | `STOA_G1_SHAPE` | `1` | `stoa/pipeline.py` |
 | `STOA_G1_TAKEOFF` | `1` | `stoa/pipeline.py` |
 | `STOA_G1_TYPE_TAG_ROUTE` | `1` | `stoa/pipeline.py` |
+| `STOA_G1_WHOLE_PLAN` | `1` | `stoa/pipeline.py` |
 | `STOA_GATE_PASSWORD` | empty | `deploy/gate.py` |
 | `STOA_GEMINI_BELOW` | `0.5` | `stoa/agent/escalate.py` |
 | `STOA_GEMINI_PLANNER` | `gemini-3.1-pro-preview` | `stoa/agent/gemini.py` |
@@ -379,6 +399,7 @@ Tuning and experiment switches. Read the module named in the last column for wha
 | `STOA_TAKEOFF_OCR_SNAP` | `1` | `stoa/features/takeoff.py` |
 | `STOA_TAKEOFF_OFFWALL_PICTURES` | `1` | `stoa/features/takeoff.py` |
 | `STOA_TAKEOFF_Q_BUDGET` | `75` | `stoa/features/takeoff.py` |
+| `STOA_TAKEOFF_SAME_OUTLINE` | `1` | `stoa/features/takeoff.py` |
 | `STOA_TAKEOFF_SHEET_PICTURE` | `1` | `stoa/features/takeoff.py` |
 | `STOA_TAKEOFF_WIN_SIDE` | `1` | `stoa/features/takeoff.py` |
 | `STOA_TEXT_CACHE` | `1` | `stoa/ocr/__init__.py`, `stoa/solvers/raster/textlayer.py` |
@@ -397,11 +418,21 @@ Tuning and experiment switches. Read the module named in the last column for wha
 | `STOA_VISION_CAP` | `0.45` | `stoa/agent/vision.py` |
 | `STOA_VISION_SECOND` | `1` | `stoa/agent/vision.py` |
 | `STOA_VISION_WAIT` | `25` | `stoa/agent/vision.py` |
+| `STOA_VP_BRACKET` | `1` | `stoa/sheet/labels.py` |
 | `STOA_VP_DIMSCALE` | `1` | `stoa/sheet/views.py` |
+| `STOA_VP_DWELLING` | `1` | `stoa/sheet/footprint.py`, `stoa/sheet/labels.py` |
+| `STOA_VP_FRAME` | `1` | `stoa/sheet/footprint.py` |
+| `STOA_VP_ONE_FLOOR_ROW` | `1` | `stoa/sheet/footprint.py` |
+| `STOA_VP_SIDE_NAMES` | `1` | `stoa/sheet/labels.py` |
+| `STOA_VP_TAG_OVERLAP` | `1` | `stoa/sheet/labels.py` |
+| `STOA_VP_TITLE_KIND` | `1` | `stoa/sheet/sets.py` |
+| `STOA_VP_TOTAL_ROW` | `1` | `stoa/sheet/footprint.py` |
+| `STOA_VP_UNGLUE` | `1` | `stoa/sheet/labels.py` |
 | `STOA_WARM_GRACE` | `3` | `stoa/formats/warm.py` |
 | `STOA_WARM_HOSTED` | empty | `stoa/formats/warm.py` |
 | `STOA_WARM_WAIT` | `240` | `stoa/formats/warm.py` |
 | `STOA_X1_BARE_TICK` | `1` | `stoa/solvers/raster/textqa.py` |
+| `TMPDIR` | `/tmp` | `stoa/solvers/openings.py` |
 | `UNTIL` | `19:00` | `serving/watchdog.sh` |
 | `VERDA_BASE_URL` | empty | `stoa/netguard.py` |
 | `VERDA_CLIENT_ID` | unset | `deploy/verda/verda.py` |

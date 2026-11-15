@@ -526,6 +526,13 @@ def test_size_words_hop_only_for_a_numbered_door(tmp_path):
         h = xref.follow_plan(str(p), 0, q)
         assert h is not None and h.to_row and h.to_row["key"] in q, q
     assert xref._size_subject("Next to door 104B, how wide is the corridor?") == "located"
+    for q in ["What is the height of the wall containing door 104B?", "How wide is the clearance in front of door 104B?"]:
+        assert xref._size_subject(q) == "located", q
+    for q in ["What are the dimensions of the pair of doors 104B?", "How wide is each leaf of door 104B?"]:
+        assert xref._size_subject(q) == "door", q
+    # F8 c11: a room's width is a plan length (AW-28: the hop to the room finish schedule answered 'CONC.' at 0.85)
+    for q in ["What is the width of room 7.04?", "What is the width of the mech room?", "What is the length of room 104?"]:
+        assert xref.follow_plan(str(p), 0, q) is None, q
     assert xref._size_subject("What is the width of door 104B's frame?") == "part"
 
 
@@ -617,6 +624,13 @@ def test_room_area_questions_stay_on_the_plan(tmp_path):
     for q in ["What is the ceiling height in the control room?", "How many rooms have a floor finish of VCT?"]:
         h = xref.follow_plan(str(p), 0, q)
         assert h is not None and h.to_page == 1, q
+    # F8 c11: a room's width is a plan length (AW-28 A-601 answered 'CONC.' at 0.85); a window is read from a WINDOW
+    # schedule, never from a room row ('windows in room 102' scored this sheet on 'room' and landed on row 102)
+    for q in ["What is the width of room 102?", "What is the width of the control room?", "What size are the windows in "
+              "room 102?", "How high is the window sill in room 103?", "What is the height of the window in the toilet?"]:
+        assert xref.follow_plan(str(p), 0, q) is None, q
+    h = xref.follow_plan(str(p), 0, "What is the height of room 102?")
+    assert h is not None and h.to_page == 1 and h.to_row and h.to_row["key"] == "102"
 
 
 def test_window_schedule_attributes(tmp_path):

@@ -141,6 +141,9 @@ and USACE door counts and toilet skirting, were added), and the sealed set grew 
 | `b8146dd` (d31) | **91.1% (82 / 90; 0 W / 0 L)**, the same answers on the 90; 25 at confidence ≥ 0.8, the same 1 wrong; evidence on 100%; 315 / 381 on the open set grown to 381 (262 / 316 on d30's rows: 13 W / 0 L; the 66 rows added at d30 48 / 66, 36 at d30; the 65 added at d31 53 / 65; areas 123 / 141, lengths 81 / 102, counts 111 / 138); mean 7.0 s, p95 25 s per question | 62.5% (20 / 32); 58.5% (38 / 65); 59.2% (61 / 103); 62.2% (89 / 143); **61.3% (106 / 173)** |
 | `4b62b93` (d32) | **91.1% (82 / 90; 0 W / 0 L)**, the same answers on the 90; 48 at confidence ≥ 0.8 (25 at d31: the new confidence map, see [Calibration](#calibration)), the same 1 wrong; evidence on 100%; 314 / 381 on the open set (315 at d31: 2 W / 3 L; areas 123 / 141, lengths 79 / 102, counts 112 / 138); mean 5.2 s, p95 16 s per question | the sealed lane did not finish at d32 (stopped for memory); 61.3% (106 / 173) at d31 |
 | **`e4a166b` (d33, the freeze build)** | **91.1% (82 / 90; 0 W / 0 L)**, the same answers on the 90; 48 at confidence ≥ 0.8, the same 1 wrong; evidence on 100%; **322 / 381** on the open set (314 at d32: 8 W / 0 L; areas 126 / 141, lengths 81 / 102, counts 115 / 138); 191 answers at confidence ≥ 0.8, 189 right; mean 4.0 s, p95 15 s per question | **64.7% (112 / 173)** (the d32 lane did not finish; 61.3% at d31) |
+| **`1389c6a` (d34, the final build: the freeze plus fixes proven with no loss)** | **91.1% (82 / 90; 0 W / 0 L)**, the same answers on the 90; evidence on 100%; **324 / 381** on the open set (322 at d33: 2 W / 0 L: the floor area of the English classrooms on a phone photo, 495 m², and the restroom count on a fitness-centre sheet set); 191 answers at confidence ≥ 0.8, 189 right; mean 4.5 s per question | **65.3% (113 / 173)** (112 at d33: 1 W / 0 L; mean 19.2 → 7.6 s, p95 104 → 22 s per question) |
+
+What d34 changed (gate against the freeze, every lane private and run alone per file: 15 won, 0 lost): besides the two open-set rows above, 8 won / 0 lost on 202 questions about the DfE sibling plans (173 → 181: a toilet, a hub, an admin skirting length, a store count, a kitchen) and 4 won / 0 lost on the held-out real drawings (61 → 65 of 120, all areas, read from the printed room tags). The confidence map keeps its gain (open set ECE 0.128, AUROC 0.906; sealed ECE 0.119, AUROC 0.915). Runs: open `20261115-033022-upload-stoa_like_dev-2fd9`, held-out real drawings `20261115-035136-upload-wild_sealed-0997` (aggregates only), DfE siblings `20261115-034752-upload-dfe26_sibling_probe-9d4e`.
 
 Gate d20 added 10 questions on a fitness-centre module sheet to dev (66 / 100 with them) and grew the sealed set to
 65 questions with line-only school plans and Stoa-style image copies of the sheets; the common rows are compared above.
@@ -416,7 +419,7 @@ Where a drawing goes is a server setting. Each step of the pipeline, and what it
 | No-GPU mode (`STOA_MODE=api`): steps meant for the local model | Google's Gemini API (Gemini 3 Flash) | what the local model would see: page images and the question |
 | Optional EU text model for free-text steps (`STOA_TEXT_BACKEND=verda`) | Verda Inference (EU) | text only |
 
-In the web app the **Private** switch (top bar; on by default from the freeze build on, remembered per browser, `?private=0` / `?private=1` in the URL)
+In the web app the **Private** switch (top bar; on by default from the freeze build on, the visitor's own choice remembered per browser, `?private=0` / `?private=1` in the URL for that link only)
 sends `private: 1` with each question. For that question the upload worker turns Gemini, Nemotron and the no-GPU
 route off, falls back from a hosted free-text model to the local one (an `eu: 1` request keeps Verda's EU model),
 and refuses steps that only exist as hosted models (the Nemotron second-opinion button) with a message.
@@ -852,7 +855,7 @@ from the morning audit all still hold on d31. On byte-new copies of the four she
 the d32 answer code (`d0514b4`), the web app's "Many questions" list on byte-new copies scores 19 of 20 too, private
 and with no hosted call: DfE 8 of 8 in 10 s, S-100F 4 of 4, M-101A 4 of 4 in 2 s with no model call at all, AFCEC 3 of
 4 (the north-wing doors are now counted from the drawn door symbols, 36 against her 34 with the gates' detector,
-instead of guessed; the first question on a new copy waits about 50 s for the detector). On the released demo build
+instead of guessed; the first question on a new copy waits about 50 s for the detector). On the freeze build
 (`75f9ee4`, with the newer door detector the live demo runs) the same list on byte-new copies scores 20 of 20, private and
 with no hosted call: DfE 8 of 8 in 15 s, S-100F 4 of 4 in 10 s, AFCEC 4 of 4 in 53 s (the north wing's 34 doors counted
 from the drawn door symbols), M-101A 4 of 4 in 2 s; 12 of the 20 answers needed no model at all. The list is off by
@@ -868,7 +871,7 @@ Finnish door-count wording (a whole-sheet guess) and four wordings of the north-
 `20261114-233445-upload-human-a809` (scored 17 of 20 at first, because the eval read her "6,095" ft² as 6.095; the
 scorer is fixed since).
 
-With the d32 answer code (`4b62b93`, private, no hosted model; the released demo build `75f9ee4` gives identical values and
+With the d32 answer code (`4b62b93`, private, no hosted model; the freeze build `75f9ee4` and the final build `1389c6a` give identical values and
 confidences) the numbers are: **19 of 20** with the door detector
 the gates use and **20 of 20** with the newer detector (v5) the live demo runs, which counts the north wing's 34 doors
 at confidence 0.71; with v2 that count is 36, marked as a rough count (confidence 0.26). Over her 20 answers the right

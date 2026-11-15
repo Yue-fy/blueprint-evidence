@@ -376,3 +376,32 @@ def test_the_visitors_own_takeoff_fixes_are_asked_for(monkeypatch):
     assert OL._status(OldT, "j2", None, "abcdef1234567890")["status"] == "running"
     assert calls == [("new", "j1", "abcdef1234567890"), ("old", "j2")]
     assert OL._visitor("abcdef1234567890") and OL._visitor("../etc") is None and OL._visitor("") is None
+
+
+def _node_ok() -> str | None:
+    import re
+    import shutil
+    import subprocess
+
+    node = shutil.which("node")
+    if not node:
+        return None
+    try:
+        v = subprocess.run([node, "--version"], capture_output=True, text=True, timeout=10).stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        return None
+    m = re.match(r"v(\d+)\.(\d+)", v)
+    return node if m and (int(m[1]), int(m[2])) >= (22, 18) else None
+
+
+@pytest.mark.skipif(_node_ok() is None, reason="needs Node >= 22.18 (type stripping)")
+def test_orderlist_question_rules_node_tests():
+    """Which typed questions the order list answers + the stock length / waste a question names
+    (web/src/features/orderlist/question.ts)."""
+    import subprocess
+
+    root = Path(__file__).resolve().parents[1]
+    test = root / "web" / "src" / "features" / "orderlist" / "question.test.ts"
+    r = subprocess.run([_node_ok(), "--test", str(test)], capture_output=True, text=True, timeout=120, cwd=root)
+    assert r.returncode == 0, r.stdout[-4000:] + r.stderr[-2000:]
+    assert "ℹ fail 0" in r.stdout

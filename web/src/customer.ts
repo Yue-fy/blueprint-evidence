@@ -5,7 +5,7 @@
  * (solvers, cost in tokens, trace, benchmark) stays one click away: "How we worked it out" and the Expert view.
  */
 import { agentAsks, crossChecks, fmtValue, pxless, quietEstimate, setAnswer, unitLabel, type SetRow } from "./card";
-import { dataLineHtml } from "./governance";
+import { dataLineHtml, geminiRan, geminiRead } from "./governance";
 import { manualTime } from "./manual-time";
 import { floorName, PROJECTS, projectOf, type Project } from "./projects";
 import { floorName as storeyWords } from "./floornames";
@@ -202,6 +202,7 @@ export function sizeCheck(a: Answer): string {
 /** Gemini's own visual estimate when the hybrid step kept ours ('Gemini 3.1 Pro cross-check: its estimate 415.0 m2;
  *  NEITHER reading is measured'), as one sentence, or ''. */
 function geminiGuess(a: Answer): string {
+  if (!geminiRan(a)) return ""; // captain 03:58: Gemini named only when it ran
   for (const t of (a.trace ?? []).map(String)) {
     const m = t.match(/(Gemini[\w .-]*?)\s*cross-check:\s*its estimate\s+([\d.,]+)\s*(m2|m²|ft2|ft²|sf|m|ft)\b/i);
     if (m && Number(m[2].replace(/,/g, "")) > 0)
@@ -258,7 +259,7 @@ export function rivalReading(a: Answer): Rival | null {
     }
     return null;
   }
-  for (const l of miss) {
+  for (const l of geminiRan(a) ? miss : []) {
     const m = l.match(/\bGemini [\d.]+ \w+ estimated\s+([\d.,]+)\s*(\S*)/i);
     if (!m) continue;
     const v = Number(m[1].replace(/,/g, ""));
@@ -895,6 +896,13 @@ function headline(a: Answer, ctx: HeroCtx): { big: string; unit: string; sentenc
   // @ 300 TOP FACE. BOTTOM: 212.45 m² traced at 1:50') → 'area of the slab "300 slab-on-grade w/ D16 @ 300", to its edge'
   if (/\bslabs?\b/i.test(ctx.question) && /^(m2|m²|ft2|sf)$/i.test(String(a.unit ?? ""))) {
     const slabs = (a.evidence ?? []).map((e) => (e.note ?? "").match(/^(.*?\bSLAB\b.*?):\s*[\d.,]+\s*(?:m²|m2|SF|ft²)/i)?.[1]).filter(Boolean) as string[];
+    // QA 03:26: 'What is the total slab area?' = 218.61 + 61.69 + 26.486 read 'area of the slab ‘300 slab on grade …’' (its
+    // first evidence row): a total says so, with how many slabs its sum adds
+    if (/\b(total|overall|all|together)\b/i.test(ctx.question)) {
+      const sum = [...(a.assumptions ?? []), ...(a.trace ?? [])].map(String).find((l) => /\d\s*\+\s*\d/.test(l));
+      const k = sum ? (sum.match(/\d\s*\+\s*(?=\d)/g)?.length ?? 0) + 1 : slabs.length;
+      return { big: fmtValue(a), unit, sentence: `total slab area${k > 1 ? ` (${k} slab types)` : ""}, to the slab edges` };
+    }
     if (slabs.length === 1) {
       const callout = slabs[0].replace(/\s+(TOP|BOTT?OM|T\.?O\.?S)\b.*$/i, "").replace(/\bSLAB-ON-GRADE\b/gi, "slab on grade").replace(/\bW\/\s*/g, "with ").trim();
       return { big: fmtValue(a), unit, sentence: `area of the slab ‘${callout}’, traced to its edge` };
@@ -950,11 +958,14 @@ function agreement(a: Answer, file: string): { ok: boolean; text: string; detail
       // 4,479 SF …' next to Gemini's 'Read 'TOTAL COMMON SPACE = 4,479 SF''): two readings of the print agree
       const pr = printedReading(a);
       const fig = pr.match(/(\d[\d,]*(?:\.\d+)?)\s*(\S+)$/);
-      if (!fig || !lines.some((l) => /gemini/i.test(l))) return null;
+      // QA 03:13 (final demo, Private = default): Private mode's own line 'data: private mode: no hosted model was called
+      // (Gemini, NVIDIA off)' matched /gemini/ → every printed-figure answer said 'our reading and Gemini's' next to
+      // 'Stayed on our server'. Only a line where Gemini READ something counts (F8 02:35 PITFALL, same family).
+      if (!fig || !geminiRan(a) || !lines.some(geminiRead)) return null; // captain 03:58: and Gemini's data says it ran
       const ours = lines.find((l) => !/gemini/i.test(l) && /^\s*\w+[\w ()]*:/.test(l) && new RegExp(String.raw`(^|[^\d,.])${fig[1].replace(/[.,]/g, "\\$&")}\s*${fig[2].replace(/[^\w]/g, "")}\b`, "i").test(l));
       return ours ? { ok: true, text: "2 independent methods agree", detail: `${ours.slice(0, 140)} · Gemini: ${pr}`, which: "our reading and Gemini's" } : null;
     }
-    return { ok: true, text: "2 independent methods agree", detail: hit.slice(0, 300), which: /gemini/i.test(hit) ? "our reading and Gemini's" : "two readings" };
+    return { ok: true, text: "2 independent methods agree", detail: hit.slice(0, 300), which: /gemini/i.test(hit) && geminiRan(a) ? "our reading and Gemini's" : "two readings" };
   }
   // UX P2b-14: Maleva windows 'Our reading 55 · second reading 52' in red, though the ✓ line says why the plan draws 52
   // (3 windows lie wholly above / below its 1.2 m cut plane): a plan-vs-model difference that a ✓ line explains is not
@@ -1088,6 +1099,11 @@ export function heroHtml(a: Answer, ctx: HeroCtx): string {
     <div class="hero-sentence">${esc(cr.ask)}${cr.why ? ` ${esc(cr.why)}` : ""}</div>`;
   if (needsMeasuring(a, ctx.question, ctx.file, ctx.sheet)) return measureFirstHtml(a, ctx);
   const h = headline(a, ctx);
+  // F1 03:52: 'perimeter of the largest room in this area in the area you drew' (the question already says where)
+  {
+    const bare = h.sentence.replace(/,?\s+in the area you drew\b/, "");
+    if (bare !== h.sentence && /\bin (?:this|that) (?:area|region|box|selection)\b/i.test(bare)) h.sentence = bare;
+  }
   const ag = agreement(a, ctx.file);
   let c = a.value === null ? { cls: "none", word: "No answer", hint: "" } : confidenceWords(a.confidence ?? 0);
   // F1 / captain AUDIT 00:31 (a): the visitor's own outline or line (or a Suggest they accepted) is theirs, not checked
@@ -1095,6 +1111,9 @@ export function heroHtml(a: Answer, ctx: HeroCtx): string {
   if (/^measure\/(area|length)/.test(a.solver ?? "")) c = { cls: "est", word: /^suggested outline/i.test(String(a.trace?.[0] ?? "")) ? "Suggested outline" : a.solver === "measure/length" ? "Your line" : "Your outline", hint: "not checked" };
   // two methods that agree are not a 'rough guess … not found on the drawing', whatever the calibrated number says
   if (ag?.ok && c.cls.includes("guess")) c = { cls: "est", word: "Best estimate", hint: "" };
+  // UX FR-3: 'Rough guess · not found on the drawing · the sum of 4 printed values' next to 4 boxed rows: it WAS found
+  if (/not found on the drawing/.test(c.hint) && (a.evidence ?? []).some((e) => e.bbox && !isSearchedArea(e) && !isHowEvidence(e)))
+    c = { ...c, hint: "check the marked places" };
   const conv = conventionOf(a, ctx.question);
   // the convention line already says it: don't repeat a reader's 'Convention: …' as the assumption
   // a printed figure read off the sheet is not 'NOT MEASURED: … visual estimate' (the solver's words for any Gemini reading)
@@ -1112,7 +1131,7 @@ export function heroHtml(a: Answer, ctx: HeroCtx): string {
   // a room's doors: "Door to Zimmer 2.10" (the room asked about is in the sentence above)
   const conn = connectionInfo(a);
   const label = (i: number) => {
-    const l = ctx.labelOf?.(i) ?? calm(evidenceLabel(ev[i].note ?? ""));
+    const l = pxless(ctx.labelOf?.(i) ?? calm(evidenceLabel(ev[i].note ?? ""))); // UX F-3: no 'px' in the customer's list
     return conn ? l.replace(`Door between ${conn.room} and `, "Door to ").replace(`Door from ${conn.room} to outside`, "Door to outside") : l;
   };
   const more = numbered(ev, Infinity).length - shown.length;
@@ -1148,7 +1167,9 @@ export function heroHtml(a: Answer, ctx: HeroCtx): string {
   // an imperial answer (US / UK sheets: '26,562 SF', "12'-6\"", '45 LF') also in metric, under the number (captain 16:15)
   const iq = typeof a.value === "number" || typeof a.value === "string" ? quantityOf(`${a.value}${a.unit && !String(a.value).includes(a.unit) ? ` ${a.unit}` : ""}`, true) : null;
   const imperial = h.metric ? "" : iq?.metric && iq.label !== "mm" && iq.label !== "cm" && !set ? iq.metric.replace(/^(\d+)(\.\d)/, (_m, x: string, y: string) => `${Number(x).toLocaleString("en")}${y}`) : "";
-  const imperialUnit = iq?.label === "SF" ? "square feet" : iq?.label === "LF" ? "linear feet" : "feet";
+  // F1 03:52: an answer converted to the ASKED unit (DfE 7.0 m² → 75.35 ft²) comes from a metric drawing
+  const toAsked = [...(a.assumptions ?? []), ...(a.trace ?? [])].some((l) => /converted to the asked unit/i.test(String(l)));
+  const imperialUnit = toAsked ? (/m²|m2/.test(imperial) ? "m²" : "metres") : iq?.label === "SF" ? "square feet" : iq?.label === "LF" ? "linear feet" : "feet";
   const givenTotal = set?.total ? `<div class="hs-total"><span>Total</span><b>${esc(set.total)}${quantityOf(set.total)?.metric ? `<small> · ${esc(quantityOf(set.total)!.metric!)}</small>` : ""}</b></div>` : "";
   const setRows = set ? `<div class="hero-set">${set.head ? `<div class="hs-head">${esc(plainify(set.head))}</div>` : ""}${set.rows.slice(0, shownRows).map((r, k) =>
     `<button type="button" class="hs-row"${r.ev >= 0 ? ` data-ev="${r.ev}"` : ""}><span class="hs-name"><i class="hs-sw" style="background:${SWATCH[k % SWATCH.length]}"></i>${esc(r.name)}</span><b>${esc(r.detail)}${qty[k]?.metric ? `<small> · ${esc(qty[k]!.metric!)}</small>` : ""}</b></button>`).join("")}${set.rows.length > shownRows ? `<div class="hs-more">+ ${set.rows.length - shownRows} more</div>` : ""}${
@@ -1312,7 +1333,10 @@ function measureFirstHtml(a: Answer, ctx: HeroCtx): string {
   const big = v !== null ? v.toLocaleString("en", { maximumFractionDigits: v >= 100 ? 0 : v >= 10 ? 1 : 2 }) : "";
   const sentence = big
     ? readerGuess(a) === "typical" ? `a typical ${length ? "length" : "size"} for this — not measured on this drawing yet`
-      : `read off a picture of the drawing without marking where — not measured yet`
+      // UX FR-3 03:01: not 'without marking where' next to 4 boxed rows (dorm circulation, read from the printed table)
+      : (a.evidence ?? []).some((e) => e.bbox && !isSearchedArea(e) && !isHowEvidence(e))
+        ? `read from the marked places on the drawing — not measured on the plan yet`
+        : `read off a picture of the drawing without marking where — not measured yet`
     : bad === "echo" ? `The reading found only ‘${String(a.value).trim()}’, the number in your question, not the ${length ? "length" : "area"}.`
     : bad === "level" ? `The reading took ‘${levelRead(a)}’ — a level printed on the drawing, not ${length ? "a length" : "an area"} — so it is not shown as the answer.`
     : bad === "checked" ? `The reading took ${typeof a.value === "number" ? a.value.toLocaleString("en", { maximumFractionDigits: 2 }) : String(a.value)} ${unitLabel(a.unit) || ""} — ${sizeCheck(a)} — so it is not shown as the answer.${geminiGuess(a)}`.replace(/\s+—/, " —")
@@ -1352,7 +1376,7 @@ function secondOpinions(a: Answer): string {
   const out: string[] = [];
   // 'escalation (confidence 0.30 < 0.5): Gemini 3.1 Pro planned …' (an unavailable planner or no answer: no pill)
   const gem = t.find((l) => /Gemini 3\.1 Pro planned\b/.test(l) && !/unavailable|reached no answer|needs \$GEMINI/i.test(l));
-  if (gem) {
+  if (gem && geminiRan(a)) {
     const kept = /not better supported|answer kept/i.test(gem);
     const same = /same value/i.test(gem);
     const word = /replaces/i.test(gem) || /gemini_agent/.test(String(a.solver ?? "")) ? "Answer worked out by Gemini" : same ? "Gemini found the same" : kept ? "Gemini checked it" : "Gemini double-checked";
@@ -1380,7 +1404,7 @@ function statusHtml(a: Answer, c: { cls: string; word: string; hint: string }, a
   const ops: string[] = [];
   // F8 02:35: 'planned 0 step(s) … reached no answer (… unavailable …); answer kept' (no key, Private mode, cap spent) is
   // NOT a Gemini check: only the two outcomes where Gemini reached a value count
-  if (t.some((l) => /Gemini 3\.1 Pro planned\b/.test(l) && /same value|not better supported/i.test(l) && !/unavailable|reached no answer|needs \$GEMINI|planned 0 step/i.test(l))) ops.push("checked by Gemini");
+  if (t.some((l) => /Gemini 3\.1 Pro planned\b/.test(l) && /same value|not better supported/i.test(l) && !/unavailable|reached no answer|needs \$GEMINI|planned 0 step/i.test(l)) && geminiRan(a)) ops.push("checked by Gemini");
   if (t.some((l) => /(Second opinion \(NVIDIA Nemotron|verifier Nemotron\b)[^:]*\)?:\s*agrees?\b/i.test(l))) ops.push("Nemotron agrees");
   const ps = printedSum(a);
   const supWord = ps ? `the sum of ${ps} printed values` : sup?.state === "supported" ? "the marked text / outline gives it" : sup?.state === "approximate" ? "outline traced, approximate" : "";
@@ -1484,7 +1508,7 @@ function tierHtml(a: Answer): string {
   const c = (a.cost ?? {}) as Record<string, number>;
   const n = (k: string) => Math.max(0, (Number(c[k] ?? 0) || 0) - (Number(c[`prep_${k}`] ?? 0) || 0));
   const calls = n("api_calls");
-  const who = (a.trace ?? []).some((l) => /gemini/i.test(String(l))) || n("gemini_usd") > 0 ? "Gemini" : "hosted model";
+  const who = geminiRan(a) ? "Gemini" : "hosted model"; // T2 03:31 / captain 03:58: what the data line says
   // the tier's own words (shared with the phone), then the calls in small type
   const more = t.tier === "high" ? `${calls || 1} ${who} call${calls > 1 ? "s" : ""}` : t.tier === "mid" && n("llm_calls") ? `${n("llm_calls")} call${n("llm_calls") > 1 ? "s" : ""}` : "";
   return `<span class="tier t-${t.tier}" title="Cost: ${esc(t.why)}${esc(prepNote(a))}${again ? ". This time it came from our answer cache: no new model calls" : ""}"><span class="tier-dots">${[1, 2, 3].map((k) => `<i class="${k <= dots ? "on" : ""}"></i>`).join("")}</span>Cost: <b>${esc(t.word)}</b>${more ? ` <small>· ${esc(more)}</small>` : ""}${again ? " <small>(cached)</small>" : ""}</span>`;
@@ -1534,11 +1558,17 @@ export function numbered(ev: Answer["evidence"], max = 5, spread = false): numbe
 
 /** G1 21:24: a count's 'searched area: the west facade of …' box (exact=false) is where we looked, not an item. */
 export const isSearchedArea = (e: Answer["evidence"][number]) => /^\s*searched area\b/i.test(e.note ?? "");
+/** A mark that says HOW it was measured (the scale bar it used, a printed scale), not what was asked: viewer2d's
+ *  frameEvidence leaves it out of the framing (UX M20), so it is not numbered or counted either while the answer marks
+ *  anything else (UX FR-3 03:01: dorm circulation's ① was the off-screen scale bar, chip 'The 8 areas' for 4 rows). */
+export const isHowEvidence = (e: Answer["evidence"][number]) =>
+  /^\s*(?:graphic )?scale bar\b|\bscale bar\b.*\bpx per (?:m|ft)\b|^\s*(?:printed )?scale\b/i.test(e.note ?? "");
 function numberedAll(ev: Answer["evidence"], max: number): number[] {
   const out: number[] = [];
   const seen = new Set<string>();
+  const skipHow = ev.some((e) => (e.bbox || e.ifc_guid) && !isSearchedArea(e) && !isHowEvidence(e));
   ev.forEach((e, i) => {
-    if (out.length >= max || !(e.bbox || e.ifc_guid) || isSearchedArea(e)) return;
+    if (out.length >= max || !(e.bbox || e.ifc_guid) || isSearchedArea(e) || (skipHow && isHowEvidence(e))) return;
     const k = e.ifc_guid ?? `${e.file}|${(e.bbox ?? []).join(",")}`;
     if (seen.has(k)) return;
     // a 2D box and its element's GlobalId are the same thing: number the box (it is what the plan shows)

@@ -68,10 +68,12 @@ export function fmtValue(a: Answer) {
  *  '… at the scale read from the scale bar'; '(50.55 px per m)' goes); the expert view keeps them. */
 export function pxless(t: string): string {
   if (typeof document === "undefined" || document.body?.dataset.view === "expert") return t;
-  return t.replace(/\s+at 1 m = [\d.,]+ ?px(?= from\b)/gi, " at the scale read")
-    .replace(/\s+at 1 m = [\d.,]+ ?px\b/gi, "")
-    .replace(/\s*\(\s*[\d.,]+ ?px per m\s*\)/gi, "")
-    .replace(/[;,]?\s*[\d.,]+ ?px per m\b/gi, "");
+  // UX F-3 (03:22): also 'Graphic scale bar 0 2 4 8 ft: 44.12 px per ft approximate' → 'Graphic scale bar 0 2 4 8 ft (approximate)'
+  return t.replace(/\s+at 1 (?:m|ft) = [\d.,]+ ?px(?= from\b)/gi, " at the scale read")
+    .replace(/\s+at 1 (?:m|ft) = [\d.,]+ ?px\b/gi, "")
+    .replace(/\s*\(\s*[\d.,]+ ?px per (?:m|ft|foot|feet)\s*\)/gi, "")
+    .replace(/:\s*[\d.,]+ ?px per (?:m|ft|foot|feet)\b\s*(approximate|approx\.?)?/gi, (_m, ap) => (ap ? " (approximate)" : ""))
+    .replace(/[;,]?\s*[\d.,]+ ?px per (?:m|ft|foot|feet)\b/gi, "");
 }
 /** "cross-check: … ✓/✗" lines from evidence notes and trace (D4: no contract change). */
 /** W4's room-segmentation reading on CubiCasa count answers (trace "room segmentation (pretrained CubiCasa5K): 3 bedroom

@@ -741,7 +741,9 @@ registerFeature("corrections", (api: FeatureApi) => {
     }
     const prev = last[task];
     const cv = prev ? convert(v, a.unit, prev.unit) : null;
-    if (!prev || cv === null || prev.file !== f.path || /\btotal|rooms\b/i.test(q) || sameNum(prev.value, cv)) return;
+    // QA 03:28: 'Save to takeoff' (own) is the visitor's explicit choice: kept even when it agrees with our reading
+    // (EFA main hall 179.21 vs 179.65: 0.25 % -> nothing was kept and the next question read the drawing again)
+    if (!prev || cv === null || prev.file !== f.path || /\btotal|rooms\b/i.test(q) || (!own && sameNum(prev.value, cv))) return;
     const ev = (a.evidence ?? []).filter((e) => e.bbox).slice(0, 1).map((e) => ({ ...e, note: undefined }));
     const r = Math.round(cv * 100) / 100;
     const u = shown(prev.unit);
@@ -757,7 +759,8 @@ registerFeature("corrections", (api: FeatureApi) => {
       void add("value", { question: prev.q, value: r, unit: unitKey(prev.unit), source: "measure", task, evidence: ev,
         ...(traced ? { traced: true } : {}) }, false).then(() => {
         const mine = store?.items.find((i) => i.kind === "value" && i.active && i.question === prev.q);
-        showOffer(`Kept: later questions about “${esc(prev.q)}” use your <b>${r} ${esc(u)}</b>${also} (${traced ? "our traced outline, chosen by you" : "measured by you"}; we said ${prev.value} ${esc(u)}).`,
+        const agrees = sameNum(prev.value, cv) ? ", it agrees" : "";
+        showOffer(`Kept: later questions about “${esc(prev.q)}” use your <b>${r} ${esc(u)}</b>${also} (${traced ? "our traced outline, chosen by you" : "measured by you"}; we said ${prev.value} ${esc(u)}${agrees}).`,
           () => undefined, "OK", () => {
             if (mine) void call("POST", `${BASE}/${mine.id}/undo?path=${encodeURIComponent(f.path)}${V}`);
           });

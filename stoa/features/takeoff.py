@@ -1797,6 +1797,59 @@ def off_wall(pdf: str, page: int, n: float | None, poly: list) -> float | None:
         return None
 
 
+SAME_OUTLINE = os.environ.get("STOA_TAKEOFF_SAME_OUTLINE", "1") != "0"
+
+
+def _same_outline(rows: list[dict]) -> None:
+    """Two labels traced to ONE outline are one floor area, counted once. The demo's DfE L00 PNG: OCR read 'Enclosed
+    Walkway' as two labels, 'Enclosed Wall' and 'Walkway', both traced the same 119.39 m² outline -> the net floor area
+    said 1,736.96 m² (the PDF twin: 1,613.2 with one 'Enclosed Walkway' 118.98). The same holds for two real labels in
+    one open space (the tracer found no wall between them). The first label (surest, not a wall word, then sheet order)
+    keeps the numbers; every row of the other goes to Review 'same outline as …', so it is visible but not summed.
+    Match = same page, an area within 0.5 % and an evidence box within 1 % of its size (a traced polygon repeated)."""
+    if not SAME_OUTLINE:
+        return
+
+    def key(r: dict):
+        ev = next((e for e in r.get("evidence") or [] if e.get("bbox")), None)
+        v = r.get("value")
+        if ev is None or not isinstance(v, (int, float)) or isinstance(v, bool) or v <= 0 or r.get("fixed"):
+            return None
+        b = [float(x) for x in ev["bbox"][:4]]
+        if len(b) < 4 or b[2] - b[0] < 2 or b[3] - b[1] < 2:  # a placeholder box locates nothing
+            return None
+        return ev.get("page", r.get("page")), b, float(v)
+
+    area = [(i, r, key(r)) for i, r in enumerate(rows)
+            if r.get("section") == "room" and r.get("quantity") == "area"]
+    area = [(i, r, k) for i, r, k in area if k is not None]
+    rank = sorted(area, key=lambda t: (-float(t[1].get("confidence") or 0),
+                                       bool(re.search(r"\bwalls?\b", str(t[1].get("item") or ""), re.I)), t[0]))
+    kept: list[tuple[dict, tuple]] = []
+    dup: dict[tuple, dict] = {}
+    for _, r, k in rank:
+        pg, b, v = k
+        tol = 0.01 * max(b[2] - b[0], b[3] - b[1], 1e-9)
+        hit = next((kr for kr, (kpg, kb, kv) in kept if kpg == pg and abs(kv - v) <= 0.005 * max(kv, v)
+                    and all(abs(x - y) <= tol for x, y in zip(kb, b))), None)
+        if hit is None:
+            kept.append((r, k))
+        else:
+            dup[(r.get("item"), r.get("copy", 1))] = hit
+    if not dup:
+        return
+    for r in rows:
+        hit = dup.get((r.get("item"), r.get("copy", 1))) if r.get("section") == "room" else None
+        if hit is not None:
+            n = f" ({hit.get('copy', 1)}/{hit.get('copies')})" if (hit.get("copies") or 1) > 1 else ""
+            what = "outline" if any(e.get("polygon") for e in hit.get("evidence") or []) else "reading"
+            u = {"m2": "m²", "ft2": "ft²"}.get(str(hit.get("unit") or "m2"), str(hit.get("unit")))
+            note = (f"same {what} as {hit.get('item')}{n} ({hit.get('value'):g} {u}): counted once, "
+                    f"there; check it (two labels in one space, or this room's own walls were not found)")
+            r["same_outline"] = hit.get("id")
+            r["review"] = f"{r['review']}; {note}" if r.get("review") else note
+
+
 _ISO_NO = re.compile(r"^[A-Z0-9]{2,8}(?:-[A-Z0-9]{1,8}){4,8}$")  # ISO 19650 / BS 1192 'SEN-DFE-XX-01-D-X-0202'
 _ISO_REV = re.compile(r"^[PCAT]\d{2}(?:\.\d+)?$")  # its revision code: P01 preliminary, C01 contractual ...
 
@@ -2049,6 +2102,7 @@ def finish(st: dict, virtual: str | None = None, abs_path: str | None = None, fi
     # labels that are no room ('Enclosed Wall', canopy, site): run() drops them since 22:11, but a job stored before that
     # (the catalogue's warmed caches) still holds them -> dropped at read time too; after the ids, so fixes stay put
     rows = [r for r in rows if not (r.get("section") == "room" and _OUTSIDE_RX.search(_clean(r.get("item") or "")))]
+    _same_outline(rows)
     # a room's area / skirting answered IN COUNT is another quantity (UX 02:05, the demo's Swiss floor 9385: 'How many
     # linear metres of baseboard does the Whg. B Zimmer need' -> pipeline/dxf '8' = a door count, evidence = door marks;
     # 'the router read this as a length question; dxf answered in count'): no reading, its marks dropped, the count

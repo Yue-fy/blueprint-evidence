@@ -393,18 +393,26 @@ def parse(question: str, vocab: list[str] | None = None, room_numbers: set[str] 
         if is_count:
             # "how many windows does the largest room have" etc.: nested, leave to table QA
             return Query("count", "sum", [], "count", notes + ["nested superlative: left to table QA"])
-        if nums or (apts and not re.search(ROOM_NOUN, ql) and not labels):
+        # PR cycle 5: "the largest bedroom in apartment A" is a superlative over A's bedrooms, not "the largest
+        # apartment B" (it summed both bedrooms: floor 9385 largest = smallest = 31.51, true 15.9 / 15.6)
+        concept_sup = any(re.match(r"\s*(?:[\w']+\s+){0,3}?(?:" + "|".join(w) + r")\b", after)
+                          for c, (w, _) in CONCEPTS.items() if c != "room")
+        if nums or (apts and not re.search(ROOM_NOUN, ql) and not labels and not concept_sup):
             pass  # "largest of room 2.04" / "the largest apartment B" -> ordinary paths below
         else:
-            labs: list[str] | None = [lab for lab, _ in labels] or [lab for lab, _ in bare_labels(q, vocab)] or None
+            labs: list[str] | None = [lab for lab, _ in labels] or None
             note = "any numbered indoor room"
-            if labs is None:
+            if labs is None:  # PR cycle 5: a concept word before a bare label, like the area path ("das grösste
+                # Schlafzimmer" on a floor labelling bedrooms 'Zimmer' read 'Schlafzimmer' as a printed label and
+                # abstained, so the 'Zimmer' fallback never ran)
                 for c, (words, clabs) in CONCEPTS.items():
                     if c == "room":
                         continue
                     if _find_words(words, ql):
                         labs, note = list(clabs), f"concept {c}"
                         break
+            if labs is None:
+                labs = [lab for lab, _ in bare_labels(q, vocab)] or None
             t = Term("rooms", labs, sup.start(), note=note, scope=[a for a, _ in apts] or None)
             return Query("area" if asks_size else "text", sop, [t], (unit if asks_size else None), notes,
                          include_outdoor=inc0, consumed=cons)

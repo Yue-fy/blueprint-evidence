@@ -33,6 +33,7 @@ implausible (> 30,000 m² on one floor).
 from __future__ import annotations
 
 import math
+import os
 import re
 
 import numpy as np
@@ -286,6 +287,85 @@ def _blank_frame_rules(img: np.ndarray, vbox, margin: float, page_px) -> None:
             img[:, max(0, x - 1):x + 2] = 255
 
 
+def _frame_rects(pg) -> list:
+    """The sheet FRAME as drawn: unfilled single-rectangle paths that run >= 85 % of the page height or width (the
+    drawing frame, title-block strips), kept only when one of them encloses >= 80 % of the page both ways and together
+    they come within 6 % of all four page edges. Display coordinates [(x0, y0, x1, y1, stroke width)]. The farmhouse
+    A1.2 (1:48): the view's extent takes in its frame, so the 'rules beyond the view' blanking never reached it and the
+    outline was the frame's inside, 216 m² (house 47.6 m²). A tight-cropped plan's outer wall is not one unfilled
+    rectangle reaching all four edges."""
+    try:
+        import pymupdf
+
+        W, H = pg.rect.width, pg.rect.height
+        rm = pg.rotation_matrix
+        if pg.rotation:
+            d = pg.rect * rm
+            W, H = abs(d.width), abs(d.height)
+        cands = []
+        for g in pg.get_drawings():
+            if g.get("fill") is not None or len(g["items"]) != 1 or g["items"][0][0] not in ("re", "qu"):
+                continue
+            r = pymupdf.Rect(g["rect"]) * rm if pg.rotation else pymupdf.Rect(g["rect"])
+            if r.height >= 0.85 * H or r.width >= 0.85 * W:
+                cands.append((r.x0, r.y0, r.x1, r.y1, float(g.get("width") or 0.0)))
+        if not any(c[2] - c[0] >= 0.8 * W and c[3] - c[1] >= 0.8 * H for c in cands):
+            return []
+        ux0, uy0 = min(c[0] for c in cands), min(c[1] for c in cands)
+        ux1, uy1 = max(c[2] for c in cands), max(c[3] for c in cands)
+        if ux0 > 0.06 * W or uy0 > 0.06 * H or ux1 < 0.94 * W or uy1 < 0.94 * H:
+            return []
+        return cands
+    except Exception:  # noqa: BLE001
+        return []
+
+
+def _reaches_frame(box, frame, zoom: float) -> bool:
+    """A display-space box (x0, y0, x1, y1) touching or crossing the largest frame rectangle's sides."""
+    main = max(frame, key=lambda f: (f[2] - f[0]) * (f[3] - f[1]))
+    tol = 2.0 + 2.0 / zoom
+    return box[0] <= main[0] + tol or box[1] <= main[1] + tol or box[2] >= main[2] - tol or box[3] >= main[3] - tol
+
+
+def _drop_frame_parts(fp: np.ndarray, frame, clip, zoom: float, px_m: float):
+    """Drop the outline's parts that reach the drawn frame, when at least one part stays clear of it (else the
+    outline is kept whole and flagged later). -> (mask, m² dropped)."""
+    import cv2
+
+    n, lab, st, _c = cv2.connectedComponentsWithStats(fp.astype(np.uint8), connectivity=8)
+    if n <= 2:
+        return fp, 0.0
+    off, keep = [], []
+    for i in range(1, n):
+        x, y, w, h = (int(st[i, k]) for k in (cv2.CC_STAT_LEFT, cv2.CC_STAT_TOP, cv2.CC_STAT_WIDTH,
+                                              cv2.CC_STAT_HEIGHT))
+        box = (clip.x0 + x / zoom, clip.y0 + y / zoom, clip.x0 + (x + w) / zoom, clip.y0 + (y + h) / zoom)
+        (off if _reaches_frame(box, frame, zoom) else keep).append(i)
+    if not off or not keep:
+        return fp, 0.0
+    drop = np.isin(lab, off)
+    out = fp.copy()
+    out[drop] = 0
+    return out, float(drop.sum()) * px_m * px_m
+
+
+def _blank_frame_rects(img: np.ndarray, rects, clip, zoom: float) -> None:
+    """Blank the four sides of each frame rectangle (stroke width + 1 px each side) in the rendered clip."""
+    h, w = img.shape[:2]
+    for x0, y0, x1, y1, sw in rects:
+        b = max(1, int(np.ceil(sw * zoom / 2))) + 1
+        X0, Y0 = int(round((x0 - clip.x0) * zoom)), int(round((y0 - clip.y0) * zoom))
+        X1, Y1 = int(round((x1 - clip.x0) * zoom)), int(round((y1 - clip.y0) * zoom))
+        ya, yb = max(0, Y0 - b), min(h, Y1 + b + 1)
+        xa, xb = max(0, X0 - b), min(w, X1 + b + 1)
+        for Y in (Y0, Y1):
+            if -b <= Y < h + b:
+                img[max(0, Y - b):min(h, Y + b + 1), xa:xb] = 255
+        for X in (X0, X1):
+            if -b <= X < w + b:
+                img[ya:yb, max(0, X - b):min(w, X + b + 1)] = 255
+
+
 def _overall_dims_check(pdf: str, page: int, r: float, bbox) -> tuple[bool, str] | None:
     """The traced outline's width / depth vs the LONGEST dimension string along each side around it (strings measured
     at 1:r within 3 %, text inside the outline's box grown by a quarter). A longest string >= half the outline's extent
@@ -512,6 +592,9 @@ def _footprint(pdf: str, page: int = 0, view=None, ratio: float | None = None, p
                     img[max(0, y0):max(0, y1), max(0, x0):max(0, x1)] = 255
                     if re.search(r"[A-Za-z]{2}", sp["text"]) and not _ROOF_WORDS.search(sp["text"]):
                         word_boxes.append((x0, y0, x1, y1))
+        frame = _frame_rects(pg) if os.environ.get("STOA_VP_FRAME", "1") != "0" else []
+        if frame:   # the drawn sheet frame / title-block strips: never part of a building outline
+            _blank_frame_rects(img, frame, clip, zoom)
         to_pdf = ~rm if pg.rotation else pymupdf.Identity
     if region and v is not None:
         _blank_frame_rules(img, (np.array(region, dtype=float) - [clip.x0, clip.y0, clip.x0, clip.y0]) * zoom,
@@ -570,6 +653,11 @@ def _footprint(pdf: str, page: int = 0, view=None, ratio: float | None = None, p
         out["missing"].append("no closed building outline found in the plan view")
         return out
     fp = got[0]
+    if frame:   # parts running to the drawn frame are the legend / title-block boxes (Swiss 1805 sheets: +24 m²)
+        fp, off_m2 = _drop_frame_parts(fp, frame, clip, zoom, px_m)
+        if off_m2:
+            out["assumptions"].append(f"left out {off_m2:,.0f} m² outside the building: part(s) running to the "
+                                      "sheet's drawn frame (legend / title-block boxes)")
     fp, cut_m2 = _drop_unlabelled(fp, ink, px_m, word_boxes)
     if cut_m2:
         out["assumptions"].append(f"left out {cut_m2:,.0f} m² of the outline: box-like region(s) with no room name in "
@@ -604,6 +692,15 @@ def _footprint(pdf: str, page: int = 0, view=None, ratio: float | None = None, p
                parts=[round(a, 1) for a in part_m2 if a >= _MIN_PART_M2], polygons=polys,
                voids=[{"m2": vd["m2"], "bbox": _px_box_to_pdf(vd["bbox_px"], clip, zoom, to_pdf)} for vd in voids],
                confidence=0.35 if line_mode else 0.6)
+    if frame:   # a framed sheet's building lies inside its frame: an outline reaching the frame was closed by it or
+        # by annotation lines out to it (farmhouse A1.2 1:48: the frame's inside 216 m², then a 194 m² blob of
+        # dimension chains + section marks out to the page edge; the house is 47.6 m²)
+        if _reaches_frame((clip.x0 + xs.min() / zoom, clip.y0 + ys.min() / zoom, clip.x0 + (xs.max() + 1) / zoom,
+                           clip.y0 + (ys.max() + 1) / zoom), frame, zoom):
+            out["confidence"] = min(out["confidence"], 0.1)
+            out["missing"].append("the traced outline reaches the sheet's drawn frame, so lines outside the building "
+                                  "(the frame, dimension / annotation lines) closed it: it is not the building's "
+                                  "outline; check it on the sheet")
     if fp.sum() < 0.2 * extent and full_px > 3 * fp.sum():
         alt = full_px * px_m * px_m
         out["alt_gea_m2"] = round(alt, 1)
@@ -763,6 +860,34 @@ def _sheet_storey(path: str, page: int, layer=None) -> str | None:
         return None
 
 
+# G1 01:58: 'What is the total GIFA?' on the EFA sheet (block Ground 4055 / First 2302 / Second 2253 / Total 8610) took
+# this sheet's storey (2302). 'total / overall / combined' + no storey named + not bound to this plan / floor / sheet
+# -> the printed Total row, when the sheet also prints storey rows and the total is at least the largest of them.
+_TOTAL_Q = re.compile(r"\b(?:total|overall|combined|sum|altogether|in\s+total|grand)\b", re.I)
+_THIS_Q = re.compile(r"\b(?:this|that|the\s+(?:current|shown|present))\s+(?:whole\s+|entire\s+)?(?:plan|floor|level|"
+                     r"storey|story|sheet|drawing|page|view)\b|\b(?:on|of|for|in)\s+the\s+(?:plan|floor\s+plan|sheet|"
+                     r"drawing)\b|\bper\s+(?:floor|level|storey)\b|\beach\s+(?:floor|level|storey)\b", re.I)
+
+
+ONE_FLOOR_WHY = "the question asks for the whole building; the sheet prints only this floor's total"
+
+
+def _asked_total_row(question: str, gross: list[dict]) -> dict | None:
+    if os.environ.get("STOA_VP_TOTAL_ROW", "1") == "0" or not _TOTAL_Q.search(question or "") or \
+            _THIS_Q.search(question or ""):
+        return None
+    floors = [r for r in gross if r["kind"] == "storey" and r["storey"] is not None]
+    tots = [r for r in gross if r["kind"] == "total" and r["storey"] is None]
+    if len({r["storey"] for r in floors}) < 2 or not tots:
+        return None
+    units = {r["unit"] for r in floors}
+    tots = [t for t in tots if t["unit"] in units and t["value"] >= max(r["value"] for r in floors if r["unit"] ==
+                                                                            t["unit"]) * 1.001]
+    if not tots:
+        return None
+    return max(tots, key=lambda r: r["value"])
+
+
 def pick_printed(rows: list[dict], question: str, sheet_storey: str | None, measured_m2=()) -> tuple[dict | None, str]:
     """The printed row the question means, and why: a storey the question names; 'whole building' -> the total;
     else this sheet's storey; else the row the measured outline matches (within 8 %); else the only gross row."""
@@ -784,7 +909,15 @@ def pick_printed(rows: list[dict], question: str, sheet_storey: str | None, meas
         tot = [r for r in gross if r["kind"] == "total" and r["storey"] is None]
         if tot:
             return max(tot, key=lambda r: r["value"]), "the question asks for the whole building: the printed total"
+        own = [r for r in gross if sheet_storey is not None and r["storey"] == sheet_storey]
+        if own and os.environ.get("STOA_VP_ONE_FLOOR_ROW", "1") != "0":
+            # AFCEC dorm A-1..A-3 print only their own 'TOTAL FIRST FLOOR = 28,770 SF': that row (one floor, said)
+            # beats a measured outline of the same floor (84 m² @0.15 on the 1:480 half-size print)
+            return own[0], ONE_FLOOR_WHY
         return None, "the question asks for the whole building; the sheet prints no building total"
+    tot_row = _asked_total_row(question, gross) if q_storey is None else None
+    if tot_row is not None:
+        return tot_row, "the question asks for the total; the sheet prints a total row over its floors"
     want = q_storey if q_storey is not None else sheet_storey
     if want is not None:
         hit = [r for r in gross if r["storey"] == want]
@@ -845,11 +978,80 @@ _EXCEPT_Q = re.compile(r"\b(?:without|excluding|excluded|exclude|except|not\s+(?
 _SQFT_Q = re.compile(r"\b(?:sq\.?\s*ft|square\s+f(?:ee|oo)t|sf|ft2|ft²)\b", re.I)
 
 
+# O1 02:24: a whole-FLAT question ('What is the total floor area of the apartment?'); footprint answers it only from the
+# flat's printed headline ('2 H+KK+S 45.5 m²'), never from a measured outline (other readers sum the rooms)
+_DWELLING_Q = re.compile(
+    r"(?:(?:total|whole|overall|entire|complete|gross)\s+)?(?:(?:floor|living|internal)\s+)?(?:area|size|square\s+"
+    r"(?:footage|met(?:re|er)s|feet))\s+(?:of|in)\s+(?:the|this)\s+(?:whole\s+|entire\s+)?(?:apartment|flat|dwelling|"
+    r"home|unit)(?:\s+in\s+(?:square\s+\w+|m2|m²|sq\.?\s*\w+))?\s*[?.!]?\s*$|how\s+(?:big|large)\s+is\s+(?:the|this)\s+"
+    r"(?:whole\s+)?(?:apartment|flat|dwelling)(?:\s+in\s+(?:square\s+\w+|m2|m²|sq\.?\s*\w+))?\s*[?.!]?\s*$|\b(?:the|this)\s+(?:apartment|flat|dwelling)(?:'s)?\s+(?:total\s+)?(?:floor\s+|living\s+)?(?:area|size)"
+    r"\b|\b(?:asunnon|huoneiston)\s+(?:koko|(?:kokonais)?pinta-?ala|asuinpinta-?ala|huoneistoala)\b|\bhuoneistoala\b|"
+    r"\basuinpinta-?ala\b|\blägenhetens\s+(?:yta|area|storlek|boyta)\b|\bbostadsyta\b|\bwohnfläche\b|"
+    r"\bgröße\s+der\s+wohnung\b", re.I)
+
+
 def is_gross_area_question(question: str) -> bool:
     """'What is the total floor area of this plan?', 'GIFA of level 01', 'How big is the building?' -> True;
-    a named room ('floor area of the kitchen'), net / all-rooms sums ('total area of all rooms') -> False."""
+    a named room ('floor area of the kitchen'), net / all-rooms sums ('total area of all rooms') -> False.
+    A whole-flat question ('How big is the apartment?') -> True: footprint_answer then reads only a printed headline."""
     q = question or ""
-    return bool(_GROSS_Q.search(q)) and not _ROOMS_Q.search(q) and not _EXCEPT_Q.search(q)
+    hit = bool(_GROSS_Q.search(q)) or (bool(_DWELLING_Q.search(q)) and os.environ.get("STOA_VP_DWELLING", "1") != "0")
+    return hit and not _ROOMS_Q.search(q) and not _EXCEPT_Q.search(q)
+
+
+def _dwelling_answer(path: str, question: str, page: int = 0):
+    """The flat's printed headline ('2 H+KK+S 45.5 m²': Finnish type code = 2 rooms + kitchenette + sauna, and the
+    flat's area; Swedish '2 rok') for a whole-flat / house question, cross-checked by the sum of the room tags.
+    None when the sheet prints no headline, or several (a block of flats)."""
+    from stoa.contract import Answer, Evidence
+    from stoa.sheet.labels import room_tags
+
+    img = not str(path).lower().endswith(".pdf")
+    if img:
+        from stoa.sheet.sets import _cached_layer
+
+        lay = _cached_layer(path)
+        tags = room_tags(path, 0, layer=lay) if lay is not None else []
+    else:
+        tags = room_tags(path, page)
+    heads = [t for t in tags if t.dwelling]
+    if len({(t.value, t.unit) for t in heads}) != 1:
+        return None
+    hd = heads[0]
+    pv, pu = hd.value, hd.unit
+    if _SQFT_Q.search(question) and pu == "m2":
+        value, unit = round(pv * 10.7639, 0), "ft2"
+    elif _M2_Q.search(question) and pu == "ft2":
+        value, unit = round(pv / 10.7639, 1), "m2"
+    else:
+        value, unit = pv, pu
+    rooms = [t for t in tags if not t.dwelling and t.unit == pu]
+    tot = round(sum(t.value for t in rooms), 2)
+    named = sum(1 for t in rooms if t.name or t.number)
+    u = "m²" if pu == "m2" else "sq ft"
+    printed = f"{hd.name} {hd.text}"
+    assumptions = [f"read from the sheet: the flat's headline '{printed}' (type code {hd.name}: the whole flat, "
+                   "its printed area)"]
+    trace = [f"printed (VP): '{printed}' (the flat's headline: type code + area)"]
+    top = 0.8 if not img else 0.75
+    if len(rooms) >= 3 and abs(tot / pv - 1) <= 0.02:
+        chk = f"its {len(rooms)} room tags add up to {tot:,g} {u} ({(tot / pv - 1) * 100:+.1f} %: agrees)"
+        conf, missing = top, []
+    else:
+        chk = (f"its {len(rooms)} room tags add up to {tot:,g} {u}: differs, some rooms may carry no tag" if rooms
+               else "no room tags to cross-check it")
+        conf, missing = top - 0.15, ["room tags that add up to the printed flat area (cross-check)"]
+    assumptions.append(chk)
+    trace.append(f"cross-check: {chk} ({named} named)")
+    if pu != unit:
+        assumptions.append(f"converted from the printed {pv:,g} {u}")
+    space = "image_px" if img else "pdf_pt"
+    ev = [Evidence(file=path, page=None if img else page, bbox=[round(c, 1) for c in hd.box], bbox_space=space,
+                   exact=not img, note=f"printed: {printed}")]
+    ev += [Evidence(file=path, page=None if img else page, bbox=[round(c, 1) for c in t.area_box], bbox_space=space,
+                    exact=not img, note=f"{t.label}: {t.text}") for t in rooms[:40]]
+    return Answer(value=value, unit=unit, confidence=round(conf, 2), evidence=ev, solver="footprint", trace=trace,
+                  assumptions=assumptions, missing=missing)
 
 
 def footprint_answer(path: str, question: str, page: int = 0):
@@ -862,6 +1064,16 @@ def footprint_answer(path: str, question: str, page: int = 0):
 
     if not is_gross_area_question(question):
         return None
+    dq = bool(_DWELLING_Q.search(question)) or bool(re.search(r"\b(?:house|home|dwelling)\b", question, re.I))
+    if dq and os.environ.get("STOA_VP_DWELLING", "1") != "0":
+        try:
+            d = _dwelling_answer(str(path), question, int(page))
+        except Exception:  # noqa: BLE001
+            d = None
+        if d is not None:
+            return d
+        if not _GROSS_Q.search(question):
+            return None   # a whole-flat question with no printed headline: the room readers sum the rooms
     if str(path).lower().endswith((".png", ".jpg", ".jpeg", ".tif", ".tiff", ".webp")):
         return _image_answer(str(path), question)
     if not str(path).lower().endswith(".pdf"):
@@ -1022,9 +1234,14 @@ def _with_printed(ans, r, rows, path, page, question, storey, space, max_conf: f
     if use:
         ev += [e for e in ans.evidence[:1]]
     checked = bool(basis) or any(a.startswith("the sheet's own part totals") for a in assumptions)
+    missing = [] if checked else ["no drawn outline or printed parts to cross-check the printed total"]
+    if why == ONE_FLOOR_WHY:
+        conf = min(conf, 0.35)
+        assumptions.append("this sheet shows one floor: the value is that floor's printed gross area")
+        missing.append("the plans (or a printed building total) of the building's other floors: upload them together "
+                       "for the whole-building total")
     out = Answer(value=value, unit=unit, confidence=round(conf, 2), evidence=ev, solver="footprint",
-                 trace=trace + (list(ans.trace) if use else []), assumptions=assumptions,
-                 missing=[] if checked else ["no drawn outline or printed parts to cross-check the printed total"])
+                 trace=trace + (list(ans.trace) if use else []), assumptions=assumptions, missing=missing)
     return out
 
 

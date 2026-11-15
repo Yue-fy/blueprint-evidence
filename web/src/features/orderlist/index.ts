@@ -11,6 +11,7 @@
  */
 import { registerFeature, type FeatureApi, type Overlay2D, type DrawingPt } from "../registry";
 import type { Answer, Evidence, FileInfo } from "../../types";
+import { orderTopic, piecesFor, roomsNamed, stockFromQ, wasteFromQ } from "./question";
 
 type Ev = Evidence;
 type SkLine = { room: string; type: string; net_m: number; with_waste_m: number; pieces: number; confidence: number; method: string; evidence: Ev[]; assumptions: string[]; wet?: boolean };
@@ -48,15 +49,7 @@ const VISITOR = (() => {
 const OPTS: [string, string, string, number][] = [
   ["skirting_waste_pct", "Skirting waste", "%", 10], ["stock_m", "Stock length", "m", 2.4],
   ["floor_waste_pct", "Floor waste", "%", 10], ["door_height_m", "Door height", "m", 2.1]];
-const SKIRT_Q = /\b(skirting|baseboards?|jalkalist\w*|sockelleist\w*|fussleist\w*|socklar?)\b/i;
-// ordering words only: 'How many metres of skirting does the D&T Food Room need?' (a demo example) stays with the pipeline
-const ORDER_Q = /\b(order|ordered|buy|purchase|pieces?|stock lengths?|tilat\w*|tilaa|osta\w*|kpl|bestell\w*|kaufen)\b/i;
-// 'in what order are the doors numbered' is not a purchase
-const NOT_ORDER_Q = /\b(in (what|which) order|order of|ordered by|reading order)\b/i;
-// floor covering / doors: only with a purchase word ('pieces' / 'kpl' alone are skirting words)
-const BUY_Q = /\b(order|buy|purchase|tilat\w*|tilaa|osta\w*|bestell\w*|kaufen)\b/i;
-const FLOOR_Q = /\b(floor(ing| coverings?| finish(es)?)|carpets?|vinyl|lino(leum)?|laminate|parquet|floor tiles?|lattiapinn\w*|lattiamatto\w*|bodenbel[aä]g\w*|golvmatt\w*)\b/i;
-const DOOR_Q = /\b(doors?|door sets?|door leaves|ov(i|ia|ea|en|et|ien)|türen?|dörr(ar)?)\b/i;
+// which typed questions the order list answers, and a stock length / waste the question names: ./question.ts
 
 const CSS = `
 .feat-panel > .feat-tabs{flex-shrink:0}
@@ -479,9 +472,8 @@ registerFeature("orderlist", (api: FeatureApi) => {
 
   // 'How much skirting should we order?' from the question box: the order list's skirting line as the answer
   api.beforeAsk((q, f) => {
-    if (!readable(f) || NOT_ORDER_Q.test(q)) return null;
-    const what = SKIRT_Q.test(q) ? (ORDER_Q.test(q) ? "skirting" : null)
-      : BUY_Q.test(q) ? (FLOOR_Q.test(q) ? "floor" : DOOR_Q.test(q) ? "doors" : null) : null;
+    if (!readable(f)) return null;
+    const what = orderTopic(q);
     if (!what) return null;
     return (async (): Promise<Answer> => {
       if (!panel.isOpen()) panel.open();
@@ -505,21 +497,35 @@ registerFeature("orderlist", (api: FeatureApi) => {
       // no skirting read on this sheet (a picture with no rooms, a sheet the takeoff could not trace): the usual reader
       if (!o.skirting.lines.length) return usual();
       const op = o.options, d = new Set(o.defaults);
-      // a question naming a room type ('pieces of skirting for the Music Room') -> only those rooms
+      // a stock length / waste the QUESTION names ('How many 3 m skirting boards …', '… with 15 % waste') counts this
+      // answer at that value (per room, as the Python order list rounds); the panel keeps its own settings
+      const qStock = stockFromQ(q), qWaste = wasteFromQ(q);
+      const stock = qStock ?? op.stock_m, waste = qWaste ?? op.skirting_waste_pct;
+      const redo = stock !== op.stock_m || waste !== op.skirting_waste_pct;
+      const all = redo ? o.skirting.lines.map((x) => ({ ...x, ...piecesFor(x.net_m, stock, waste) })) : o.skirting.lines;
+      // a question naming a room by its printed NAME ('… does the D&T Food Room need?') -> that room; a room the order
+      // list left out (wet room, stair, 'check by hand') -> the usual reader, never the whole sheet's total; else a
+      // room TYPE ('pieces of skirting for the Music Rooms') -> only those rooms
       const ql = q.toLowerCase();
-      const named = o.skirting.lines.filter((x) => typeIn(x.type, ql));
-      const sk = named.length ? { ...o.skirting, lines: named, pieces: named.reduce((n, x) => n + x.pieces, 0),
-        total_net_m: Math.round(named.reduce((n, x) => n + x.net_m, 0) * 100) / 100,
-        total_with_waste_m: Math.round(named.reduce((n, x) => n + x.with_waste_m, 0) * 100) / 100,
-        pieces_if_offcuts_reused: Math.ceil(named.reduce((n, x) => n + x.with_waste_m, 0) / op.stock_m - 1e-9),
-        confidence: Math.min(...named.map((x) => x.confidence)), review: [] } : o.skirting;
+      const byName = new Set(roomsNamed(all.map((x) => x.room), q));
+      const left = roomsNamed([...(o.skirting.review ?? []).map((x) => x.room), ...(o.skirting.excluded ?? []).map((x) => x.room)], q);
+      if (!byName.size && left.length) return usual();
+      const named = byName.size ? all.filter((x) => byName.has(x.room)) : all.filter((x) => typeIn(x.type, ql));
+      const sel = named.length ? named : all;
+      const sk = named.length || redo ? { ...o.skirting, lines: sel, pieces: sel.reduce((n, x) => n + x.pieces, 0),
+        total_net_m: Math.round(sel.reduce((n, x) => n + x.net_m, 0) * 100) / 100,
+        total_with_waste_m: Math.round(sel.reduce((n, x) => n + x.with_waste_m, 0) * 100) / 100,
+        pieces_if_offcuts_reused: Math.ceil(sel.reduce((n, x) => n + x.with_waste_m, 0) / stock - 1e-9),
+        confidence: named.length ? Math.min(...named.map((x) => x.confidence)) : o.skirting.confidence,
+        review: named.length ? [] : o.skirting.review } : o.skirting;
       const dl = (k: string) => (d.has(k) ? " (default: change it in the Order list panel)" : "");
+      const fromQ = " (from your question; the Order list panel keeps its own setting)";
       return {
         value: sk.pieces, unit: "pieces", confidence: Math.min(0.75, sk.confidence || 0.3), solver: "orderlist",
-        evidence: sk.lines.map((x) => perRoom(x, op.stock_m, op.deduct_openings === 0)).filter((e): e is Ev => !!e),
-        trace: [`order list: ${sk.pieces} pieces of ${op.stock_m} m skirting = ${sk.lines.length} rooms, ${sk.total_net_m} m net + ${op.skirting_waste_pct} % waste = ${sk.total_with_waste_m} m, rounded up per room`,
+        evidence: sk.lines.map((x) => perRoom(x, stock, op.deduct_openings === 0)).filter((e): e is Ev => !!e),
+        trace: [`order list: ${sk.pieces} pieces of ${stock} m skirting = ${sk.lines.length} rooms, ${sk.total_net_m} m net + ${waste} % waste = ${sk.total_with_waste_m} m, rounded up per room`,
           ...sk.lines.map((x) => `${x.room}: ${x.net_m} m -> ${x.pieces} pcs`)],
-        assumptions: [`stock length ${op.stock_m} m${dl("stock_m")}`, `waste ${op.skirting_waste_pct} %${dl("skirting_waste_pct")}`,
+        assumptions: [`stock length ${stock} m${qStock != null ? fromQ : dl("stock_m")}`, `waste ${waste} %${qWaste != null ? fromQ : dl("skirting_waste_pct")}`,
           op.deduct_openings === 0 ? "skirting = each room's whole wall-face outline, door openings not deducted (the takeoff's Conventions tab)"
             : "skirting = each room's wall-face perimeter minus its door openings (the takeoff's reading)",
           `no skirting in ${op.wet_skirting ? "" : "tiled wet rooms, "}stairs, lifts, shafts: ${sk.excluded.map((x) => x.room).join(", ") || "none on this sheet"}`

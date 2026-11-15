@@ -618,6 +618,56 @@ _NUMBERED_Q = re.compile(r"\bhow many\b.*?\b(?:numbered\s+(?:rooms|spaces)|rooms
 _PLAIN_ROOMS_Q = re.compile(r"^\W*how many rooms(?:\s+(?:are|is)\s+(?:there|shown|drawn))?(?:\s+(?:on|in)\s+(?:this|the)\s+"
                             r"(?:plan|floor|drawing|sheet|building))?(?:\s+(?:are|is)\s+(?:there|shown|drawn))?\W*$", re.I)
 
+# a plain 'how many rooms' (no type, no label named): every room counts, whatever its name
+_GENERIC_ROOMS_Q = re.compile(r"^\W*(?:how many|number of|count(?: the)?)\s+rooms\b(?:\s+(?:are|is|there|shown|drawn|on|in|"
+                              r"this|the|plan|floor|drawing|sheet|building|level|storey|story|does|do|have|has|total|"
+                              r"altogether|whole|entire|page|it))*\W*$", re.I)
+BARE_ROOM = __import__("os").environ.get("STOA_G1_BARE_ROOM", "1") != "0"
+
+_CIRCULATION = re.compile(r"\b(?:corridor|lobby|stairs?|stairway|staircase|lift|elevator|landing|walkway|circulation)\b", re.I)
+
+
+def _every_room_name(pdf_abs: str, path: str, space: str):
+    """A plain 'How many rooms are there?' on a sheet that names its rooms in mixed case (DfE L00): every printed room
+    name counted once (stacked lines merged by E1's lineplan.labels), title-block / note text left out; corridors,
+    lobbies, stairs and lifts are counted and also stated separately (whether they are 'rooms' is a convention).
+    Low confidence: an unnamed room is missed and the convention is the asker's. None when nothing room-like is read."""
+    from collections import Counter
+
+    try:
+        from stoa.evidence.lineplan import labels
+        labs = labels(pdf_abs, 0)
+    except Exception:  # noqa: BLE001
+        return None
+
+    def roomish(t: str) -> bool:
+        t = t.strip()
+        if not t or re.search(r"\d", t) or not t[:1].isupper() or (t.endswith(")") and "(" not in t) or \
+                not re.search(r"[a-z]", t):  # mixed-case names only: 'INT' / 'FIN' / 'CLG' are abbreviations
+            return False
+        if re.search(r"\b[A-Z]{4,}\b", t) or len(t.split()) > 5:
+            return False  # title block headings (DESCRIPTION, ORIGINATOR), notes
+        return not re.search(r"\b(?:plan|level|issued|school|scale|drawing|title|project|revision|status|client|"
+                             r"sheet|north|key)\b", t, re.I)
+
+    rooms = [lb for lb in labs if roomish(lb["text"])]
+    if len(rooms) < 5:
+        return None
+    circ = [lb for lb in rooms if _CIRCULATION.search(lb["text"])]
+    n, nc = len(rooms), len(circ)
+    kinds = Counter(re.sub(r"\s+", " ", lb["text"]).strip() for lb in rooms)
+    ev = [Evidence(file=path, page=0, bbox=list(lb["bbox"]), bbox_space=space, exact=True, note=f"room name '{lb['text']}'")
+          for lb in rooms[:120]]
+    ck = Counter(re.sub(r"\s+", " ", lb["text"]).strip() for lb in circ)
+    return Answer(value=n, unit="count", confidence=0.5, evidence=ev, solver="label_count",
+                  trace=[f"label_count: {n} printed room names on the sheet (every name once, stacked lines merged): "
+                         + "; ".join(f"{k} x{v}" if v > 1 else k for k, v in kinds.most_common(14))
+                         + (" …" if len(kinds) > 14 else "")],
+                  assumptions=["Convention: one printed room name = one room; a room drawn without a name is not counted",
+                               (f"includes {nc} circulation space(s) ({', '.join(f'{k} x{v}' if v > 1 else k for k, v in ck.most_common(6))}); "
+                                f"without them {n - nc} rooms") if nc else "no corridors / lobbies / stairs are named"],
+                  missing=["which spaces count as rooms (circulation, stores, toilets) is the asker's convention"])
+
 
 def room_numbers(lines) -> list[tuple]:
     """US room numbering (USACE A-101F: 'FILTER ROOM' over '101'): (number, name, name box, number box) for every bare
@@ -883,6 +933,17 @@ class LabelCount(BaseSolver):
             a = _numbered_answer(lines, question, path, space, plain_hits=len(hits))
             if a is not None:
                 return a
+        if BARE_ROOM and len(hits) >= 2 and _GENERIC_ROOMS_Q.match(question) and \
+                all(re.fullmatch(r"rooms?", _fold(t).strip()) for t, _ in hits):
+            # G1 c15 (Stoa's DfE L00 PDF): 'How many rooms are there?' = 7 @0.83 from 7 lines reading exactly 'Room' =
+            # the second line of 'Plant / Room', 'Group / Room', 'Fitness / Room' … (the sheet has 8 Secondary
+            # Classrooms + 10 Group Rooms + 3 Plant Rooms alone). A plain room count counts every room, whatever its
+            # name: bare 'Room' tails are not that count
+            every = _every_room_name(p, path, space) if p.lower().endswith(".pdf") else None
+            if every is not None:
+                return every
+            return self.abstain(f"the {len(hits)} 'Room' line(s) are the last line of longer room names (Plant Room, "
+                                "Group Room …); a plain room count needs every room, not the labels with the word 'Room'")
         stacked = 0
         for (t1, b1), (t2, b2) in pairs:
             # 'Secondary' over 'Classroom' (DfE PNG: OCR reads a two-line label as two lines; stoa-like sl-035)

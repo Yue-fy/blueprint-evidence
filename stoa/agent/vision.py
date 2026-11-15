@@ -257,6 +257,12 @@ def _words_only(v) -> bool:
     if not isinstance(v, str) or ";" in v:
         return False
     t = v.strip()
+    if "\n" in t and os.environ.get("STOA_G1_LIST_ANS", "1") != "0" and \
+            sum(bool(re.search(r"\d", ln)) for ln in t.splitlines()) >= 2:
+        # UX 02:12 P2b-10 (Maleva IFC, a demo example): 'How many rooms are on each floor?' -> ifc 'Total spaces (whole
+        # model): 285 / By storey: - 1.korrus: 50 …' @0.85 was 'no number' -> 2 Gemini calls ($0.07, 'Fairly sure'):
+        # a per-group breakdown, one number per line, is a structured answer
+        return False
     return not re.fullmatch(r"[~≈]?\s*-?\d+(?:[.,]\d+)?\s*(?:m²|m2|m³|m3|m|ft²|ft2|sq ?ft|ft)?", t)
 
 

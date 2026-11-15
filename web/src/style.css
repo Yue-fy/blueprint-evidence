@@ -1532,7 +1532,7 @@ body[data-view="customer"] .hero-value .big.xlong { font-size: 40px; letter-spac
 .feat-tabs { display: flex; flex: 0 0 auto; gap: 2px; margin: 10px 16px 0; padding: 2px; border-radius: 999px; background: var(--fill); overflow-x: auto; overflow-y: hidden; scrollbar-width: none; }
 .feat-tabs[hidden] { display: none; }
 .feat-tabs::-webkit-scrollbar { display: none; }
-.feat-tabs button { flex: 1 0 auto; min-height: 36px; padding: 6px 9px; border: 0; border-radius: 999px; background: transparent; color: var(--ink); font: inherit;
+.feat-tabs button { flex: 1 0 auto; min-height: 36px; padding: 6px 7px; border: 0; border-radius: 999px; background: transparent; color: var(--ink); font: inherit;
   font-size: 13px; font-weight: 500; white-space: nowrap; cursor: pointer; }
 .feat-tabs button:hover:not(.on) { background: var(--fill-2); }
 .feat-tabs button.on { background: var(--cfff-bg); font-weight: 600; box-shadow: 0 3px 8px rgba(0, 0, 0, .12), 0 3px 1px rgba(0, 0, 0, .04); }
@@ -1543,6 +1543,8 @@ body[data-view="customer"] .hero-value .big.xlong { font-size: 40px; letter-spac
 .feat-caret { font-size: 11px; color: var(--muted); margin-left: -2px; }
 .feat-more-menu button { display: flex; align-items: center; gap: 10px; }
 .feat-more-menu button.warn::after { content: "⚠"; margin-left: auto; color: #b25000; font-size: 13px; }
+/* F3 03:14: a folded plug-in's warning (Self-check '1 issue', trust map) was visible only inside the menu: the More pill says it too */
+.feat-bar:has(> .feat-btn.feat-folded[data-warn="1"]) > .feat-more::after { content: "⚠"; margin-left: 4px; color: #b25000; font-size: 13px; }
 .feat-more-menu button:hover .feat-ic, .feat-more-menu button:focus-visible .feat-ic { color: #fff; }
 /* features' buttons on the answer card (F8 'Report') */
 .hero-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 10px; }
@@ -1727,7 +1729,7 @@ body .v2d-overlay .ev.tinted .pin circle { fill: color-mix(in srgb, var(--tint) 
 #pane3d > .feat-bar { top: 72px; bottom: auto; max-width: calc(100% - 100px); }
 /* UX 23:30 M16: the guided demo's caption sits under the floating Plan / 3D bar (it covered the tool pills at the bottom)
    and has an × to end the demo */
-body[data-view="customer"] #tourNote:not(:empty) { top: 76px; bottom: auto; }
+body[data-view="customer"] #tourNote:not(:empty) { top: var(--bar-b, 76px); bottom: auto; }
 #tourNote .tour-x { pointer-events: auto; margin-left: 12px; width: 28px; height: 28px; border: 0; border-radius: 999px; background: rgba(255, 255, 255, .16);
   color: inherit; font-size: 18px; line-height: 1; cursor: pointer; vertical-align: middle; }
 #tourNote .tour-x:hover { background: rgba(255, 255, 255, .28); }

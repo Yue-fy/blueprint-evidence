@@ -850,3 +850,46 @@ def test_each_room_and_exterior_on_pictures(tmp_path):
     assert a.value is None and "per room" in a.trace[-1]
     a = OpeningsSolver().solve(str(tmp_path / "plan.png"), "How many exterior doors does the building have?")
     assert a.value is None and "picture" in a.trace[-1]
+
+
+def test_room_label_tie_breaks_and_cubicle_pairs(tmp_path):
+    """DfE L00 (G1 02:24): 'the Toilets' meets 'Toilets' + three 'Toilet' labels by stem (exact form wins); 'Servery and
+    Furniture Store' is a 4-line label lineplan cuts after 3 lines (a stacked tail joins it); 'Servery' must not become
+    'Server Room' by a cut stem; two cubicle leaves meeting on a partition end are 2 doors, not a double."""
+    from stoa.evidence.lineplan import _words
+    from stoa.solvers import openings as O
+
+    lab = lambda t, b, n=1: {"text": t, "bbox": list(b), "n": n, "line_h": (b[3] - b[1]) / n,  # noqa: E731
+                             "words": _words(t), "pt": ((b[0] + b[2]) / 2, (b[1] + b[3]) / 2)}
+    head = lab("Servery and Furniture", (971.1, 818.4, 987.8, 831.8), 3)
+    tail = lab("Store", (974.1, 831.9, 984.8, 836.3))
+    other = lab("Store", (187.0, 577.8, 196.5, 582.2))
+    st = O._stacked_tails([head, tail, other])
+    assert [s["text"] for s in st] == ["Servery and Furniture Store"]
+    server = lab("Server Room", (900, 990, 935, 995))
+    assert O._verbatim_over_stem([server], [head, tail, other, server] + st, ["servery"])[0]["text"] == \
+        "Servery and Furniture Store"
+    assert O._verbatim_over_stem([server], [head, tail, other, server] + st, ["lead", "into", "servery"])[0]["text"] \
+        == "Servery and Furniture Store"  # words outside the room name do not block it
+    assert O._verbatim_over_stem([server], [server], ["server"]) == [server]
+    toilets = [lab("Toilets", (211, 219, 223, 224)), lab("Toilet", (244, 578, 254, 582)), lab("Toilet", (568, 939, 579, 943))]
+    assert [x["text"] for x in O._exact_form(toilets, ["toilets"])] == ["Toilets"]
+    assert len(O._exact_form(toilets, ["toilet"])) == 3  # 'the toilet' with two Toilet rooms stays ambiguous
+
+    # cubicle pair: two leaves whose closed ends meet on a filled partition end -> two singles (room scope only)
+    pdf = tmp_path / "cub.pdf"
+    doc = pymupdf.open()
+    pg = doc.new_page(width=200, height=200)
+    pg.draw_rect(pymupdf.Rect(96, 96, 104, 140), color=(0, 0, 0), fill=(0, 0, 0))  # partition, end at y=100
+    doc.save(pdf)
+    arc = lambda c, p0, p1: {"c": c, "r": 20.0, "p0": p0, "p1": p1}  # noqa: E731
+    pair = {"arcs": [arc((80, 100), (100, 100), (80, 80)), arc((120, 100), (100, 100), (120, 80))], "leaves": 2,
+            "kind": "double"}
+    tr: list = []
+    out = O._split_partition_pairs(str(pdf), 0, [(pair, None)], tr)
+    assert [d["kind"] for d, _ in out] == ["single", "single"] and all("bbox" in d for d, _ in out)
+    empty = tmp_path / "open.pdf"
+    doc = pymupdf.open()
+    doc.new_page(width=200, height=200)
+    doc.save(empty)
+    assert O._split_partition_pairs(str(empty), 0, [(pair, None)], []) == [(pair, None)]  # a real double stays one

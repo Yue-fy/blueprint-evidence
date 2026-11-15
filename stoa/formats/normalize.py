@@ -102,19 +102,25 @@ def is_deep(path: str | Path) -> bool:
         return False
 
 
+TRANSPARENT_BG_SHARE = 0.25  # a transparent BACKGROUND: >= this share of pixels with alpha < 128
+
+
 @functools.lru_cache(maxsize=256)
-def _alpha_min(path: str, mtime: float, size: int) -> int:
+def _transparent_share(path: str, mtime: float, size: int) -> float:
+    import numpy as np
     from PIL import Image
 
     Image.MAX_IMAGE_PIXELS = None
     with Image.open(path) as im:
-        return int(im.convert("RGBA").getextrema()[3][0])
+        a = np.asarray(im.convert("RGBA"))[::2, ::2, 3]
+    return float((a < 128).mean()) if a.size else 0.0
 
 
 def needs_picture_png(path: str | Path) -> bool:
     """Should prepare() read this PNG from readable_picture's copy? 16-bit grey (eight_bit), or a TRANSPARENT background
     (F6 01:17: cv2.imread / convert("RGB") drop alpha, a CAD export's black-under-alpha-0 sheet reads as BLACK; the web
-    upload flattens it, the CLI / API path did not). Header only for opaque modes; the alpha check decodes once per file."""
+    upload flattens it, the CLI / API path did not): >= 25 % of the pixels transparent. Header only for opaque modes; the
+    alpha check decodes once per file."""
     from PIL import Image
 
     Image.MAX_IMAGE_PIXELS = None
@@ -124,8 +130,10 @@ def needs_picture_png(path: str | Path) -> bool:
         if mode in DEEP_MODES:
             return True
         if mode in ("RGBA", "LA", "PA") or (mode == "P" and transp):
+            # a transparent BACKGROUND, not a few clear pixels: 37 dataset CubiCasa PNGs have 0-11 % transparent pixels
+            # and are read as they always were (their measured answers and path-keyed readers stay)
             st = Path(path).stat()
-            return _alpha_min(str(path), st.st_mtime, st.st_size) < 255
+            return _transparent_share(str(path), st.st_mtime, st.st_size) >= TRANSPARENT_BG_SHARE
     except Exception:  # noqa: BLE001 — unreadable: the readers say so
         return False
     return False

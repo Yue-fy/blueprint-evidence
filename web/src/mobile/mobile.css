@@ -75,6 +75,8 @@ body.m[data-step="asking"] #chips, body.m[data-step="asking"] #askForm { opacity
 .m-sheets .m-chip[aria-pressed="true"] { background: var(--accent); border-color: transparent; color: #fff; }
 .m-casenote { margin-top: 10px; color: var(--muted); font-size: 13px; line-height: 1.4; }
 .m-casenote a { color: var(--accent); text-decoration: none; font-weight: 600; white-space: nowrap; }
+/* UX REPORT-FINAL F-8: 'Open the 3D model ›' was a 16 px tall tap target: its own 44 px row under the credit */
+.m-casenote a { display: flex; align-items: center; width: fit-content; min-height: 44px; }
 /* where the answer came from: one button per mark, tap = zoom there */
 .m-where { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 12px; }
 .m-where .m-wlabel { width: 100%; color: var(--muted); font-size: 13px; }

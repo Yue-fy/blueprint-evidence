@@ -11,7 +11,7 @@ import type { Answer, FileInfo, KgRoom, RoomGraph } from "./types";
 import { roomKind, roomName, roomShown, Viewer2D } from "./viewer2d";
 import type { Viewer3D } from "./viewer3d"; // loaded lazily: web-ifc + three are ~4 MB
 import { clearSelection, currentSelection } from "./features/registry";
-import { plainSteps, targetNoun } from "./customer";
+import { isHowEvidence, plainSteps, targetNoun } from "./customer";
 import { answerNotes, cardActions, emitAnswer, emitClarifyPick, emitDrawing, emitMeasure, emitReadAs, emitScale, emitUpload, featureAnswer, initFeatures, enabled as enabledFeature, hasSelection, type AskContext, type DrawingPt, type PointerCtx, type Selection, type SelectionType } from "./features/registry";
 import "./features"; // feature plug-ins (append-only list in web/src/features/index.ts)
 import tourSteps from "../fixtures/tour.json";
@@ -561,12 +561,15 @@ function marksWhat(a: Answer, k: number): string {
   const t = String(a.intent?.target ?? "").toLowerCase();
   const known = !!t && !/^(unknown|element|other|thing|item|object)s?$/.test(t);
   if (a.intent?.task === "count" && typeof a.value === "number") {
-    if (known) return `${fmtValue(a)} ${targetNoun(a.intent?.target, a.value)}`;
+    // UX F-9: a count read from the whole image with fewer boxes drawn ('16 doors marked' over 5 boxes) → '5 of 16 doors'
+    // (one box = a printed figure / a region, not one of the items: left as it was)
+    const part = k >= 2 && k < a.value ? `${k.toLocaleString("en")} of ` : "";
+    if (known) return `${part}${fmtValue(a)} ${targetNoun(a.intent?.target, a.value)}`;
     // UX P2b-1: '5 unknowns marked' for 'How many check valves (CV)?': the card's own words ('check valves (CV) on this
     // drawing'), else '5 places'
     const sen = (document.querySelector("#hero .hero-sentence")?.textContent ?? "").trim()
       .replace(/\s+(?:on|in|of)\s+(?:this|the)\s+(?:drawing|sheet|plan|page|whole building|building|model)\b.*$/i, "").trim();
-    return sen && sen.length <= 48 && !/\d/.test(sen) ? `${fmtValue(a)} ${sen}` : `${fmtValue(a)} places`;
+    return sen && sen.length <= 48 && !/\d/.test(sen) ? `${part}${fmtValue(a)} ${sen}` : `${part}${fmtValue(a)} places`;
   }
   // UX P2b-11: 'rooms on each floor' (a list per floor) marked 285 rooms twice (plan box + 3D element): 'The 285 rooms'
   if (a.intent?.task === "count" && known) return `The ${k} ${targetNoun(a.intent?.target, k)}`;
@@ -580,8 +583,11 @@ function marksChip() {
   const a = state.answer;
   const f = state.file;
   // one per place: an element marked on the plan AND in the 3D model (bbox + GlobalId) counts once (UX P2b-11)
-  const k = a && f ? new Set(a.evidence.filter((e) => (e.bbox && e.file === f.path) || e.ifc_guid)
-    .map((e) => e.ifc_guid || `${e.page ?? 0}:${(e.bbox ?? []).map((v) => Math.round(Number(v))).join(",")}`)).size : 0;
+  // (UX FR-3: the scale bar it was measured with is not one of 'the 4 areas', unless it is all that is marked)
+  const placed = a && f ? a.evidence.filter((e) => (e.bbox && e.file === f.path) || e.ifc_guid) : [];
+  const asked = placed.filter((e) => !isHowEvidence(e));
+  const k = new Set((asked.length ? asked : placed)
+    .map((e) => e.ifc_guid || `${e.page ?? 0}:${(e.bbox ?? []).map((v) => Math.round(Number(v))).join(",")}`)).size;
   const sel = currentSelection();
   let html = "";
   let act: (() => void) | null = null;
@@ -612,8 +618,14 @@ function placeChip() {
   if (!el) return;
   // under the guided demo's caption when it shows (both sit under the Plan / 3D bar)
   const note = document.getElementById("tourNote");
+  // W5 c29 (1024 x 768): the sheet tabs + Plan / 3D bar wraps to two rows on a tablet (Maleva: 6 sheet tabs) and the
+  // chip at a fixed 76 px covered 'Side by side' / 'Accuracy': the chip and the tour caption (--bar-b) go under its bottom
+  const tb = document.getElementById("toolbar");
+  const hostTop = (el.offsetParent as HTMLElement | null)?.getBoundingClientRect().top;
+  const barB = Math.max(76, tb && tb.offsetHeight && hostTop !== undefined ? Math.round(tb.getBoundingClientRect().bottom - hostTop + 12) : 0);
+  document.documentElement.style.setProperty("--bar-b", `${barB}px`);
   const nh = note && !note.hidden && note.innerHTML ? Math.ceil(note.getBoundingClientRect().height) + 8 : 0;
-  let top = 76 + nh;
+  let top = barB + nh;
   // UX SO-4 / SO-5: centred in the part of the viewer left of an open panel (it covered Measure's scale line and the
   // zoom stack that moves beside the panel); UX 02:00: Measure's own panel (top-right on desktop) counts too — the chip
   // centres left of it, or drops below it when the space left of it is too small
@@ -638,6 +650,7 @@ function placeChip() {
   el.style.maxWidth = moved ? `${Math.max(240, Math.round(right - 32))}px` : "";
   requestAnimationFrame(placeZoom); // the zoom stack beside a panel starts under the chip (UX SO-4)
 }
+window.addEventListener("resize", () => requestAnimationFrame(placeChip)); // the bar may wrap / unwrap
 window.addEventListener("stoa:selection", () => requestAnimationFrame(marksChip));
 // W7 01:47 (UX S-M6): a legend room type lit in 3D over an answer drops the answer's 3D marks: the chip then offers
 // 'Show 211 doors' (which re-lights the answer; W7's lit type goes) instead of still saying '211 doors marked · Hide'
@@ -1597,7 +1610,11 @@ async function runAsk() {
     // G1 15:34: Gemini looking at a phone photo takes 1–4 min; the request waits up to 10 min (upload workers)
     // QA 19:11: do not name Gemini by elapsed time (the slow part is often our own reading of a scan, private mode calls
     // no hosted model, and the team's Gemini cap can be reached); say what may be happening, and that it can take minutes
-    if (he) he.textContent = s >= 2 ? `${Math.floor(s)} s${s >= 25 ? (privacy.on ? " · reading the drawing closely on our server… a photo or scan can take a few minutes the first time"
+    // captain 03:18: a door / window count waits on the symbol finder over the whole sheet (CPU, ~1 min the first time,
+    // then cached): say that, not 'a second model'
+    const symbols = /\b(how many|number of|count)\b/i.test(q) && /\b(doors?|windows?|openings?)\b/i.test(q);
+    if (he) he.textContent = s >= 2 ? `${Math.floor(s)} s${s >= 25 ? (symbols ? " · counting the door and window symbols on the whole sheet… the first time takes about a minute, then it is instant"
+      : privacy.on ? " · reading the drawing closely on our server… a photo or scan can take a few minutes the first time"
       : " · reading the drawing closely, maybe with a second model… a photo or scan can take a few minutes the first time")
       : s >= 7 ? " · still reading the drawing…" : ""}` : ""; // G1 23:01: elapsed time alone does not say why
     const slow = card.querySelector<HTMLElement>(".slow");
@@ -1964,6 +1981,7 @@ async function renderAnswer(a: Answer, roundTripMs: number) {
       return { answer, ms: performance.now() - t0 };
     },
   });
+  void glanceDiffNote(a, askedPath, askedQ);
   if (askedPath === v2d.openFile) {
     const sc = answerScale(a, v2d.space);
     if (sc) measure.setAutoScale(sc);
@@ -2206,7 +2224,9 @@ function endTour() {
 $("tourBtn").addEventListener("click", async () => {
   if (!tourBack && tourStep === tourList().length - 1) {
     endTour();
-    if (isCustomer()) showLanding(true);
+    $("bench").hidden = true; // UX F-5: ▸ after 7/7 left the Accuracy report open over the projects
+    // after this click's other listener (the home-page one below hides a visible landing on every tour click)
+    if (isCustomer()) window.setTimeout(() => showLanding(true), 0);
     return;
   }
   if (!$("landing").hidden) pushAppEntry();
@@ -2271,7 +2291,7 @@ $("viewToggle").addEventListener("click", () => {
     if (!state.file) void fileInfo(DEMO[0]).then((f) => f && openFile(f));
   }
 });
-// --- PRIVATE MODE (captain 18:53): drawings never leave our server; remembered per browser, ?private=1 in the URL ---
+// --- PRIVATE MODE (captain 18:53): drawings never leave our server; remembered per browser (button only); ?private=0/1 links ---
 let privTimer = 0;
 function privNote(on: boolean) {
   const n = $("privNote");
@@ -2307,37 +2327,48 @@ window.addEventListener("vite:preloadError", (e) => { e.preventDefault(); staleB
 window.addEventListener("unhandledrejection", (e) => {
   if (/dynamically imported module|Importing a module script failed|error loading dynamically imported/i.test(String((e.reason as Error)?.message ?? e.reason ?? ""))) staleBuild();
 });
-function setPrivate(on: boolean, tell = true) {
+/** UX 03:19: builds before 03:09 wrote 'be.private' = '0' on EVERY page load, so the new Private default never reached a
+ *  returning visitor (Stoa's testers, booth phones). The choice now lives in 'be.private.v2', written ONLY when the
+ *  visitor presses the Private button (`chosen`); the phone (mobile/main.ts) should read / write the same key. */
+const PRIV_KEY = "be.private.v2";
+function setPrivate(on: boolean, tell = true, chosen = false) {
   privacy.on = on;
   const b = $("privBtn");
   b.setAttribute("aria-checked", String(on));
   b.title = on ? "Private mode is on: drawings never leave our server. Click to allow Gemini / NVIDIA second readings."
     : "Private mode: drawings never leave our server (no Gemini or NVIDIA steps)";
   document.body.classList.toggle("private", on);
-  try {
-    localStorage.setItem("be.private", on ? "1" : "0");
-  } catch {
-    /* storage off: the URL still says it */
+  if (chosen) {
+    try {
+      localStorage.setItem(PRIV_KEY, on ? "1" : "0");
+    } catch {
+      /* storage off: a reload falls back to the default (Private on), the safe side */
+    }
+    // UX 03:28: the URL is never written on load (a copied link from a browser with Private off turned it off for
+    // whoever opened it). A '?private=' the visitor came in with gives way to their own click (PRIV_KEY keeps it).
+    const url = new URL(location.href);
+    if (url.searchParams.has("private")) {
+      url.searchParams.delete("private");
+      history.replaceState(history.state, "", url);
+    }
   }
-  const url = new URL(location.href);
-  if (on) url.searchParams.set("private", "1");
-  else url.searchParams.delete("private");
-  history.replaceState(null, "", url);
   if (tell) privNote(on);
 }
-$("privBtn").addEventListener("click", () => setPrivate(!privacy.on));
-setPrivate((() => {
+$("privBtn").addEventListener("click", () => setPrivate(!privacy.on, true, true));
+{
   const u = new URL(location.href).searchParams.get("private");
-  if (u !== null) return u === "1";
+  let stored: string | null = null;
+  try {
+    stored = localStorage.getItem(PRIV_KEY);
+  } catch {
+    /* storage off: the default */
+  }
   // S0 03:1x freeze (D62 5, captain's 30 % rule: QA 03:02 default mode = 50 % Expensive on Stoa's PNGs with 0 values changed by
   // Gemini; P1: local = 99.7 % of the hybrid's accuracy): Private is the DEFAULT, Gemini / NVIDIA is the visitor's opt-in
-  // (the button; '?private=0' links too). A visitor who switched it off keeps that ('be.private' = '0').
-  try {
-    return localStorage.getItem("be.private") !== "0";
-  } catch {
-    return true;
-  }
-})(), false);
+  // (the button; '?private=0' links too). A visitor who switched it off WITH THE BUTTON keeps that (PRIV_KEY = '0').
+  // T2 03:38: a '?private=0' link opened by someone who never chose it says so ('Private mode is off …'), never silently.
+  setPrivate(u !== null ? u === "1" : stored !== "0", u === "0" && stored !== "0");
+}
 
 // the guided demo from the top bar also works from the home page
 $("tourBtn").addEventListener("click", () => {
@@ -2522,6 +2553,35 @@ const printedTotalSub = (rule?: string) => {
   const lab = rule?.match(/'([^'=]{3,60}?)\s*=/)?.[1]?.trim();
   return lab ? `printed on the sheet as ‘${calm(lab)}’` : "printed on the sheet";
 };
+/** captain 03:18: AFCEC dorm 'how many windows?' answered 52 (plan views) while 'This floor at a glance' on the same
+ *  screen said 'Windows whole sheet 77': two numbers for one quantity, silently. A whole-sheet door / window count that
+ *  differs from the glance line says so under the answer, and why when the answer says it (plan views only). */
+const SHEET_WORDS = /^(floor|sheet|plan|drawing|level|building|storey|story|page|whole|entire|total|it|there|this|these)$/i;
+async function glanceDiffNote(a: Answer, path: string, q: string) {
+  if (!isCustomer() || !/\.(pdf|png|jpe?g)$/i.test(path) || typeof a.value !== "number" || a.intent?.task !== "count") return;
+  const t = String(a.intent?.target ?? "").toLowerCase();
+  const kind = /^doors?$/.test(t) || (/\bdoors?\b/i.test(q) && !/\bwindows?\b/i.test(q)) ? "doors"
+    : /^windows?$/.test(t) || (/\bwindows?\b/i.test(q) && !/\bdoors?\b/i.test(q)) ? "windows" : "";
+  if (!kind || a.intent?.filters?.room) return;
+  // a room's / wing's doors are not the sheet's: 'of the Kitchen', 'in the west wing', 'does room 119 have'
+  for (const m of q.matchAll(/\b(?:of|in|for|on|does|do|has|have)\s+(?:the\s+|this\s+)?([\p{L}\d][\p{L}\d-]*)/giu))
+    if (!SHEET_WORDS.test(m[1])) return;
+  const page = v2d.numPages > 1 ? v2d.page : 0;
+  const g = await glanceOf(path, page);
+  if (state.answer !== a || state.file?.path !== path || !g.ok) return;
+  const gl = kind === "doors" ? g.doors : g.windows;
+  const gv = gl?.value;
+  if (typeof gv !== "number" || gv === a.value || (kind === "doors" && g.doors?.leaves === a.value)) return;
+  // W5 c29: the batch plug-in's own card line ('This sheet's takeoff: 52 windows (this answer +40 %)') already says it
+  if (/\bthis sheet's takeoff\b/i.test($("hero").innerText)) return;
+  const notes = [...(a.trace ?? []), ...(a.assumptions ?? []), ...a.evidence.map((e) => e.note ?? "")].join("\n");
+  // 'plan views only' explains a SMALLER answer only (an old reader's 73 vs the glance's 52 said it backwards)
+  const why = a.value < gv && /\bplan views?\b|scoped to (?:the )?plan/i.test(notes) ? " (all views of the sheet; this answer counts the plan views only)"
+    : " (a different way of counting: the marked places show this answer's)";
+  $("hero").querySelector(".hero-diff")?.remove();
+  $("hero").querySelector(".hero-sentence")?.insertAdjacentHTML("afterend",
+    `<div class="hero-conv hero-diff">Not the same as ‘This floor at a glance’: <b>${esc(String(gv))} ${kind}</b> on the whole sheet${esc(why)}.</div>`);
+}
 async function glanceCard(f: FileInfo) {
   const el = $("glance");
   const page = v2d.numPages > 1 ? v2d.page : 0;
@@ -2660,9 +2720,12 @@ async function glanceCard(f: FileInfo) {
     void glanceOf(c.file, c.page ?? 0).then((og) => {
       if (glanceFor !== key || el.querySelector(".gl-copy")) return;
       const theirs = og.ok && og.area_m2 ? `${n(og.area_m2, 1)} m²` : "";
+      // F2 03:04: a FRESH takeoff of a scan measures few rooms (lineplan on traced scans: DfE scan 532.9 m² for 30 of 86
+      // rooms) — say how many, so '532.9 m²' next to 1,717.2 is not read as the floor's area
+      const part = g.rooms && g.rooms_labelled && g.rooms < 0.9 * g.rooms_labelled ? ` for ${g.rooms} of ${g.rooms_labelled} rooms` : "";
       const p = document.createElement("p");
       p.className = "gl-copy";
-      p.innerHTML = `This sheet is a print of <b>${esc(calm(c.label || c.level || "another sheet of this project"))}</b>${theirs ? `: its takeoff (${esc(theirs)}) is the one to use` : ""}${theirs && g.area_m2 ? `; this copy reads ${esc(n(g.area_m2, 1))} m²` : ""}. <button type="button" class="link gl-orig">Open the original</button>`;
+      p.innerHTML = `This sheet is a print of <b>${esc(calm(c.label || c.level || "another sheet of this project"))}</b>${theirs ? `: its takeoff (${esc(theirs)}) is the one to use` : ""}${theirs && g.area_m2 ? `; this copy reads ${esc(n(g.area_m2, 1))} m²${part}` : ""}. <button type="button" class="link gl-orig">Open the original</button>`;
       el.querySelector(".gl-head")?.after(p);
       p.querySelector(".gl-orig")?.addEventListener("click", () => {
         const pi = cat && os ? cat.sheets.indexOf(os) : -1;

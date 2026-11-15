@@ -1363,14 +1363,14 @@ _ROOM_SUBJECT_Q = re.compile(r"\b(?:sizes?|areas?|dimensions?|big|large|tall|hig
 _SUBJ_SIZE = re.compile(r"\b(?:how\s+big|rough\s+opening|sizes?|widths?|heights?|thickness|dimensions?|wide|tall|high|"
                         r"thick|big|lengths?|long)\b", re.I)
 _SUBJ_FUNC = frozenset("a an the of is are was were be its it this that these those what whats s for does do did has "
-                       "have how which me us give tell show find please and or in on per any".split())
-_SUBJ_OK = frozenset("door doors opening openings leaf leaves clear overall nominal actual total rough schedule "
+                       "have how which me us give tell show find please and or in on per any each both every either all".split())
+_SUBJ_OK = frozenset("door doors pair pairs set sets single double opening openings leaf leaves clear overall nominal actual total rough schedule "
                      "scheduled listed printed shown specified given according exact exactly approximate approximately "
                      "roughly mm cm m ft feet foot inch inches meters metres millimeters millimetres size sizes width "
                      "widths height heights thickness dimension dimensions wide tall high thick big".split())
 _SUBJ_LOC = frozenset("next behind beside besides outside inside near nearest nearby by at adjacent opposite across "
                       "beyond past from between along through above below under over around off to into after before "
-                      "leading serving with within facing".split())
+                      "leading serving with within facing front side sides containing contains holding housing having via".split())
 _SUBJ_SPACE = frozenset("room rooms space spaces corridor corridors hall halls hallway hallways lobby stair stairs "
                         "stairway stairwell office offices toilet toilets restroom restrooms closet closets kitchen "
                         "bathroom bedroom vestibule wall walls ceiling ceilings floor floors landing area building storey "
@@ -1596,7 +1596,10 @@ def follow_plan(path: str, page: int, question: str, set_paths: list[str] | None
     keyed = bool(_KEYED_OPENING_Q.search(q) and _KEYED_SIZE_Q.search(q) and not _PLAN_Q.search(q)) and not room_subject
     # F8 c8: 'What type is window W1?' / 'type of door 104S': a type named for ONE numbered opening is a schedule cell
     keyed_type = bool(_KEYED_OPENING_Q.search(q) and re.search(r"\btypes?\b", q, re.I) and not _PLAN_Q.search(q))
-    room_area = bool((_AREA_Q.search(q) or _ROOM_SIZE_Q.search(q) and not _DOOR_WORD_Q.search(q) or room_subject)
+    # F8 c11: a ROOM's width / length is measured on the plan: AW-28 'What is the width of room 104?' hopped to the room
+    # finish schedule A-601 and answered 'CONC.' (the floor finish) at 0.85; on the plan A-101 the reader traced 1.8 m
+    room_len = bool(re.search(r"\b(?:widths?|lengths?)\b", q, re.I) and not _DOOR_WORD_Q.search(q))
+    room_area = bool((_AREA_Q.search(q) or _ROOM_SIZE_Q.search(q) and not _DOOR_WORD_Q.search(q) or room_subject or room_len)
                      and not re.search(r"\bschedule", q, re.I) and not keyed)
     named_size = keyed or bool(_KEYED_OPENING_Q.search(q) and re.search(r"\b(?:size|width|height|thickness)\b", q, re.I)
                                and not _PLAN_Q.search(q) and not room_subject)
@@ -1618,6 +1621,10 @@ def follow_plan(path: str, page: int, question: str, set_paths: list[str] | None
         if scheds:
             want = {_sing(w) for w in _words(" ".join(_OPENING_Q.findall(q)))} or \
                 ({"room", "finish"} if _FINISH_Q.search(q) else set())
+            if "window" in want and "door" not in want:
+                # F8 c11: 'What size are the windows in room 104?' / 'window sill height in room 104' scored the ROOM
+                # FINISH & DOOR SCHEDULE on 'room' and landed on room 104's row: a window is read from a WINDOW schedule
+                want = {"window"}
             pointed = {(os.path.realpath(r.target_file or path), r.target_page) for r in refs if r.target_page is not None}
             scored = [(len(want & {_sing(w) for w in _words(e.title)}),
                        (os.path.realpath(e.file or path), e.page) in pointed, e) for e in scheds]

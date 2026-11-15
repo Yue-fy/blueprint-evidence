@@ -81,6 +81,14 @@ export function dataWent(a: Answer): Place[] {
   return [...keys].map((k) => PLACES[k]);
 }
 
+/** QA 03:13 / T2 03:31: a trace line where Gemini READ something; not Private mode's own line 'data: private mode: no hosted
+ *  model was called (Gemini, NVIDIA off)', nor a planner that was unavailable / reached no answer (F8 02:35). */
+export const geminiRead = (l: string) => /gemini/i.test(l) && !/no hosted model|private mode|not called|never ran|unavailable|reached no answer|planned 0 step|\b(?:gemini|nvidia)[^)]*\boff\b/i.test(l);
+/** Captain 03:58: the card may name Gemini only when this answer's data really went to Gemini (data_used / its cost /
+ *  the network line: the same truth as 'Stayed on our server'), never because a trace line mentions the word (Private
+ *  mode's own '(Gemini, NVIDIA off)' line made a printed-figure card say 'our reading and Gemini's agree'). */
+export const geminiRan = (a: Answer): boolean => dataWent(a).includes(PLACES.gemini);
+
 /** The value strip's line: '🔒 Stayed on our server' or 'Data: our server · Gemini (Google)'. */
 export function dataLineHtml(a: Answer, esc: (s: string) => string): string {
   const ps = dataWent(a);

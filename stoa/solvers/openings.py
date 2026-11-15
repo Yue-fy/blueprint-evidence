@@ -1198,6 +1198,120 @@ def pick_pages(pdf: str, question: str, max_pages: int = 8) -> tuple[list[int], 
 _ROOM_STOP = _STOP | {"have", "has", "together", "combined", "altogether", "room", "rooms", "does", "do", "got"}
 
 
+def _meet_ink(pdf: str, page: int, d: dict) -> float:
+    """Share of dark pixels in a small disc-sized square where a 'double' door's two closed leaves meet."""
+    import pymupdf
+
+    a, b = d["arcs"]
+    dd = math.dist(a["c"], b["c"]) or 1.0
+    mx = a["c"][0] + (b["c"][0] - a["c"][0]) / dd * a["r"]
+    my = a["c"][1] + (b["c"][1] - a["c"][1]) / dd * a["r"]
+    rad = max(0.8, 0.08 * min(a["r"], b["r"]))
+    with pymupdf.open(pdf) as doc:
+        pix = doc[page].get_pixmap(clip=pymupdf.Rect(mx - rad, my - rad, mx + rad, my + rad), dpi=600,
+                                   colorspace=pymupdf.csGRAY)
+    s = pix.samples
+    return sum(1 for v in s if v < 128) / max(1, len(s))
+
+
+def _split_partition_pairs(pdf: str, page: int, doors_in: list, trace: list) -> list:
+    """Inside a NAMED room only: two leaves whose closed ends meet on a wall end (WC cubicle doors either side of a
+    partition, DfE L00 'Toilets': ink 0.66 at the meeting point vs 0.07-0.16 for all 21 real double doors of the sheet)
+    are two doors, not one double. Whole-plan counts are left as they are (DfE L00 115 = the expert's count).
+    STOA_DR_PARTITION=0 = off. Genuine vector pages only: on a TRACED copy of a picture (<stem>.vecN.pdf) the traced
+    ink fills the meeting point of real double doors too (DfE PNG's 6000-px upload copy: the kitchen's double door
+    0.45 -> 5 doors instead of 4)."""
+    if os.environ.get("STOA_DR_PARTITION", "1") == "0" or re.search(r"\.vec\d+\.pdf$", str(pdf)):
+        return doors_in
+    out = []
+    for d, c in doors_in:
+        if d.get("kind") == "double" and len(d.get("arcs") or []) == 2:
+            try:
+                ink = _meet_ink(pdf, page, d)
+            except Exception:  # noqa: BLE001 - a render failure keeps the pair as drawn
+                ink = 0.0
+            if ink >= 0.4:
+                trace.append(f"openings: a 'double door' whose leaves meet on a wall end (ink {ink:.2f}) = 2 doors "
+                             "(cubicle doors either side of a partition)")
+                for x in d["arcs"]:
+                    xs = [p[0] for p in (x["c"], x["p0"], x["p1"])]
+                    ys = [p[1] for p in (x["c"], x["p0"], x["p1"])]
+                    bb = [min(xs), min(ys), max(xs), max(ys)]
+                    out.append(({"arcs": [x], "leaves": 1, "kind": "single", "bbox": bb,
+                                 "center": ((bb[0] + bb[2]) / 2, (bb[1] + bb[3]) / 2)}, c))
+                continue
+        out.append((d, c))
+    return out
+
+
+def _stacked_tails(labs: list[dict]) -> list[dict]:
+    """A room name printed on 4+ lines ('Servery / and / Furniture / Store', DfE L00): lineplan.labels merges at most
+    3 stacked lines, so the 4th line ('Store') is a label of its own and 'the Furniture Store' only meets the sheet's
+    nine 'Store' labels. -> the capped label + the single line stacked right under it, as one extra candidate label
+    (same column, same line height, the usual line gap). STOA_DR_STACK=0 = off."""
+    if os.environ.get("STOA_DR_STACK", "1") == "0":
+        return []
+    from stoa.evidence import lineplan
+
+    out = []
+    for a in labs:
+        n, h = a.get("n") or 1, a.get("line_h") or 0
+        X0, Y0, X1, Y1 = a["bbox"]
+        if n < 3 or h <= 0 or abs((Y1 - Y0) - n * h) > 0.3 * n * h:  # capped stacks only, page frame (not rotated)
+            continue
+        for b in labs:
+            x0, y0, x1, y1 = b["bbox"]
+            hb = b.get("line_h") or (y1 - y0)
+            if b is a or (b.get("n") or 1) != 1 or abs(hb - h) > 0.35 * h:
+                continue
+            if -0.5 * h <= y0 - Y1 <= 0.8 * h and abs((x0 + x1) / 2 - (X0 + X1) / 2) <= 0.25 * max(X1 - X0, x1 - x0) + 2:
+                text = f"{a['text']} {b['text']}"
+                box = [min(X0, x0), Y0, max(X1, x1), y1]
+                out.append({"text": text, "bbox": box, "n": n + 1, "line_h": h, "words": lineplan._words(text),
+                            "pt": ((box[0] + box[2]) / 2, (box[1] + box[3]) / 2), "stacked": True,
+                            "head": tuple(a["bbox"])})
+                break
+    return out
+
+
+def _exact_form(m: list[dict], words: list[str]) -> list[dict]:
+    """Several labels meet the question by stem ('Toilets' meets 'Toilets' and three 'Toilet' rooms): the ONE label
+    whose every name word is written exactly as in the question wins; otherwise the tie stays (-> abstain).
+    STOA_DR_EXACT_LABEL=0 = off."""
+    if os.environ.get("STOA_DR_EXACT_LABEL", "1") == "0":
+        return m
+    from stoa.evidence import lineplan
+
+    qs = set(words)
+    ex = [lab for lab in m
+          if (lw := [w for w in lab["words"] if w not in lineplan._GENERIC and w not in _ROOM_STOP]) and set(lw) <= qs]
+    return ex if len(ex) == 1 else m
+
+
+def _plural_pair(a: str, b: str) -> bool:
+    return a == b or a + "s" == b or b + "s" == a or a + "es" == b or b + "es" == a
+
+
+def _verbatim_over_stem(m: list[dict], labs: list[dict], words: list[str]) -> list[dict]:
+    """The best label meets a question word only by a cut stem ('Servery' -> 'Server Room': 'server' is a prefix of
+    'servery', not its plural) while ONE other label holds every question word verbatim ('Servery and Furniture Store',
+    DfE L00) -> that label. A stacked 4-line label replaces its own 3-line head. Plurals ('Offices' for 'office') stay
+    a match. STOA_DR_EXACT_LABEL=0 = off."""
+    if os.environ.get("STOA_DR_EXACT_LABEL", "1") == "0" or not words:
+        return m
+    from stoa.evidence.lineplan import _same
+
+    lw = m[0]["words"]
+    words = [w for w in words if any(_same(w, x) for x in lw)]  # the words the match rests on ('lead into' are not)
+    if not words or all(any(_plural_pair(w, x) for x in lw) for w in words):
+        return m
+    qs = set(words)
+    ex = [lab for lab in labs if qs <= set(lab["words"])]
+    heads = {lab["head"] for lab in ex if lab.get("stacked")}
+    ex = [lab for lab in ex if lab.get("stacked") or tuple(lab["bbox"]) not in heads]
+    return ex if len(ex) == 1 else m
+
+
 def named_rooms(pdf: str, page: int, question: str, scale_n: float) -> list[dict] | None:
     """[{label, polygon (pdf_pt)}] for every room the question names (a list 'A, B and C' -> each part), traced around
     its label at 1:scale_n; None when the question names no room label of this sheet; [] when a named room has no
@@ -1208,6 +1322,7 @@ def named_rooms(pdf: str, page: int, question: str, scale_n: float) -> list[dict
     labs = lineplan.labels(pdf, page)
     if not labs:
         return None
+    labs = labs + _stacked_tails(labs)
     hits: list[dict] = []
     qwords = {w for w in re.findall(r"[^\W\d_]{3,}", question.lower()) if w not in _ROOM_STOP}
     whole = lineplan._match_labels(labs, question)
@@ -1221,6 +1336,10 @@ def named_rooms(pdf: str, page: int, question: str, scale_n: float) -> list[dict
         if not words:
             continue
         m = lineplan._match_labels(labs, p)
+        if len(m) > 1:
+            m = _exact_form(m, words)
+        elif len(m) == 1:
+            m = _verbatim_over_stem(m, labs, words)
         if len(m) == 1 and m[0] not in hits:
             hits.append(m[0])
         elif len(m) > 1 and len(parts) == 1:
@@ -2978,6 +3097,7 @@ class OpeningsSolver(BaseSolver):
                     return self.abstain("no door lies on the traced outline of " + " + ".join(
                         repr(r["label"]) for r in rooms) + " (a room has at least one door: the outline or the name "
                         "match is probably wrong)", trace)
+                doors_in = _split_partition_pairs(pdf, page, doors_in, trace)
                 room_note = " in " + " + ".join(repr(r["label"]) for r in rooms)
                 trace.append(f"openings: room scope{room_note}: doors whose doorway lies on an edge of the traced room "
                              "outline")
@@ -3667,6 +3787,24 @@ class OpeningsSolver(BaseSolver):
             "missed, so the count may be low" if q["target"] == "door" else
             "the room's outline was traced from the picture (vector copy); windows by the symbol detector on it")]
         cap = 0.5 if roomish else 0.4  # whole-plan totals on a picture: more arcs to miss (DfE 91 of 101)
+        if (q["target"] == "door" and roomish and clean and not q.get("double") and not q.get("single")
+                and not q.get("leaves") and os.environ.get("STOA_DR_ROOM_XCHECK", "0") == "1"):
+            # OFF by default (measured 02:25): Brier over DfE's 18 rooms 4.5 -> 3.5, but on Ziying's two rooms it moves
+            # the wrong way (Kitchen 4 right 0.5 -> 0.35; Multi-Purpose Hall 6 of 8 wrong 0.5 -> 0.6)
+            n_det = self._room_det_check(img, str(out), question, f, ans.trace, ans.trace)
+            if n_det is not None:
+                # DfE PNG, 18 named rooms vs the vector PDF: detector == traced in 15 (13 right), != in 4 (1 right:
+                # the Kitchen, where the detector also boxes the Changing room's toilet door, Ziying 4)
+                if n_det == ans.value:
+                    cap = 0.6
+                    ans.assumptions = [*ans.assumptions, f"the door detector finds the same {n_det} door symbol"
+                                       f"{'s' if n_det != 1 else ''} on the room's walls (a second reading agrees)"]
+                else:
+                    cap = 0.35
+                    ans.assumptions = [*ans.assumptions, f"the door detector finds {n_det} door symbol"
+                                       f"{'s' if n_det != 1 else ''} on the room's walls, the traced swings "
+                                       f"{ans.value}: check the marked doors (a door of the next room close to this "
+                                       "room's wall, or a faint swing)"]
         if not clean:
             # a scan / photo: faint or broken swings (X1's A-101F scan: 6 of 9 leaves traced -> 4 doors vs 6)
             cap -= 0.2
@@ -3674,6 +3812,58 @@ class OpeningsSolver(BaseSolver):
                                "to trace, so this count is likely low"]
         ans.confidence = min(ans.confidence, cap)
         return ans
+
+    @staticmethod
+    def _room_det_check(img: str, vec: str, question: str, f: float, ans_trace: list, trace: list) -> int | None:
+        """Second reading for a named room's doors on a picture: V1's detector on a crop of the picture round the room's
+        traced outline (+1.5 m), door boxes whose centre is within 0.6 m of an edge of it. f = image px per traced pt.
+        None when the scale, the outline or the detector is missing (at most ~10 s of the detector budget)."""
+        import hashlib
+
+        from PIL import Image
+
+        mo = next((re.search(r"printed scale 1:(\d+)", t) for t in ans_trace if "printed scale 1:" in t), None)
+        if not mo:
+            return None
+        scale_n = float(mo.group(1))
+        try:
+            rooms = named_rooms(vec, 0, question, scale_n)
+        except Exception:  # noqa: BLE001
+            rooms = None
+        if not rooms:
+            return None
+        m = 1.5 / (PT_M * scale_n)
+        xs = [p[0] for r in rooms for p in r["polygon"]]
+        ys = [p[1] for r in rooms for p in r["polygon"]]
+        try:
+            with Image.open(img) as im:
+                W, H = im.size
+                box = (max(0, int((min(xs) - m) * f)), max(0, int((min(ys) - m) * f)),
+                       min(W, int((max(xs) + m) * f)), min(H, int((max(ys) + m) * f)))
+                if box[2] - box[0] < 20 or box[3] - box[1] < 20:
+                    return None
+                key = hashlib.sha1(f"{os.path.abspath(img)}|{os.path.getmtime(img)}|{box}".encode()).hexdigest()[:16]
+                cache = Path(os.environ.get("TMPDIR", "/tmp")) / "stoa-dr-room"
+                cache.mkdir(parents=True, exist_ok=True)
+                png = cache / f"{key}.png"
+                if not png.exists():
+                    im.convert("L").crop(box).save(png)
+        except Exception:  # noqa: BLE001
+            return None
+        ppm = f / (PT_M * scale_n)
+        _DET_DEADLINE[0] = min(_DET_DEADLINE[0] or 1e18, time.monotonic() + float(
+            os.environ.get("STOA_DR_XCHECK_TIMEOUT", "10")))
+        r = _det_client(str(png), min(1.0, 60.0 / ppm), 0.4)
+        if r is None:
+            trace.append(f"openings: detector cross-check on the room skipped ({_det_why()})")
+            return None
+        tol = 0.6 / (PT_M * scale_n)
+        n = sum(1 for b in r["boxes"] if b[5] == "door" and b[4] >= 0.5 and any(
+            _on_edge(rr["polygon"], (((b[0] + b[2]) / 2 + box[0]) / f, ((b[1] + b[3]) / 2 + box[1]) / f), tol)
+            for rr in rooms))
+        trace.append(f"openings: detector cross-check: {n} door box{'es' if n != 1 else ''} on the walls of "
+                     + " + ".join(repr(rr["label"]) for rr in rooms))
+        return n
 
     @staticmethod
     def _clean(img: str) -> bool:

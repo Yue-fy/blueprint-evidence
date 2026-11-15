@@ -134,6 +134,7 @@ registerFeature("selfcheck", (api) => {
   // all ran on nothing said 'No inconsistencies' with 0 agreeing)
   const checked = (r: Report) => r.passed.length > 0 || r.checks.some((c) => c.status === "ran" && c.compared > 0);
   let retries = 0;
+  let revTries = 0; // the toolbar's re-asks of a print comparison that was not read yet (cold upload)
 
   // 'Clear marks' / Esc (window 'stoa:clear-marks' without a scope, W5 12737064) hide every box this panel drew until
   // the visitor clicks a finding or an agreement again (or the panel shows another sheet's report)
@@ -291,9 +292,16 @@ registerFeature("selfcheck", (api) => {
       .then((o) => { const t = box.querySelector(".sc-orig"); if (t) t.textContent = headOf(o); })
       .catch(() => { const t = box.querySelector(".sc-orig"); if (t) t.textContent = "open it to check"; });
     const k = key();
-    void revOf(c).then((r) => {
+    let tries = 0;
+    const paint = (r: RevCmp | null) => {
       const el2 = box.querySelector<HTMLElement>(".sc-rev");
-      if (k !== key() || !el2 || !r || !r.line) return;
+      if (k !== key() || !el2 || !r || !r.line || !el2.isConnected) return;
+      // not read yet (a cold upload's text layer is still being made): ask again every 15 s for 2 minutes
+      if (r.status === "unread" && tries < 8) {
+        tries += 1;
+        setTimeout(() => { if (k === key() && el2.isConnected) void revOf(c).then(paint); }, 15000);
+      }
+      if (rev && rev.status !== "unread" && r.status === "unread") return;
       rev = r;
       // the headline counts it like the toolbar does ('Self-check · 1 issue')
       const sum = el.querySelector<HTMLElement>(".sc-sum");
@@ -322,17 +330,21 @@ registerFeature("selfcheck", (api) => {
       };
       el2.addEventListener("click", toggle);
       el2.addEventListener("keydown", (ev) => { if ((ev as KeyboardEvent).key === "Enter") toggle(); });
-    });
+    };
+    void revOf(c).then(paint);
   }
   /** On an ORIGINAL: its prints uploaded with it whose revision differs (red / amber) or matches (green), each with
    *  'Open the print'; nothing when it has none (or no project plug-in). */
-  function showPrints(el: HTMLElement, box: HTMLElement) {
+  function showPrints(el: HTMLElement, box: HTMLElement, tries = 0) {
     const ps = printsOf();
     if (!ps.length) return;
     const k = key();
     const here = api.file()!.path, pg = api.page();
     void Promise.all(ps.map((p) => revPair(p.file, p.page, here, pg).then((r) => ({ p, r })))).then((rs) => {
-      if (k !== key()) return;
+      if (k !== key() || !box.isConnected) return;
+      // a print whose text layer is not made yet (cold upload): ask again every 15 s for 2 minutes
+      if (rs.some((x) => x.r?.status === "unread") && tries < 8)
+        setTimeout(() => { if (k === key() && box.isConnected) showPrints(el, box, tries + 1); }, 15000);
       const told = rs.filter((x) => x.r && x.r.status !== "unread" && x.r.evidence.length);
       if (!told.length) return;
       box.hidden = false;
@@ -391,7 +403,10 @@ registerFeature("selfcheck", (api) => {
     const u = `/api/feat/selfcheck/copy?path=${encodeURIComponent(print)}&page=${page}&orig=${encodeURIComponent(orig)}&opage=${opage}`;
     if (!revCache.has(u)) {
       revCache.set(u, fetch(u).then((x) => (x.ok ? (x.json() as Promise<RevCmp>) : null)).catch(() => null));
-      revCache.get(u)!.then((r) => { if (!r) revCache.delete(u); });
+      // an 'unread' print is not cached: a picture's text layer usually appears ~30-60 s after the upload (QA 03:33: a
+      // byte-new scan said 'could not be read' at 12 s while the server read C01 vs C02 at 45 s); the server's own
+      // cache is keyed by both text layers, so asking again is cheap
+      revCache.get(u)!.then((r) => { if (!r || r.status === "unread") revCache.delete(u); });
     }
     return revCache.get(u)!;
   }
@@ -532,25 +547,40 @@ registerFeature("selfcheck", (api) => {
     const k = key();
     load().then((r) => {
       if (k !== key()) return;
+      let again = false;
       if (noLayer(r) && retries < 4) {
         retries += 1;
+        again = true;
         setTimeout(() => { if (k === key()) autorun(); }, 30000);
       }
+      // the open panel still shows this sheet's 'no text layer yet' report: show the one read now
+      if (!noLayer(r) && panel.isOpen() && report && noLayer(report)) render(panel.el);
+      // a print comparison not read yet (the picture's text layer is still being made): once more in 15 s, 2 min at most
+      const revAgain = () => {
+        if (again || revTries >= 8) return;
+        revTries += 1;
+        again = true;
+        setTimeout(() => { if (k === key()) autorun(); }, 15000);
+      };
       const n = r.findings.length;
       if (n) label(`Self-check · ${n} issue${n > 1 ? "s" : ""}`, n);
       else if (checked(r)) label("Self-check ✓");
       // a print / copy of another uploaded sheet whose revision is not the original's (T3's project; GET /copy)
       const c = copyOf();
       if (c) void revOf(c).then((x) => {
-        if (k !== key() || !x || x.severity !== "error") return;
+        if (k !== key() || !x) return;
+        if (x.status === "unread") return revAgain();
+        if (x.severity !== "error") return;
         label(`Self-check · ${n + 1} issue${n ? "s" : ""}`, n + 1);
       });
       // an ORIGINAL with a print uploaded with it that is not its revision
       else if (printsOf().length) {
         const f2 = api.file()!.path, pg = api.page();
         void Promise.all(printsOf().map((p) => revPair(p.file, p.page, f2, pg))).then((xs) => {
+          if (k !== key()) return;
+          if (xs.some((x) => x?.status === "unread")) revAgain();
           const bad = xs.filter((x) => x && x.severity === "error").length;
-          if (k !== key() || !bad) return;
+          if (!bad) return;
           label(`Self-check · ${n + bad} issue${n + bad > 1 ? "s" : ""}`, n + bad);
         });
       }
@@ -610,6 +640,7 @@ registerFeature("selfcheck", (api) => {
   });
   api.onDrawing(() => {
     retries = 0;
+    revTries = 0;
     overlay.clear();
     if (panel.isOpen()) render(panel.el);
     else report = null;

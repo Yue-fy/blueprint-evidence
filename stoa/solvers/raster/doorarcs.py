@@ -62,20 +62,31 @@ ARC_THREADS = max(1, int(os.environ.get("STOA_O1_ARC_THREADS", "6") or 1))  # 1 
 # copy (128 arcs, identical): 36.8 s sequential, 14.9 s with 4 threads, 9.9 s with 8 (box load ~250)
 
 
-def _arc_chunk(work: np.ndarray, pairs: list) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Best ring score / radius / quadrant per pixel over (r, q) pairs, in order (strict '>': earlier pairs win ties)."""
+def _arc_chunk(work: np.ndarray, pairs: list, base: int = 0) -> tuple[np.ndarray, np.ndarray]:
+    """Best ring score per pixel over (r, q) pairs, in order (strict '>': earlier pairs win ties), and the index
+    (base + position) of the pair that gave it. O1 c16 (X1 03:12: a 37 Mpx traced scan took the process 0.3 -> 8.6 GB):
+    one score buffer and one mask are reused for every pair and the winner is one uint16 index instead of a float32
+    radius + an int8 quadrant -> ~2.7 instead of ~4.5 work-sized float32 arrays per running chunk, identical results."""
     import cv2
 
     best = np.full(work.shape, -1.0, np.float32)
-    best_r = np.zeros(work.shape, np.float32)
-    best_q = np.zeros(work.shape, np.int8)
-    for r, q in pairs:
+    idx = np.zeros(work.shape, np.uint16)
+    s = np.empty(work.shape, np.float32)
+    m = np.empty(work.shape, bool)
+    for j, (r, q) in enumerate(pairs):
         on, off = ring_kernel(float(r), q)
         kern = on / on.sum() - off / off.sum()  # filter2D correlates (no flip needed)
-        s = cv2.filter2D(work, cv2.CV_32F, kern, borderType=cv2.BORDER_CONSTANT)
-        m = s > best
-        best[m], best_r[m], best_q[m] = s[m], r, q
-    return best, best_r, best_q
+        cv2.filter2D(work, cv2.CV_32F, kern, dst=s, borderType=cv2.BORDER_CONSTANT)
+        np.greater(s, best, out=m)
+        np.copyto(best, s, where=m)
+        idx[m] = base + j
+    return best, idx
+
+
+def _fold(best: np.ndarray, idx: np.ndarray, b: np.ndarray, bi: np.ndarray) -> None:
+    m = b > best  # later chunks win only when strictly better (the sequential loop's tie rule)
+    np.copyto(best, b, where=m)
+    np.copyto(idx, bi, where=m)
 
 
 def detect(png: str, px_per_m: float, r_m: tuple[float, float] = R_M, thr: float = THR, ink_lvl: int = INK,
@@ -89,7 +100,9 @@ def detect(png: str, px_per_m: float, r_m: tuple[float, float] = R_M, thr: float
     if k != 1.0:  # never below ~2 px line spacing: arcs vanish when downscaled (half-res recall 7% vs 91% full)
         im = im.resize((round(im.size[0] * k), round(im.size[1] * k)), Image.BICUBIC if k > 1 else Image.LANCZOS)
     g = np.asarray(im)
+    del im
     ink = (g < ink_lvl).astype(np.float32)
+    del g
     ppm = px_per_m * k
     cut = legend_cut(ink)
     work = ink[:cut]
@@ -104,29 +117,34 @@ def detect(png: str, px_per_m: float, r_m: tuple[float, float] = R_M, thr: float
         # P1 18:01: 124 sequential filter2D on Stoa's DfE sheet (7009 x 4957 after the upscale) = 27 of 35 s on the
         # upload's critical path. cv2 releases the GIL: chunks run in threads, each folds its own best in (r, q)
         # order, and the chunks are folded here in order with the same strict '>' -> identical results (ties keep the
-        # earlier (r, q)). Waves of ARC_THREADS chunks bound memory (~3 work-sized arrays per running chunk).
+        # earlier (r, q)). Waves of ARC_THREADS chunks bound memory; a chunk's result is dropped as soon as it is
+        # folded (O1 c16: the wave's futures used to hold every result until the next wave).
         from concurrent.futures import ThreadPoolExecutor
 
         size = max(4, -(-len(pairs) // (3 * ARC_THREADS)))
-        chunks = [pairs[i:i + size] for i in range(0, len(pairs), size)]
-        best = best_r = best_q = None
+        starts = list(range(0, len(pairs), size))
+        best = idx = None
         with ThreadPoolExecutor(ARC_THREADS) as ex:
-            for i in range(0, len(chunks), ARC_THREADS):
-                for f in [ex.submit(_arc_chunk, work, c) for c in chunks[i:i + ARC_THREADS]]:
-                    b, br, bq = f.result()
+            for i in range(0, len(starts), ARC_THREADS):
+                fs = [ex.submit(_arc_chunk, work, pairs[a:a + size], a) for a in starts[i:i + ARC_THREADS]]
+                for j in range(len(fs)):
+                    b, bi = fs[j].result()
+                    fs[j] = None
                     if best is None:
-                        best, best_r, best_q = b, br, bq
-                        continue
-                    m = b > best
-                    best[m], best_r[m], best_q[m] = b[m], br[m], bq[m]
+                        best, idx = b, bi
+                    else:
+                        _fold(best, idx, b, bi)
+                    del b, bi
     else:
-        best, best_r, best_q = _arc_chunk(work, pairs)
+        best, idx = _arc_chunk(work, pairs)
+    pr = np.asarray([p[0] for p in pairs], np.float64)
+    pq = np.asarray([p[1] for p in pairs], np.int64)
     sz = int(max(5, 0.35 * ppm)) | 1
     peaks = (best >= cv2.dilate(best, np.ones((sz, sz), np.uint8))) & (best >= thr)
     ys, xs = np.nonzero(peaks)
     dets = []
     for y, x in zip(ys, xs):
-        r, q = float(best_r[y, x]), int(best_q[y, x])
+        r, q = float(np.float32(pr[idx[y, x]])), int(pq[idx[y, x]])
         if r < r_m[0] * ppm - 0.01:
             continue
         quads = [_score_at(ink, int(x), int(y), r, j) for j in range(4)]

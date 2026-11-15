@@ -300,29 +300,53 @@ def _bedroom_fallback(fm: FloorModel, t: qparse.Term, names: list[str]) -> tuple
     return names, None
 
 
-def _bath_fallback(fm: FloorModel, t: qparse.Term) -> tuple[list[Room], str | None]:
-    """Many Swiss plans print only a number + area in the bathroom, no 'Bad'/'Bain'/'Bagno' (PR 01:40: 339 of 4,560
+def _bath_fallback(fm: FloorModel, t: qparse.Term, labelled=()) -> tuple[list[Room], str | None]:
+    """Many Swiss plans print only a number in a bathroom, no 'Bad'/'Bain'/'Bagno' and no area (PR 01:40: 339 of 4,560
     rooms with a bathtub/shower/WC inside, on 125 of 1,040 floors; e.g. floor 9385 room 2.04). 'The bathroom' then
     abstained and the VLM guessed another printed number ('4.92', the Reduit), and 'how many bathrooms' said 0 @0.69.
-    When no room in scope is labelled as a bathroom, read the UNNAMED rooms with a bathtub or shower drawn inside as
-    the bathrooms (WC-only rooms when there are none), and say so."""
+    So UNNAMED indoor rooms in scope with a fixture drawn inside are read as bathrooms too, and we say so:
+    - with a bathtub or shower: always (a second shower room is a bathroom in every reading);
+    - with only a WC: only in an apartment (or the unit-less rest) with no other bathroom, labelled or by fixtures;
+      next to a bathroom it is a separate toilet ('the area of the bathroom' = the bath room, not bath + WC), and the
+      assumption names it as not counted.
+    v2 (PR cycle 5): per apartment, not only when nothing in scope is labelled: 117 of the 123 floors MIX labelled and
+    unnamed bathrooms, so 'how many bathrooms on this floor' still counted only the labelled ones. Label-dropout test
+    (blank one labelled bathroom at a time on 300 fully labelled floors, gold = the plan's labels): floor count right
+    36 -> 1017 of 1320 (v1 -> v2), apartment 565 -> 989 of 1238. Most of the rest are WC-only rooms next to another
+    bathroom, which these plans DO label 'Bad' (789 of 790 named WC-only rooms): counting them too reached 1201, but
+    then 'the area of the bathroom' summed bath + WC on 5 of 20 real unnamed cases, so we left them out on purpose.
+    `labelled` = the bathroom rooms already counted by their label."""
     if not t.note.startswith("concept bathroom"):
         return [], None
     from shapely.geometry import Point
 
-    def holding(kinds):
-        pts = [Point((it.bbox[0] + it.bbox[2]) / 2, (it.bbox[1] + it.bbox[3]) / 2)
-               for k in kinds for it in fm.items.get(k, [])]
-        return [r for r in fm.rooms if not r.name and not r.outdoor and not r.shaft and r.area >= 1.0
-                and (not t.scope or r.unit in t.scope) and any(r.poly.buffer(0.05).contains(p) for p in pts)]
+    pts = {k: [Point((it.bbox[0] + it.bbox[2]) / 2, (it.bbox[1] + it.bbox[3]) / 2) for it in fm.items.get(k, [])]
+           for k in ("bathtub", "shower", "toilet")}
 
-    rooms, what = holding(("bathtub", "shower")), "a bathtub or shower"
-    if not rooms:
-        rooms, what = holding(("toilet",)), "a WC"
+    def has(r, kinds):
+        zone = r.poly.buffer(0.05)
+        return any(zone.contains(p) for k in kinds for p in pts[k])
+
+    seen = {id(r) for r in labelled}
+    cand = [r for r in fm.rooms if not r.name and id(r) not in seen and not r.outdoor and not r.shaft and r.area >= 1.0
+            and (not t.scope or r.unit in t.scope or ("*" in t.scope and r.unit))]
+    wet = [r for r in cand if has(r, ("bathtub", "shower"))]
+    have = {r.unit for r in labelled} | {r.unit for r in wet}
+    wcs = [r for r in cand if not has(r, ("bathtub", "shower")) and has(r, ("toilet",))]
+    keep = {id(r) for r in wet} | {id(r) for r in wcs if r.unit not in have}
+    rooms = [r for r in cand if id(r) in keep]  # plan order
     if not rooms:
         return [], None
-    return rooms, (f"no room is labelled as a bathroom (Bad/Bain/Bagno); read the {len(rooms)} unnamed room(s) with "
-                   f"{what} drawn inside as the bathroom(s): " + ", ".join(r.label() for r in rooms))
+    left = [r for r in wcs if id(r) not in keep]
+    n_wc = sum(1 for r in wcs if id(r) in keep)
+    lead = ("no room is labelled as a bathroom (Bad/Bain/Bagno); read" if not labelled else
+            f"besides the {len(labelled)} room(s) labelled as a bathroom, also read")
+    what = ("a bathtub or shower" if not n_wc else "a WC" if not wet else
+            f"a bathtub, shower or WC ({n_wc} with only a WC, in an apartment with no other bathroom)")
+    return rooms, (f"{lead} the {len(rooms)} unnamed room(s) with {what} drawn inside as bathroom(s): "
+                   + ", ".join(r.label() for r in rooms)
+                   + (f"; not counted: {', '.join(r.label() for r in left)} (only a WC, next to a bathroom: read as a "
+                      f"separate toilet)" if left else ""))
 
 
 def _in_scope(fm: FloorModel, kind: str, bbox, scope: list[str] | None) -> bool:
@@ -396,24 +420,25 @@ def _eval_term(fm: FloorModel, t: qparse.Term, qr: qparse.Query) -> _Part:
         names = t.arg if isinstance(t.arg, list) else [t.arg]
         names, fb = _bedroom_fallback(fm, t, names)
         texts = [tx for tx in fm.texts if tx.text in names] or [tx for tx in fm.texts if tx.text.lower() in {n.lower() for n in names}]
+        in_rooms = {id(tx): r for r in fm.rooms for tx in r.texts}
         if t.scope:
-            in_rooms = {id(tx): r for r in fm.rooms for tx in r.texts}
             texts = [tx for tx in texts if (r := in_rooms.get(id(tx))) is not None and r.unit in t.scope]
-        if not texts:
-            baths, bfb = _bath_fallback(fm, t)
-            if baths:
-                return _Part(len(baths), 0.5, [(r.bbox, _room_note(r)) for r in baths],
-                             [f"bathrooms by fixtures = {len(baths)}: {', '.join(r.label() for r in baths)}"],
-                             [f"{t.note}: labels {names}", bfb])
+        # unnamed rooms with a bathtub / shower / WC drawn inside (bathroom concept only; [] otherwise)
+        baths, bfb = _bath_fallback(fm, t, [in_rooms[id(tx)] for tx in texts if id(tx) in in_rooms])
         boxes = []
         for tx in texts:
             room = next((r for r in fm.rooms if tx in r.texts), None)
             boxes.append((room.bbox if room else tx.bbox, f"'{tx.text}'" + (f" room {room.number}" if room and room.number else "")))
+        boxes += [(r.bbox, _room_note(r)) for r in baths]
         conf = RULE_CONF["count_label"] * (0.7 if t.note.startswith("concept") else 1.0)
         asm = [f"{t.note}: labels {names}"] if t.note else []
         if fb:
             conf, asm = 0.5, asm + [fb]
-        return _Part(len(texts), conf, boxes, [f"rooms labelled {names} = {len(texts)} ROOM_TEXT entries"], asm)
+        tr = [f"rooms labelled {names} = {len(texts)} ROOM_TEXT entries"]
+        if baths:
+            conf, asm = min(conf, 0.5), asm + [bfb]
+            tr.append(f"bathrooms by fixtures = {len(baths)}: {', '.join(r.label() for r in baths)}")
+        return _Part(len(texts) + len(baths), conf, boxes, tr, asm)
     if k == "area_room":
         rooms = [r for r in fm.rooms if r.number == t.arg]
         if not rooms:
@@ -436,6 +461,8 @@ def _eval_term(fm: FloorModel, t: qparse.Term, qr: qparse.Query) -> _Part:
             cands = [r for r in fm.rooms if r.number and not r.shaft and (qr.include_outdoor or not r.outdoor)]
         if t.scope:
             cands = [r for r in cands if r.unit in t.scope]
+        baths, bfb = _bath_fallback(fm, t, cands) if names is not None else ([], None)
+        cands = cands + baths  # "the largest bathroom": unnamed rooms with sanitary fixtures compete too (PR cycle 5)
         unnamed = [r for r in cands if not r.name]
         if names is None and unnamed and len(unnamed) < len(cands):
             # numbered polygons without a name are mostly ducts/shafts/niches (< 1 m²): not what "a room" means
@@ -455,6 +482,11 @@ def _eval_term(fm: FloorModel, t: qparse.Term, qr: qparse.Query) -> _Part:
                + ("; outdoor rooms excluded" if names is None and not qr.include_outdoor else "")
                + (f"; {len(unnamed)} numbered polygons without a room name (ducts/niches) ignored"
                   if names is None and unnamed and len(cands) < len(unnamed) + len(cands) and all(c.name for c in cands) else "")]
+        if baths and any(x is r for x in baths):  # the answer IS an unnamed room read as a bathroom
+            fb = bfb
+        elif baths:  # a labelled bathroom won; the unnamed ones only lost to it
+            asm.append(f"also compared {len(baths)} unnamed room(s) with a bathtub, shower or WC drawn inside: "
+                       + ", ".join(x.label() for x in baths))
         if fb:
             conf, asm = min(conf, 0.5), asm + [fb]
         p = _Part(r.net, conf * (0.85 if t.note.startswith("concept") else 1.0), [(r.bbox, _room_note(r))], tr, asm)
@@ -470,9 +502,8 @@ def _eval_term(fm: FloorModel, t: qparse.Term, qr: qparse.Query) -> _Part:
         rooms = _rooms_with_name(fm, names)
         if t.scope:  # "the kitchen in apartment A"
             rooms = [r for r in rooms if r.unit in t.scope]
-        if not rooms:
-            rooms, bfb = _bath_fallback(fm, t)
-            fb = bfb or fb
+        baths, bfb = _bath_fallback(fm, t, rooms)  # + unnamed rooms with sanitary fixtures (bathroom concept only)
+        rooms, fb = rooms + baths, bfb or fb
         val = sum(r.net for r in rooms)
         asm = ["net floor area = sum of ROOM_OUTLINE polygon areas"] + ([f"{t.note}: labels {names}"] if t.note else [])
         if t.scope:

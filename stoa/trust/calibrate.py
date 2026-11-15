@@ -89,9 +89,6 @@ CONTRA_MAX = 0.39  # 'contra' basis (right <= 25 % on replays): shown as 'Our gu
 # counts 'nothing to mark' 32 / 32); the map (fitted on Stoa-like sheets) showed them at 0.87 and zero counts at 0.39.
 # These kinds were recognised on 0 of 35,488 Stoa-like / wild / scan / sealed upload rows. Kill switch STOA_T1_FAMILY=0.
 FAMILY_READERS = {"swiss_plan": ("pdf_vector", "dxf"), "bim_plan": ("plan_rooms", "ifcplan_pdf")}
-# keep-own's evidence (V1's 2,262 dataset rows, 98.5 % right) is CubiCasa-style pictures only: cubicasa_plan 2,123,
-# plan_render 46, 'scan' 93. Elsewhere (a real-world sheet the reader is not trained on) the unlocated cap stays.
-OWN_KINDS = ("cubicasa_plan", "plan_render")
 
 
 def _support_line(ans) -> tuple[str | None, str]:
@@ -233,7 +230,7 @@ def calibrate(ans, path: str | None = None):
     if state is None:
         return ans  # no support check ran (a stub, an early return): outside what the map was fitted on
     keep = next((m for t in ans.trace or [] if isinstance(t, str) for m in [_KEPT_OWN.search(t)] if m), None)
-    if keep and recognised_kind(ans) in OWN_KINDS and os.environ.get("STOA_T1_KEEP_OWN", "1") != "0":
+    if keep and os.environ.get("STOA_T1_KEEP_OWN", "1") != "0":
         # V1 01:47-01:50 (d32, 23k dataset files uploaded alone): a count the reader did not locate but whose OWN calibrated
         # confidence is >= 0.9 (sanity.uncounted_guard kept it) is right 94-99.5 % of the time (CubiCasa-style apartment
         # plans); the unlocated cap (<= 0.39) took that lane's ECE 0.063 -> 0.241. On Stoa-like sheets such rows: 0. Keep

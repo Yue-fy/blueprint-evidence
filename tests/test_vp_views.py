@@ -861,3 +861,128 @@ def test_storey_words_estonian():
     assert _storey_of("Maleva tänav 18 korterelamu — Korruse plaan: 1.korrus")[0] == "0"
     assert _storey_of("korrus 3")[0] == "2" and _storey_of("Keldrikorrus")[0] == "-1"
     assert _storey_of("Katusekorrus")[0] == "attic" and _storey_of("Katuse plaan")[0] == "roof"
+
+
+def test_unglue_ocr_room_numbers_only_when_the_sheet_prints_them_spaced():
+    """EFA colour sheet scan: OCR reads 'MFL1' / 'MFL3' next to 'MFL 2' -> 'MFL 1' (the MFL total sums 6 rooms, not 2);
+    an id that is never printed spaced ('GC2' catchments) stays as read."""
+    from stoa.sheet.labels import RoomTag, _unglue
+
+    def tag(name):
+        return RoomTag(name=name, number=None, value=55.0, unit="m2", text="55 m2", box=(0, 0, 1, 1),
+                       area_box=(0, 0, 1, 1))
+
+    tags = [tag("MFL1"), tag("MFL 2"), tag("MFL3"), tag("English Staff Work Room"), tag("LINED CATCHMENT GC2"),
+            tag("MFL 3WR")]
+    _unglue(tags)
+    assert [t.name for t in tags] == ["MFL 1", "MFL 2", "MFL 3", "English Staff Work Room", "LINED CATCHMENT GC2",
+                                      "MFL 3WR"]
+
+
+def test_footprint_drawn_frame_parts_dropped_and_frame_outline_flagged():
+    """A framed sheet's building lies inside its frame. Swiss 1805 4. OG (A3, frame + legend + title block): the legend
+    and title-block boxes joined the outline (301 m²) -> dropped (~208 m²). Farmhouse A1.2 (1:48): every reading
+    reaches the frame (the frame's inside 216 m², then a blob of dimension chains) -> confidence 0.1 + a check line."""
+    import importlib
+    import sys
+
+    import pymupdf
+
+    importlib.import_module("stoa.sheet.footprint")
+    F = sys.modules["stoa.sheet.footprint"]
+    swiss = need(".stoa/human/drawings/db526bc17a3-cb0f8d8c.pdf")
+    d = F.footprint(swiss)
+    assert 195 <= d["gea_m2"] <= 220 and any("drawn frame" in a for a in d["assumptions"])
+    farm = need(".stoa/neutral/x1/56c726cab3/56c726cab3.p6.pdf")
+    with pymupdf.open(farm) as doc:
+        assert len(F._frame_rects(doc[0])) >= 2
+    d = F.footprint(farm)
+    assert d["confidence"] <= 0.1 and any("drawn frame" in m for m in d["missing"])
+
+
+def test_title_block_title_names_a_non_plan_sheet():
+    """T3 01:20 (FTC 125-page set): a sheet with a plan view on it whose title block says 'ROOM FINISH SCHEDULE',
+    'PLUMBING DETAILS', 'FIRE ALARM MATRIX' or 'REFLECTED CEILING PLAN - SECOND FLOOR' is not a floor plan; titles
+    that also name a plan, and legend lines picked up as titles, change nothing."""
+    from stoa.sheet.sets import _title_kind
+
+    assert _title_kind("A-600 ROOM FINISH SCHEDULE", "floor_plan") == "schedule"
+    assert _title_kind("PLUMBING DETAILS", "floor_plan") == "detail"
+    assert _title_kind("FIRE ALARM MATRIX", "drawing") == "schedule"
+    assert _title_kind("REFLECTED CEILING PLAN - SECOND FLOOR", "floor_plan") == "rcp"
+    for keep in ("FLOOR PLAN & RCP", "FLOOR PLAN AND DETAILS", "ENLARGED PLANS AND DETAILS", "SECOND FLOOR PLAN",
+                 "SPOT ELEVATION MARKER", "Revision Schedule", "TABLE 4-20.0 IN THE UFC FOR FINISHES", "& SECTIONS",
+                 "AND DETAILS"):
+        assert _title_kind(keep, "floor_plan") == "floor_plan", keep
+    assert _title_kind("ROOM FINISH SCHEDULE", "cover") == "cover"
+
+
+def test_total_question_takes_the_printed_total_row():
+    """G1 01:58: the EFA colour sheet's GIFA block prints Ground 4055 / First 2302 / Second 2253 / Total 8610;
+    'What is the total GIFA?' (no floor named, not 'this plan') is the Total row, not this sheet's floor."""
+    from stoa.sheet.footprint import footprint_answer, pick_printed
+
+    f = need(f"{NEUTRAL}/d7c5a1e97b/d7c5a1e97b.pdf")
+    a = footprint_answer(f, "What is the total GIFA?")
+    assert a.value == 8610 and any("add up" in x for x in a.assumptions)
+    assert footprint_answer(f, "What is the total gross internal floor area?").value == 8610
+    assert footprint_answer(f, "What is the total floor area of this plan?").value == 2302
+    assert footprint_answer(f, "What is the GIFA of the second floor?").value == 2253
+    rows = [{"value": v, "unit": "m2", "kind": k, "storey": s, "net": False, "text": t, "label": t}
+            for v, k, s, t in ((100, "storey", "0", "Ground"), (80, "storey", "1", "First"), (60, "total", None, "GIFA"))]
+    assert pick_printed(rows, "What is the total GIFA?", "1")[0]["value"] == 80   # a 'total' below a floor: not a sum
+
+
+def test_bracketed_tags_and_loose_ocr_name_lines():
+    """G1 01:3x: DfE 2012 baseline sheets print '(55.0 m2)' under the name -> tags; EFA phone photo: 'English 8' overlaps
+    its '55 m2' line by 0.4 x the tag height (OCR boxes) and must stay that tag's name (X1 sl-340: 9 x 55 = 495)."""
+    from stoa.sheet.labels import _unbracket, room_tags
+
+    assert _unbracket("(55.0 m2)") == "55.0 m2" and _unbracket("[12 m²]") == "12 m²" and _unbracket("Hall (A)") == "Hall (A)"
+    d = ".stoa/datasets/stoa-like/dfe-baseline-2012/"
+    t = room_tags(need(d + "15723_2_01_002_primary_type_2_420__26_001.pdf"))
+    assert len(t) >= 15 and any(x.name == "Studio" and x.value == 55 for x in t)
+    photo = f"{NEUTRAL}/f453dd22d1/f453dd22d1.photo.png"
+    from stoa.solvers.area_tags import _cached_layer
+
+    lay = _cached_layer(need(photo))
+    if lay is None:
+        pytest.skip("no cached text layer for the EFA photo")
+    names = {x.name for x in room_tags(photo, 0, layer=lay)}
+    assert {f"English {i}" for i in range(1, 10)} <= names
+
+
+def test_finnish_flat_headline_and_codes_beside_or_below():
+    """O1 02:24 (Finnish CubiCasa-style flat plan): '2 H+KK+S' over '45.5 m²' is the flat's headline (type code + its
+    area), never a room; room codes sit beside ('KK' left of '6.0 m²', 'S' left of '2.5 m²'), further above ('TK') or
+    below ('OH' under '13.0 m²') their area. 'How big is the apartment?' = the headline, checked by the 8 rooms."""
+    from stoa.sheet.labels import _DWELLING, _side_names
+    from stoa.sheet.views import _Line
+
+    assert all(_DWELLING.match(t) for t in ("2 H+KK+S", "3h+k+s", "1H+KT", "4h+k+s+p", "2 rok", "3 r+k"))
+    assert not any(_DWELLING.match(t) for t in ("KK", "OH", "2 H", "H+K", "Kitchen 2"))
+
+    def L(t, b):
+        return _Line(text=t, box=b, src=b, size=0)
+
+    areas = [L("6.0 m²", (315, 272, 394, 304)), L("13.0 m²", (291, 498, 382, 526)), L("2.0 m²", (545, 755, 620, 786)),
+             L("2.5 m²", (847, 96, 918, 132))]
+    names = [L("KK", (249, 280, 291, 305)), L("OH", (322, 583, 361, 606)), L("TK", (554, 693, 598, 719)),
+             L("S", (791, 119, 808, 143)), L("3600", (326, 616, 386, 641)), L("18 x 12", (250, 834, 323, 855))]
+    got = {ln.text: l2.text for _k, ln, l2 in _side_names(areas + names, list(enumerate(areas)), set())}
+    assert got == {"6.0 m²": "KK", "13.0 m²": "OH", "2.0 m²": "TK", "2.5 m²": "S"}
+    from stoa.sheet.footprint import footprint_answer, is_gross_area_question
+
+    assert is_gross_area_question("How big is the apartment?") and is_gross_area_question("Mikä on asunnon pinta-ala?")
+    assert not is_gross_area_question("What is the total net floor area of the apartment?")
+    p = "/tmp/stoa-uploads/106fd68db466/data/cubicasa5k/asunto-2h-kk-s.png"
+    from stoa.sheet.sets import _cached_layer
+
+    if not os.path.exists(p) or _cached_layer(p) is None:
+        pytest.skip("O1's Finnish flat upload is not on this machine")
+    a = footprint_answer(p, "What is the total floor area of the apartment?")
+    assert a.value == 45.5 and a.confidence >= 0.7 and str(a.trace[0]).startswith("printed (VP)")
+    from stoa.sheet.labels import as_area_tags
+
+    t = as_area_tags(p, "What is the total floor area of the apartment?", layer=_cached_layer(p))
+    assert len(t) == 8 and abs(sum(x["value"] for x in t) - 45.5) < 0.01 and all(x["name"] for x in t)

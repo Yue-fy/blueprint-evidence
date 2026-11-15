@@ -49,7 +49,7 @@ client creates one instance, ships a git bundle, runs, and a watcher pulls the r
 
 **Working prototype.** The demo runs the detector we trained on Verda (v5; chosen by our gate at 4 wins / 0 losses
 vs the previous model, every clean control unchanged). Exam path at scale: every dataset file uploaded alone, the
-way Stoa tests; on the final code (11,891-question sample) accuracy held and confident-wrong answers fell 244 → 19.
+way Stoa tests; on the final code (11,891-question sample) accuracy held and confident-wrong answers fell from 244 to under 60.
 GPU offload prototype: our detector service sends a new sheet to a GPU twin on Verda: 15 s instead of 4+ min for a
 6,000 px scan, identical boxes; one script brings a twin up in 293 s. Spend: ≈ €26 of the €200 credits by 02:00 Sun.
 

@@ -54,7 +54,8 @@ latest version for the demo: 4 won, 0 lost on 56 door and window questions, ever
 detector's training and serving code lives in the team's workspace repository; this repository calls it as an
 optional service (`STOA_DET_URL`) and answers without it.
 
-Spend: about €26 of the €200 in credits by 02:00 on Sunday 15 November, most of it on GPU instances and the rest
+Spend: about €28 of the €200 in credits by 03:20 on Sunday 15 November (about €30 once the last instance is deleted at
+05:10), most of it on GPU instances and the rest
 on Verda Inference text calls. The last instance, a detector endpoint for the night, is deleted at the end of the event.
 
 ## Path to scale

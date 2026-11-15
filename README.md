@@ -69,7 +69,7 @@ skipped; in the web app one that fails switches itself off. The rest of the app 
 
 All numbers come from our eval tool (`python -m stoa.eval`). Counts must be exact; areas, lengths and volumes must be
 within 2%. Each row names its mode and the commit it was measured on (on the `night` branch of our
-[workspace repository](https://github.com/Yue-fy/Junction_Hannah_family)). The code in this repository is commit `c66948a` of that branch, and every commit named below is in its history. The live demo during judging runs `75f9ee4`, an earlier commit of this code, with the Private switch on by default (private mode). **Private** = local models only, every
+[workspace repository](https://github.com/Yue-fy/Junction_Hannah_family)). The code in this repository is commit `016824e` of that branch, and every commit named below is in its history. The live demo during judging runs this same code, with the Private switch on by default (private mode). **Private** = local models only, every
 hosted model off; **hybrid** = with the Gemini 3.1 Pro escalation and the Nemotron check on. Except in the dataset's
 sealed test, every file is uploaded alone under a meaningless name, as Stoa will test. Method and caveats: [docs/RESULTS.md](docs/RESULTS.md).
 
@@ -78,17 +78,17 @@ bound for a new drawing, not a forecast.
 
 | Test | Mode | Result | Commit |
 |---|---|---|---|
-| Stoa's own four example sheets: 90 questions in Stoa's kinds (room and type areas, baseboards, slab areas, door counts, piping) | private | **91.1%** (82/90): vector PDFs 38/41, Stoa's PNG copies 44/49 (the same answers at `b8146dd` and `4b62b93`) | `e4a166b` |
+| Stoa's own four example sheets: 90 questions in Stoa's kinds (room and type areas, baseboards, slab areas, door counts, piping) | private | **91.1%** (82/90): vector PDFs 38/41, Stoa's PNG copies 44/49 (the same answers at `b8146dd`, `4b62b93` and `e4a166b`) | `1389c6a` |
 | Same 90 questions: Gemini 3.1 Pro asked directly / Qwen3-VL-8B asked directly, without our pipeline | hosted / local | 61%, no evidence / 26% | |
 | Real drawings from outside the dataset, development set (168 questions) | private | 70.2% (118/168), as at `aff2f1f`; 71.4% at `f2cd8f1` | `b8146dd` |
-| Stoa's four example sheets, 20 numeric questions measured by hand by our teammate (each with a written method). She answered the 12 on three of the sheets after the d29 code was built | private | **19/20** with the door detector our gates use, **20/20** with the newer one the live demo runs; 18/20 at `aff2f1f`, 16/20 at `f2cd8f1`, and 8/12 on those 12 there, before her four misses were fixed from her answers | `4b62b93`, `75f9ee4` |
+| Stoa's four example sheets, 20 numeric questions measured by hand by our teammate (each with a written method). She answered the 12 on three of the sheets after the d29 code was built | private | **19/20** with the door detector our gates use, **20/20** with the newer one the live demo runs; 18/20 at `aff2f1f`, 16/20 at `f2cd8f1`, and 8/12 on those 12 there, before her four misses were fixed from her answers | `4b62b93`, `75f9ee4`, `1389c6a` |
 
 **Files nobody tuned on.** Run only by our gatekeeper, who saw aggregates, never rows. These are the better forecast.
 
 | Test | Mode | Result | Commit |
 |---|---|---|---|
-| Sibling sheets of Stoa's four drawing sets, with line-only school plans and image copies (173 questions) | private | **64.7%** (112/173); 61.3% at `b8146dd`, 58.4% at `aff2f1f`, 41.3% (59/143) at `1795365` | `e4a166b` |
-| Real drawings from outside the dataset, held-out set (120 questions on other files) | private | **49.2%** (59/120); 50.8% at `f2cd8f1`, 51.7% at `e3a1d9f` | `aff2f1f` |
+| Sibling sheets of Stoa's four drawing sets, with line-only school plans and image copies (173 questions) | private | **65.3%** (113/173); 64.7% at `e4a166b`, 61.3% at `b8146dd`, 58.4% at `aff2f1f`, 41.3% (59/143) at `1795365` | `1389c6a` |
+| Real drawings from outside the dataset, held-out set (120 questions on other files) | private | **54.2%** (65/120); 50.8% at `e4a166b` and `f2cd8f1`, 49.2% at `aff2f1f`, 51.7% at `e3a1d9f` | `1389c6a` |
 | Real drawings, held-out set (105 questions; the same product code and rows scored 48.6% private, `02a7a4d`) | hybrid | **64.8%** | `fc0927a` |
 | For reference: Gemini 3.1 Pro asked directly, first version of the real-drawing set (125 questions) | hosted | 43.8%, no evidence | `9e1c725` |
 | Stoa dataset, sealed test split: 2,000 scored of 2,199 questions (the 199 free-text answers are not scored), run twice in total | private | 87.7% micro, 79.7% weighted | `bb94fe4` |
@@ -141,8 +141,8 @@ sealed test, 56% of answers needed no model call at all. Gemini 3.1 Pro asked di
 ## Cost, latency and data governance
 
 You decide where a drawing may go. In the web app, the **Private** switch in the top bar (on by default; a visitor
-who switches it off, or opens the page with `?private=0`, allows Gemini and Nemotron for unsure answers, and the
-browser remembers that) keeps every question on our server, and each answer says where its data went:
+who switches it off allows Gemini and Nemotron for unsure answers, and the browser remembers that choice; a link with
+`?private=0` turns it off for that link only) keeps every question on our server, and each answer says where its data went:
 "Stayed on our server", or "Data: our server · Gemini (Google)" (or NVIDIA Nemotron, or Verda in the EU).
 On the server, the same modes are settings; every mode runs the same code.
 

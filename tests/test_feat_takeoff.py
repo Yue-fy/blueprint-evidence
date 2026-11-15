@@ -582,6 +582,37 @@ def test_a_count_is_no_skirting_or_area():
         assert sk["labelled"] >= sk["rooms"]
 
 
+def test_two_labels_on_one_outline_count_once():
+    """The demo's DfE L00 PNG: OCR read 'Enclosed Walkway' as 'Enclosed Wall' + 'Walkway', both traced the same
+    119.39 m² outline -> the net floor area counted it twice (1,736.96 vs the PDF twin's 1,613.2)."""
+    st = _st()
+    poly = [[0, 0], [100, 0], [100, 10], [0, 10]]
+    for name, conf in (("Enclosed Wall", 0.5), ("Walkway", 0.5)):
+        st["rows"].append({"section": "room", "item": name, "copy": 1, "copies": 1, "quantity": "area", "unit": "m2",
+                           "value": 119.39, "confidence": conf, "status": "ok",
+                           "evidence": [{"page": 0, "bbox": [315, 3128, 1975, 3313], "polygon": poly}]})
+        st["rows"].append({"section": "room", "item": name, "copy": 1, "copies": 1, "quantity": "baseboard",
+                           "unit": "m", "value": 63.1, "confidence": 0.45, "status": "ok",
+                           "evidence": [{"page": 0, "bbox": [315, 3128, 1975, 3313]}]})
+    before = T.summary(T.finish(_st()))["area"]["value"]
+    st2 = T.finish(st)
+    rows = {(r["item"], r["quantity"]): r for r in st2["rows"]}
+    assert not rows[("Walkway", "area")]["review"] and not rows[("Walkway", "baseboard")]["review"]
+    assert rows[("Enclosed Wall", "area")]["review"].startswith("same outline as Walkway (119.39 m²): counted once")
+    assert rows[("Enclosed Wall", "baseboard")]["review"] and rows[("Enclosed Wall", "area")]["same_outline"]
+    assert T.summary(st2)["area"]["value"] == round(before + 119.39, 2)
+    # a room of the same size elsewhere on the sheet is another room
+    st3 = T.finish({**st, "rows": [r for r in st["rows"] if r["item"] != "Enclosed Wall"] + [
+        {**r, "evidence": [{"page": 0, "bbox": [315, 4128, 1975, 4313], "polygon": poly}]}
+        for r in st["rows"] if r["item"] == "Enclosed Wall"]})
+    assert not any(r.get("same_outline") for r in st3["rows"])
+    T.SAME_OUTLINE = False
+    try:
+        assert not any(r.get("same_outline") for r in T.finish(st)["rows"])
+    finally:
+        T.SAME_OUTLINE = True
+
+
 def test_skirting_that_cannot_fit_the_room_goes_to_review():
     st = _st()
     st["rows"].append({"section": "room", "item": "Office", "copy": 1, "copies": 1, "quantity": "baseboard",

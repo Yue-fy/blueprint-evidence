@@ -223,6 +223,10 @@ _MODEL_SCOPE = re.compile(r"\b(?:in|of) the (?:whole |entire )?(?:model|building
                           r"\bbevat het model\b|\bin het model\b|\bw modelu\b|\bdans le modèle\b|\bnel modello\b", re.I)
 
 
+_APARTMENT_REF = re.compile(r"\b(?i:apartments?|flats?|wohnung(?:en)?|whg\.?|appartements?|appartamento|lägenhet|asunto)"
+                            r"\s*(?:[A-Z]{1,2}\d{0,2}|\d{1,3}[A-Z]?)\b")  # PR c6: = pipeline._APARTMENT_REF
+
+
 def _match(rooms, words: set[str]):
     ids = {w for w in words if re.search(r"\d", w)}
     names = words - ids
@@ -317,7 +321,9 @@ class PlanRooms(BaseSolver):
         trace.append(f"plan_rooms: {len(rooms)} filled room polygons with labels (fill {plan['fill']}); {note}")
         it = parse(question)
         q = question.lower()
-        if it.filters.get("apartment") or it.scope == "apartment":
+        if it.filters.get("apartment") or it.scope == "apartment" or _APARTMENT_REF.search(question):
+            # PR c6: intent keeps no apartment filter for a room type ("the largest bedroom in apartment C" =
+            # area bedroom [drawing]): the sheet's largest room beat pdf_vector's right 15.9 on uploads
             return self.abstain("plan_rooms does not know which rooms form an apartment", trace)
         assumptions = [f"room areas = the filled room polygons on the sheet × {note.split(':')[0] if n is None else f'1:{n}'}"
                        .replace("printed scale 1", "scale 1"), note]

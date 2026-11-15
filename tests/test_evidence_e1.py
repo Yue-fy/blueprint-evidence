@@ -721,8 +721,43 @@ def test_lineplan_counts_only_the_rooms_labelled_exactly_as_asked(tmp_path, monk
     assert LP.answer(f, "How many rooms labelled 'Toilet' are there on this plan?").value == 2
     assert LP.answer(f, "How many rooms labelled 'Toilets' are there on this plan?").value == 1
     assert LP.answer(f, "How many toilets are there?").value == 6  # a type question still counts every toilet label
+    stack = str(tmp_path / "stack.pdf")  # 'Servery' / 'and' / 'Furniture' / 'Store' on four lines is ONE label
+    doc = pymupdf.open()
+    pg = doc.new_page(width=600, height=400)
+    for i, t in enumerate(("Servery", "and", "Furniture", "Store")):
+        pg.insert_text((100, 100 + 4.5 * i), t, fontsize=4)
+    for x in (200, 300):
+        pg.insert_text((x, 200), "Store", fontsize=4)
+    doc.save(stack)
+    assert LP.answer(stack, "How many rooms labelled 'Store' are there on this plan?").value == 2
     monkeypatch.setattr(LP, "COUNT_EXACT", False)
     assert LP.answer(f, "How many rooms labelled 'Toilet' are there on this plan?").value == 6
+
+
+def test_the_room_labelled_exactly_as_quoted_is_measured_when_a_plural_label_also_matches(tmp_path, monkeypatch):
+    # D1 02:0x (DfE SEN L01): 'How big is the room labelled 'Toilet'' matched 'Toilets' too (plural fold) -> two rooms of
+    # different size -> None; the one label that IS the quoted text is the room asked about
+    import pymupdf
+
+    from stoa.evidence import lineplan as LP
+
+    f = str(tmp_path / "toilets.pdf")
+    doc = pymupdf.open()
+    pg = doc.new_page(width=600, height=400)
+    sh = pg.new_shape()
+    for r in [(100, 100, 200, 200), (250, 100, 400, 250)]:
+        sh.draw_rect(pymupdf.Rect(*r))
+    sh.finish(color=(0, 0, 0), width=1.0)
+    sh.commit()
+    pg.insert_text((130, 150), "Toilet", fontsize=7)
+    pg.insert_text((300, 175), "Toilets", fontsize=7)
+    pg.insert_text((450, 380), "SCALE 1:100", fontsize=8)
+    doc.save(f)
+    a = LP.answer(f, "How big is the room labelled 'Toilet'?")
+    assert a is not None and abs(a.value - (100 * 0.0254 / 72 * 100) ** 2) <= 0.02 * 12.45, a
+    monkeypatch.setattr(LP, "ROOM_EXACT", False)
+    assert LP.answer(f, "How big is the room labelled 'Toilet'?") is None
+
 
 def test_counted_elements_at_one_spot_say_so():
     from stoa.contract import Answer, Evidence
@@ -2022,8 +2057,58 @@ def test_skirting_leaves_out_door_recesses_and_slits_of_a_traced_outline():
     from shapely.ops import substring
 
     runs = [list(substring(ring, 0, s_a).coords), list(substring(ring, s_b, ring.length).coords)]
-    per_cut, sk_cut, why = LP._recess_cut(ring, [door], runs, mpp)
+    per_cut, sk_cut, why, a_cut = LP._recess_cut(ring, [door], runs, mpp)
+    assert abs(a_cut - (1.0 * 0.3 + 0.1 * 0.6)) < 0.05, a_cut  # the recess + the slit
     assert abs(per_cut - (0.6 + 1.2 - 0.1)) < 0.08, (per_cut, why)  # two 0.3 m jambs + the slit's 2 x 0.6 m sides
     assert abs(sk_cut - (0.6 + 1.2)) < 0.12, (sk_cut, why)
     assert full - per_cut > 2 * (10 + 8) + 3.0 - 0.1  # the alcove's 2 x 1.5 m sides stay
     assert any("recess" in w for _, w in why) and any(w == "slit" for _, w in why)
+
+
+def test_lineplan_count_leaves_out_view_titles(tmp_path, monkeypatch):
+    # G1 01:57 (MFC A-103): 'MODULE 05 - RESTROOMS - FLOOR PLAN' is the view's title, not a third restroom
+    import pymupdf
+
+    from stoa.evidence import lineplan as LP
+
+    f = str(tmp_path / "restrooms.pdf")
+    doc = pymupdf.open()
+    pg = doc.new_page(width=600, height=400)
+    for x, y, t in [(60, 80, "Female Restrooms"), (300, 80, "Male Restrooms"), (200, 360, "MODULE 05 - RESTROOMS - FLOOR PLAN"),
+                    (450, 220, "Storage")]:
+        pg.insert_text((x, y), t, fontsize=8)
+    doc.save(f)
+    assert LP.answer(f, "How many restrooms are there?").value == 2
+    monkeypatch.setattr(LP, "COUNT_NO_TITLES", False)
+    assert LP.answer(f, "How many restrooms are there?").value == 3
+
+
+def test_room_number_beats_one_extra_label_word(monkeypatch):
+    # T1 02:01 (EFA c2 first floor): 'Art 1 - Small' carries one word more than 'Art 2' / 'Art 3 - 3D'; 'Art 1' must
+    # still pick it (it matched the other two)
+    from stoa.evidence import lineplan as LP
+
+    def lab(t):
+        return {"text": t, "words": LP._words(t), "pt": (0, 0), "bbox": [0, 0, 1, 1]}
+
+    labs = [lab("Art 3 - 3D"), lab("Art 2"), lab("Art 1 - Small"), lab("Art Store")]
+    assert [x["text"] for x in LP._match_labels(labs, "Art 1")] == ["Art 1 - Small"]
+    assert [x["text"] for x in LP._match_labels(labs, "Art 2")] == ["Art 2"]
+    monkeypatch.setattr(LP, "NUM_PICK", False)
+    assert "Art 1 - Small" not in [x["text"] for x in LP._match_labels(labs, "Art 1")]
+
+
+def test_exact_label_word_beats_a_prefix_match(monkeypatch):
+    # DR 02:50 (Stoa's DfE L00): 'the Servery' matched 'Server Room' ('server' is a prefix of 'servery', no extra word)
+    # instead of 'Servery and Furniture Store'; a plural fold still counts as exact ('Toilets' for 'toilet')
+    from stoa.evidence import lineplan as LP
+
+    def lab(t):
+        return {"text": t, "words": LP._words(t), "pt": (0, 0), "bbox": [0, 0, 1, 1]}
+
+    labs = [lab("Server Room"), lab("Servery and Furniture Store"), lab("Toilets"), lab("Accessible Toilet")]
+    assert [x["text"] for x in LP._match_labels(labs, "How big is the Servery?")] == ["Servery and Furniture Store"]
+    assert [x["text"] for x in LP._match_labels(labs, "How big is the server room?")] == ["Server Room"]
+    assert [x["text"] for x in LP._match_labels(labs, "How big is the toilet?")] == ["Toilets"]
+    monkeypatch.setattr(LP, "EXACT_FIRST", False)
+    assert [x["text"] for x in LP._match_labels(labs, "How big is the Servery?")] == ["Server Room"]

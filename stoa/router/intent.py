@@ -194,6 +194,10 @@ DERIVED = ("rate", "cost", "given")
 _OPS_RX = [(n, re.compile(p, re.I)) for n, p in _OPS]
 _APT_SCOPE = re.compile(r"\b(?i:apartment|wohnung|appartement|appartamento|asunto|unit)\s+[A-Z0-9]{1,3}\b")
 _GENERIC = {"room", "unknown", "sanitary"}
+_ROOM_SCOPE = re.compile(r"\b(?:does|do|did|has|have|in|into|inside|within|of|to|for|from|at|off|serving|serve)\s+"
+                         r"(?:the|this|that|each|every|our|a|an)\s+[a-z]+(?:\s+[a-z]+)?(?:\s+(?:have|has|contain|got))?", re.I)
+_ROOM_SCOPE_ON = __import__("os").environ.get("STOA_G1_ROOM_SCOPE", "1") != "0"
+_ROOMISH = {"kitchen", "bedroom", "bathroom", "sauna", "balcony", "wc", "wc_room"}  # rooms that can scope a count
 
 
 def targets_mentioned(question: str) -> list[str]:
@@ -250,6 +254,17 @@ def modifiers(question: str) -> list[str]:
         if "rest" in ops and re.search(r"\b(?:leaving out|apart from|besides|other than)\s+(?:the\s+|any\s+|all\s+)?"
                                        r"(?:doors?|door ?ways?|openings?|door openings?)\b", q2):
             ops.remove("rest")
+    if len(t_out) >= 2 and _ROOM_SCOPE_ON and re.match(r"\W*how many\b", outside, re.I):
+        # DR 02:04 (Stoa's DfE L00, Ziying's dfe-05 list): 'How many doors does the kitchen have?' / '… lead into the
+        # kitchen?' / 'How many windows are in the kitchen?' -> 'multi' (kitchen is also a count target) -> the general
+        # agent first (1 @0.4 / 131 @0.07; openings alone 4 @0.7 = her 4 doors). The room after does / in / into / of …
+        # is the SCOPE of the counted class, not a second class ('How many doors AND windows …' stays multi)
+        sc = _ROOM_SCOPE.search(outside)
+        if sc and not re.search(r"\b(?:largest|biggest|smallest|most|fewest|least)\b", sc.group(0), re.I):
+            head = {t for t in targets_mentioned(outside[:sc.start()]) if t not in _GENERIC}
+            rest = {t for t in targets_mentioned(_ROOM_SCOPE.sub(" ", outside[sc.start():])) if t not in _GENERIC}
+            if head and not (rest - head):
+                t_out = head
     n_out = len(t_out)
     n_in = max([len({t for t in targets_mentioned(m) if t not in _GENERIC} - t_out)
                 for m in re.findall(r"\(([^)]*)\)", q2)] or [0])
@@ -348,11 +363,17 @@ _PIPE_SIZE = re.compile(r"\b(?:what(?:'s| is| are)? (?:the )?sizes?|sizes? of|ho
                         # QA 19:33: 'What pipe size feeds the truck fill stand?' (raster '6 ft' @0.40)
                         r"\b(?:pipe|piping|line|header|duct|riser|main|valve|conduit|rebar|bar)\s+(?:sizes?|diameters?)\b|"
                         r"\b(?:nominal )?diameter of the (?:\w+ )?(?:pipe|line|header|duct|riser|main)\b", re.I)
+# F8 01:53 (SFO A-303 / AFCEE A-602 / AW-28 A-601, 10/10 probes): 'What size is door 7.01A?' / 'What is the size of window
+# W3?' parsed as AREA (card: 'Net internal area' + a scale): a door / window size is its printed W x H, a text question
+_OPENING_SIZE = re.compile(r"\b(?:what(?:'s| is| are)? (?:the )?sizes?|sizes? of|how (?:big|large))\b(?:\W+[\w.-]+){0,3}?\W+"
+                           r"(?:doors?|windows?|openings?|louv(?:er|re)s?|hatch(?:es)?|grilles?)\b"
+                           r"(?!\s+(?:area|areas|surface|schedule|count))", re.I)
+_OPENING_SIZE_ON = __import__("os").environ.get("STOA_G1_OPENING_SIZE", "1") != "0"
 
 
 def infer_task(q: str) -> tuple[str, str | None]:
     """-> (task, unit). Unit follows the question's own unit words (m² vs ft² etc.)."""
-    if _PIPE_SIZE.search(q):
+    if _PIPE_SIZE.search(q) or (_OPENING_SIZE_ON and _OPENING_SIZE.search(q)):
         return "text", None
     mq = _QTY_AFTER_COUNT.search(q)
     if mq:
@@ -397,6 +418,15 @@ def parse(question: str) -> Intent:
                                          for t2, rx2 in _TARGETS if t2 not in _SCOPE_WORDS and t2 != "room"):
                 # F 08:28: "How many doors …, including the apartment entrance doors?" -> target 'apartment': a room /
                 # apartment word right before an object noun is a scope ("bathroom sinks", "kitchen windows")
+                continue
+            if t in _ROOMISH and _ROOM_SCOPE_ON and task == "count" and \
+                    re.search(r"\b(?:does|do|did|has|have|in|into|inside|within|of|to|for|from|at|off|serving)\s+(?:the|this|"
+                              r"that|each|every|our|a|an)\s+(?:\w+\s+)?$", q_noquote[:m.start()], re.I) and \
+                    any(rx2.search(q_noquote[:m.start()]) for t2, rx2 in _TARGETS if t2 not in _SCOPE_WORDS and
+                        t2 not in _GENERIC):
+                # DR 02:04: 'How many doors does the kitchen have?' / '… lead into the kitchen?' -> target 'kitchen'
+                # (the list order puts rooms first): a room named after does / in / into the … is the SCOPE of the
+                # thing counted before it -> the door readers count the kitchen's doors
                 continue
             target = t
             break

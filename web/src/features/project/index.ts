@@ -663,12 +663,18 @@ registerFeature("project", (api) => {
 
   /** The re-asked answer after the visitor picked one of N same-named rooms: only that room's mark, and the pick said
    *  instead of '6 rooms … their mean' (the card counted the 6 marks: '52.29 m² of the 6 classrooms together'). */
-  function onePicked(a: Answer, n: number, v: number, note: string): Answer {
-    const ev = a.evidence ?? [];
+  function onePicked(a: Answer, n: number, v: number, note: string, shown?: Answer | null): Answer {
+    // F7 keeps the user's value without reading the drawing again ('corrections/kept': no evidence, 'very sure'): the
+    // picked room's outline then comes from the answer that was on screen (its N marks), and so does the confidence,
+    // since a pick only chooses which of OUR traced rooms is meant (F7's own rule: 'our traced outline, chosen by you')
+    const borrow = !(a.evidence ?? []).length && !!shown?.evidence?.length;
+    const ev = (borrow ? shown!.evidence : a.evidence) ?? [];
     const val = (e: { note?: string | null }) => Number(String(e.note ?? "").match(/:\s*([\d.,]+)\s*(?:m²|m2|sq)/i)?.[1]?.replace(/,/g, "") ?? NaN);
-    const hit = ev.find((e) => Math.abs(val(e) - v) < 0.005) ?? ev[n - 1];
+    // borrowed marks: only the outline whose own value is the pick (a second pick sees the first pick's single outline)
+    const hit = ev.find((e) => Math.abs(val(e) - v) < 0.005) ?? (borrow ? undefined : ev[n - 1]);
     if (!hit) return a;
-    return { ...a, evidence: [hit], assumptions: [note, ...(a.assumptions ?? []).filter((x) => !/rooms are labelled .*\bmean\b/i.test(String(x)))] };
+    return { ...a, evidence: [hit], ...(borrow && typeof shown!.confidence === "number" ? { confidence: Math.min(a.confidence ?? 1, shown!.confidence) } : {}),
+      assumptions: [note, ...(a.assumptions ?? []).filter((x) => !/rooms are labelled .*\bmean\b/i.test(String(x)))] };
   }
   async function patchItem(id: string, body: Record<string, unknown>, picked?: { n: number; v: number }) {
     if (!proj) return;
@@ -680,13 +686,19 @@ registerFeature("project", (api) => {
     const it = r.item;
     if (it?.f7 && it.scope === "sheet" && api.file()?.path === it.file && body.value !== undefined) {
       try {
+        // the answer on screen when the visitor picked (its N marks), if it is this item's question on this sheet
+        const shown = picked && api.question() === it.question ? api.answer() : null;
         const c = await j<{ rev?: number }>(withVisitor(`/api/feat/corrections?path=${encodeURIComponent(it.file)}`));
         const mark = asked;
         if (c.rev) {
-          const a = await api.askWith(it.question, { page: it.page, solver_args: { learn: c.rev, visitor: VISITOR }, show: false });
+          // solver 'pipeline' named: web/src/api.ts ask() sends solver_args only with a solver or a plug-in's ask args,
+          // and since the freeze F7 adds none for a visitor whose store (loaded on file open) has no active item yet
+          // -> our learn / visitor were dropped and the plain cached mean came back under 'you picked mark 2' (M1 03:14).
+          // F7's wrap_upload turns an explicit 'pipeline' with learn back into ask_upload's default ('upload') solver.
+          const a = await api.askWith(it.question, { page: it.page, solver: "pipeline", solver_args: { learn: c.rev, visitor: VISITOR }, show: false });
           // shown only if the visitor has not asked something else meanwhile (mainline-10: the classroom re-ask
           // landed after 'How many classrooms does the school have?' and replaced its 11 with 52.29 m²)
-          if (asked === mark && api.file()?.path === it.file) api.showAnswer(picked ? onePicked(a, picked.n, picked.v, String(body.note ?? "")) : a, it.question);
+          if (asked === mark && api.file()?.path === it.file) api.showAnswer(picked ? onePicked(a, picked.n, picked.v, String(body.note ?? ""), shown) : a, it.question);
         }
       } catch {
         /* F7 not served: the review list keeps the user's value anyway */

@@ -695,6 +695,16 @@ def test_room_list_superlative_and_perimeter_in_a_box(tmp_path, monkeypatch):
     assert a.value == 21.3 and a.unit == "m" and all("perimeter of the" in q for q in calls)
     a = R.with_region(str(p), "How much skirting for this room?", {"page": 0, "bbox": [100, 100, 300, 300]}, solve)
     assert a.value == 14.2 and a.unit == "m" and a.solver == "region/labels"
+    # 'the perimeter of the largest room' = the largest room by area (Kitchen), then its perimeter (was its name)
+    a = R.with_region(str(p), "What is the perimeter of the largest room in this area?", box, solve)
+    assert a.value == 14.2 and a.unit == "m" and "largest" in a.assumptions[0] and "Kitchen" in a.assumptions[0]
+    a = R.with_region(str(p), "How much skirting does the smallest room in here need?", box, solve)
+    assert a.value == 7.1 and a.unit == "m"
+    # the unit the visitor names: the room is asked by name in the sheet's m² (DfE laundry: 7.0 m² for 'square feet')
+    a = R.with_region(str(p), "How many square feet is this room?", {"page": 0, "bbox": [100, 100, 300, 300]}, solve)
+    assert a.value == 134.55 and a.unit == "ft2" and any("converted" in s for s in a.assumptions)
+    a = R.with_region(str(p), "How big is this room?", {"page": 0, "bbox": [100, 100, 300, 300]}, solve)
+    assert a.value == 12.5 and a.unit == "m2"
 
 
 def test_what_room_is_this_reads_the_printed_name(tmp_path, monkeypatch):
@@ -747,3 +757,114 @@ def test_wall_base_is_skirting_and_linear_feet_is_not_a_count(tmp_path):
     reg = R.parse_region({"space": "image_px", "polygon": [[104, 96], [396, 104], [404, 346], [96, 354]]})
     a = R.outline_measure(str(p), q, reg, user_px_per_m=50)
     assert a.unit == "m" and abs(a.value - 21.0) / 21.0 < 0.02 and any("(no skirting)" in (e.note or "") for e in a.evidence)
+
+
+def test_room_dims_from_its_own_outline(tmp_path, monkeypatch):
+    """'How wide is this room?' / 'dimensions' in a box = the sides of the room's own outline at the printed scale (DfE
+    laundry: the masked raster read said 'Cannot be determined'); an L-shaped room is said not to be a rectangle."""
+    monkeypatch.setenv("STOA_FEATURES", "region")
+    p = _pdf(tmp_path)  # 'Kitchen' at (150, 200), SCALE 1:100: 1 pt = 0.0352778 m
+    m_pt = 0.0254 / 72 * 100
+    shape = {"poly": [[120, 160], [280, 160], [280, 240], [120, 240]]}  # 160 x 80 pt = 5.64 x 2.82 m
+
+    def solve(path, q):
+        if "Kitchen" not in q:
+            return Answer(value=None, confidence=0.0)
+        poly = shape["poly"]
+        area = R._poly_area(poly) * m_pt ** 2
+        xs, ys = [x for x, _ in poly], [y for _, y in poly]
+        return Answer(value=round(area, 2), unit="m2", confidence=0.77, solver="pipeline/plan_rooms",
+                      evidence=[Evidence(file=path, page=0, bbox=[min(xs), min(ys), max(xs), max(ys)],
+                                         bbox_space="pdf_pt", polygon=poly, note="Kitchen: area")])
+
+    box = {"page": 0, "bbox": [100, 100, 300, 300]}
+    assert R._rooms_mode("How wide is this room?") == "dims"
+    assert R._rooms_mode("How long is this wall?") == "" and R._rooms_mode("How long is it here?") == ""
+    a = R.with_region(str(p), "How wide is this room?", box, solve)
+    assert a.solver == "region/room_dims" and a.unit == "m" and a.value == pytest.approx(80 * m_pt, abs=0.01)
+    assert "Kitchen" in a.assumptions[0] and "a rectangle" in a.assumptions[0] and a.confidence >= 0.69
+    a = R.with_region(str(p), "What is the length of this room?", box, solve)
+    assert a.value == pytest.approx(160 * m_pt, abs=0.01)
+    a = R.with_region(str(p), "What are the dimensions of this room?", box, solve)
+    assert a.value == "5.64 m × 2.82 m" and a.unit is None and any(e.polygon for e in a.evidence)
+    a = R.with_region(str(p), "How wide is this room in feet?", box, solve)
+    assert a.unit == "ft" and a.value == pytest.approx(80 * m_pt / 0.3048, abs=0.01)
+    shape["poly"] = [[120, 120], [280, 120], [280, 200], [200, 200], [200, 280], [120, 280]]  # an L
+    a = R.with_region(str(p), "What are the dimensions of this room?", box, solve)
+    assert "not a rectangle" in a.assumptions[0] and a.confidence < 0.5
+
+
+def test_count_in_room_asks_the_room_by_name(tmp_path, monkeypatch):
+    """'How many doors does this room have?' in a box = the room named in it asked by name on the full sheet (DfE
+    laundry: pipeline/openings 1 @0.76 with its mark; the masked copy's raster read said 4 in 62 s)."""
+    monkeypatch.setenv("STOA_FEATURES", "region")
+    p = _two_room_pdf(tmp_path)
+    where = {"x": 130}
+    calls = []
+
+    def solve(path, q):
+        calls.append(q)
+        if q == "How many doors does the Kitchen have?":
+            ev = [Evidence(file=path, page=0, bbox=[where["x"], 130, where["x"] + 10, 140], bbox_space="pdf_pt",
+                           note="door 1"),
+                  Evidence(file=path, page=0, bbox=[where["x"] + 140, 200, where["x"] + 150, 210], bbox_space="pdf_pt",
+                           note="door 2")]
+            return Answer(value=2, unit="count", confidence=0.756, solver="pipeline/openings", evidence=ev)
+        return Answer(value=None, confidence=0.0, solver="pipeline/prior")
+
+    box = {"page": 0, "bbox": [100, 100, 300, 300]}
+    a = R.with_region(str(p), "How many doors does this room have?", box, solve)
+    assert a.value == 2 and a.solver == "region/room:pipeline/openings" and calls == ["How many doors does the Kitchen have?"]
+    assert "Kitchen" in a.assumptions[0] and a.confidence == 0.75 and len(a.evidence) == 3  # + the drawn box
+    where["x"] = 900  # its marks are elsewhere: another Kitchen; the other strategies answer
+    a = R.with_region(str(p), "How many doors are in this room?", box, solve)
+    assert not str(a.solver or "").startswith("region/room:")
+    calls.clear()
+    R.with_region(str(p), "How many people fit in this room?", box, solve)
+    assert "How many people fit does the Kitchen have?" not in calls and not any("does the Kitchen" in q for q in calls)
+
+
+def test_count_in_room_skips_a_name_printed_twice(tmp_path, monkeypatch):
+    """Two 'Store' rooms on the sheet: 'How many doors does the Store have?' is ambiguous, so it is never asked (DfE 5-room
+    box: vlm_lora 2 @0.20 with no marks, 19 s); the box's own marks answer, said so."""
+    monkeypatch.setenv("STOA_FEATURES", "region")
+    p = tmp_path / "stores.pdf"
+    d = pymupdf.open()
+    pg = d.new_page(width=600, height=400)
+    pg.insert_text((150, 200), "Store", fontsize=10)
+    pg.insert_text((480, 200), "Store", fontsize=10)
+    d.save(p)
+    calls = []
+
+    def solve(path, q):
+        calls.append(q)
+        if q == "How many doors are on this plan?":
+            ev = [Evidence(file=path, page=0, bbox=[x, 140, x + 10, 150], bbox_space="pdf_pt", note=f"door {i}")
+                  for i, x in enumerate([150, 200, 500])]
+            return Answer(value=3, unit="count", confidence=0.756, solver="pipeline/openings", evidence=ev)
+        return Answer(value=None, confidence=0.0, solver="pipeline/prior")
+
+    a = R.with_region(str(p), "How many doors does this room have?", {"page": 0, "bbox": [100, 100, 300, 300]}, solve)
+    assert not any("the Store" in q for q in calls)
+    assert a.value == 2 and a.solver.startswith("region/marks:") and "no single named room" in a.assumptions[0]
+    assert a.confidence <= 0.5
+
+
+def test_count_in_room_zero_by_name_loses_to_marks_in_the_box(tmp_path, monkeypatch):
+    """DfE PNG laundry: 'How many doors does the Laundry have?' = room_graph 0 @0.65, but the whole sheet's door marks put
+    1 inside the box (the PDF's answer): the marks are counted and both readings are said."""
+    monkeypatch.setenv("STOA_FEATURES", "region")
+    p = _two_room_pdf(tmp_path)
+
+    def solve(path, q):
+        if q == "How many doors does the Kitchen have?":
+            return Answer(value=0, unit="count", confidence=0.65, solver="pipeline/room_graph",
+                          evidence=[Evidence(file=path, page=0, bbox=[120, 120, 280, 280], bbox_space="pdf_pt")])
+        if q == "How many doors are on this plan?":
+            ev = [Evidence(file=path, page=0, bbox=[x, 140, x + 10, 150], bbox_space="pdf_pt", note=f"door {i}")
+                  for i, x in enumerate([150, 500])]
+            return Answer(value=2, unit="count", confidence=0.756, solver="pipeline/openings", evidence=ev)
+        return Answer(value=None, confidence=0.0, solver="pipeline/prior")
+
+    a = R.with_region(str(p), "How many doors does this room have?", {"page": 0, "bbox": [100, 100, 300, 300]}, solve)
+    assert a.value == 1 and a.solver.startswith("region/marks:") and "said 0" in a.assumptions[0] and a.confidence <= 0.5

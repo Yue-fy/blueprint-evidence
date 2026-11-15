@@ -280,6 +280,27 @@ def _mark_index_sheets(sh: list) -> None:
                 x.title, x.title_source = "DRAWING INDEX", "index"
 
 
+_TITLE_OVERRIDES = ("schedule", "detail", "rcp", "section", "elevation", "notes")
+# legend / note lines picked up as a title ('SPOT ELEVATION MARKER', 'Revision Schedule', 'TABLE 4-20.0 IN THE UFC …')
+_NOT_A_TITLE = re.compile(r"\b(?:MARKERS?|SYMBOLS?|TAGS?|LEGENDS?|INDICATORS?|TABLE|SEE|REFER|REVISIONS?|IN\s+THE|"
+                          r"PER|TYP(?:ICAL)?)\b|^\s*(?:AND\b|&)", re.I)
+
+
+def _title_kind(title: str | None, kind: str) -> str:
+    """The title block names a sheet that is NOT a plan although a plan view is on it (T3 01:20, FTC 125-page set:
+    'A-600 ROOM FINISH SCHEDULE', 'P-501 PLUMBING DETAILS', 'FA-602 FIRE ALARM MATRIX', 'A-122 REFLECTED CEILING
+    PLAN - SECOND FLOOR' were floor_plan): its kind wins over floor_plan / drawing, unless the title also names a plan
+    ('FLOOR PLAN & RCP', 'FLOOR PLAN AND DETAILS', 'ENLARGED PLANS AND DETAILS' stay plans)."""
+    if kind not in ("floor_plan", "drawing") or not title or os.environ.get("STOA_VP_TITLE_KIND", "1") == "0":
+        return kind
+    k = view_kind(title)
+    if k not in _TITLE_OVERRIDES or _NOT_A_TITLE.search(title):
+        return kind
+    if re.search(r"\bPLANS?\b", re.sub(r"\bCEILING\s+PLANS?\b", " ", title, flags=re.I), re.I):
+        return kind
+    return k
+
+
 def _apply_tb_title(sh: "Sheet", common: set | None = None, prefer: bool = False) -> None:
     """Fill an empty title from the title block's own line. In a set (`prefer`, `common` known) that line also
     replaces a title read off the views ('PLAN' -> 'DORMITORY MODULE'; a cover whose drawing index was read as plan
@@ -404,6 +425,7 @@ def classify(path: str, page: int = 0, layer=None, _set_mode: bool = False) -> S
     sh.confidence = round(0.4 + 0.2 * bool(sh.number) + 0.2 * bool(sh.title) + 0.15 * (sh.kind != "unknown"), 2)
     if not _set_mode:            # a set fills these in sheet_index, once it knows which lines repeat on every sheet
         _apply_tb_title(sh)
+        sh.kind = _title_kind(sh.title, sh.kind)
     return sh
 
 
@@ -442,6 +464,13 @@ def sheet_index(paths, layers: dict | None = None, max_pages: int = 300) -> list
         common = {t for t, c in cnt.items() if c >= max(2, 0.3 * len(out))}
     for x in out:
         _apply_tb_title(x, common, prefer=common is not None)
+    seen: dict = {}
+    for x in out:
+        if x.title:
+            seen[x.title.strip().upper()] = seen.get(x.title.strip().upper(), 0) + 1
+    for x in out:      # a title printed on >= 3 sheets is a legend line ('SPOT ELEVATION MARKER' on 14 plans)
+        if x.title and seen.get(x.title.strip().upper(), 0) < 3:
+            x.kind = _title_kind(x.title, x.kind)
     _mark_index_sheets(out)
     return out
 

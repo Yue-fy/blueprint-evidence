@@ -228,6 +228,15 @@ class DoorDetect(BaseSolver):
 
             if _image_lines(p) is None:  # never start a slow reading here (S0 16:48); raster reads it
                 return self.abstain("the image's text layer (scale) has not been read yet")
+        try:  # T2 01:44: in Private mode a detector off this machine is refused: say that, not 'not running'
+            from stoa import llm as _llm
+
+            if hasattr(_llm, "check_private_url"):
+                _llm.check_private_url(_det_url(), "door detector")
+        except ImportError:
+            pass
+        except RuntimeError as e:
+            return self.abstain(str(e)[:160])
         if not _up():
             return self.abstain(f"the door/window detector service ({_det_url()}) is not running")
         t0 = time.perf_counter()

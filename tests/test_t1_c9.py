@@ -56,9 +56,9 @@ def test_uncounted_count_with_a_high_own_confidence_keeps_it_below_very_sure():
     sanity.uncounted_guard) shows that confidence capped at 0.89, not the unlocated cap 0.39; lower ones stay a guess."""
     from stoa.trust import sanity as SA
 
-    def unl(n, conf, q, kind="cubicasa_plan"):
+    def unl(n, conf, q):
         a = Answer(value=n, unit="count", confidence=conf, evidence=[], solver="pipeline/vlm_lora",
-                   trace=[REC % kind, "intent: count room [drawing] (lang en)"])
+                   trace=["intent: count room [drawing] (lang en)"])
         return S.mark_support(q, SA.uncounted_guard(q, a))
 
     a = unl(1, 0.97, "How many bathrooms are there?")
@@ -67,6 +67,3 @@ def test_uncounted_count_with_a_high_own_confidence_keeps_it_below_very_sure():
     assert 0.85 <= a.confidence <= C.NOT_SUPPORTED_MAX, a.trace
     low = C.calibrate(unl(3, 0.7, "How many doors are there?"), "/tmp/x/sheet.png")
     assert low.confidence <= C.UNLOCATED_MAX
-    # outside the CubiCasa-style pictures it was measured on, an unlocated count stays a guess
-    other = C.calibrate(unl(4, 0.95, "How many doors are there?", kind="cad_sheet"), "/tmp/x/sheet.png")
-    assert other.confidence <= C.UNLOCATED_MAX, other.trace

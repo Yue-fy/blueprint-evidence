@@ -118,6 +118,14 @@ _CANON_GROUPS = (
 _CANON = {w: g[0] for g in _CANON_GROUPS for w in g}
 
 
+EXACT_FIRST = bool(int(__import__("os").environ.get("E1_EXACT_FIRST", "1")))
+
+
+def _plural_twin(a: str, b: str) -> bool:
+    lo, hi = sorted((a, b), key=len)
+    return hi in (lo + "s", lo + "es") or (lo.endswith("y") and hi == lo[:-1] + "ies")
+
+
 def _same(a: str, b: str, canon: bool = False) -> bool:
     if a == b:
         return True
@@ -180,6 +188,11 @@ def _from_frame(b, d) -> list[float]:
     return [min(p[0] for p in pts), min(p[1] for p in pts), max(p[0] for p in pts), max(p[1] for p in pts)]
 
 
+# D1 01:4x: DfE Primary L00 prints 'Servery' / 'and' / 'Furniture' / 'Store' on FOUR lines; with 3 the last line was a
+# 'Store' of its own (rooms labelled 'Store': 8 vs 7)
+LABEL_LINES = int(__import__("os").environ.get("E1_LABEL_LINES", "4"))
+
+
 def labels(pdf_abs: str, page: int = 0, min_letters: int = 3) -> list[dict]:
     """Room-name labels: text lines with letters, vertically stacked lines of one label merged ('CONFERENCE' over
     'ROOM'). Stacking runs in each line's own reading frame, so labels drawn upwards (a sheet plotted with /Rotate 90:
@@ -205,7 +218,7 @@ def labels(pdf_abs: str, page: int = 0, min_letters: int = 3) -> list[dict]:
                 continue
             X0, Y0, X1, Y1 = lab["bbox"]
             if -0.5 * h <= y0 - Y1 <= 0.8 * h and y0 > Y0 and abs(cx - (X0 + X1) / 2) <= 0.25 * max(X1 - X0, x1 - x0) + 2 \
-                    and lab["n"] < 3 and abs((Y1 - Y0) / lab["n"] - h) <= 0.35 * h:
+                    and lab["n"] < LABEL_LINES and abs((Y1 - Y0) / lab["n"] - h) <= 0.35 * h:
                 hit = lab
                 break
         if hit is None:
@@ -354,21 +367,36 @@ def _match_labels(labs: list[dict], question: str, canon: bool = False) -> list[
         hit = sum(1 for w in qw if w in joined or any(_same(w, lw, canon) for lw in lab["words"]))
         miss = sum(1 for lw in lab["words"] if lw not in _GENERIC and not any(_same(w, lw, canon) for w in qw)
                    and not _compound(lw, qw))
+        # DR 02:50: 'the Servery' hit 'Server Room' ('server' a prefix of 'servery') as well as 'Servery and Furniture
+        # Store', and the fewer extra words won; a word matched only through a prefix that is not a plural fold ranks
+        # below an exact match with as many hits
+        loose = sum(1 for w in qw if w not in joined and not any(w == lw or _plural_twin(w, lw) for lw in lab["words"])
+                    and any(_same(w, lw, canon) for lw in lab["words"])) if EXACT_FIRST else 0
         if hit and not (QUALIFIER_CLASH and _qual_clash(question, lab["words"])):
-            scored.append((hit, -miss, lab))
+            scored.append((hit, -loose, -miss, lab))
     if not scored:
         # X1 01:05: no label holds the question's words as written: the abbreviations of its room nouns ('BED 2' for
         # 'bedroom 2', 'COMMS ROOM' for 'communications room', 'LDRY'); only as a fallback -- Level 11 prints BOTH
         # 'COMMS ROOM' and a 'COMMUNICATION ROOM' monitor label, and 'the comms room' must stay the former
         return _match_labels(labs, question, True) if CANON_WORDS and not canon else []
-    top = max((h, m) for h, m, _ in scored)
-    best = [lab for h, m, lab in scored if (h, m) == top]
+    top = max((h, x, m) for h, x, m, _ in scored)
+    best = [lab for h, x, m, lab in scored if (h, x, m) == top]
     # 'bedroom 1' / 'Zimmer 2': the number written after the room word picks 'BEDROOM1' / 'BED ROOM 1' among the ties
     nums = re.findall(r"[^\W\d_]{3,}\s*(\d{1,2})\b(?!\s*(?:m|cm|mm|ft|%|°|\.\d))", question)
     if nums and len(best) > 1:
         byn = [lab for lab in best if any(re.search(rf"(?<!\d)0*{n}(?!\d)", lab["text"]) for n in nums)]
         if byn:
             return byn
+    if nums and NUM_PICK:
+        # T1 02:01 (EFA c2 'Art 1, Art 2 and Art 3'): 'Art 1 - Small' has one word more than 'Art 2' / 'Art 3 - 3D', so
+        # it never reached the ties and 'Art 1' matched the other two; when no best label carries the asked number,
+        # the labels with as many word hits that DO carry it win (fewest extra words first)
+        if not any(re.search(rf"(?<!\d)0*{n}(?!\d)", lab["text"]) for lab in best for n in nums):
+            same = [(m, lab) for h, x, m, lab in scored if h == top[0] and
+                    any(re.search(rf"(?<!\d)0*{n}(?!\d)", lab["text"]) for n in nums)]
+            if same:
+                mm = max(m for m, _ in same)
+                return [lab for m, lab in same if m == mm]
     # 'Classroom Area A' / 'Group Exercise B' (AF module plans): a capital letter after the room word picks among ties
     lets = re.findall(r"[^\W\d_]{3,}\s+([A-Z])(?=\s*(?:[?.,;:)]|$|\s+(?:and|or|on|in|at|und|oder)\b))", question)
     if lets and len(best) > 1:
@@ -992,11 +1020,17 @@ def _sum_answer(path, pdf, page, q, n, labs, what) -> Answer | None:
         return None
     if labs_full is not None and len(ms) != len(measured):
         return None  # 'all X': a room that could not be traced would be missing from the total
+    cuts = [_recess_area(pdf, page, n, m) if what == "area" else 0.0 for _, m in ms]
+    if any(cuts):  # traced picture rooms: their parts in door recesses / wall cavities left out (as for one room)
+        ms = [(lab, {**m, "area_m2": round(m["area_m2"] - c, 2)}) for (lab, m), c in zip(ms, cuts)]
     total = round(sum(m["area_m2"] for _, m in ms), 2)
     terms = " + ".join(f"{m['area_m2']:g} ({lab['text'][:24]})" for lab, m in ms)
     a = _multi(path, page, n, ms, what, total, 0.45, f"sum of {len(ms)} rooms found by their labels: {terms} = "
                f"{total} m²{alt}", ["each outline traced from the drawn wall lines around its label (door openings "
                                     "closed)"])
+    if any(cuts):
+        a.assumptions.append(f"{sum(cuts):.2f} m² of the traced regions inside door recesses / narrow wall cavities left "
+                             f"out ({sum(1 for c in cuts if c)} room(s); the picture draws walls as outlines)")
     if alt and ex_q is not None and labs_full is ex_q[0]:
         a.assumptions.append(f"rooms labelled exactly '{ex_q[1]}' (case and spacing ignored{', plural folded' if ex_q[2] else ''}); "
                              "labels that only contain these words are other rooms")
@@ -1243,6 +1277,13 @@ _HOW_MANY = re.compile(r"\b(?:how many|number of|count the|wie viele|anzahl (?:d
 
 
 COUNT_EXACT = bool(int(__import__("os").environ.get("E1_COUNT_EXACT", "1")))
+COUNT_NO_TITLES = bool(int(__import__("os").environ.get("E1_COUNT_NO_TITLES", "1")))
+NUM_PICK = bool(int(__import__("os").environ.get("E1_NUM_PICK", "1")))  # _match_labels: the asked room number beats
+#                                                                            one extra label word
+_VIEW_TITLE = re.compile(r"\s[-–—]\s.*\s[-–—](?:\s|$)|^\s*(?:module|level|block|zone|wing|phase|unit)\s*[\dA-Z]{1,3}\s*[-–—:]\s"
+                         r"|\b(?:floor|ceiling|roof|site|key|furniture|enlarged|partial)\s+plan\b|\b(?:rcp|axon\w*|elevation|"
+                         r"section)\b", re.I)
+ROOM_EXACT = bool(int(__import__("os").environ.get("E1_ROOM_EXACT", "1")))
 
 
 def _count_answer(path: str, pdf: str, page: int, q: str) -> Answer | None:
@@ -1281,9 +1322,13 @@ def _count_answer(path: str, pdf: str, page: int, q: str) -> Answer | None:
         except Exception:  # noqa: BLE001
             return None
     every = floor_plan_labels(pdf, page, labels(pdf, page, min_letters=2))
+    if COUNT_NO_TITLES:  # G1 01:57 (MFC A-103 'How many restrooms?' 3 vs 2): a VIEW TITLE ('MODULE 05 - RESTROOMS - FLOOR
+        #                   PLAN') names the drawing, not a room
+        every = [lab for lab in every if not _VIEW_TITLE.search(lab["text"])]
     labs = [lab for lab in every if pat.search(lab["text"])]
     exact_note = ""
-    if COUNT_EXACT and (_QUOTED.search(q) or re.search(r"\b(?:labell?ed|named|called|titled|marked)\b", q, re.I)):
+    if COUNT_EXACT and len(_QUOTED.findall(q)) <= 1 and \
+            (_QUOTED.search(q) or re.search(r"\b(?:labell?ed|named|called|titled|marked)\b", q, re.I)):
         # D1 01:3x: 'How many rooms labelled 'Accessible Toilet'' counted every toilet-kind label (11 vs 5: 'Toilets',
         # 'Toilet' too) -> an exact-label question counts the labels whose text IS that name (case / spacing ignored;
         # plural fold only when nothing matches exactly), as _exact_labels does for areas
@@ -1495,14 +1540,14 @@ def _skirting(pdf: str, page: int, n: float, m: dict) -> dict | None:
     rev = _reveals(ring, total_pt, openings, tol / ppt, m_per_pt) if SKIRT_REVEALS else 0.0
     per -= rev
     val = per - sum(o[2] for o in outs)
-    rc = _recess_cut(ring, outs, runs, m_per_pt) if RECESS_CUT and not rev else (0.0, 0.0, [])
+    rc = _recess_cut(ring, outs, runs, m_per_pt) if RECESS_CUT and not rev else (0.0, 0.0, [], 0.0)
     if rc[0] > 0 and val - rc[1] > 0:
         per, val = per - rc[0], val - rc[1]
     else:
-        rc = (0.0, 0.0, [])
+        rc = (0.0, 0.0, [], 0.0)
     return {"perimeter_m": round(per, 3), "value_m": round(val, 3), "openings": outs, "runs": runs,
             "reveals_m": round(rev, 3), "lined": lined, "recess_m": round(rc[1], 3), "recess_n": len(rc[2]),
-            "recess_per_m": round(rc[0], 3)}
+            "recess_per_m": round(rc[0], 3), "recess_area_m2": round(rc[3], 3)}
 
 
 def _behind_gaps(pdf: str, page: int, n: float, m: dict, lined: list) -> float:
@@ -1608,12 +1653,30 @@ RECESS_CUT = bool(int(__import__("os").environ.get("E1_RECESS_CUT", "1")))
 RECESS_MAX_M = 0.75  # deeper than a wall: an alcove / passage, keeps its skirting
 RECESS_LEAVES = bool(int(__import__("os").environ.get("E1_RECESS_LEAVES", "1")))
 RECESS_PERIM = bool(int(__import__("os").environ.get("E1_RECESS_PERIM", "1")))  # perimeter answers lose the same parts
+RECESS_AREA = bool(int(__import__("os").environ.get("E1_RECESS_AREA", "1")))  # traced pages: area answers lose their area
+RECESS_AREA_MAX_M2 = 100.0
 SLIT_MAX_M = 3.0  # a slit this deep: a hollow wall's cavity the trace ran into (D1 dfe26 PNG Entrance and Cloakroom)
 SLIT_W_M = 0.3  # an outward excursion narrower than this is no part of the room (a trace running out along a line)
 
 
-def _recess_cut(ring, outs: list, runs: list, m_per_pt: float) -> tuple[float, float, list]:
-    """(perimeter cut m, skirting cut m, [(cut m, why)]) for the outline's DOOR RECESSES and SLITS (D1 00:46, F2 01:38:
+def _recess_area(pdf: str, page: int, n: float, m: dict) -> float:
+    """m² of a traced picture room's region inside door recesses / narrow wall cavities (0 when not applicable: not a
+    traced page, a hall >= RECESS_AREA_MAX_M2, or > 15 % of the room)"""
+    from stoa.evidence import linework as L
+
+    val = float(m.get("area_m2") or 0.0)
+    if not (RECESS_AREA and 0 < val < RECESS_AREA_MAX_M2 and (L._page(pdf, page) or {}).get("traced")):
+        return 0.0
+    try:
+        sk = _skirting(pdf, page, n, m)
+    except Exception:  # noqa: BLE001
+        return 0.0
+    cut = float((sk or {}).get("recess_area_m2") or 0.0)
+    return cut if 0.01 <= cut < 0.15 * val else 0.0
+
+
+def _recess_cut(ring, outs: list, runs: list, m_per_pt: float) -> tuple[float, float, list, float]:
+    """(perimeter cut m, skirting cut m, [(cut m, why)], area cut m²) for the outline's DOOR RECESSES and SLITS (D1 00:46, F2 01:38:
     on a traced picture the walls are outlines, not fills, so a door way closes at the wall's OUTER face and the room runs
     into the recess: Stoa's DfE PNG Multi-Purpose Hall 68.47 m outline vs 63.44 on the PDF, skirting 55.45 vs gold 50.4;
     Kitchen 25.32 vs 22.0). (1) Slits: the outline running out along a stray line and back (a mitre-joined opening of
@@ -1630,9 +1693,9 @@ def _recess_cut(ring, outs: list, runs: list, m_per_pt: float) -> tuple[float, f
     try:
         P = Polygon(ring.coords).buffer(0)
     except Exception:  # noqa: BLE001
-        return 0.0, 0.0, []
+        return 0.0, 0.0, [], 0.0
     if P.geom_type != "Polygon" or P.area <= 0:
-        return 0.0, 0.0, []
+        return 0.0, 0.0, [], 0.0
     eps = 0.03 / m_per_pt
 
     def opened(G, r_m):
@@ -1656,13 +1719,22 @@ def _recess_cut(ring, outs: list, runs: list, m_per_pt: float) -> tuple[float, f
 
     P0 = opened(P, SLIT_W_M / 2)
     if P0.is_empty or P0.geom_type != "Polygon" or P0.area < 0.8 * P.area:
-        return 0.0, 0.0, []
+        return 0.0, 0.0, [], 0.0
     cut, taken = [], []
+    area, used = [0.0], set()
+
+    def comps_near(G, pc, tag):  # the area of G's parts this piece bounds (each part once)
+        for i, c in enumerate(getattr(G, "geoms", [G])):
+            if (tag, i) not in used and not c.is_empty and c.distance(pc) < eps:
+                used.add((tag, i))
+                area[0] += c.area * m_per_pt * m_per_pt
+    rest0 = P.difference(P0)
     for pc in pieces(ring, P0):
         ch = chord(pc)
         if ch <= 1.5 * SLIT_W_M and 0.2 <= depth(pc, P0) <= SLIT_MAX_M:
             cut.append((pc.length * m_per_pt - ch, "slit"))
             taken.append(pc)
+            comps_near(rest0, pc, "s")
     if RECESS_LEAVES:
         # (1b) door LEAVES standing open in the room: the outline runs up one side of the leaf line and back down
         # (DfE PNG hall: 0.72 + 0.62 m at a double door's hinge). An inward notch < SLIT_W_M wide, 0.25-1.2 m deep,
@@ -1682,6 +1754,12 @@ def _recess_cut(ring, outs: list, runs: list, m_per_pt: float) -> tuple[float, f
                         >= 0.6 * pc.length:  # counted as wall (a leaf), not a notch the openings already took
                     cut.append((pc.length * m_per_pt - ch, "door leaf"))
                     taken.append(pc)
+    # door leaves standing open into the room (thin inward notches) closed first: the bay between a double door's two
+    # leaves is the swing, not a recess (MFC r100 laundry: 200.5 -> 188.7 ft² vs 200 before this)
+    P0c = P0.buffer(SLIT_W_M / 2 / m_per_pt, join_style=2, mitre_limit=5.0).buffer(
+        -SLIT_W_M / 2 / m_per_pt, join_style=2, mitre_limit=5.0) if RECESS_LEAVES else P0
+    if P0c.geom_type == "Polygon" and not P0c.is_empty:
+        P0 = P0c
     ring0 = LineString(list(P0.exterior.coords))
     for a, b, ln in outs:
         if ln > 2.6:
@@ -1694,14 +1772,20 @@ def _recess_cut(ring, outs: list, runs: list, m_per_pt: float) -> tuple[float, f
             if pc.distance(mid) > 0.1 / m_per_pt or any(pc.distance(t) < eps and t.length >= pc.length for t in taken):
                 continue
             ch = chord(pc)
-            if 0.08 <= depth(pc, Q) <= RECESS_MAX_M and 0.5 * ln <= ch <= ln + 1.0:
+            dp = depth(pc, Q)
+            jambs = sum(LineString(r).intersection(pc.buffer(eps)).length for r in runs if len(r) >= 2) * m_per_pt
+            if 0.08 <= dp <= RECESS_MAX_M and 0.5 * ln <= ch <= ln + 1.0 and \
+                    jambs >= 0.5 * (pc.length * m_per_pt - ch) and Q.distance(mid) * m_per_pt >= 0.5 * dp:
+                # its sides are drawn walls (jambs) and the door way is at its BACK (the wall's outer face); a strip
+                # of room behind a door way closed at the room's edge is room (MFC scan laundry, 197.3 -> 192.7 ft²)
                 cut.append((pc.length * m_per_pt - ch, f"door recess at the {ln:.2f} m opening"))
                 taken.append(pc)
+                comps_near(P0.difference(Q), pc, f"r{ln:.3f}")
     if not taken:
-        return 0.0, 0.0, []
+        return 0.0, 0.0, [], 0.0
     region = unary_union([pc.buffer(eps) for pc in taken])
     sk = sum(LineString(r).intersection(region).length for r in runs if len(r) >= 2) * m_per_pt
-    return sum(c for c, _ in cut), sk, cut
+    return sum(c for c, _ in cut), sk, cut, area[0]
 
 
 def _reveals(ring, total_pt: float, openings: list, tol_pt: float, m_per_pt: float) -> float:
@@ -2102,6 +2186,12 @@ def _answer(path: str, question: str, page: int) -> Answer | None:
             return r
         # ONE named room with a 'both / all / total' word ('the multi-purpose hall, both halves together (partition
         # open)', X1 sl-059): that room, measured as one
+    if ROOM_EXACT and len(hits) > 1 and len(_QUOTED.findall(q)) <= 1:
+        # D1 02:0x: 'How big is the room labelled 'Toilet'' (DfE SEN L01) matched 'Toilets' too (plural fold) -> two rooms
+        # of different size -> None; the one label that IS the quoted / named text is the room asked about
+        ex = _exact_labels(labs, q)
+        if ex and not ex[2] and len(ex[0]) == 1:
+            hits = ex[0]
     near = _NEAR_Q.search(q)
     if near and hits:
         hits = _match_labels(labs, q[:near.start()])
@@ -2166,6 +2256,14 @@ def _answer(path: str, question: str, page: int) -> Answer | None:
                               "lines around the label")
     if m is None and m_pocket is not None:
         m = m_pocket  # flagged below (confidence <= 0.1)
+    printed = None
+    if PRINTED_TAG and what == "area" and tag_box:
+        try:
+            printed = _printed_area(pdf, page, pick, all_labs)
+        except Exception:  # noqa: BLE001
+            printed = None
+        if printed is not None and (m is None or abs(m["area_m2"] - printed[0]) > PRINTED_TAG_TOL * printed[0]):
+            return _printed_answer(path, page, n, name, how, printed, m)
     if m is None:
         return None
     twin_note = walls_note
@@ -2256,6 +2354,16 @@ def _answer(path: str, question: str, page: int) -> Answer | None:
     elif what == "area":
         val, unit = m["area_m2"], "m2"
         ev = [Evidence(**ev_kw, polygon=poly, note=f"{name[:50]}: {val} m² traced at 1:{n:g} (approximate)")]
+        # a traced picture's outlined walls let the room run into its door recesses / a hollow wall's cavity
+        # (D1 dfe26 PNG 'Entrance and Cloakroom' 11.84 vs 10.7 m²); in halls (>= 100 m²) the recesses are < 1 %
+        # and below a scan trace's own noise (DfE heavy scan hall 242.91 -> 240.62 vs 246.37), so left alone
+        cut = _recess_area(pdf, page, n, m)
+        if cut:
+            if True:
+                assumptions.append(f"area = the traced region {val} m² minus {cut:.2f} m² of it inside door recesses / "
+                                   f"narrow wall cavities the trace ran into (the picture draws walls as outlines): "
+                                   f"{val - cut:.2f} m²")
+                val = round(val - cut, 2)
     elif what == "perimeter":
         try:
             from shapely.geometry import Polygon
@@ -2296,6 +2404,24 @@ def _answer(path: str, question: str, page: int) -> Answer | None:
                          *([f"lineplan: printed dimensions {dr['dims'][0][0]} x {dr['dims'][1][0]} mm span the traced "
                             f"room (each measures its own line: {dr['dims'][0][6]} / {dr['dims'][1][6]} mm) -> "
                             f"{dr['area_m2']} m²"] if dr is not None else [])])
+
+
+def _printed_answer(path: str, page: int, n: float, name: str, how: str, printed: tuple, m: dict | None) -> Answer:
+    """The area printed with the matched label wins over a traced outline that disagrees with it by > PRINTED_TAG_TOL
+    (or that did not close): exact evidence on the printed text, the traced outline only named in the assumptions."""
+    m2, text, b = printed
+    traced = (f"the outline traced from the wall lines at 1:{n:g} gives {m['area_m2']} m² "
+              f"({(m['area_m2'] / m2 - 1) * 100:+.0f} %: it probably closed round a pocket of lines or ran into a "
+              "neighbour), so the printed number wins") if m is not None else \
+        f"no outline closed around the label at 1:{n:g}"
+    ev = [Evidence(file=path, page=page, bbox=[round(v, 1) for v in b], bbox_space="pdf_pt", exact=True,
+                   note=f"{name[:50]}: printed area '{text.strip()[:40]}' = {round(m2, 2)} m²")]
+    return Answer(value=round(m2, 2), unit="m2", confidence=0.6, evidence=ev, solver=SOLVER,
+                  assumptions=[f"room = {how}", f"area = the area printed with that label ('{text.strip()[:40]}'); "
+                               + traced],
+                  missing=[],
+                  trace=[f"lineplan: {how}; printed area with the label {round(m2, 2)} m² ('{text.strip()[:40]}'); "
+                         + (f"traced {m['area_m2']} m², variant {m['variant']}" if m is not None else "no trace")])
 
 
 def _scale_words(path: str, page: int, n: float) -> str:
@@ -2340,6 +2466,77 @@ def _pocket(bbox: list, tag_box, name: str, q_subj: str, area_m2: float) -> str 
         return (f"a {hall.group(0).lower()} of {area_m2:.1f} m² is implausibly small: the outline probably closes round "
                 "lines inside the hall (court or floor markings, seating, furniture) near its label")
     return None
+
+
+PRINTED_TAG = bool(int(os.environ.get("E1_PRINTED_TAG", "1")))
+PRINTED_TAG_TOL = float(os.environ.get("E1_PRINTED_TAG_TOL", "0.2"))
+
+
+def _printed_area(pdf: str, page: int, pick: dict, labs: list | None = None) -> tuple | None:
+    """X1 02:24 (real-world sealed: a German area question on a US sheet with printed SF tags; the cross-language label
+    match reached lineplan, which traced a 4.1 m² pocket @0.77 while the room's tag prints its area): the area printed
+    WITH the matched label -- on the label's own line(s) ('KITCHEN 120 SF') or on a line just below / above it, centred
+    on it (a room-number line may sit between), in the text's own reading frame (sheets plotted with /Rotate 90 draw
+    every label upwards) -> (m², printed text, bbox pdf_pt), else None. Two candidates at the same distance on both
+    sides (a neighbour's tag above, its own below) -> the one below (name, then area); a tag that fits another
+    label better (below it) is that room's. Areas under 1 m² and '1/2 SF'
+    fractions are not room tags."""
+    from stoa.evidence import linework as L
+
+    def tag_m2(text):
+        for m in L._AREA_TAG.finditer(text):
+            if m.start() > 0 and text[m.start() - 1] == "/":
+                continue
+            try:
+                v = L._num(m.group(1))
+            except ValueError:
+                continue
+            m2 = v * 0.09290304 if m.group(2).lower().startswith(("sf", "sq", "ft")) else v
+            if m2 >= 1.0:
+                return m2
+        return None
+
+    own = tag_m2(pick["text"])
+    if own:
+        return round(own, 3), pick["text"], tuple(pick["bbox"])
+
+    def key(lab, b, f):
+        """(side: 0 below / same line, 1 above; gap in line heights) of tag box b for label lab in frame f, or None:
+        a tag stack is name / room number / area (0920ea2a4e: 'Investigations' / '7.05' / '120 SF' sits 0.9 line
+        above 'Corridor', whose own '61 SF' is 1.2 lines below it), so below wins before distance"""
+        h = float(lab.get("line_h") or 1.0)
+        X0, Y0, X1, Y1 = _to_frame(lab["bbox"], f)
+        bx0, by0, bx1, by1 = _to_frame(b, f)
+        if (by1 - by0) > 2.5 * h or (bx1 - bx0) > 6 * max(X1 - X0, h):
+            return None  # a table cell / note block, not a room tag line
+        centred = abs((bx0 + bx1) / 2 - (X0 + X1) / 2) <= 0.5 * max(X1 - X0, bx1 - bx0) + h
+        below, above = by0 - Y1, Y0 - by1
+        if centred and -0.3 * h <= below <= 1.6 * h:
+            return 0, round(max(below, 0.0) / h, 1)
+        if centred and -0.3 * h <= above <= 1.6 * h:
+            return 1, round(max(above, 0.0) / h, 1)
+        if abs((by0 + by1) / 2 - (Y0 + Y1) / 2) <= 0.5 * h and -0.3 * h <= bx0 - X1 <= 2.0 * h:
+            return 0, round(max(bx0 - X1, 0.0) / h, 1)  # the same line, a separately placed span to the right
+        return None
+
+    cands = []
+    for text, b, d in L.text_lines_dir(pdf, page):
+        m2 = tag_m2(text) if len(text) <= 40 else None
+        if not m2:
+            continue
+        f = _frame(d)
+        k = key(pick, b, f)
+        if k is None:
+            continue
+        # the tag belongs to the label it fits best: one printed below another room's name is that room's
+        if any(lab is not pick and (k2 := key(lab, b, f)) is not None and k2 < k for lab in labs or ()):
+            continue
+        cands.append((k, m2, text, b))
+    if not cands:
+        return None
+    cands.sort(key=lambda c: c[0])
+    _k, m2, text, b = cands[0]
+    return round(m2, 3), text, tuple(b)
 
 
 def add_traced_outlines(ans: Answer, max_items: int = 6) -> Answer:

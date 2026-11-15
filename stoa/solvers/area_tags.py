@@ -22,6 +22,11 @@ from stoa.solvers.base import BaseSolver
 FT2_M2 = 0.09290304
 _ROOMNO = re.compile(r"^(?:\d{1,2}\.\d{2}|[A-Z]{0,2}\d{2,4}[A-Z]?)$")
 _APT_LABEL = re.compile(r"^(?:Whg\.?|Wohnung|App\.?|Appartement|Apt\.?|Unit)\s*[A-Z0-9]{1,3}$", re.I)
+# a Finnish / Swedish dwelling-type code printed with the flat's total: '2 H+KK+S', '3h+k+s', '1 h + kt', '2 rok', '3 r+k'
+_APT_TYPE = re.compile(r"(?i)^\s*\d\s*(?:h|mh|r)\s*\+\s*(?:kk|k|kt|keitti[öo]|k[öo]k|kv|rt)\b"
+                       r"(?:\s*\+\s*(?:s|sauna|vh|p|parv|las|wc|kph|khh|ter|terassi|lp|ph|kh|et|aula|tk|vh))*\s*$|"
+                       r"^\s*\d\s*rok\b|^\s*\d\s*r\s*\+\s*k\b")
+HEADLINE_ON = os.environ.get("STOA_G1_APT_HEADLINE", "1") != "0"
 _APT_Q = re.compile(r"\b(?:apartment|wohnung|whg\.?|appartement|appartamento|flat|logement)\s+([A-Z0-9]{1,2})\b", re.I)
 # F5 20:22: DfE baseline sheets print 'A: 62 m2' / 'NIA: 62 m2' / 'Area = 62 m2' under the room name -> a short letter
 # prefix with ':' / '=' is the tag's own label, not a room number
@@ -34,6 +39,14 @@ _SYN = {"gym": ["fitness", "gym", "weight", "exercise"], "toilet": ["rest", "toi
         "conference": ["conf", "conference", "meeting"], "storage": ["storage", "stor", "closet", "utility"],
         "bedroom": ["bd", "bedroom", "bed"], "corridor": ["corr", "corridor", "hall"], "hall": ["hall", "corr"],
         "office": ["office", "off"], "unit": ["unit", "u"], "apartment": ["unit", "apt", "bd", "studio"]}
+if os.environ.get("STOA_G1_APT_HEADLINE", "1") != "0":
+    # O1 02:24: Finnish flat plans tag rooms with codes (OH olohuone, MH makuuhuone, KH kylpyhuone, ET eteinen, KK
+    # keittokomero, VH vaatehuone, PH pesuhuone, KHH kodinhoitohuone): 'area of the bedroom' -> the MH tag
+    for _k, _v in (("bedroom", ["mh", "makuuhuone"]), ("bathroom", ["kh", "kylpyhuone", "ph", "pesuhuone", "bath"]),
+                   ("living", ["oh", "olohuone", "living"]), ("hall", ["et", "eteinen"]), ("kitchen", ["kk", "keittiö",
+                                                                                                     "keittokomero"]),
+                   ("closet", ["vh", "vaatehuone", "closet"]), ("utility", ["khh", "kodinhoitohuone", "utility"])):
+        _SYN[_k] = [*_SYN.get(_k, []), *[x for x in _v if x not in _SYN.get(_k, [])]]
 _STOP = {"what", "is", "the", "of", "area", "areas", "how", "big", "large", "in", "square", "feet", "foot", "metres",
          "meters", "m²", "m2", "sf", "ft²", "ft2", "sq", "ft", "room", "rooms", "this", "on", "floor", "plan", "sheet",
          "drawing", "a", "an", "which", "one", "are", "there", "size", "total", "net", "gross", "all", "and", "to",
@@ -352,6 +365,30 @@ class AreaTags(BaseSolver):
         count = re.search(r"\bhow many\b(?!\s+(?:square|sq\b|sq\.|m²|m2|ft²|ft2|sf|cubic|linear|metres|meters|feet))|"
                           r"\bnumber of\b", q)
         units_scope = re.search(r"\b(units?|apartments?|dwellings?|flats?)\b", q)
+        heads = [t for t in named if _APT_TYPE.match(str(t["name"] or ""))] if HEADLINE_ON else []
+        if heads:
+            # O1 02:24 (Finnish apartment plan, F2's upload asunto-2h-kk-s.png): 'What is the total floor area of the
+            # apartment?' -> 64.5 = KH 3.5 + '2 H+KK+S 45.5 m²' + ET 5.5 + MH 10.0; '2 H+KK+S' (2 rooms + kitchenette +
+            # sauna) is the flat's HEADLINE = its total (the 8 room tags sum to 45.5): never a room in a sum
+            named = [t for t in named if t not in heads]
+            whole = re.search(r"\b(?:apartments?|flats?|dwellings?|units?|asun\w*|lägenhet\w*|wohnung\w*|home|house)\b", q) \
+                or (total and re.search(r"\b(?:all (?:the )?rooms|every room|whole|entire|this (?:plan|floor|sheet|drawing)|"
+                                        r"(?:total|overall) (?:floor )?area\??$)", q))
+            if whole and len(heads) == 1 and not count and not re.search(r"\b(largest|biggest|smallest)\b", q) and \
+                    not re.search(r"\b(?:bedroom|kitchen|bathroom|sauna|living|hall|closet|toilet|wc|office|store)s?\b", q):
+                h = heads[0]
+                v = conv(h["value"], h["unit"])
+                rest = [t for t in tags if t is not h]
+                s_rest = sum(conv(t["value"], t["unit"]) for t in rest)
+                agree = len(rest) >= 2 and abs(s_rest - v) <= 0.02 * v
+                return ans(v, [h], 0.9 if agree else 0.75,
+                           [f"area = the apartment's printed total: '{h['name']} {h['text']}' (a dwelling-type code: "
+                            "rooms + kitchen + …, printed with the flat's area)"] +
+                           ([f"cross-check ✓: the {len(rest)} room tags add up to {s_rest:.1f} {unit_txt}"] if agree else
+                            [f"the {len(rest)} other area tags add up to {s_rest:.1f} {unit_txt} (not every room may be "
+                             "tagged)"] if rest else []),
+                           extra_trace=[f"area_tags: apartment headline tag '{h['name']}' = {v:g} {unit_txt}" +
+                                        (f"; room tags sum {s_rest:.1f} ✓" if agree else "")])
         scope = named
         if units_scope:
             scope = [t for t in named if (t["number"] or "").upper().startswith("U") or

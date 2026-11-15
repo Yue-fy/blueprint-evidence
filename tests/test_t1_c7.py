@@ -116,13 +116,11 @@ def test_named_tag_family_without_marks_is_not_supported():
 def test_uncounted_keeps_a_high_reader_confidence_never_very_sure():
     from stoa.trust import sanity as SA
 
-    hi = _ans(2, [], conf=0.95, solver="pipeline/vlm_lora",
-              trace=['recognised: {"kind": "cubicasa_plan", "confidence": 0.99}', "intent: count door [drawing] (lang en)"])
+    hi = _ans(2, [], conf=0.95, solver="pipeline/vlm_lora", trace=["intent: count door [drawing] (lang en)"])
     out = SA.uncounted_guard("How many doors are there?", hi, None)
     assert out.value == 2 and out.confidence == 0.95
     lo = _ans(12, [], conf=0.6, solver="pipeline/vlm_lora", trace=["intent: count door [drawing] (lang en)"])
     assert SA.uncounted_guard("How many doors are there?", lo, None).confidence == SA.UNCOUNTED_CAP
     shown = C.calibrate(S.mark_support("How many doors are there?", out), "plan.png")
-    # T1 c8 (V1 01:47): such counts are 98.5 % right on the dataset's apartment plans (CubiCasa-style pictures only, c9):
-    # kept, but never 'Very sure'
+    # T1 c8 (V1 01:47): such counts are 98.5 % right on the dataset's apartment plans: kept, but never 'Very sure'
     assert shown.value == 2 and C.UNLOCATED_MAX < shown.confidence <= C.NOT_SUPPORTED_MAX

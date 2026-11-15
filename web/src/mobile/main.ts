@@ -1304,6 +1304,10 @@ function renderResult() {
   const unit = unitLabel(a.unit) || (isArea(a, q) ? "m²" : isLength(a, q) ? "m" : "");
   let big = a.value === null || a.value === undefined ? "" : fmtValue(a);
   const words = typeof a.value === "string" && !/\d/.test(a.value);
+  // a words-only answer is no answer to a size / measuring / 'how many' question (a photo's 'kitchen' for 'How big is
+  // this room?': tap it to measure), but it IS the answer to 'What is the biggest room?' ('Multi-Purpose Hall', the DfE
+  // sheet showed 'No answer' with both words marked) or any free-text question: shown as the desktop shows it
+  const hideWords = words && (size || measure || /^\s*how (many|much)\b/i.test(q));
   // the desktop's words (Very sure / Fairly sure / Best estimate / Our guess / Rough guess, same 0.4 as the expert
   // workbench): a 0.05 answer must not read like a measurement
   const c = a.value === null ? { cls: "none", word: "No answer", hint: "" } : confidenceWords(a.confidence ?? 0);
@@ -1348,7 +1352,7 @@ function renderResult() {
   const useMine = !!mine && (!!mine.room || measure || words || !big);
   big = useMine ? mine!.value : shownBig;
   const lowConf = !useMine && guessy;
-  const guessNum = ((measure || words) && !useMine) || lowConf;
+  const guessNum = ((measure || hideWords) && !useMine) || lowConf;
   // 'Total floor area?' is about the whole drawing: tapping one room does not answer it. From the question's words:
   // the parser's intent.scope is 'drawing' for EVERY question ('How big is the laundry?' too), so it cannot tell
   const whole = wholeQ(q);
@@ -1368,7 +1372,7 @@ function renderResult() {
   const tapName = mine?.room && !(a.solver === "tap" && state.lines.length) ? state.rooms[state.rooms.length - 1]?.name ?? "" : "";
   // 'How long is this wall?': the visitor's line, its own button to measure another one
   const tapLine = a.solver === "tap" && isLength(a, q);
-  const noNumber = !big || (guessNum && words);
+  const noNumber = !big || (guessNum && hideWords);
   // a list or a long text answer ('Total spaces (whole model): 285\nBy storey:\n- 1.korrus: 50 …', 'the rooms off the
   // corridor: 2.10 'Zimmer', 2.11 …') in the 64 px number font filled two screens (Maleva 'rooms on each floor')
   const listed = typeof a.value === "string" ? listParts(a.value) : null;
@@ -1394,7 +1398,7 @@ function renderResult() {
   r.innerHTML = `
     <div class="m-hero">
       <div class="m-q">${tapName ? `<b>${esc(tapName)}</b> · the ${state.rooms[state.rooms.length - 1]?.zone ? "area" : "room"} you tapped` : esc(tappedLabel ? "The room you tapped" : q)}</div>
-      ${listed && !useMine ? listHtml(listed) : big && !(guessNum && words) ? `<div class="m-value"><span class="m-big${big.length > 9 ? " long" : ""}">${guessNum ? "≈ " : ""}${esc(big)}</span>${unit && (!words || useMine) ? `<span class="m-unit">${esc(unit)}</span>` : ""}</div>`
+      ${listed && !useMine ? listHtml(listed) : big && !(guessNum && hideWords) ? `<div class="m-value"><span class="m-big${big.length > 9 ? " long" : ""}">${guessNum ? "≈ " : ""}${esc(big)}</span>${unit && (!words || useMine) ? `<span class="m-unit">${esc(unit)}</span>` : ""}</div>`
         : `<div class="m-value"><span class="m-big name">${blocked ? "Not a floor plan" : size ? "Not measured yet" : "No answer"}</span></div>`}
       <div class="m-sentence">${esc(useMine ? mine!.how : blocked ? `This ${sheet()} shows ${/^[aeiou]/.test(np!.kind) ? "an" : "a"} ${np!.kind}${np!.title ? ` (‘${np!.title}’)` : ""}, not a floor plan: ${isArea(a, q) ? "floor area" : "rooms and doors"} cannot be measured on it.${npGuess ? ` A rough guess said ≈ ${npGuess} (not measured).` : ""}` : rejected ? rejectedWhy(a, q, rejected) : printed && printed === dims ? `Added up from the dimensions printed on the ${sheet()}: ${dims}.` : printed && printed === sum ? `Added up from the area table printed on the ${sheet()}: ${sum}.` : printed ? `As printed on the ${sheet()}: “${printed}”.` : a.solver === "tap" && state.lines.length ? `The line you tapped is drawn on the ${sheet()}. Set the scale to measure it: tap both ends of the scale bar or of a printed dimension.` : a.solver === "tap" && state.rooms.length ? `The room you tapped is outlined on the ${sheet()}. Set the scale to measure it: tap both ends of the scale bar or of a printed dimension.` : guessNum && size && measure && listed ? `Each line as read from the ${sheet()}, not measured on it: tap the ${tapNoun(q)} to measure one.` : guessNum && size && measure ? (whole ? `An estimate for the whole ${sheet()}, not measured on it. To measure one room, tap it.` : `Not measured on ${sheet() === "drawing" ? "the drawing" : "your photo"} yet: tap the ${tapNoun(q)} to outline it.`) : sentence(a, q))}</div>
       <div class="hero-badges m-badges">
@@ -2217,7 +2221,7 @@ async function traceRoom(ev: Pt) {
 }
 
 // ---------- private mode (captain 18:53): the photo never leaves our server; the desktop's switch, key and URL flag ----------
-// (localStorage 'be.private', ?private=1), so a phone opened from the desktop's link keeps the visitor's choice. Uploads
+// (localStorage 'be.private.v2', set by the button only; a ?private=1 / 0 link sets the mode on open), so a phone keeps the visitor's choice. Uploads
 // and questions carry private=1 (W5's middleware turns every hosted step off; its answer cache keys on it).
 let privTimer = 0;
 function privNote(on: boolean) {
@@ -2231,32 +2235,42 @@ function privNote(on: boolean) {
   window.clearTimeout(privTimer);
   privTimer = window.setTimeout(() => (n.hidden = true), 9000);
 }
-function setPrivate(on: boolean, tell = true) {
+/** UX 03:19: builds before 03:09 wrote 'be.private' = '0' on EVERY page load, so the new Private default never reached a
+ *  returning visitor (Stoa's testers, booth phones). The choice lives in 'be.private.v2', written ONLY when the visitor
+ *  presses the Private button (`chosen`): the same key as the desktop's (W5 cc447b8b), so both pages share one choice. */
+const PRIV_KEY = "be.private.v2";
+function setPrivate(on: boolean, tell = true, chosen = false) {
   privacy.on = on;
   const b = $("privBtn");
   b.setAttribute("aria-checked", String(on));
   b.title = on ? "Private mode is on: your photo never leaves our server. Tap to allow Gemini / NVIDIA second readings."
     : "Private mode: your photo never leaves our server (no Gemini or NVIDIA steps)";
-  try {
-    localStorage.setItem("be.private", on ? "1" : "0");
-  } catch {
-    /* storage off: the URL still says it */
+  if (chosen) {
+    try {
+      localStorage.setItem(PRIV_KEY, on ? "1" : "0");
+    } catch {
+      /* storage off: a reload falls back to the default (Private on), the safe side */
+    }
+    // UX 03:28 / T2 03:38 (W5 959dec2b on the desktop): the URL is never written on load (a link copied from a phone
+    // with Private off turned it off for whoever opened it). A '?private=' the visitor came in with gives way to their
+    // own tap (PRIV_KEY keeps the choice).
+    const url = new URL(location.href);
+    if (url.searchParams.has("private")) {
+      url.searchParams.delete("private");
+      history.replaceState(history.state, "", url);
+    }
   }
-  const url = new URL(location.href);
-  if (on) url.searchParams.set("private", "1");
-  else url.searchParams.delete("private");
-  history.replaceState(null, "", url);
   if (tell) privNote(on);
 }
-$("privBtn").addEventListener("click", () => setPrivate(!privacy.on));
+$("privBtn").addEventListener("click", () => setPrivate(!privacy.on, true, true));
 setPrivate((() => {
   const u = new URL(location.href).searchParams.get("private");
   if (u !== null) return u === "1";
   // S0 03:1x freeze (D62 5, captain's 30 % rule: QA 03:02 default mode = 50 % Expensive on Stoa's PNGs with 0 values changed by
   // Gemini; P1: local = 99.7 % of the hybrid's accuracy): Private is the DEFAULT, Gemini / NVIDIA is the visitor's opt-in
-  // (the button; '?private=0' links too). A visitor who switched it off keeps that ('be.private' = '0').
+  // (the button; '?private=0' links too). A visitor who switched it off WITH THE BUTTON keeps that (PRIV_KEY = '0').
   try {
-    return localStorage.getItem("be.private") !== "0";
+    return localStorage.getItem(PRIV_KEY) !== "0";
   } catch {
     return true;
   }
