@@ -1355,6 +1355,52 @@ _DOOR_WORD_Q = re.compile(r"\b(?:doors?|windows?|openings?)\b", re.I)
 _ROOM_SUBJECT_Q = re.compile(r"\b(?:sizes?|areas?|dimensions?|big|large|tall|high|wide|height|width|long|length)\b[^?]*?"
                              r"\b(?:room|space)s?\b(?!(?:'s)?\s+(?:doors?|windows?)\b)[^?]*?\b(?:doors?|windows?)\s+"
                              r"(?:no\.?\s*|number\s*|#\s*)?(?:\d{1,3}[A-Z]?\.\d{1,3}[A-Z]?|[A-Z]{0,2}-?\d{1,4}[A-Z]?)\b", re.I)
+# F8 c11: whose size is it? A numbered door often only LOCATES the thing measured ('How wide is the corridor outside
+# door 104S?', 'How thick is the wall at door 104S?', 'height of the window next to door 7.04A'): AW-28 / SFO hopped 19
+# of 23 such phrasings and put the door's printed 3'-0" / 7'-0" / 1 3/4" over the reader's answer at 0.8. A PART of the
+# door ('the louver in door 104S', 'glass size', 'the frame of door 104S') is still read on its schedule row, but not
+# from the door's own WIDTH / HEIGHT column.
+_SUBJ_SIZE = re.compile(r"\b(?:how\s+big|rough\s+opening|sizes?|widths?|heights?|thickness|dimensions?|wide|tall|high|"
+                        r"thick|big|lengths?|long)\b", re.I)
+_SUBJ_FUNC = frozenset("a an the of is are was were be its it this that these those what whats s for does do did has "
+                       "have how which me us give tell show find please and or in on per any".split())
+_SUBJ_OK = frozenset("door doors opening openings leaf leaves clear overall nominal actual total rough schedule "
+                     "scheduled listed printed shown specified given according exact exactly approximate approximately "
+                     "roughly mm cm m ft feet foot inch inches meters metres millimeters millimetres size sizes width "
+                     "widths height heights thickness dimension dimensions wide tall high thick big".split())
+_SUBJ_LOC = frozenset("next behind beside besides outside inside near nearest nearby by at adjacent opposite across "
+                      "beyond past from between along through above below under over around off to into after before "
+                      "leading serving with within facing".split())
+_SUBJ_SPACE = frozenset("room rooms space spaces corridor corridors hall halls hallway hallways lobby stair stairs "
+                        "stairway stairwell office offices toilet toilets restroom restrooms closet closets kitchen "
+                        "bathroom bedroom vestibule wall walls ceiling ceilings floor floors landing area building storey "
+                        "story level exit passage ramp shaft garage".split())
+
+
+def _size_subject(q: str) -> str:
+    """'door' | 'located' (the door only locates what is measured) | 'part' (a part of the numbered door)."""
+    md, ms = _KEYED_OPENING_Q.search(q), _SUBJ_SIZE.search(q)
+    if not md or not ms:
+        return "door"
+    words = lambda s: re.findall(r"[a-z]+", s.lower())  # noqa: E731
+    if ms.start() >= md.end():                       # 'door 104S: what are its dimensions?'
+        seg = words(q[md.end():ms.start()])
+        m = re.match(r"\s*(?:is|are)\s+(?:the|a|an|this|that)\s+([a-z]+)", q[ms.end():], re.I)
+        tail = [m.group(1).lower()] if m else []
+    else:                                            # 'How wide is the corridor outside door 104S?'
+        seg = words(re.sub(r"'s\b", "", q[ms.end():md.start()]))   # 'the storage room's door 104B'
+        while seg and seg[-1] not in _SUBJ_FUNC and seg[-1] not in _SUBJ_LOC:
+            seg.pop()                                # 'the mech room door 104S': a modifier of the door itself
+        before = words(q[:ms.start()])[-1:]          # 'glass size in door 104S', 'the frame width of door 104S'
+        tail = before
+    m = re.match(r"\s*'s\s+([a-z]+)", q[md.end():], re.I)   # "door 104S's frame"
+    tail = tail + ([m.group(1).lower()] if m else [])
+    content = [w for w in seg + tail if w not in _SUBJ_FUNC and w not in _SUBJ_OK]
+    if any(w in _SUBJ_LOC for w in seg) or any(w in _SUBJ_SPACE for w in content):
+        return "located"
+    return "part" if content else "door"
+
+
 _SHEET_Q = re.compile(rf"\b(?:(?:on|in|from|see|sheet|drawing|dwg\.?)\s+)({_NUM})\b|\b({_NUM})\b")
 _DETAIL_Q = re.compile(rf"\b(?:detail|section|view|callout)\s+([A-Z]{{0,2}}\d{{1,3}}[A-Z]?|[A-Z]{{1,2}})(?:\s*(?:/|on|of)\s*({_NUM}))?\b",
                        re.I)
@@ -1545,7 +1591,8 @@ def follow_plan(path: str, page: int, question: str, set_paths: list[str] | None
                            f"{q} (view: {r.target_view})" if r.target_view else q)
     refs = page_refs(path, here.page, with_views=False, set_paths=sp)
     # (2) schedule questions: door / window / room attributes live on the schedule sheet
-    room_subject = bool(_ROOM_SUBJECT_Q.search(q))
+    subj = _size_subject(q)
+    room_subject = bool(_ROOM_SUBJECT_Q.search(q)) or subj == "located"
     keyed = bool(_KEYED_OPENING_Q.search(q) and _KEYED_SIZE_Q.search(q) and not _PLAN_Q.search(q)) and not room_subject
     # F8 c8: 'What type is window W1?' / 'type of door 104S': a type named for ONE numbered opening is a schedule cell
     keyed_type = bool(_KEYED_OPENING_Q.search(q) and re.search(r"\btypes?\b", q, re.I) and not _PLAN_Q.search(q))
@@ -1603,7 +1650,7 @@ def follow_plan(path: str, page: int, question: str, set_paths: list[str] | None
                     box = row["bbox"]
                     why += (f", {via}" if via else "") + f", row {row['key']} of {row['table']}"
                     ql = q.lower()
-                    col = None if row["kind"] not in ("door", "window") else \
+                    col = None if row["kind"] not in ("door", "window") or subj == "part" else \
                         "width" if re.search(r"\b(?:width|wide)\b", ql) else \
                         "height" if re.search(r"\b(?:height|tall|high)\b", ql) else \
                         "thickness" if re.search(r"\bthick(?:ness)?\b", ql) else None
@@ -1613,7 +1660,7 @@ def follow_plan(path: str, page: int, question: str, set_paths: list[str] | None
                     if col and len(named) > 1:
                         # 'width and height' = the door's size; with the thickness too: no single answer
                         col = "size" if named == {"width", "height"} else None
-                    if row["kind"] in ("door", "window") and not named and \
+                    if row["kind"] in ("door", "window") and not named and subj != "part" and \
                             re.search(r"\b(?:size|dimensions?|how\s+big)\b", ql) and not _PLAN_Q.search(q):
                         col = "size"                                # F8 c8: width x height of the named row
                     cells, asked = _row_cells(pick.file or path, pick.page, box, col)
@@ -1621,7 +1668,7 @@ def follow_plan(path: str, page: int, question: str, set_paths: list[str] | None
             except Exception:  # noqa: BLE001
                 pass
             qq = q
-            if keyed and not re.search(r"\b(?:width|height|thickness|size)\b", q, re.I):
+            if keyed and subj != "part" and not re.search(r"\b(?:width|height|thickness|size)\b", q, re.I):
                 # the schedule's own column word: 'How tall is door 7.04A?' read the WIDTH on d31 (3'-0" @0.65, gold 7'-0")
                 w = _KEYED_SIZE_Q.search(q).group(0).lower()
                 col = {"wide": "width", "tall": "height", "high": "height"}.get(w, "thickness" if w.startswith("thick") else "size")

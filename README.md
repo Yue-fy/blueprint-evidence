@@ -69,7 +69,7 @@ skipped; in the web app one that fails switches itself off. The rest of the app 
 
 All numbers come from our eval tool (`python -m stoa.eval`). Counts must be exact; areas, lengths and volumes must be
 within 2%. Each row names its mode and the commit it was measured on (on the `night` branch of our
-[workspace repository](https://github.com/Yue-fy/Junction_Hannah_family)). The code in this repository is commit `2a764ce` of that branch, and every commit named below is in its history. The live demo during judging runs `75f9ee4`, an earlier commit of this code, with the Private switch on by default (private mode). **Private** = local models only, every
+[workspace repository](https://github.com/Yue-fy/Junction_Hannah_family)). The code in this repository is commit `c66948a` of that branch, and every commit named below is in its history. The live demo during judging runs `75f9ee4`, an earlier commit of this code, with the Private switch on by default (private mode). **Private** = local models only, every
 hosted model off; **hybrid** = with the Gemini 3.1 Pro escalation and the Nemotron check on. Except in the dataset's
 sealed test, every file is uploaded alone under a meaningless name, as Stoa will test. Method and caveats: [docs/RESULTS.md](docs/RESULTS.md).
 
@@ -170,10 +170,10 @@ about $0.010 (mostly local GPU time to read the sheet's text once), each further
 - **On Stoa's own sheets the hosted step adds little.** In the web app (`1795365`) it got 11 of 17 right against
   12 of 17 for our own reading before it: it overrode 6 right readings of ours and missed 6 chances to fix a wrong
   one, and 15 of 18 answers became "expensive". Since then a value read from the drawing's own geometry or text is
-  kept over a vision reading. On the same code and rows (`4b62b93`, the Gemini answers replayed from the cache of earlier
-  live calls) the hybrid scores 315 against 314 of all 381 open questions (1 won, 0 lost), at about 2.3 times the
-  recorded cost ($1.04 against $0.45 per 1,000); 106 of the 381 had no cached reply and stayed private, so the hybrid's
-  share is a lower bound. At `aff2f1f` both modes scored 82 of Stoa's 90 questions (81 against 78 at `f2cd8f1`) and 250
+  kept over a vision reading. On the same code and rows (`e4a166b`, the Gemini answers replayed from the cache of earlier
+  live calls) the hybrid scores 323 against 322 of all 381 open questions (1 won, 0 lost), at about 2.4 times the
+  recorded cost ($0.99 against $0.42 per 1,000; about $4 live); at `4b62b93` 315 against 314 for $1.04 against $0.45.
+  Rows with no cached reply stayed private, so the hybrid's share is a lower bound. At `aff2f1f` both modes scored 82 of Stoa's 90 questions (81 against 78 at `f2cd8f1`) and 250
   against 249 of 316. Private mode gives up nothing measurable there.
 - **Storage and processing are two different things.** Uploads are *stored* on the server that runs the web app,
   and so are the caches built from them (uploads in `STOA_UPLOADS`, a temporary folder by default); our code never

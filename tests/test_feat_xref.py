@@ -509,6 +509,24 @@ def test_size_words_hop_only_for_a_numbered_door(tmp_path):
         assert h is not None and h.to_row and h.to_row["key"] == row, q
     for q in ["How wide is door 999Z?", "How wide is the door into the kitchen?", "How many doors are 3 feet wide?"]:
         assert xref.follow_plan(str(p), 1, q) is None, q
+    # F8 c11: the door only LOCATES what is measured (AW-28 / SFO: 19 of 23 such phrasings put the door's printed size
+    # over the reader's answer at 0.8): no hop; a PART of the door is read on its row, never from WIDTH / HEIGHT
+    for q in ["How wide is the corridor outside door 7.04A?", "How thick is the wall at door 104B?",
+              "What is the height of the window next to door 7.04B?", "How high is the ceiling behind door 104B?",
+              "What is the clear width of the corridor by door 7.04A?", "How wide is the opening next to door 104B?"]:
+        for page in (0, 1):
+            assert xref.follow_plan(str(p), page, q) is None, (q, page)
+    for q in ["What size is the louver in door 7.04A?", "What is the width of the frame of door 104B?",
+              "What is the glass size in door 7.04B?"]:
+        h = xref.follow_plan(str(p), 0, q)
+        assert h is not None and h.to_row and h.to_row["asked"] is None and h.question == q, q
+    for q in ["How wide is the mech room door 104B?", "Door 7.04A: what are its dimensions?", "What is the clear width "
+              "of door 104B?", "How tall is the opening of door 7.04A?", "What is door 104B's width?"]:
+        assert xref._size_subject(q) == "door", q
+        h = xref.follow_plan(str(p), 0, q)
+        assert h is not None and h.to_row and h.to_row["key"] in q, q
+    assert xref._size_subject("Next to door 104B, how wide is the corridor?") == "located"
+    assert xref._size_subject("What is the width of door 104B's frame?") == "part"
 
 
 def _node22() -> str | None:

@@ -76,11 +76,11 @@ the known weaknesses.
 - **Local first.** Deterministic readers (CAD, IFC, PDF vector geometry, schedules, OCR) answer what they can on CPU;
   our fine-tuned Qwen3-VL-8B runs on our own GPU; a hosted model is asked only for unsure answers, and only when the
   user allows it. On the sealed test, 56% of answers needed no model call at all.
-- **Cost per 1,000 questions on Stoa's kind of sheets, private** (`4b62b93`, the 401 open Stoa-like questions; GPU
-  at $2/h, CPU at $0.05 per core-hour): **$0.45**: $0.11 on vector PDFs, $0.83 on PNG pictures, $2.61 on phone
-  photos; median 1.6 s, p95 16 s; no answer called a hosted model. The same rows with Gemini and Nemotron allowed
-  (their replies replayed from earlier live calls and priced as if made): 315 against 314 of 381 right for $1.04
-  per 1,000, and about $3.5–4 live, since 106 rows had no cached reply. Gemini 3.1 Pro asked directly costs $7.59
+- **Cost per 1,000 questions on Stoa's kind of sheets, private** (`e4a166b`, the 401 open Stoa-like questions; GPU
+  at $2/h, CPU at $0.05 per core-hour): **$0.42**: $0.08 on vector PDFs, $0.83 on PNG pictures, $2.33 on phone
+  photos; median 1.6 s, p95 15 s; no answer called a hosted model. The same rows with Gemini and Nemotron allowed
+  (their replies replayed from earlier live calls and priced as if made): 323 against 322 of 381 right for $0.99
+  per 1,000, and about $4 live (`4b62b93`: 315 against 314 for $1.04). Gemini 3.1 Pro asked directly costs $7.59
   per 1,000 questions, without evidence. Hybrid on the held-out real drawings: about $8 per 1,000 for +16 points
   (`fc0927a`); on Stoa's own sheets it now adds one answer in 381, so private is enough there.
 - **Every answer shows its cost**: a tier badge (cheap, in-between, expensive), the hosted calls and the local GPU
